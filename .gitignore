@@ -8,3 +8,6 @@ target/
 # NOT: build/ BİLİNÇLİ commit'lidir (prebuilt WASM — fork'layan Rust kurmadan
 # deploy eder). Kaynaktan yeniden derlersen build/ güncellenir, commit'le.
 node_modules/
+
+# yerel probe/test config'leri
+wrangler.probe.toml
