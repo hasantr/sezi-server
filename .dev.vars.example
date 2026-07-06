@@ -1,0 +1,8 @@
+JWT_SIGNING_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+ADMIN_INVITE_KEY="dev-secret"
+
+# Arama TURN relay'i (calls Faz 1.5) — internet üstü aramalar.
+# CF paneli → Realtime → TURN → Create → Key ID + API Token al, buraya koy.
+# SET DEĞİLSE arama TURN'süz çalışır (yalnız LAN/WiFi/STUN).
+TURN_KEY_ID="buraya-cf-turn-key-id"
+TURN_API_TOKEN="buraya-cf-turn-api-token"

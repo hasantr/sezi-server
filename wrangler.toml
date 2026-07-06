@@ -1,0 +1,77 @@
+# Sezi Server — Cloudflare Worker (self-host şablonu)
+#
+# Bu dosya "Deploy to Cloudflare" butonu için parametriktir: kaynak ID'leri
+# (D1/KV) buton akışında OTOMATİK oluşturulup buraya yazılır. CLI ile kuruyorsan
+# README'deki 3 komutla kaynakları oluşturup ID'leri işle.
+#
+# PREBUILT: `build/` klasörü derlenmiş WASM içerir → deploy için Rust GEREKMEZ
+# ([build] bölümü bilinçli yok; `wrangler deploy` yalnız upload eder).
+
+name = "sezi-server"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# D1 — sunucu veritabanı (üyeler/davetler/kuyruk-metadata; içerik E2E-şifreli,
+# sunucu OKUYAMAZ). Şema ilk istekte otomatik kurulur (self-migration).
+[[d1_databases]]
+binding = "DB"
+database_name = "sezi"
+database_id = ""            # buton doldurur; CLI: `wrangler d1 create sezi` çıktısındaki id
+migrations_dir = "./migrations"
+
+# R2 — medya blob'ları (uçtan-uca şifreli; sunucu-kör).
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "sezi-media"
+
+# KV — hız-limiti sayaçları.
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = ""                     # buton doldurur; CLI: `wrangler kv namespace create RATE_LIMIT`
+
+# Durable Objects — kullanıcı-başına gelen-kutusu + oda-başına eklenti-log'u.
+# Deploy'da otomatik oluşur, ön-hazırlık gerekmez.
+[[durable_objects.bindings]]
+name = "USER_INBOX"
+class_name = "UserInbox"
+
+[[durable_objects.bindings]]
+name = "PLUGIN_ROOM_LOG"
+class_name = "PluginRoomLog"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UserInbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PluginRoomLog"]
+
+[triggers]
+# Günlük temizlik (04:00 UTC) + 2dk'da bir teslim-tekrar-deneme drain'i.
+crons = ["0 4 * * *", "*/2 * * * *"]
+
+[vars]
+# JWT iss claim'i — sunucu kendi imzalar/kendi doğrular; herhangi bir sabit değer
+# çalışır (URL olması gerekmez).
+JWT_ISSUER = "sezi-server"
+EMAIL_FROM = "verify@sezi.local"
+TOKEN_TTL_SEC = "604800"
+ENV = "prod"
+# TURN bütçe bekçisi: aylık kimlik tavanı — aşılınca aramalar doğrudan/STUN'a
+# düşer, Cloudflare faturası durur.
+TURN_MONTHLY_CAP = "5000"
+# Android push (opsiyonel): Firebase proje ID'si. Boşsa push atlanır, mesajlaşma
+# normal çalışır (uygulama açıkken/WS ile teslim).
+FCM_PROJECT_ID = ""
+
+# ── Secret'lar — HEPSİ OPSİYONEL ──────────────────────────────────────────────
+# JWT_SIGNING_KEY / ADMIN_INVITE_KEY: girilmezse sunucu İLK AÇILIŞTA kendisi
+#   üretir ve D1'de saklar (self-provisioning). Kendi anahtarını yönetmek istersen
+#   `wrangler secret put JWT_SIGNING_KEY` (PKCS8 PEM Ed25519) — env HER ZAMAN kazanır.
+# TURN_KEY_ID / TURN_API_TOKEN: CF Realtime TURN (opsiyonel; yoksa arama LAN/STUN).
+# FCM_SERVICE_ACCOUNT: Firebase service-account JSON (opsiyonel; Android push).
+# CF_API_TOKEN / CF_ACCOUNT_ID: kullanım paneli "faturayla birebir" modu —
+#   bunları uygulama içinden de girebilirsin (Sunucu → Kullanım → CF Analytics).

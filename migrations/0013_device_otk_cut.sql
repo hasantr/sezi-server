@@ -1,0 +1,14 @@
+-- Sezgi: çoklu-cihaz adresleme S2.3 (WIRE-CUT — per-device OTK havuzu temiz-kesik).
+--
+-- M2-S2.3 wire-cut: tekil `envelope_b64` sökülür, OTK claim artık
+-- (user_id, device_id) düzeyinde tüketilir (keys/handlers.rs bundle v2).
+--
+-- ESKİ NULL-device OTK havuzunu SİL (temiz-kesik): S1 boyunca cihaz device_id
+-- göndermeden replenish edenler `device_id IS NULL` satır bıraktı. S2.3 claim'i
+-- `WHERE device_id = ?` ile çalıştığından bu legacy NULL havuzu artık ASLA
+-- claim edilemez = ölü stok. Client (primary cihaz) deploy sonrası device_id ile
+-- yeniden replenish eder → havuz somut-device satırlarıyla dolar. Eski NULL
+-- satırları temizlemek D1'i şişmekten korur + "neden OTK bitmiyor" karışıklığını
+-- önler. (signed_prekeys NULL device_id DOKUNULMAZ — bundle SPK'yı device-filtresiz
+-- en-yeni seçer; primary SPK rotate edilince zaten device_id'li satır gelir.)
+DELETE FROM one_time_prekeys WHERE device_id IS NULL;

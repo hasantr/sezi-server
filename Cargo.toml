@@ -1,0 +1,45 @@
+[package]
+name = "sezgi-worker-rs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker = { version = "0.8", features = ["d1", "http"] }
+worker-macros = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+console_error_panic_hook = "0.1"
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+# FCM HTTP v1 OAuth2 service-account JWT (RS256). Saf-Rust (WebCrypto subtle yerine);
+# PKCS8 PEM import + deterministik PKCS1v15 imza (RNG gerektirmez).
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false }
+hmac = "0.12"
+# device_id türetimi (core ile parite: hex(blake3(ed_pub)[..8])). no_std/portable
+# (wasm32 SIMD-yok fallback) — default-features kapalı.
+blake3 = { version = "1", default-features = false }
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+
+# Misc
+uuid = { version = "1", features = ["v4", "js"] }
+getrandom = { version = "0.2", features = ["js"] }
+
+# Wasm interop (D1 BLOB binding)
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

@@ -1,0 +1,10 @@
+# Rust
+target/
+
+# Wrangler yerel durum + gizli değişkenler
+.wrangler/
+.dev.vars
+
+# NOT: build/ BİLİNÇLİ commit'lidir (prebuilt WASM — fork'layan Rust kurmadan
+# deploy eder). Kaynaktan yeniden derlersen build/ güncellenir, commit'le.
+node_modules/

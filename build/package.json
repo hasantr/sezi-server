@@ -1,0 +1,14 @@
+{
+  "files": [
+    "index_bg.wasm",
+    "index.js",
+    "index.d.ts"
+  ],
+  "main": "index.js",
+  "name": "sezgi-worker-rs",
+  "sideEffects": [
+    "./index.js"
+  ],
+  "type": "module",
+  "version": "0.1.0"
+}
