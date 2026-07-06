@@ -26,7 +26,7 @@ pub async fn send_verification_code(env: &Env, email: &str, code: &str) -> Resul
 }
 
 /// Email adresini log için kısmen maskele: ilk 2 char + *** + @domain.
-/// "hsn.salihoglu@gmail.com" → "hs***@gmail.com".
+/// "ali.veli@example.com" → "al***@example.com".
 fn mask_email(email: &str) -> String {
     if let Some(at) = email.find('@') {
         let local = &email[..at];
