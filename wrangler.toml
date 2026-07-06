@@ -18,9 +18,10 @@ workers_dev = true
 [[d1_databases]]
 binding = "DB"
 database_name = "sezi"
-# database_id BİLİNÇLİ yok: "Deploy to Cloudflare" butonu / wrangler otomatik
-# oluşturur. CLI'da elle: `wrangler d1 create sezi` → çıktıdaki id'yi buraya ekle:
-# database_id = "..."
+# PLACEHOLDER: "Deploy to Cloudflare" butonu yeni D1 oluşturup bu ID'yi kendisi
+# günceller (butonun parser'ı alanın MEVCUT olmasını ister — CF dokümanı).
+# CLI ile kuruyorsan: `wrangler d1 create sezi` → çıktıdaki gerçek id'yi yaz.
+database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "./migrations"
 
 # R2 — medya blob'ları (uçtan-uca şifreli; sunucu-kör).
@@ -31,8 +32,9 @@ bucket_name = "sezi-media"
 # KV — hız-limiti sayaçları.
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
-# id BİLİNÇLİ yok: buton/wrangler otomatik oluşturur. CLI'da elle:
-# `wrangler kv namespace create RATE_LIMIT` → id = "..."
+# PLACEHOLDER: buton yeni KV namespace oluşturup ID'yi kendisi günceller.
+# CLI ile: `wrangler kv namespace create RATE_LIMIT` → gerçek id'yi yaz.
+id = "00000000000000000000000000000000"
 
 # Durable Objects — kullanıcı-başına gelen-kutusu + oda-başına eklenti-log'u.
 # Deploy'da otomatik oluşur, ön-hazırlık gerekmez.
