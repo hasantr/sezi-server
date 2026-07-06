@@ -11,3 +11,4 @@ node_modules/
 
 # yerel probe/test config'leri
 wrangler.probe.toml
+wrangler.live.toml
