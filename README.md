@@ -46,7 +46,14 @@ npx wrangler deploy
 
 ## Güncelleme
 
-Fork'unu bu repo ile senkron tut (GitHub **Sync fork**) → Cloudflare bağlı-dağıtım otomatik yeniden deploy eder (butonla kurduysan). CLI kurulumunda: `git pull && npx wrangler deploy`. Veritabanı şeması kendini günceller (self-migration).
+1. GitHub'da fork'unda **Sync fork → Update branch** yap.
+2. Cloudflare'a bağlı kurulumda bu genellikle otomatik yeniden-deploy tetikler; **tetiklenmezse** Cloudflare dashboard → Workers & Pages → sunucun → **Deployments/Builds** sekmesinden "Retry/Deploy" ile elle tetikle, ya da bilgisayarında tek komut: `npx wrangler deploy` (fork klasöründe).
+
+Veritabanı şeması kendini günceller (self-migration) — veri kaybolmaz.
+
+## Aynı hesapta birden fazla sunucu
+
+Kurarken **veritabanı adı çakışmasına** dikkat: ikinci sunucuyu aynı Cloudflare hesabına kurarken kurulum ekranında **D1 veritabanı adını** benzersiz yap (örn. `sezi-aile`, `sezi-okul`). Aynı adı kullanırsan iki sunucu **aynı veritabanını paylaşır** (üyeler/veriler karışır). Worker/KV adlarının değişmesi zararsızdır. Not: ücretsiz plan kotaları (istek/depolama) hesaptaki tüm sunucular arasında paylaşılır.
 
 ## Mimari (kısaca)
 

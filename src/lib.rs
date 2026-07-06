@@ -1,9 +1,5 @@
 use crate::auth::jwt::{public_jwk, verify_access_token};
-use crate::d1util::d1_int;
 use crate::respond::json_err;
-use crate::utils::now_secs;
-use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsValue;
 use worker::*;
 
 mod admin;
@@ -14,6 +10,7 @@ mod devices;
 mod email;
 mod groups;
 mod keys;
+mod maintenance;
 mod media;
 mod messages;
 mod plugin_blob;
@@ -28,6 +25,7 @@ mod storage;
 mod turn;
 mod usage;
 mod utils;
+mod welcome;
 
 pub use messages::inbox_do::UserInbox;
 pub use plugin_log::PluginRoomLog;
@@ -37,10 +35,11 @@ fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Günlük cleanup cron — wrangler.toml [triggers] crons.
-/// Recipient ack atınca medya zaten anında silinir; bu fallback "kimse
-/// almadı, 30 gün geçti" senaryosu için. Ayrıca expired invite_tokens ve
-/// verification_codes da temizlenir (D1 büyümesin).
+/// Günlük cleanup cron — wrangler.toml [triggers] crons. Günlük gövde
+/// `maintenance::run_daily` (cron + lazy-yol ORTAK fonksiyon; gövde oraya
+/// saf-taşındı). Cron her koşuşta damgasını tazeler → cron'lu kurulumda
+/// lazy-yol uyur (maintenance.rs modül başlığı; cron'suz şablon-kurulumda
+/// bakım tamamen lazy-yoldan yürür).
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // Self-host Faz A boot-guard: cron, izolate'i fetch'ten ÖNCE cold-start
@@ -51,6 +50,9 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // W4-b: HER scheduled invocation'da durable-retry drain (Fable#4: cron-string match KIRILGAN
     // → drain'i KOŞULSUZ çalıştır; "*/2 * * * *" sık-drain + "0 4 * * *" günlük ikisinde de koşar).
     crate::messages::handlers::drain_fanout_retry(&env).await;
+    // Lazy-maintenance damgası: cron çalışan kurulumda drain-damgası hep taze →
+    // fetch-yolu lazy-drain HİÇ uyanmaz (prod bit-aynı).
+    maintenance::stamp_drain(&env).await;
     // MINOR-2 (Fable+Codex): sık-cron ise erken-çık (cleanup/GC koşma). Günlük "0 4 * * *" VE
     // beklenmedik normalize-sürprizi → cleanup'a DÜŞER (fail-toward-running: gürültülü-ama-GÜVENLİ;
     // eski `!= "0 4"` yönü sürprizde cleanup+GC'yi SESSİZCE hiç koşturmazdı = media-GC+TTL-GC durur).
@@ -58,119 +60,25 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if event.cron() == "*/2 * * * *" {
         return;
     }
-    if let Err(e) = cleanup_expired(&env).await {
-        // Debug-format kaldırıldı: error içerisinde SQL parametre/binding
-        // (user_id, email vb.) sızabiliyordu. İlk 80 char yeter — error
-        // kategorisi görünür, PII görünmez.
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("cleanup error: {}", truncated);
-    }
-    crate::messages::handlers::gc_fanout_retry(&env).await;
-    // Kota Faz-0 (SHADOW): günlük authoritative reconcile — best-effort depolama
-    // sayaçlarındaki (user_storage/server_stats) drift'i media_objects gerçeğinden
-    // yeniden-hesapla (self-heal). Hata cron'un kalanını kırmaz — logla-devam.
-    if let Err(e) = crate::usage::reconcile_storage(&env).await {
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("usage reconcile error: {}", truncated);
-    }
-}
-
-#[derive(Deserialize)]
-struct ExpiredMediaRow {
-    blob_id: String,
-    // Kota Faz-0 (SHADOW): silinen blob'un sayaç-düşümü için boyut + yükleyen.
-    size_bytes: i64,
-    uploader_id: String,
-}
-
-async fn cleanup_expired(env: &Env) -> Result<()> {
-    let now = now_secs() as i64;
-    let db = env.d1("DB")?;
-
-    // 1) expired media: R2 + D1 sil
-    let rows: Vec<ExpiredMediaRow> = db
-        .prepare("SELECT blob_id, size_bytes, uploader_id FROM media_objects WHERE expires_at < ? LIMIT 500")
-        .bind(&[d1_int(now)])?
-        .all()
-        .await?
-        .results()?;
-
-    if !rows.is_empty() {
-        // Tek choke-point (crate::storage) üzerinden; R2-bağımlılığı tek yerde.
-        // Lite kurulum (R2-binding'siz): blob-delete ATLANIR ama D1-meta silme +
-        // sayaç-düşümü DEVAM eder — aksi halde `from_env`in `?`sı cron'u her gece
-        // Err'letir ve SONRAKİ temizlik adımları (invite/verification GC) atlanırdı.
-        // (Meta satırı yalnız R2-sonradan-kaldırıldı kenarında var olabilir; upload
-        // Lite'ta D1-insert'ten önce 503'lenir.)
-        if crate::storage::MediaStore::available(env) {
-            let store = crate::storage::MediaStore::from_env(env)?;
-            for row in &rows {
-                let _ = store.delete(&row.blob_id).await; // best-effort günlük temizlik
-            }
-        }
-        let placeholders: String =
-            (0..rows.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "DELETE FROM media_objects WHERE blob_id IN ({})",
-            placeholders
-        );
-        let binds: Vec<JsValue> = rows
-            .iter()
-            .map(|r| JsValue::from_str(&r.blob_id))
-            .collect();
-        db.prepare(&sql).bind(&binds)?.run().await?;
-        console_log!("cleanup: {} expired media blobs removed", rows.len());
-        // Kota Faz-0 (SHADOW, best-effort): süresi dolup silinen medyayı depolama
-        // sayaçlarından düş (0-clamp; hata temizliği kırmaz, günlük reconcile onarır).
-        let removed: Vec<(String, i64)> = rows
-            .iter()
-            .map(|r| (r.uploader_id.clone(), r.size_bytes))
-            .collect();
-        crate::usage::media_removed(&db, &removed).await;
-    }
-
-    // 2) expired invite tokens (used veya süresi dolmuş)
-    db.prepare(
-        "DELETE FROM invite_tokens WHERE expires_at < ? OR used = 1",
-    )
-    .bind(&[d1_int(now)])?
-    .run()
-    .await?;
-
-    // 3) expired verification codes
-    db.prepare("DELETE FROM verification_codes WHERE expires_at < ?")
-        .bind(&[d1_int(now)])?
-        .run()
-        .await?;
-
-    // 4) revoked / expired refresh tokens
-    db.prepare(
-        "DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1",
-    )
-    .bind(&[d1_int(now)])?
-    .run()
-    .await?;
-
-    // 5) süresi dolmuş link istekleri (M2-S3.2; consume zaten satırı siler →
-    //    'consumed' durumu persist edilmez, lazy-GC + bu cron expired'ları toplar)
-    db.prepare("DELETE FROM link_requests WHERE expires_at < ?")
-        .bind(&[d1_int(now)])?
-        .run()
-        .await?;
-
-    Ok(())
+    // Günlük set (cleanup + fanout-TTL-GC + kota-reconcile) — lazy-yol ile
+    // bit-aynı ortak gövde + günlük-damga (lazy günlük-GC'yi uyutur).
+    maintenance::run_daily(&env).await;
+    maintenance::stamp_daily(&env).await;
 }
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // Self-host Faz A boot-guard: D1 self-migration (A2) + anahtar
     // self-provisioning (A1). İzolate-scope memoized → ilk istekte koşar,
     // sonrası no-op (hot-path'e D1-roundtrip SOKULMAZ). env-secret'lı +
     // wrangler-migrated kurulumda (bizim prod) tamamen no-op'a düşer.
     // /sync'ten ÖNCE olmalı: sync_ws token doğrular → anahtar hazır olmalı.
     self_provision::ensure_ready(&env).await;
+
+    // Lazy-maintenance (cron'suz kurulum): istek-sırtında bakım tetikleyicisi.
+    // İstek kritik-yoluna maliyeti thread_local zaman-karşılaştırması (D1'siz,
+    // await'siz); damga-kontrol + olası iş `ctx.wait_until` arka-planında.
+    maintenance::maybe_run_lazy(&env, &ctx);
 
     // /sync WS upgrade direkt DO'ya geçilir (Router'dan önce ele alalım,
     // çünkü WS upgrade için header passthrough şart).
@@ -181,7 +89,9 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 
     Router::new()
-        .get("/", root)
+        // Kök = hoş-geldin sayfası (insan-okur; taze kurulumda 404-güvensizliği
+        // yerine "sunucun hazır" + adres-kopyala yönergesi). API'ler dokunulmadı.
+        .get_async("/", welcome::welcome)
         .get("/healthz", |_, _| {
             Response::from_json(&serde_json::json!({"ok": true}))
         })
@@ -265,24 +175,6 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/turn/credentials", turn::credentials)
         .run(req, env)
         .await
-}
-
-#[derive(Serialize)]
-struct RootInfo {
-    name: &'static str,
-    env: String,
-}
-
-fn root(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let env_name = ctx
-        .env
-        .var("ENV")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "unknown".into());
-    Response::from_json(&RootInfo {
-        name: "sezgi-worker-rs",
-        env: env_name,
-    })
 }
 
 async fn jwks(_req: Request, ctx: RouteContext<()>) -> Result<Response> {

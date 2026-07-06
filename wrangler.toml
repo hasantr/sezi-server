@@ -63,9 +63,12 @@ new_sqlite_classes = ["UserInbox"]
 tag = "v2"
 new_sqlite_classes = ["PluginRoomLog"]
 
-[triggers]
-# Günlük temizlik (04:00 UTC) + 2dk'da bir teslim-tekrar-deneme drain'i.
-crons = ["0 4 * * *", "*/2 * * * *"]
+# [triggers]/cron BİLİNÇLİ YOK: CF free-planı hesap-başına cron sayısını
+# sınırlar (aynı hesapta 2. sunucu cron-adımında hata alıyordu). Bakım
+# (temizlik + teslim-tekrar-drain'i) cron'suz da çalışır: sunucu bunları
+# istek-sırtında kendisi yürütür (lazy-maintenance, src/maintenance.rs).
+# İstersen cron da ekleyebilirsin (dashboard → Settings → Triggers) —
+# eklersen lazy-yol kendiliğinden uyur, çift-koşum olmaz.
 
 [vars]
 # JWT iss claim'i — sunucu kendi imzalar/kendi doğrular; herhangi bir sabit değer
