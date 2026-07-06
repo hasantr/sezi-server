@@ -132,14 +132,22 @@ pub async fn ensure_ready(env: &Env) {
 /// için: DO fetch'i lib.rs `#[event(fetch)]`'ten GEÇMEZ → kendi izolate'inin
 /// cache'ini doldurmalı. Memoized; env-secret varsa D1'e hiç gitmez.
 pub async fn ensure_keys(env: &Env) {
-    ensure_one_key(env, "JWT_SIGNING_KEY", "jwt_signing_key", &JWT_PEM, generate_jwt_signing_pem)
-        .await;
+    ensure_one_key(
+        env,
+        "JWT_SIGNING_KEY",
+        "jwt_signing_key",
+        &JWT_PEM,
+        generate_jwt_signing_pem,
+        validate_jwt_pem,
+    )
+    .await;
     ensure_one_key(
         env,
         "ADMIN_INVITE_KEY",
         "admin_invite_key",
         &ADMIN_INVITE,
         generate_admin_invite_key,
+        validate_invite_key,
     )
     .await;
 }
@@ -171,6 +179,7 @@ async fn ensure_one_key(
     db_key: &str,
     cache: &'static std::thread::LocalKey<RefCell<Option<String>>>,
     generate: fn() -> Result<String>,
+    validate: fn(&str) -> bool,
 ) {
     // 1) env secret → bugünkü davranış BİT-AYNI: okuma noktaları env'i zaten
     //    doğrudan okur (jwt.rs), D1'e HİÇ gidilmez, cache gereksiz.
@@ -181,24 +190,64 @@ async fn ensure_one_key(
     if cache.with(|c| c.borrow().is_some()) {
         return;
     }
-    // 3) D1'den oku / 4) yoksa üret+persist. Hata = console_error + cache boş
-    //    kalır → SONRAKİ istek yeniden dener (D1 geçici hatasında self-heal;
-    //    bu yol zaten yalnız env-secret'sız kurulumlarda çalışır).
-    match resolve_from_db(env, db_key, generate).await {
+    // 3) D1'den oku (+VALIDATE; bozuksa yeniden-üret = self-heal) / 4) yoksa
+    //    üret+persist. Hata = console_error + cache boş kalır → SONRAKİ istek
+    //    yeniden dener (D1 geçici hatasında self-heal; bu yol zaten yalnız
+    //    env-secret'sız kurulumlarda çalışır).
+    match resolve_from_db(env, db_key, generate, validate).await {
         Ok(v) => cache.with(|c| *c.borrow_mut() = Some(v)),
         Err(e) => console_error!("self_provision: {} cozulemedi: {}", db_key, e),
     }
 }
 
-/// D1 `server_config` oku; yoksa üret + persist + kazananı geri oku.
+/// D1 `server_config` oku + DOĞRULA; bozuksa/yoksa üret + persist.
+///
+/// SELF-HEAL (2026-07-06 sezi-server2 vakası): eski/bozuk bir build D1'e
+/// GEÇERSİZ JWT-PEM yazmıştı → güncel kod onu körü körüne kullanıp her token
+/// imzasında/jwks'te 500 veriyordu (kayıt yarıda öldü → hayalet-owner →
+/// sunucu kalıcı-kilit). Kural: kullanıcı ASLA worker-içini elle temizlemez →
+/// D1'den okunan değer validate'i GEÇMEZSE yeniden üret + ÜSTÜNE yaz.
 async fn resolve_from_db(
     env: &Env,
     db_key: &str,
     generate: fn() -> Result<String>,
+    validate: fn(&str) -> bool,
 ) -> Result<String> {
     let db = env.d1("DB")?;
     if let Some(v) = read_config(&db, db_key).await? {
-        return Ok(v);
+        if validate(&v) {
+            return Ok(v);
+        }
+        // Bozuk kayıt → yeniden üret + INSERT OR REPLACE (bilinçli: ON CONFLICT
+        // DO NOTHING bozuk kaydı KORURDU; burada üstüne yazmak ŞART).
+        console_warn!(
+            "self_provision: {} D1 kaydi BOZUK (validate gecmedi) → yeniden uretiliyor (self-heal; 2026-07-06 sezi-server2 vakasi)",
+            db_key
+        );
+        let candidate = generate()?;
+        // Paranoya: ürettiğimizi de yazmadan önce doğrula — üretici ile
+        // doğrulayıcı ayrışırsa bozuk değeri D1'e persist etmeyelim.
+        if !validate(&candidate) {
+            return Err(Error::RustError(format!(
+                "self_provision: {db_key} uretilen deger validate'i gecemedi (uretici/dogrulayici uyumsuz?)"
+            )));
+        }
+        db.prepare(
+            "INSERT OR REPLACE INTO server_config (key, value, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(&[d1_text(db_key), d1_text(&candidate), d1_int(now_secs() as i64)])?
+        .run()
+        .await?;
+        console_log!(
+            "self_provision: {} yeniden uretildi + D1'e yazildi (bozuk kaydin ustune)",
+            db_key
+        );
+        // Yarış notu: iki izolate aynı anda self-heal ederse REPLACE'te
+        // son-yazan kazanır. İki değer de TAZE-ÜRETİM + validate'li olduğu
+        // için zararsız: kaybeden izolate kendi değerini kullanır, izolate
+        // recycle'ında herkes D1'deki kazanana yakınsar (bozuk-kayıt tekrar
+        // doğamaz — yazılan her değer validate'ten geçti).
+        return Ok(candidate);
     }
 
     // Taze fork ilk boot: ÜRET + persist. YARIŞ GUARD'ı: iki eşzamanlı
@@ -207,6 +256,12 @@ async fn resolve_from_db(
     // geri okunur → iki instance ASLA farklı anahtar kullanmaz (son kullanılan
     // = D1'deki tek gerçek).
     let candidate = generate()?;
+    // Paranoya (yukarıdakiyle aynı gerekçe): bozuk değer D1'e persist edilmesin.
+    if !validate(&candidate) {
+        return Err(Error::RustError(format!(
+            "self_provision: {db_key} uretilen deger validate'i gecemedi (uretici/dogrulayici uyumsuz?)"
+        )));
+    }
     db.prepare(
         "INSERT INTO server_config (key, value, created_at) VALUES (?, ?, ?)
          ON CONFLICT(key) DO NOTHING",
@@ -219,10 +274,35 @@ async fn resolve_from_db(
         db_key
     );
     match read_config(&db, db_key).await? {
-        Some(winner) => Ok(winner),
+        // Kazanan da validate'ten geçmeli: yarışı eski/bozuk bir yazar
+        // kazandıysa (teorik) onu kullanma → kendi taze değerimize düş;
+        // sonraki boot'un bozuk-kayıt dalı D1'i onarır.
+        Some(winner) if validate(&winner) => Ok(winner),
+        Some(_) => {
+            console_warn!(
+                "self_provision: {} yarisi kazanan D1 degeri BOZUK — kendi taze degerimiz kullaniliyor (sonraki boot self-heal eder)",
+                db_key
+            );
+            Ok(candidate)
+        }
         // Beklenmedik (insert az önce başarılıydı) — kendi değerimize düş.
         None => Ok(candidate),
     }
+}
+
+// ── Anahtar doğrulayıcıları (saf → unit-testli) ─────────────────────────────
+
+/// D1'den okunan JWT-PEM geçerli mi? jwt.rs'in KULLANACAĞI parser'ın kendisiyle
+/// doğrulanır (`parse_signing_pem`) → "validate geçti ama imzada patladı"
+/// ayrışması imkânsız (aynı fonksiyon).
+fn validate_jwt_pem(v: &str) -> bool {
+    crate::auth::jwt::parse_signing_pem(v).is_ok()
+}
+
+/// Admin-invite anahtarı için makul kapı: boş/whitespace olmasın yeter
+/// (opak paylaşılan-sır; format zorunluluğu yok).
+fn validate_invite_key(v: &str) -> bool {
+    !v.trim().is_empty()
 }
 
 async fn read_config(db: &D1Database, key: &str) -> Result<Option<String>> {
@@ -596,5 +676,32 @@ mod tests {
         // 32 byte → b64url padding'siz 43 karakter.
         assert_eq!(k.len(), 43);
         assert!(crate::utils::b64u_decode(&k).unwrap().len() == 32);
+    }
+
+    /// Self-heal kapısı (2026-07-06 sezi-server2 vakası): bozuk D1 kaydı
+    /// validate'i GEÇMEMELİ (→ yeniden-üretim yolu), üretilen taze anahtar
+    /// GEÇMELİ (→ körü körüne kullanım yerine doğrulanmış kullanım).
+    #[test]
+    fn validate_jwt_pem_bozuk_kaydi_reddediyor_tazeyi_kabul_ediyor() {
+        // Saha benzeri bozukluklar: boş, PEM-değil, gövdesi-çöp PEM, kırpılmış PEM.
+        assert!(!validate_jwt_pem(""));
+        assert!(!validate_jwt_pem("hic PEM degil"));
+        assert!(!validate_jwt_pem(
+            "-----BEGIN PRIVATE KEY-----\nQk9aVUsgS0FZSVQ=\n-----END PRIVATE KEY-----\n"
+        ));
+        let pem = generate_jwt_signing_pem().unwrap();
+        let truncated = &pem[..pem.len() / 2];
+        assert!(!validate_jwt_pem(truncated));
+        // Taze üretim geçer (üretici ↔ doğrulayıcı uyumu).
+        assert!(validate_jwt_pem(&pem));
+        // wrangler-secret tarzı kaçışlı-newline PEM de geçer (parser replace'li).
+        assert!(validate_jwt_pem(&pem.replace('\n', "\\n")));
+    }
+
+    #[test]
+    fn validate_invite_key_bos_reddediyor_tazeyi_kabul_ediyor() {
+        assert!(!validate_invite_key(""));
+        assert!(!validate_invite_key("   \n\t"));
+        assert!(validate_invite_key(&generate_admin_invite_key().unwrap()));
     }
 }

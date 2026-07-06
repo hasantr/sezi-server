@@ -121,6 +121,18 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     };
     let device_id = body.device_id.as_deref();
 
+    // SELF-HEAL SIRALAMASI (2026-07-06 sezi-server2 vakası): token imzası TÜM
+    // DB-yazımlarından ÖNCE. Eski akış user-INSERT'ten (ve davet/kod
+    // mutasyonlarından) SONRA imzalıyordu; JWT-anahtarı bozukken imza patlayınca
+    // user-satırı yazılmış kalıyordu → owner-yuvası cihazsız/token'sız "hayalet"
+    // kullanıcıyla yanmış oluyordu (/bootstrap 410 → sunucu kalıcı-kilit).
+    // İmza + refresh-üretimi yalnız CPU+anahtar işidir (DB'siz) → burada
+    // başarısızlık = hiçbir DB-mutasyonu yapılmadan 500 (hayalet OLUŞAMAZ).
+    // Başarı yolu bit-aynı: aynı token, aynı yazımlar, aynı göreli sıra.
+    let access_token = sign_access_token(&ctx.env, &user_id, device_id)?;
+    let refresh = generate_refresh_token();
+    let refresh_hash = sha256_hex(&refresh);
+
     // İlk kayıt olan = owner (sunucu kurucusu, korumalı). Sonrakiler member;
     // owner sonradan set_role ile member'ları admin yapar.
     #[derive(Deserialize)]
@@ -222,9 +234,8 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         .run()
         .await?;
 
-    let access_token = sign_access_token(&ctx.env, &user_id, device_id)?;
-    let refresh = generate_refresh_token();
-    let refresh_hash = sha256_hex(&refresh);
+    // Refresh-token'ın DB kaydı imza-SONRASI blokta (kritik olan: USER-satırı
+    // imzadan önce yazılmasın; refresh-satırı zaten en son yazılıyordu).
     db.prepare(
         "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
          VALUES (?, ?, ?, 0, ?, ?)",
