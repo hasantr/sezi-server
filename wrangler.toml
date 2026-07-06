@@ -68,9 +68,11 @@ ENV = "prod"
 # TURN bütçe bekçisi: aylık kimlik tavanı — aşılınca aramalar doğrudan/STUN'a
 # düşer, Cloudflare faturası durur.
 TURN_MONTHLY_CAP = "5000"
-# Android push (opsiyonel): Firebase proje ID'si. Boşsa push atlanır, mesajlaşma
-# normal çalışır (uygulama açıkken/WS ile teslim).
-FCM_PROJECT_ID = ""
+# NOT: FCM_PROJECT_ID BİLİNÇLİ olarak burada YOK — Deploy-butonu boş var'ı
+# doldurtmaya zorluyor; kod yokluğunu tolere eder (push sessizce atlanır,
+# mesajlaşma normal). Android push'u SONRADAN açmak için: CF dashboard →
+# Worker → Settings → Variables → FCM_PROJECT_ID ekle + FCM_SERVICE_ACCOUNT
+# secret'ı gir (Firebase Console → Project Settings → Service accounts → JSON).
 
 # ── Secret'lar — HEPSİ OPSİYONEL ──────────────────────────────────────────────
 # JWT_SIGNING_KEY / ADMIN_INVITE_KEY: girilmezse sunucu İLK AÇILIŞTA kendisi
