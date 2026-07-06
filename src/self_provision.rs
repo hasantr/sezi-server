@@ -21,7 +21,12 @@
 //! dürüst-server modeli. Anahtar HİÇBİR endpoint'te dönmez (yalnız worker-içi).
 //!
 //! **A2 — D1 self-migration**: `migrations/*.sql` gömülü (`include_str!`);
-//! ilk istekte `_sezi_migrations` tracking'ine göre eksikler SIRAYLA uygulanır.
+//! ilk istekte `_sezi_migrations` tracking'ine göre eksikler TEK `db.batch`te
+//! uygulanır (2026-07-06 free-plan vakası: Workers free-planı istek-başına
+//! ~50 subrequest kapıyor; eski dosya-başına batch+track-INSERT deseni taze
+//! kurulum ilk-boot'unda ~50+ D1-çağrısıyla ortadan kesiliyordu → jwks/verify
+//! deterministik 500. Tek-batch ilk-boot'u ~4 D1-çağrısına indirir + tüm
+//! bekleyenler hepsi-ya-hiç atomik olur).
 //! wrangler-uyumu (KRİTİK): mevcut prod migration'ları `wrangler d1 migrations
 //! apply` ile uyguladı → wrangler'ın kendi `d1_migrations` tablosundaki kayıtlar
 //! uygulanmış-SAYILIR (prod'da hiçbir migration yeniden koşmaz). Ek kemer:
@@ -346,10 +351,6 @@ async fn ensure_migrations(env: &Env) {
     if MIGRATIONS_CHECKED.with(|c| c.get()) {
         return;
     }
-    // Bayrağı BAŞARISIZLIKTA DA set et — karar: kalıcı migration hatasında
-    // hot-path'i her istekte D1-migration denemesine boğma; hata console_error
-    // ile görünür, bir SONRAKİ izolate cold-start'ı yeniden dener.
-    MIGRATIONS_CHECKED.with(|c| c.set(true));
     let db = match env.d1("DB") {
         Ok(d) => d,
         Err(e) => {
@@ -363,11 +364,20 @@ async fn ensure_migrations(env: &Env) {
     // kaldı; eski şemayla çalışan endpoint'ler çalışmaya devam eder, yenisini
     // isteyenler zaten anlamlı hata verir. Tam-blokaj self-host operatörüne
     // "server ölü" görünürdü; böyle yalnız yeni özellik aksar + log konuşur.
-    if let Err(e) = run_migrations(&db).await {
-        console_error!(
+    //
+    // Bayrak YALNIZ BAŞARIDA set edilir (2026-07-06 free-plan vakası): eski
+    // "denemeden önce set" kararı, subrequest-limitinde ortadan kesilen bir
+    // ilk-boot'u izolat ömrü boyunca ZEHİRLİ bırakıyordu (migration'lar hiç
+    // bitmedi ama bir daha denenmedi → deterministik jwks/verify 500). Yeni
+    // kural: Err'de set ETME → sonraki istek yeniden dener (migration'lar
+    // tolerant + batch-atomik = tekrar-GÜVENLİ). Kalıcı-hata döngüsü riski,
+    // kesik-boot'ta kalıcı-zehirden iyidir; batch başarılıysa zaten tek-sefer.
+    match run_migrations(&db).await {
+        Ok(()) => MIGRATIONS_CHECKED.with(|c| c.set(true)),
+        Err(e) => console_error!(
             "self_provision: self-migration durdu (mevcut sema ile hizmete devam): {}",
             e
-        );
+        ),
     }
 }
 
@@ -410,21 +420,88 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         }
     }
 
-    for (name, sql) in MIGRATIONS {
-        if applied.contains(*name) {
-            continue;
-        }
-        apply_one(db, name, sql).await?;
+    let pending: Vec<(&str, &str)> = MIGRATIONS
+        .iter()
+        .filter(|(name, _)| !applied.contains(*name))
+        .copied()
+        .collect();
+    // Prod bit-aynı guard: wrangler-seed'li kurulumda bekleyen = 0 → tek-batch
+    // HİÇ kurulmaz (erken dönüş; bugünkü prod deploy no-op davranışı korunur).
+    if pending.is_empty() {
+        return Ok(());
     }
-    Ok(())
+
+    // TEK-BATCH (2026-07-06 free-plan subrequest bütçesi): bekleyen TÜM
+    // dosyaların statement'ları + her dosyanın tracking-INSERT'i dosya-sırasında
+    // tek `db.batch`e (= tek subrequest, implicit transaction) girer. Eski
+    // dosya-başına batch+INSERT deseni taze kurulumda ~50 D1-çağrısıydı →
+    // Workers free-planının ~50-subrequest kapısında ilk-boot ortadan
+    // kesiliyordu. Atomiklik de GÜÇLENDİ: 0017-tipi tuzak ("çıplak ALTER +
+    // ardıl UPDATE") artık yalnız dosya-içi değil, TÜM bekleyen küme için
+    // hepsi-ya-hiç — kesik/yarım şema durumu imkânsız.
+    let merged = merge_pending_statements(&pending);
+    let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(merged.len());
+    for m in &merged {
+        match m {
+            MergedStmt::Sql(s) => stmts.push(db.prepare(s)),
+            MergedStmt::Track(name) => stmts.push(
+                db.prepare(
+                    "INSERT OR IGNORE INTO _sezi_migrations (name, applied_at) VALUES (?, ?)",
+                )
+                .bind(&[d1_text(name), d1_int(now_secs() as i64)])?,
+            ),
+        }
+    }
+    match db.batch(stmts).await {
+        Ok(_) => {
+            console_log!(
+                "self_provision: {} migration tek-batch uygulandi",
+                pending.len()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if is_benign_schema_conflict(&msg) {
+                // Şema-çakışması (duplicate-column / already-exists): iki
+                // eşzamanlı cold-start yarışı ya da "wrangler-uygulanmış ama
+                // d1_migrations tablosuna erişilemedi" DB'si. Tek-batch geri
+                // sarıldı (şemaya dokunulmadı) → DOSYA-DOSYA tolerant-apply
+                // fallback'ine düş: çakışan dosyalar uygulanmış-sayılır,
+                // gerçekten eksikler koşar. NADİR yol — subrequest maliyeti
+                // eski desenle aynı (dosya-başına ≤2 çağrı), kabul edildi.
+                console_warn!(
+                    "self_provision: tek-batch sema-cakismasi ({}) → dosya-dosya tolerant fallback",
+                    msg
+                );
+                for &(name, sql) in &pending {
+                    apply_one(db, name, sql).await?;
+                }
+                Ok(())
+            } else {
+                // GERÇEK hata. Tek-batch'te "hangi dosya patladı" bilgisi yok →
+                // D1'in ham hata metnini aynen taşı (SQLite mesajı çoğu kez
+                // tablo/kolon adıyla dosyayı ele verir); dosya-bazlı teşhis
+                // gerekirse fallback yolu zaten dosya-adıyla raporlar.
+                Err(Error::RustError(format!(
+                    "tek-batch migration ({} bekleyen): {msg}",
+                    pending.len()
+                )))
+            }
+        }
+    }
 }
 
-/// Tek migration'ı ATOMİK uygula (D1 batch = implicit transaction: bir
-/// statement bile hata verirse TAMAMI rollback — devices/handlers.rs deseninin
-/// aynısı). Atomiklik ayrıca 0017-tipi tuzağı kapatır: "çıplak ALTER (duplicate
-/// column) + ardıl UPDATE" dosyasında ALTER hatası TÜM batch'i geri sarar →
-/// UPDATE tek başına ASLA koşmaz (koşsaydı canlı `device_list_rev` high-water'ını
-/// geri çekerdi = veri regresyonu; 2026-07-06 migration-denetim bulgusu).
+/// Tek migration'ı ATOMİK uygula — artık YALNIZ tek-batch'in benign
+/// şema-çakışması fallback'inde çağrılır (ana yol = `run_migrations` tek-batch;
+/// bu yol dosya-bazlı tolerant-apply gerektiğinde devreye girer). D1 batch =
+/// implicit transaction: bir statement bile hata verirse TAMAMI rollback —
+/// devices/handlers.rs deseninin aynısı. Atomiklik 0017-tipi tuzağı dosya-içi
+/// kapatır: "çıplak ALTER (duplicate column) + ardıl UPDATE" dosyasında ALTER
+/// hatası TÜM batch'i geri sarar → UPDATE tek başına ASLA koşmaz (koşsaydı
+/// canlı `device_list_rev` high-water'ını geri çekerdi = veri regresyonu;
+/// 2026-07-06 migration-denetim bulgusu). Tek-batch ana yolu bunu daha da
+/// güçlendirir: hepsi-ya-hiç TÜM bekleyen küme için geçerli.
 async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
     let statements = split_sql_statements(sql);
     if statements.is_empty() {
@@ -474,6 +551,33 @@ async fn record_applied(db: &D1Database, name: &str) -> Result<()> {
 }
 
 // ── Saf yardımcılar (unit-testli) ───────────────────────────────────────────
+
+/// Tek-batch birleştirmesinin bir öğesi: migration dosyasından ham SQL
+/// statement ya da o dosyanın `_sezi_migrations` tracking-INSERT işareti
+/// (INSERT'in kendisi bind'li — SQL metni çağıranda kurulur; burada yalnız
+/// dosya adı taşınır ki birleştirme SAF + unit-testli kalsın).
+#[derive(Debug, PartialEq)]
+enum MergedStmt {
+    Sql(String),
+    Track(String),
+}
+
+/// Bekleyen dosyaları TEK batch vektörüne birleştir — sıra sözleşmesi:
+/// dosya1-stmt'leri, dosya1-track, dosya2-stmt'leri, dosya2-track, ...
+/// (track her zaman kendi dosyasının statement'larından SONRA: batch implicit
+/// transaction olsa da sıra, fallback teşhisi ve okunabilirlik için korunur).
+/// Boş/yorum-only dosya → yalnız track (apply_one'ın "uygulanmış say"
+/// savunmasıyla aynı sonuç). Boş bekleyen → boş vektör.
+fn merge_pending_statements(pending: &[(&str, &str)]) -> Vec<MergedStmt> {
+    let mut out = Vec::new();
+    for &(name, sql) in pending {
+        for s in split_sql_statements(sql) {
+            out.push(MergedStmt::Sql(s));
+        }
+        out.push(MergedStmt::Track(name.to_string()));
+    }
+    out
+}
 
 /// wrangler `d1_migrations.name` = dosya adı (".sql" uzantılı) — bizim liste
 /// uzantısız. Normalize: trim + ".sql" soy.
@@ -628,6 +732,67 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[0], "INSERT INTO t VALUES ('a;b', 'it''s')");
         assert_eq!(stmts[1], "SELECT 1");
+    }
+
+    /// Tek-batch sıra sözleşmesi: dosya1-stmt'leri → dosya1-track →
+    /// dosya2-stmt'leri → dosya2-track... Yorum-only dosya yalnız track üretir.
+    #[test]
+    fn tek_batch_birlestirme_sirasi() {
+        let pending: [(&str, &str); 3] = [
+            (
+                "0001_a",
+                "CREATE TABLE a (id INTEGER); CREATE INDEX ia ON a(id);",
+            ),
+            ("0002_b", "-- yalniz yorum, statement yok\n"),
+            ("0003_c", "ALTER TABLE a ADD COLUMN x TEXT;"),
+        ];
+        let merged = merge_pending_statements(&pending);
+        assert_eq!(
+            merged,
+            vec![
+                MergedStmt::Sql("CREATE TABLE a (id INTEGER)".into()),
+                MergedStmt::Sql("CREATE INDEX ia ON a(id)".into()),
+                MergedStmt::Track("0001_a".into()),
+                MergedStmt::Track("0002_b".into()),
+                MergedStmt::Sql("ALTER TABLE a ADD COLUMN x TEXT".into()),
+                MergedStmt::Track("0003_c".into()),
+            ]
+        );
+    }
+
+    /// Bekleyen boş → boş vektör (run_migrations zaten erken döner ama saf
+    /// fonksiyonun sözleşmesi de net olsun).
+    #[test]
+    fn tek_batch_bos_bekleyen_bos_doner() {
+        assert!(merge_pending_statements(&[]).is_empty());
+    }
+
+    /// Gerçek gömülü liste üstünde bütünlük: birleştirilmiş uzunluk =
+    /// toplam-statement + dosya-başına-1-track; her dosyanın track'i kendi
+    /// statement'larından SONRA gelir (taze-fork ilk-boot senaryosunun aynısı).
+    #[test]
+    fn tek_batch_tum_migrationlar_stmt_arti_track() {
+        let pending: Vec<(&str, &str)> = MIGRATIONS.to_vec();
+        let merged = merge_pending_statements(&pending);
+        let stmt_toplam: usize = MIGRATIONS
+            .iter()
+            .map(|(_, sql)| split_sql_statements(sql).len())
+            .sum();
+        assert_eq!(merged.len(), stmt_toplam + MIGRATIONS.len());
+        // Track sırası = MIGRATIONS sırası; son öğe son dosyanın track'i.
+        let tracks: Vec<&String> = merged
+            .iter()
+            .filter_map(|m| match m {
+                MergedStmt::Track(n) => Some(n),
+                MergedStmt::Sql(_) => None,
+            })
+            .collect();
+        let beklenen: Vec<String> = MIGRATIONS.iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(tracks, beklenen.iter().collect::<Vec<_>>());
+        assert_eq!(
+            merged.last(),
+            Some(&MergedStmt::Track(MIGRATIONS.last().unwrap().0.to_string()))
+        );
     }
 
     #[test]

@@ -1,0 +1,37 @@
+name = "sezi-probe2"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sezi-probe2"
+database_id = "e29742a2-23c8-4f5c-8c5b-99fa9450b0de"
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "ee360fa92d3447f788c5709336fdb56e"
+
+[[durable_objects.bindings]]
+name = "USER_INBOX"
+class_name = "UserInbox"
+
+[[durable_objects.bindings]]
+name = "PLUGIN_ROOM_LOG"
+class_name = "PluginRoomLog"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UserInbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PluginRoomLog"]
+
+[vars]
+JWT_ISSUER = "sezi-server"
+EMAIL_FROM = "verify@sezi.local"
+TOKEN_TTL_SEC = "604800"
+ENV = "prod"
+TURN_MONTHLY_CAP = "5000"
