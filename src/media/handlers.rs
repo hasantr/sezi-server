@@ -14,6 +14,15 @@ pub async fn upload(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Err(resp) => return Ok(resp),
     };
 
+    // Lite kurulum (R2 OPSİYONEL): MEDIA binding'i yoksa medya hattı kapalı → EN BAŞTA
+    // (auth'tan sonra, rate-limit/kota/D1'den ÖNCE) temiz 503. D1-insert'e HİÇ girilmez:
+    // binding'siz kurulumda öksüz meta satırı oluşmaz, sayaçlar şişmez. Client tarafı
+    // "media_not_configured"ı nonretryable sayar (op_result.rs) — owner dashboard'dan
+    // binding ekleyene dek her deneme 503 kalacağı için retry anlamsız.
+    if !crate::storage::MediaStore::available(&ctx.env) {
+        return json_err(503, "media_not_configured");
+    }
+
     // S2 (Fable HIGH — kota/DoS): per-user upload rate-limit. Sürekli 50MB upload
     // R2 depolama + CF egress faturasını şişirebiliyordu (turn.rs bütçe-bekçisi
     // medyada yok). KV sliding-window (auth redeem/verify ile AYNI altyapı). 60
@@ -145,8 +154,15 @@ pub async fn ack(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // Önce R2 blob'u sil (correctness): gerçek R2 hatası propagate edilir → D1
     // metası KORUNUR (öksüz-blob önlenir; sonraki ack/cleanup yeniden dener).
     // R2 delete idempotent → yoksa hata vermez, tekrar 204. Başarınca D1 meta sil.
-    let store = crate::storage::MediaStore::from_env(&ctx.env)?;
-    store.delete(&id).await?;
+    // Lite kurulum kenarı: binding YOKSA (R2 sonradan dashboard'dan KAPATILMIŞ
+    // olabilir — meta satırları D1'de kalmış) R2-delete ATLANIR ama D1-meta silme
+    // DEVAM eder: blob'a zaten erişilemez, metayı bırakmak yalnız sayaç/cron
+    // kirliliği üretir. (Binding geri gelirse o blob R2'de öksüz kalabilir —
+    // kabul edilen kenar; ack-delete zaten best-effort + TTL fallback'li.)
+    if crate::storage::MediaStore::available(&ctx.env) {
+        let store = crate::storage::MediaStore::from_env(&ctx.env)?;
+        store.delete(&id).await?;
+    }
     db.prepare("DELETE FROM media_objects WHERE blob_id = ?")
         .bind(&[d1_text(&id)])?
         .run()
@@ -174,6 +190,11 @@ pub async fn download(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Ok(uid) => uid,
         Err(resp) => return Ok(resp),
     };
+    // Lite kurulum (R2 OPSİYONEL): binding yoksa indirme de kapalı → upload ile
+    // simetrik 503 (rate-limit/D1'e girmeden erken çıkış).
+    if !crate::storage::MediaStore::available(&ctx.env) {
+        return json_err(503, "media_not_configured");
+    }
     // W12 (media-hardening, 2026-07-02): per-user DOWNLOAD rate-limit — upload 60/5dk kapılıyken
     // download SINIRSIZDI = asimetri. Download = R2-EGRESS yolu → sınırsız indirme CF-egress
     // faturasını şişirir (upload-guard'ın koruduğu AYNI maliyetin asıl kaynağı; turn.rs-tarzı

@@ -36,6 +36,17 @@ impl MediaStore {
         }))
     }
 
+    /// Medya deposu YAPILANDIRILMIŞ MI? — "Lite kurulum" farkındalığı (R2 OPSİYONEL).
+    /// Deploy-to-CF şablonu R2-binding'siz kurulabilir (taze CF hesabında R2-aboneliği/
+    /// kart-doğrulama istememek için); o kurulumda mesajlaşma/grup/arama TAM çalışır,
+    /// medya-bağımlı hatlar temiz `503 media_not_configured` döner. Owner medyayı
+    /// SONRADAN CF dashboard'dan binding ekleyerek açar (kod/redeploy gerekmez) →
+    /// bu fonksiyon bir sonraki istekte true görür.
+    /// UCUZ: `env.bucket` yalnız binding lookup'ı (ağa ÇIKMAZ) → her istekte çağrılabilir.
+    pub fn available(env: &Env) -> bool {
+        env.bucket("MEDIA").is_ok()
+    }
+
     /// Blob'u yaz (content-type backend metadata'sına işlenir).
     pub async fn put(&self, blob_id: &str, bytes: Vec<u8>, content_type: &str) -> Result<()> {
         match self {

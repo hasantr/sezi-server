@@ -74,6 +74,12 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     if !is_group_admin(&role) {
         return json_err(403, "not_admin");
     }
+    // Lite kurulum (R2 OPSİYONEL): eklenti-kod deposu = R2 → binding yoksa server-saklı
+    // kod yüklenemez; medya hattıyla AYNI temiz 503 (client nonretryable sayar). Yetki
+    // kontrolünden SONRA (önce 403, sonra servis-durumu) ama rate-limit/body'den ÖNCE.
+    if !crate::storage::MediaStore::available(&ctx.env) {
+        return json_err(503, "media_not_configured");
+    }
     // Per-user upload rate-limit (medya-upload deseni; R2 depolama/egress DoS guard).
     let kv = ctx.env.kv("RATE_LIMIT")?;
     if !crate::ratelimit::check_rate_limit(&kv, &format!("pcode:put:{user_id}"), 60, 5 * 60).await? {
@@ -106,6 +112,10 @@ pub async fn get_code(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
+    // Lite kurulum (R2 OPSİYONEL): binding yoksa kod indirilemez → put_code ile simetrik 503.
+    if !crate::storage::MediaStore::available(&ctx.env) {
+        return json_err(503, "media_not_configured");
+    }
     let store = crate::storage::MediaStore::from_env(&ctx.env)?;
     match store.get_code(&room_id, &blob_id).await? {
         Some(bytes) => {

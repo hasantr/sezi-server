@@ -7,11 +7,13 @@
 ## Kurulum (5 dakika, komut satırı gerekmez)
 
 1. **Cloudflare hesabı aç** (ücretsiz): <https://dash.cloudflare.com/sign-up>
-2. Yukarıdaki **Deploy to Cloudflare** butonuna bas — Cloudflare repo'yu senin hesabına kopyalar, veritabanını (D1), depolamayı (R2) ve hız-limit deposunu (KV) otomatik oluşturur, deploy eder.
+2. Yukarıdaki **Deploy to Cloudflare** butonuna bas — Cloudflare repo'yu senin hesabına kopyalar, veritabanını (D1) ve hız-limit deposunu (KV) otomatik oluşturur, deploy eder.
 3. Deploy bitince sana bir adres verilir: `https://sezi-server.<hesabın>.workers.dev`
 4. **Sezi uygulamasında** "Sunucu ekle → Kendi sunucunu kur" adımında bu adresi yapıştır. **İlk kayıt olan hesap sunucunun sahibi (owner) olur** — davetleri, limitleri, her şeyi uygulamadan yönetirsin.
 
-Hepsi bu. İmza anahtarları ilk açılışta sunucu tarafından otomatik üretilir; veritabanı şeması ilk istekte kendini kurar. `wrangler secret` ya da migration komutu **gerekmez**.
+Hepsi bu. İmza anahtarları ilk açılışta sunucu tarafından otomatik üretilir; veritabanı şeması ilk istekte kendini kurar. `wrangler secret` ya da migration komutu **gerekmez**. Kart bilgisi **istenmez**.
+
+> **Lite kurulum:** Bu şablon "hafif" kurulur — mesajlaşma, gruplar ve aramalar tam çalışır; **fotoğraf/dosya paylaşımı** için Cloudflare'da R2 depolamayı sonradan etkinleştirmen yeterlidir (kart doğrulaması ister; 10 GB'a kadar ücretsiz, üstü cüzi). Nasıl: dashboard'da R2'yi etkinleştir → `sezi-media` bucket'ı oluştur → Worker → Settings → **Bindings → R2 ekle** (`MEDIA` / `sezi-media`). Kod/komut gerekmez; uygulama özelliği kendiliğinden gösterir.
 
 ## Ne alırsın
 

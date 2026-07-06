@@ -50,6 +50,10 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
     let name = row.map(|r| r.name).unwrap_or_else(|| "Sezi".into());
     let retention_days = fetch_retention_days(&ctx.env).await;
     let message_retention_days = fetch_message_retention_days(&ctx.env).await;
+    // Lite kurulum (R2 OPSİYONEL): MEDIA binding'ine bağımlı özellikler DİNAMİK ilan
+    // edilir. Owner binding'i sonradan dashboard'dan eklerse (redeploy'suz) bir sonraki
+    // /capabilities çağrısı true döner → client kartı kendini günceller.
+    let media_ok = crate::storage::MediaStore::available(&ctx.env);
     Response::from_json(&serde_json::json!({
         "version": 1,
         "name": name,
@@ -69,16 +73,23 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
             "media_days": retention_days,
             "message_days": message_retention_days,
         },
-        // Sunucu özellik ilanı (C3). true=destekli, false=henüz yok ("yakında").
-        // calls/backup/apps 2026-07-05'te gerçeğe çekildi: hepsi landed+saha
-        // (arama signaling relay + R2-yedek + R2-eklenti-kod/log) → true.
+        // Sunucu özellik ilanı (C3). true=destekli, false=yapılandırılmamış/henüz yok.
+        // R2-bağımlılık haritası (Lite kurulum, kod-kanıtlı 2026-07-06):
+        //   - media/files → media/handlers.rs upload/download = R2 blob → media_ok.
+        //   - apps → eklenti-kod dağıtımı plugin_blob.rs put/get_code = R2 (8KB üstü VE
+        //     tüm bundle'lar DAİMA R2; core plugin_install.rs CODE_INLINE_THRESHOLD).
+        //     Plugin-log DO-tabanlı (R2'siz çalışır) ve ≤8KB tek-html inline gider ama
+        //     platformun ana dağıtım yolu R2 → dürüst ilan = media_ok.
+        //   - backup → SERVER-endpoint'i YOK (yedek core'da yerel-dosya export/import;
+        //     worker'da backup rotası hiç yok) → R2'den BAĞIMSIZ, true kalır.
+        //   - calls → signaling relay (DO/WS) + TURN (CF Calls API) → R2'siz TAM, true.
         "features": {
             "messaging": true,
-            "media": true,
-            "files": true,
+            "media": media_ok,
+            "files": media_ok,
             "calls": true,
             "backup": true,
-            "apps": true
+            "apps": media_ok
         },
         "p2p": {
             "supported": true,

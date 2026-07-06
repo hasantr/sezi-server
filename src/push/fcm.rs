@@ -7,6 +7,14 @@
 //! (module-global cache, ~1sa) → `fcm/v1/projects/{FCM_PROJECT_ID}/messages:send`.
 //! RS256 saf-Rust `rsa` (deterministik PKCS1v15 — RNG yok). 404/UNREGISTERED → stale
 //! token (caller `push_tokens`'tan siler).
+//!
+//! Config çözümü (owner self-service): per-key **env ÖNCE, D1 `server_config`
+//! sonra** (cf_analytics `resolve_cfg` deseni). env set (bizim prod:
+//! wrangler.toml `FCM_PROJECT_ID` + secret `FCM_SERVICE_ACCOUNT`) → D1'e HİÇ
+//! gidilmez, bugünkü yol BİT-AYNI. env yoksa owner'ın `PATCH /admin/fcm-config`
+//! ile app'ten girdiği D1 değerleri kullanılır; o da yoksa → push sessiz no-op
+//! (FAIL-OPEN — FCM opsiyonel, worker normal çalışır; bugünkü "kurulu değil"
+//! davranışı). Ayrıntı `resolve_project_id` / `resolve_service_account`.
 
 use std::sync::Mutex;
 
@@ -34,10 +42,103 @@ struct CachedToken {
 
 // Module-global OAuth token cache (warm-isolate ömrü). Codex: DO-memory'ye BAĞLAMA.
 // workerd tek-thread → Mutex no-op; isolate geri-dönüşümünde cache sıfırlanır (yeniden alınır).
+//
+// NOT (fcm-config self-service): owner app'ten YENİ service-account girerse bu
+// cache eski SA ile alınmış token'ı süresi dolana dek (~1sa) kullanmaya devam
+// edebilir (config-değişimi cache'i düşürmez). KABUL EDİLEBİLİR: izolate ömrü
+// kısa (workerd sık geri-dönüştürür) + eski token Google'da geçerli kaldıkça
+// push zaten çalışır; en geç ~1sa'de taze SA ile yenilenir.
 static TOKEN_CACHE: Mutex<Option<CachedToken>> = Mutex::new(None);
 
+// ── Config çözümü — env-first / D1-fallback (cf_analytics `resolve_cfg` deseni) ──
+//
+// MEMOIZE EDİLMEDİ (bilinçli karar; self_provision thread_local deseni yerine
+// per-send taze okuma): push gönderimi SEYREK — yalnız alıcı-offline mesaj başı
+// tetiklenir ve aynı `maybe_push_wake` çağrısı push_tokens için ZATEN D1'e
+// gidiyor → tek ek SELECT ihmal edilebilir. thread_local memoize ise owner'ın
+// app'ten YENİ girdiği config'i izolate ömrü boyunca görmezdi ("kaydettim ama
+// push gelmiyor" tuzağı — self_provision'daki anahtarlar sabit, bu config ise
+// owner eliyle değişiyor). Taze okuma = kaydet → İLK push'ta devreye girer.
+// env-set kurulumda (bizim prod) bu fonksiyonlar D1'e HİÇ gitmez (bit-aynı).
+//
+// GÜVENLİK (D1-saklama trade-off'u — admin/cf_config.rs ile AYNI):
+// FCM_SERVICE_ACCOUNT içinde Google service-account private-key'i var; D1
+// CF at-rest şifreli, worker Google OAuth imzası için plaintext okumak zorunda
+// (decrypt-anahtarı olmayan bir şeyle şifrelenemez). Owner'ın KENDİ Firebase
+// projesi, KENDİ sunucusu — E2E içerik DEĞİL (push zaten içeriksiz wake;
+// anahtar sızsa bile mesaj içeriği açılamaz, yalnız sahte-wake atılabilir).
+// Değer HİÇBİR endpoint'ten dönmez (yalnız worker-içi okuma); güvenlik-bilinçli
+// owner env-secret'e taşırsa env HER ZAMAN kazanır.
+
+/// Trim + boş → None (env ve D1 değerleri AYNI disiplinle normalize edilir —
+/// cf_analytics `normalize` deseni).
+fn normalize(raw: String) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// D1 `server_config` (0025 key-value) tek anahtar oku — FAIL-OPEN MUTLAK:
+/// tablo yok (migration öncesi) / satır yok / D1 hatası → None → caller sessiz
+/// no-op (push opsiyonel; fcm hiçbir isteği düşürmez).
+async fn read_db_config(db: &D1Database, key: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Row {
+        value: String,
+    }
+    let row: Option<Row> = db
+        .prepare("SELECT value FROM server_config WHERE key = ? LIMIT 1")
+        .bind(&[d1_text(key)])
+        .ok()?
+        .first(None)
+        .await
+        .ok()?;
+    normalize(row?.value)
+}
+
+/// Firebase proje-id: env var ÖNCE (bugünkü yol — bizim prod D1'e hiç gitmeden
+/// BİT-AYNI), yoksa/boşsa D1 `fcm_project_id` (owner app'ten girdi). None =
+/// FCM kurulu değil → caller sessiz no-op (bugünkü davranış).
+async fn resolve_project_id(env: &Env, db: &D1Database) -> Option<String> {
+    if let Some(v) = env.var("FCM_PROJECT_ID").ok().and_then(|v| normalize(v.to_string())) {
+        return Some(v);
+    }
+    read_db_config(db, "fcm_project_id").await
+}
+
+/// Service-account JSON: env secret ÖNCE (bugünkü yol), yoksa D1
+/// `fcm_service_account`. İçerik doğrulaması yazım anında (`PATCH
+/// /admin/fcm-config` — geçerli JSON + client_email + private_key).
+async fn resolve_service_account(env: &Env, db: &D1Database) -> Option<String> {
+    if let Some(v) = env
+        .secret("FCM_SERVICE_ACCOUNT")
+        .ok()
+        .and_then(|s| normalize(s.to_string()))
+    {
+        return Some(v);
+    }
+    read_db_config(db, "fcm_service_account").await
+}
+
+/// FCM kurulu mu (proje-id VE service-account ikisi de [env-veya-D1] mevcut) —
+/// `/admin/stats` `fcm_configured` alanı + `PATCH /admin/fcm-config` cevabı.
+/// WRITE-ONLY sözleşmenin okuma yüzü: değer değil yalnız bool sızar. HAFİF:
+/// Google'a ÇIKMAZ, yalnız varlığa bakar; fail-open false (D1 binding yok →
+/// kurulmamış say; stats ASLA 500 atmaz).
+pub async fn is_configured(env: &Env) -> bool {
+    let db = match env.d1("DB") {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    resolve_project_id(env, &db).await.is_some()
+        && resolve_service_account(env, &db).await.is_some()
+}
+
 /// Service-account JWT → OAuth2 access_token (cache'li). 60sn marj ile yeniler.
-async fn get_access_token(env: &Env) -> Result<String> {
+async fn get_access_token(env: &Env, db: &D1Database) -> Result<String> {
     let now = now_secs();
     if let Ok(guard) = TOKEN_CACHE.lock() {
         if let Some(c) = guard.as_ref() {
@@ -47,7 +148,12 @@ async fn get_access_token(env: &Env) -> Result<String> {
         }
     }
 
-    let sa_json = env.secret("FCM_SERVICE_ACCOUNT")?.to_string();
+    // env-first/D1-fallback. None = yarı-kurulu (proje-id var, SA yok) → Err —
+    // bugünkü `env.secret(..)?` davranış-şekliyle aynı sınıf: caller console_warn
+    // basar, o mesajın push'u atlanır (worker normal çalışır).
+    let sa_json = resolve_service_account(env, db)
+        .await
+        .ok_or_else(|| Error::RustError("fcm: service_account yok (env+D1)".into()))?;
     let sa: ServiceAccount = serde_json::from_str(&sa_json)
         .map_err(|e| Error::RustError(format!("fcm: service_account parse: {e}")))?;
     // JSON-string'te private_key satır-sonları `\n` kaçışlı olabilir → gerçek newline'a çevir.
@@ -110,8 +216,8 @@ async fn get_access_token(env: &Env) -> Result<String> {
 
 /// Bir cihaza İÇERİKSİZ uyandırma push'u. Dönüş: `Ok(true)`=gönderildi, `Ok(false)`=token
 /// STALE (UNREGISTERED/geçersiz → caller `push_tokens`'tan silmeli), `Err`=geçici hata.
-async fn send_wake(env: &Env, fcm_token: &str, project_id: &str) -> Result<bool> {
-    let access_token = get_access_token(env).await?;
+async fn send_wake(env: &Env, db: &D1Database, fcm_token: &str, project_id: &str) -> Result<bool> {
+    let access_token = get_access_token(env, db).await?;
     let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
     // data-ONLY (notification yok) → Android terminated'da onBackgroundMessage tetiklenir
     // + içerik taşımaz. priority=high → doze'dan uyandırır.
@@ -148,22 +254,21 @@ async fn send_wake(env: &Env, fcm_token: &str, project_id: &str) -> Result<bool>
 
 /// Alıcı OFFLINE (delivered_live=false) → kayıtlı push-token'larına içeriksiz wake yolla.
 /// `recipient_device_id` Some → yalnız o cihaz; None → kullanıcının TÜM cihazları (device-blind
-/// pending). Best-effort: secret/var yoksa sessiz no-op (FCM opsiyonel — kurulmamışsa worker
-/// normal çalışır). Stale token (`Ok(false)`) → `push_tokens`'tan sil.
+/// pending). Best-effort: config (env VEYA owner'ın app'ten girdiği D1) yoksa sessiz no-op
+/// (FCM opsiyonel — kurulmamışsa worker normal çalışır). Stale token (`Ok(false)`) →
+/// `push_tokens`'tan sil.
 pub async fn maybe_push_wake(
     env: &Env,
     db: &D1Database,
     recipient_id: &str,
     recipient_device_id: Option<&str>,
 ) {
-    // FCM kurulu değil (proje-id/secret yok) → sessiz no-op.
-    let project_id = match env.var("FCM_PROJECT_ID") {
-        Ok(v) => v.to_string(),
-        Err(_) => return,
+    // FCM kurulu değil (proje-id env'de de D1'de de yok) → sessiz no-op.
+    // env-first: bizim prod (wrangler.toml FCM_PROJECT_ID) D1'e hiç gitmez.
+    let project_id = match resolve_project_id(env, db).await {
+        Some(p) => p,
+        None => return,
     };
-    if project_id.is_empty() {
-        return;
-    }
 
     #[derive(Deserialize)]
     struct TokRow {
@@ -194,7 +299,7 @@ pub async fn maybe_push_wake(
     // debounce redundant + zararlıydı. Storm'un asıl kökü WEDGE'ti (resend-loop) → Fix-2/3 (coalesce +
     // 5xx-retry + boot-401-expedite) ile çözüldü → her undelivered mesaj wake almalı (doğru teslim).
     for row in rows {
-        match send_wake(env, &row.fcm_token, &project_id).await {
+        match send_wake(env, db, &row.fcm_token, &project_id).await {
             Ok(true) => {}
             Ok(false) => {
                 // Stale token → temizle (sonraki mesajlarda boşa deneme yok).

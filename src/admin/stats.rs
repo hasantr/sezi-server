@@ -106,6 +106,13 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // (UI "bağlı ama veri gelmiyor" ayrımını yapabilir).
     let cf_configured = crate::cf_analytics::is_configured(&ctx.env).await;
 
+    // v7: fcm_configured — owner UI'ı "push kurulu mu" bilir (env VEYA owner'ın
+    // app'ten girdiği D1 değeri; proje-id VE service-account İKİSİ de gerek).
+    // WRITE-ONLY SÖZLEŞME (cf_configured ile aynı): değerler bu endpoint dahil
+    // HİÇBİR yerden dönmez, yalnız bu bool. `is_configured` hafif (Google'a
+    // çıkmaz, yalnız varlığa bakar; fail-open false).
+    let fcm_configured = crate::push::fcm::is_configured(&ctx.env).await;
+
     // requests_today — CF varsa CF'nin fatura-doğru sayısı; yoksa self-report
     // usage_counters 'requests' (per-istek D1-sayım pahalı → satır yazılmaz →
     // 0-stub). Wire tipi HER ZAMAN sayı (null asla) — eski client'ın i64
@@ -212,6 +219,8 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         "storage_cf_bytes": storage_cf_bytes,
         // v6 (additive): token var-mı bool'u — DEĞERİ ASLA (write-only sözleşme).
         "cf_configured": cf_configured,
-        "version": 6,
+        // v7 (additive): FCM push kurulu-mu bool'u — DEĞERLER ASLA (write-only).
+        "fcm_configured": fcm_configured,
+        "version": 7,
     }))
 }

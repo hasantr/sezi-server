@@ -24,10 +24,19 @@ database_name = "sezi"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "./migrations"
 
-# R2 — medya blob'ları (uçtan-uca şifreli; sunucu-kör).
-[[r2_buckets]]
-binding = "MEDIA"
-bucket_name = "sezi-media"
+# R2 (medya) — BİLİNÇLİ KAPALI ("Lite" kurulum): R2, Cloudflare hesabında
+# abonelik-etkinleştirme (kart doğrulaması) istiyor; ilk kurulum kartsız olsun
+# diye binding yok. Mesajlaşma/grup/arama TAM çalışır; fotoğraf/dosya paylaşımı
+# kapalı görünür. SONRADAN AÇMAK (kod/redeploy GEREKMEZ):
+#   1. CF dashboard → R2 → etkinleştir (10 GB'a kadar ücretsiz) → "sezi-media"
+#      adında bucket oluştur.
+#   2. Workers & Pages → sezi-server → Settings → Bindings → Add → R2 bucket →
+#      Variable name: MEDIA, bucket: sezi-media → Deploy.
+#   3. Bitti — uygulama özelliği kendiliğinden gösterir (/capabilities dinamik).
+# (İstersen aşağıyı açıp CLI ile de verebilirsin:)
+# [[r2_buckets]]
+# binding = "MEDIA"
+# bucket_name = "sezi-media"
 
 # KV — hız-limiti sayaçları.
 [[kv_namespaces]]

@@ -99,9 +99,16 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
 
     if !rows.is_empty() {
         // Tek choke-point (crate::storage) üzerinden; R2-bağımlılığı tek yerde.
-        let store = crate::storage::MediaStore::from_env(env)?;
-        for row in &rows {
-            let _ = store.delete(&row.blob_id).await; // best-effort günlük temizlik
+        // Lite kurulum (R2-binding'siz): blob-delete ATLANIR ama D1-meta silme +
+        // sayaç-düşümü DEVAM eder — aksi halde `from_env`in `?`sı cron'u her gece
+        // Err'letir ve SONRAKİ temizlik adımları (invite/verification GC) atlanırdı.
+        // (Meta satırı yalnız R2-sonradan-kaldırıldı kenarında var olabilir; upload
+        // Lite'ta D1-insert'ten önce 503'lenir.)
+        if crate::storage::MediaStore::available(env) {
+            let store = crate::storage::MediaStore::from_env(env)?;
+            for row in &rows {
+                let _ = store.delete(&row.blob_id).await; // best-effort günlük temizlik
+            }
         }
         let placeholders: String =
             (0..rows.len()).map(|_| "?").collect::<Vec<_>>().join(",");
@@ -204,6 +211,9 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // CF Analytics config — owner self-service (YALNIZ owner; WRITE-ONLY:
         // token buradan yalnız yazılır, hiçbir endpoint geri döndürmez).
         .patch_async("/admin/cf-config", admin::cf_config::set_cf_config)
+        // FCM push config — owner self-service (YALNIZ owner; WRITE-ONLY:
+        // service-account buradan yalnız yazılır, hiçbir endpoint geri döndürmez).
+        .patch_async("/admin/fcm-config", admin::fcm_config::set_fcm_config)
         // Kota epic Faz-0: self-report kullanım istatistikleri (admin/owner-gated;
         // SHADOW-MODE — yalnız rapor, hiçbir limit zorlanmaz).
         .get_async("/admin/stats", admin::stats::stats)
