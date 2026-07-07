@@ -109,6 +109,20 @@ pub async fn bootstrap(_req: Request, ctx: RouteContext<()>) -> Result<Response>
         // used=1 olduğundan seçilmez → taze token üretilir).
     }
 
+    let token = ensure_genesis_token(&db).await?;
+
+    Response::from_json(&serde_json::json!({
+        "bootstrap_token": token,
+        "note": "Bu kodu kullanan ILK kisi sunucu sahibi (owner) olur; sonra bu kapi kapanir.",
+    }))
+}
+
+/// Genesis token get-or-mint (bootstrap handler + hoş-geldin sayfası ortak yolu).
+/// SÖZLEŞME: yalnız owner-YOK durumunda çağrılmalı (çağıran kapıyı kontrol eder);
+/// kendisi owner denetimi YAPMAZ. Davranış `bootstrap()`ın orijinal gövdesiyle
+/// bit-aynı: mevcut kullanılmamış genesis'i SELECT → yoksa INSERT-OR-IGNORE +
+/// kanonik re-SELECT (M10 yarış-deseni AYNEN korunur).
+pub(crate) async fn ensure_genesis_token(db: &D1Database) -> Result<String> {
     // Mevcut kullanılmamış genesis daveti var mı? (owner_user_id IS NULL = sistem üretimi)
     #[derive(Deserialize)]
     struct TokenRow {
@@ -161,11 +175,7 @@ pub async fn bootstrap(_req: Request, ctx: RouteContext<()>) -> Result<Response>
             }
         }
     };
-
-    Response::from_json(&serde_json::json!({
-        "bootstrap_token": token,
-        "note": "Bu kodu kullanan ILK kisi sunucu sahibi (owner) olur; sonra bu kapi kapanir.",
-    }))
+    Ok(token)
 }
 
 /// Hayalet-owner grace penceresi: hesap bundan gençse ASLA hayalet sayılmaz

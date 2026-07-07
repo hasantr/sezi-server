@@ -4,8 +4,11 @@
 //! tıklayınca 404/çıplak-JSON görüyordu — "sunucum çalışıyor mu?" sorusuna
 //! güven vermiyor. Bu sayfa üç durumda insan-okur Türkçe cevap verir:
 //!   - Owner YOK (taze kurulum): "sunucun hazır" + adresi-kopyala + app'e
-//!     yapıştırma yönergesi. KURULUŞ KODU SAYFAYA YAZILMAZ — /bootstrap'ı
-//!     app kendisi çeker; tarayıcıya sır sızdırılmaz.
+//!     yapıştırma yönergesi + KURULUŞ KODU (Hasan-kararı 2026-07-07: app'in
+//!     otomatik-genesis-çekimi aksarsa görünür yedek-yol). Güvenlik-eşdeğer:
+//!     kod owner-yokken zaten `GET /bootstrap`'tan public (kendini-kapatan
+//!     kapı) → sayfada göstermek ek yüzey açmaz. Owner oluşunca kod bir daha
+//!     ASLA gösterilmez.
 //!   - Owner VAR: "sunucu aktif" + davet-kodu yönergesi.
 //!   - D1-hatası: FAIL-OPEN nötr metin (sayfa yine döner; durum iddiası yok).
 //!
@@ -16,6 +19,7 @@
 use serde::Deserialize;
 use worker::*;
 
+use crate::auth::bootstrap::ensure_genesis_token;
 use crate::d1util::d1_text;
 
 /// `GET /` — owner-durumuna göre hoş-geldin sayfası. `Response::from_html`
@@ -23,13 +27,25 @@ use crate::d1util::d1_text;
 pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // FAIL-OPEN: owner-sorgusu düşerse (D1 yok/geçici hata) None → nötr metin.
     let owner = owner_exists(&ctx.env).await;
+    // Kuruluş kodu YALNIZ owner-YOK durumunda çekilir (owner-var / D1-hata
+    // kollarında ASLA). /bootstrap ile aynı get-or-mint yolu (M10 yarış-deseni
+    // dahil). FAIL-OPEN: kod alınamazsa None → sayfa yine döner, kod kutusu
+    // yerine "birazdan yenile" satırı.
+    let genesis = if owner == Some(false) {
+        match ctx.env.d1("DB") {
+            Ok(db) => ensure_genesis_token(&db).await.ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     // Adres = isteğin origin'i (scheme://host[:port]) — kullanıcının tarayıcıda
     // gördüğü adresin aynısı; custom-domain'de de doğru kalır.
     let origin = req
         .url()
         .map(|u| u.origin().ascii_serialization())
         .unwrap_or_default();
-    Response::from_html(render_welcome(owner, &origin))
+    Response::from_html(render_welcome(owner, &origin, genesis.as_deref()))
 }
 
 /// Owner var mı? (verify'daki ilk-kullanıcı=owner kuralı → owner-satırı =
@@ -107,6 +123,11 @@ const PAGE: &str = r#"<!doctype html>
     font-weight: 600; padding: 8px 12px; font-family: inherit;
   }
   .addr button:hover { background: var(--accent-dark); }
+  .lbl {
+    font-size: 11.5px; font-weight: 600; letter-spacing: .5px;
+    text-transform: uppercase; color: var(--ink-faint);
+    margin: 20px 0 6px; text-align: left;
+  }
   .foot { font-size: 12px; color: var(--ink-faint); margin: 18px 0 0; }
 </style>
 </head>
@@ -120,9 +141,11 @@ __CONTENT__
 "#;
 
 /// İçeriği kur (SAF → unit-testli). `owner`: `Some(false)`=taze kurulum,
-/// `Some(true)`=aktif sunucu, `None`=D1-hatası (nötr). Sayfada SIR YOK —
-/// kuruluş kodu asla gömülmez (app /bootstrap'tan kendisi çeker).
-fn render_welcome(owner: Option<bool>, origin: &str) -> String {
+/// `Some(true)`=aktif sunucu, `None`=D1-hatası (nötr). `genesis`: kuruluş
+/// kodu — YALNIZ `Some(false)` kolunda gösterilir (o durumda kod zaten
+/// /bootstrap'tan public; görünür yedek-yol). Owner-var/D1-hata kollarında
+/// çağıran `None` geçer, kod ASLA gömülmez.
+fn render_welcome(owner: Option<bool>, origin: &str, genesis: Option<&str>) -> String {
     let addr = html_escape(origin);
     // Kopyala-butonu adresi DOM'dan okur (`#addr`) → adres için ayrıca
     // JS-string-escape gerekmez; pano API'siz eski tarayıcıda buton sessiz düşer,
@@ -130,13 +153,27 @@ fn render_welcome(owner: Option<bool>, origin: &str) -> String {
     let addr_box = format!(
         r#"<div class="addr"><code id="addr">{addr}</code><button onclick="navigator.clipboard.writeText(document.getElementById('addr').textContent).then(()=>{{this.textContent='Kopyalandı ✓'}})">Adresi kopyala</button></div>"#
     );
+    // Kuruluş-kodu kutusu (yalnız taze-kurulum kolunda kullanılır). Kod b64u
+    // olsa da savunmacı HTML-escape; kopyala-butonu adres-kopyala deseninin
+    // aynısı (DOM'dan okur, `#gcode`). FAIL-OPEN: kod yoksa kutu yerine
+    // "birazdan yenile" satırı — sayfa yine döner.
+    let code_box = match genesis {
+        Some(code) => {
+            let code = html_escape(code);
+            format!(
+                r#"<p class="lbl">Kuruluş kodu</p><div class="addr"><code id="gcode">{code}</code><button onclick="navigator.clipboard.writeText(document.getElementById('gcode').textContent).then(()=>{{this.textContent='Kopyalandı ✓'}})">Kodu kopyala</button></div><p>Bu kodla <b>ilk kaydolan</b> sunucunun sahibi olur; sunucu sahiplenince kod geçersizleşir. Uygulama bu kodu normalde kendisi alır — burası yedek yol.</p>"#
+            )
+        }
+        None => "<p>Kuruluş kodu şu an alınamadı — sayfayı birazdan yenile.</p>".to_string(),
+    };
     let content = match owner {
         Some(false) => format!(
             "<div class=\"emoji\">🎉</div>\
              <h1>Sezi sunucun hazır ve çalışıyor</h1>\
              <p>Bu sunucu şu an boş — kurulumu tamamlayan ilk kişi sunucu sahibi olur.</p>\
              {addr_box}\
-             <p>Sezi uygulamasında <b>“Sunucu ekle → Kendi sunucunu kur”</b> adımına bu adresi yapıştır — kuruluş kodu otomatik alınır.</p>"
+             <p>Sezi uygulamasında <b>“Sunucu ekle → Kendi sunucunu kur”</b> adımına bu adresi yapıştır — kuruluş kodu otomatik alınır.</p>\
+             {code_box}"
         ),
         Some(true) => format!(
             "<div class=\"emoji\">✅</div>\
@@ -170,51 +207,77 @@ mod tests {
     use super::*;
 
     const ORIGIN: &str = "https://sezi-ornek.workers.dev";
+    /// Gerçek genesis 24-char b64u; test için ayırt-edici sabit yeter.
+    const KOD: &str = "GENESIS_ORNEK_KOD_24chr0";
 
     #[test]
-    fn taze_kurulum_sayfasi_yonerge_ve_adres_icerir() {
-        let html = render_welcome(Some(false), ORIGIN);
+    fn taze_kurulum_sayfasi_yonerge_adres_ve_kurulus_kodu_icerir() {
+        let html = render_welcome(Some(false), ORIGIN, Some(KOD));
         assert!(html.contains("hazır ve çalışıyor"));
         assert!(html.contains("Kendi sunucunu kur"));
         assert!(html.contains(ORIGIN));
         assert!(html.contains("charset=\"utf-8\""));
-        // SIR SIZMAZ: kuruluş kodu/bootstrap-token sayfada asla yer almaz —
-        // yalnız app'in izleyeceği yol tarif edilir.
-        assert!(!html.to_lowercase().contains("token"));
-        assert!(html.contains("otomatik alınır"), "kod sayfada değil, app çeker");
+        assert!(html.contains("otomatik alınır"), "app-yolu yönergesi kalır");
+        // Hasan-kararı 2026-07-07: owner-YOKKEN kuruluş kodu SAYFADA GÖRÜNÜR
+        // (görünür yedek-yol; kod bu durumda /bootstrap'tan zaten public).
+        assert!(html.contains(KOD), "kuruluş kodu sayfada gösterilmeli");
+        assert!(html.contains("Kuruluş kodu"));
+        assert!(html.contains("ilk kaydolan"), "sahiplenme uyarısı");
+        assert!(html.contains("yedek"), "yedek-yol uyarısı");
+        assert!(!html.contains("alınamadı"), "kod varken fail-open satırı yok");
+    }
+
+    /// FAIL-OPEN: kod alınamazsa sayfa YİNE döner; kod kutusu yerine yenile-satırı.
+    #[test]
+    fn taze_kurulum_kod_alinamazsa_yenile_satiri() {
+        let html = render_welcome(Some(false), ORIGIN, None);
+        assert!(html.contains("hazır ve çalışıyor"), "sayfa yine tam döner");
+        assert!(html.contains("alınamadı"));
+        assert!(html.contains("yenile"));
+        assert!(!html.contains("id=\"gcode\""), "kod kutusu gösterilmez");
     }
 
     #[test]
-    fn aktif_sunucu_sayfasi_davet_yonergesi_icerir() {
-        let html = render_welcome(Some(true), ORIGIN);
+    fn aktif_sunucu_sayfasi_davet_yonergesi_icerir_kod_asla_sizmaz() {
+        // Savunmacı kilit: genesis yanlışlıkla Some geçse bile owner-VAR
+        // kolunda kod ASLA gömülmez (render tek-otorite).
+        let html = render_welcome(Some(true), ORIGIN, Some(KOD));
         assert!(html.contains("Sezi sunucusu aktif"));
         assert!(html.contains("davet kodu"));
         // Aktif sunucuda kurulum-yönergesi GÖSTERİLMEZ (genesis kapısı kapandı).
         assert!(!html.contains("Kendi sunucunu kur"));
+        assert!(!html.contains(KOD), "owner-VAR: kuruluş kodu sızmaz");
+        assert!(!html.contains("Kuruluş kodu"));
     }
 
     #[test]
-    fn d1_hatasi_notr_sayfa_doner_fail_open() {
-        let html = render_welcome(None, ORIGIN);
+    fn d1_hatasi_notr_sayfa_doner_fail_open_kod_sizmaz() {
+        let html = render_welcome(None, ORIGIN, Some(KOD));
         assert!(html.contains("Sezi sunucusu"));
         assert!(html.contains("okunamadı"));
         // Nötr sayfa durum İDDİA ETMEZ: ne "hazır" ne "aktif".
         assert!(!html.contains("hazır ve çalışıyor"));
         assert!(!html.contains("sunucusu aktif"));
+        // D1-hata kolunda kod ASLA gömülmez (owner-durumu bilinmiyor).
+        assert!(!html.contains(KOD), "D1-hata: kuruluş kodu sızmaz");
     }
 
     #[test]
-    fn origin_html_escape_leniyor() {
-        let html = render_welcome(Some(false), "https://a<script>b");
+    fn origin_ve_kod_html_escape_leniyor() {
+        let html = render_welcome(Some(false), "https://a<script>b", Some("k<img>d"));
         assert!(!html.contains("a<script>b"));
         assert!(html.contains("a&lt;script&gt;b"));
+        assert!(!html.contains("k<img>d"));
+        assert!(html.contains("k&lt;img&gt;d"));
         assert_eq!(html_escape(r#"<a href="x">&"#), "&lt;a href=&quot;x&quot;&gt;&amp;");
     }
 
     #[test]
     fn sayfa_iskeleti_tek_enjeksiyon_noktasi_dolduruluyor() {
-        for owner in [Some(true), Some(false), None] {
-            let html = render_welcome(owner, ORIGIN);
+        for (owner, genesis) in
+            [(Some(true), None), (Some(false), Some(KOD)), (Some(false), None), (None, None)]
+        {
+            let html = render_welcome(owner, ORIGIN, genesis);
             assert!(!html.contains("__CONTENT__"), "placeholder dolmalı");
             assert!(html.contains("prefers-color-scheme: dark"), "koyu tema desteği");
             assert!(html.starts_with("<!doctype html>"));
