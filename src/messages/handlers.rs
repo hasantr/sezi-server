@@ -263,8 +263,8 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // yoğun meşru sohbetin üstü (insan ~<2/sn), otomatik-spam'i keser. KV sliding-
     // window (auth redeem/verify + media/upload ile AYNI altyapı). Grup fan-out
     // bu sınırın İÇİNDE (1 send = N DO-write ama 1 hit) → meşru grup-mesajı serbest.
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("msg:send:{sender_id}"), 300, 60).await? {
+    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("msg:send:{sender_id}"), 300, 60).await {
         return json_err(429, "rate_limited");
     }
     let body: SendBody = match req.json().await {
@@ -366,14 +366,14 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // daha fazla = meşru kullanım serbest, amplifikasyon-spam kesilir. Üye-tavanı
         // (MAX_GROUP_MEMBERS=256) tek-send maliyetini sınırlar → birlikte sınırlı toplam.
         if !pairs.is_empty()
-            && !crate::ratelimit::check_rate_limit_weighted(
-                &kv,
+            && !crate::ratelimit::check_rate_limit_weighted_env(
+                &ctx.env,
                 &format!("msg:grp_fanout:{sender_id}"),
                 6000,
                 60,
                 pairs.len(),
             )
-            .await?
+            .await
         {
             return json_err(429, "rate_limited");
         }
@@ -591,8 +591,8 @@ pub async fn read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // sınırsız forward-read push edilebiliyordu (DoS). send() (line ~94) ile TUTARLI
     // guard: per-user `msg:read:{recipient_id}` kovasında 300/60s, fail-closed 429.
     // (Ayrı kova → meşru read trafiği send kotasını yemez; read başına yine 1 hit.)
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("msg:read:{recipient_id}"), 300, 60).await?
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("msg:read:{recipient_id}"), 300, 60)
+        .await
     {
         return json_err(429, "rate_limited");
     }
@@ -701,8 +701,7 @@ pub async fn self_read(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // send_self_read_durable hata'da retry'siz DROP eder (pre-existing) → 429 teorik okuma-kaybı;
     // ama limit legit-üstü olduğundan yalnız abuse'un KENDİ sahte-read'i düşer. Client-retry ayrı
     // robustness follow-up'ı (bu değişiklik legit yol için hatasız).
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("msg:selfread:{user_id}"), 300, 60).await? {
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("msg:selfread:{user_id}"), 300, 60).await {
         return json_err(429, "rate_limited");
     }
     let body = req.text().await.unwrap_or_default();

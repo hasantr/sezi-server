@@ -1,7 +1,7 @@
 use crate::auth::hashing::hash_code;
 use crate::d1util::{d1_int, d1_opt_text, d1_text};
 use crate::email::mailer::send_verification_code;
-use crate::ratelimit::check_rate_limit;
+use crate::ratelimit::check_rate_limit_env;
 use crate::respond::{json_err, no_content};
 use crate::utils::{now_secs, random_bytes};
 use serde::Deserialize;
@@ -16,7 +16,9 @@ struct RedeemBody {
 const CODE_TTL_SEC: u64 = 10 * 60;
 
 pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let env_name = ctx.env.var("ENV")?.to_string();
+    // ŞABLON-DİYETİ: ENV env-yoksa "prod" say (FAIL-SECURE — dev-davranışına düşmesin:
+    // rate-limit aktif kalır + dev_code sızmaz). Env-set kurulumlar bit-aynı.
+    let env_name = crate::utils::var_or(&ctx.env, "ENV", "prod");
     if env_name == "prod" {
         let ip = req
             .headers()
@@ -24,9 +26,9 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             .ok()
             .flatten()
             .unwrap_or_else(|| "local".into());
-        let kv = ctx.env.kv("RATE_LIMIT")?;
+        // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam.
         let key = format!("auth:redeem:{}", ip);
-        if !check_rate_limit(&kv, &key, 5, 5 * 60).await? {
+        if !check_rate_limit_env(&ctx.env, &key, 5, 5 * 60).await {
             return json_err(429, "rate_limited");
         }
     }

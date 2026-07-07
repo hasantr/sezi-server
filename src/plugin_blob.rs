@@ -81,8 +81,8 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         return json_err(503, "media_not_configured");
     }
     // Per-user upload rate-limit (medya-upload deseni; R2 depolama/egress DoS guard).
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("pcode:put:{user_id}"), 60, 5 * 60).await? {
+    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("pcode:put:{user_id}"), 60, 5 * 60).await {
         return json_err(429, "rate_limited");
     }
     // Boyut tavanı (content-length ön-kontrol → büyük gövdeyi okumadan reddet).

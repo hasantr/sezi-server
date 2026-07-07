@@ -27,9 +27,9 @@ pub async fn upload(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // R2 depolama + CF egress faturasını şişirebiliyordu (turn.rs bütçe-bekçisi
     // medyada yok). KV sliding-window (auth redeem/verify ile AYNI altyapı). 60
     // upload / 5dk: meşru medya-paylaşımının çok üstü, otomatik-abuse'ü keser.
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("media:upload:{user_id}"), 60, 5 * 60)
-        .await?
+    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("media:upload:{user_id}"), 60, 5 * 60)
+        .await
     {
         return json_err(429, "rate_limited");
     }
@@ -201,8 +201,7 @@ pub async fn download(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // bütçe medyada yok). 600/5dk = meşru galeri-görüntüleme burst'ünün üstünde (sliding-window
     // burst-toleranslı), runaway/egress-DoS keser. KV-hata fail-open (2026-06-28 dersi).
     // NOT: bu M11-IDOR'u ÇÖZMEZ (o = recipient/room-binding cross-layer epic); egress-DoS savunması.
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("media:download:{uid}"), 600, 5 * 60).await? {
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("media:download:{uid}"), 600, 5 * 60).await {
         return json_err(429, "rate_limited");
     }
     let id = match ctx.param("id") {

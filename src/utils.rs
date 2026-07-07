@@ -2,7 +2,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use worker::Date;
+use worker::{Date, Env};
 
 pub fn now_ms() -> u64 {
     Date::now().as_millis()
@@ -53,4 +53,13 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 
 pub fn random_b64u(n: usize) -> String {
     b64u_encode(&random_bytes(n))
+}
+
+/// ŞABLON-DİYETİ (deploy-ekranı sadeliği): `[vars]` satırı wrangler.toml'dan
+/// silinebilsin diye env-var yoksa kod-default'u döner. Env-SET kurulumlar
+/// (prod) bit-aynı davranır — env her zaman kazanır.
+pub fn var_or(env: &Env, key: &str, default: &str) -> String {
+    env.var(key)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| default.to_string())
 }

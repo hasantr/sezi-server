@@ -104,8 +104,8 @@ pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     };
 
     // Rate-limit (nadir çağrı; ucuz koruma — mevcut KV sliding-window altyapısı).
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("devices:list:{auth_user}"), 20, 60).await? {
+    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("devices:list:{auth_user}"), 20, 60).await {
         return json_err(429, "rate_limited");
     }
 

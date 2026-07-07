@@ -7,6 +7,16 @@ use worker::{Env, Error, Result};
 const ACCESS_TTL_SEC: u64 = 15 * 60;
 const KID: &str = "sezgi-1";
 
+/// ŞABLON-DİYETİ: `JWT_ISSUER` env-yoksa kod-default'u. Şablon wrangler.toml'dan
+/// `[vars]` satırı silinebilsin (deploy-ekranı sadeliği); env-set kurulumlar (prod)
+/// bit-aynı. Sign + verify + device_id-claim ÜÇÜ de bu tek helper'dan okur →
+/// issuer üretimi/denetimi asla ayrışamaz.
+const DEFAULT_ISSUER: &str = "sezi-server";
+
+fn issuer(env: &Env) -> String {
+    crate::utils::var_or(env, "JWT_ISSUER", DEFAULT_ISSUER)
+}
+
 /// PKCS8-PEM → SigningKey. env-secret yolu ve self-provision yolu AYNI
 /// parser'dan geçer (self_provision üretim-roundtrip unit-testi bunu çağırır →
 /// üretilen anahtarın format uyumu kanıtlı). `\\n` replace: wrangler secret'a
@@ -56,7 +66,7 @@ struct JwtClaims {
 
 pub fn sign_access_token(env: &Env, user_id: &str, device_id: Option<&str>) -> Result<String> {
     let signing = load_signing_key(env)?;
-    let issuer = env.var("JWT_ISSUER")?.to_string();
+    let issuer = issuer(env);
     let now = now_secs();
     let header = JwtHeader {
         alg: "EdDSA",
@@ -81,7 +91,7 @@ pub fn sign_access_token(env: &Env, user_id: &str, device_id: Option<&str>) -> R
 pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
     let signing = load_signing_key(env)?;
     let verifying = signing.verifying_key();
-    let issuer = env.var("JWT_ISSUER")?.to_string();
+    let issuer = issuer(env);
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(Error::RustError("jwt: bad format".into()));
@@ -119,7 +129,7 @@ pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
 pub fn device_id_from_token(env: &Env, token: &str) -> Result<Option<String>> {
     let signing = load_signing_key(env)?;
     let verifying = signing.verifying_key();
-    let issuer = env.var("JWT_ISSUER")?.to_string();
+    let issuer = issuer(env);
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(Error::RustError("jwt: bad format".into()));

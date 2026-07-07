@@ -1,23 +1,44 @@
 use crate::utils::now_secs;
-use worker::{console_log, kv::KvStore, Result};
+use worker::{console_log, kv::KvStore, Env, Result};
 
-/// KV-tabanlı sliding window rate-limit. Mevcut TS implementasyonun birebir kopyası.
-pub async fn check_rate_limit(
-    kv: &KvStore,
+/// ŞABLON-DİYETİ (deploy-ekranı sadeliği): self-host şablonunda `RATE_LIMIT` KV
+/// binding'i YOK (Deploy-to-Cloudflare her binding için alan gösterir + KV isim-
+/// çakışması riski). Binding yoksa hız-limiti SESSİZCE atlanır (fail-open —
+/// aşağıdaki KV-hata kültürüyle aynı). Kurulu-KV'li prod bit-aynı davranır.
+/// Tüm çağıranlar bu env-yardımcılarından geçer → `env.kv("RATE_LIMIT")?` gibi
+/// `?`-propagasyonu (binding-yok = 500) hiçbir handler'da kalmaz.
+pub async fn check_rate_limit_env(env: &Env, key: &str, max_hits: usize, window_sec: u64) -> bool {
+    check_rate_limit_weighted_env(env, key, max_hits, window_sec, 1).await
+}
+
+/// [check_rate_limit_env]'in ağırlıklı varyantı (M12 fan-out guard'ı için).
+pub async fn check_rate_limit_weighted_env(
+    env: &Env,
     key: &str,
     max_hits: usize,
     window_sec: u64,
-) -> Result<bool> {
-    check_rate_limit_weighted(kv, key, max_hits, window_sec, 1).await
+    weight: usize,
+) -> bool {
+    let kv = match env.kv("RATE_LIMIT") {
+        Ok(kv) => kv,
+        // Binding yok (self-host şablonu) → limitsiz devam.
+        Err(_) => return true,
+    };
+    // check_rate_limit_weighted zaten içeride fail-open (KV get/put hatası →
+    // Ok(true)); Err pratikte dönmez ama dönerse de fail-open.
+    check_rate_limit_weighted(&kv, key, max_hits, window_sec, weight)
+        .await
+        .unwrap_or(true)
 }
 
 /// M12 (fan-out amplifikasyon): AĞIRLIKLI sliding-window. `weight` = bu olayın
 /// "maliyeti" (örn. grup-send fan-out genişliği = N DO-write). Pencerede biriken
 /// toplam ağırlık `max_hits`'i aşarsa reddeder; aksi halde `weight` adet zaman
-/// damgası ekler (her biri pencere boyunca sayılır). `weight=1` → `check_rate_limit`
-/// ile birebir aynı davranış. Maliyet KV-friendly: tek get + tek put (vektör
-/// `weight` kadar büyür, makul üye-tavanı [MAX_GROUP_MEMBERS] altında sınırlı).
-pub async fn check_rate_limit_weighted(
+/// damgası ekler (her biri pencere boyunca sayılır). `weight=1` → ağırlıksız
+/// (eski `check_rate_limit`) ile birebir aynı davranış. Maliyet KV-friendly: tek
+/// get + tek put (vektör `weight` kadar büyür, üye-tavanı altında sınırlı).
+/// Modül-içi çekirdek: dışarısı env-yardımcılarını kullanır (binding opsiyonel).
+async fn check_rate_limit_weighted(
     kv: &KvStore,
     key: &str,
     max_hits: usize,

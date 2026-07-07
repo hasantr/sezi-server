@@ -1,7 +1,7 @@
 use crate::auth::hashing::{sha256_hex, verify_code};
 use crate::auth::jwt::sign_access_token;
 use crate::d1util::{d1_blob, d1_int, d1_null, d1_opt_text, d1_prekey_id, d1_text};
-use crate::ratelimit::check_rate_limit;
+use crate::ratelimit::check_rate_limit_env;
 use crate::respond::json_err;
 use crate::utils::{b64_decode, b64u_encode, now_secs, random_bytes};
 use serde::Deserialize;
@@ -42,7 +42,9 @@ const REFRESH_TTL_SEC: u64 = 30 * 24 * 60 * 60;
 const ACCESS_TTL_SEC: u64 = 15 * 60;
 
 pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let env_name = ctx.env.var("ENV")?.to_string();
+    // ŞABLON-DİYETİ: ENV env-yoksa "prod" say (FAIL-SECURE); KV binding OPSİYONEL
+    // (yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env).
+    let env_name = crate::utils::var_or(&ctx.env, "ENV", "prod");
     if env_name == "prod" {
         let ip = req
             .headers()
@@ -50,8 +52,7 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             .ok()
             .flatten()
             .unwrap_or_else(|| "local".into());
-        let kv = ctx.env.kv("RATE_LIMIT")?;
-        if !check_rate_limit(&kv, &format!("auth:verify:{}", ip), 5, 5 * 60).await? {
+        if !check_rate_limit_env(&ctx.env, &format!("auth:verify:{}", ip), 5, 5 * 60).await {
             return json_err(429, "rate_limited");
         }
     }

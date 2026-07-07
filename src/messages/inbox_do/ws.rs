@@ -372,40 +372,21 @@ impl UserInbox {
                 // uyguluyor; SICAK WS-send bunu ATLIYORDU → WS'ten sınırsız mesaj enjekte
                 // edilip alıcı DO (SQLite) şişirilebiliyordu. AYNI KV-kovası/parametre →
                 // ortak limit (HTTP+WS toplamı 300/60s). revoke-check'ten SONRA, alıcı DO'ya
-                // /notify'dan ÖNCE. KV-hata → fail-closed (`ref` yanıtlanır). KV binding
-                // self.env'den (HTTP `ctx.env.kv("RATE_LIMIT")` ile aynı).
-                match self.env.kv("RATE_LIMIT") {
-                    Ok(kv) => match crate::ratelimit::check_rate_limit(
-                        &kv, &format!("msg:send:{sender_id}"), 300, 60,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let _ = ws.send_with_str(
-                                serde_json::json!({"type":"send_err","ref":reff,"code":"rate_limited"})
-                                    .to_string()
-                                    .as_str(),
-                            );
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            let _ = ws.send_with_str(
-                                serde_json::json!({"type":"send_err","ref":reff,"code":"rate_limit_unavailable"})
-                                    .to_string()
-                                    .as_str(),
-                            );
-                            return Ok(());
-                        }
-                    },
-                    Err(_) => {
-                        let _ = ws.send_with_str(
-                            serde_json::json!({"type":"send_err","ref":reff,"code":"rate_limit_unavailable"})
-                                .to_string()
-                                .as_str(),
-                        );
-                        return Ok(());
-                    }
+                // /notify'dan ÖNCE. KV binding self.env'den (HTTP yoluyla aynı).
+                // ŞABLON-DİYETİ: self-host şablonunda RATE_LIMIT KV binding'i YOK
+                // (deploy-ekranı sadeliği + isim-çakışması) → binding-yok/KV-hata
+                // fail-open, limitsiz devam (kurulu-KV'li prod bit-aynı).
+                if !crate::ratelimit::check_rate_limit_env(
+                    &self.env, &format!("msg:send:{sender_id}"), 300, 60,
+                )
+                .await
+                {
+                    let _ = ws.send_with_str(
+                        serde_json::json!({"type":"send_err","ref":reff,"code":"rate_limited"})
+                            .to_string()
+                            .as_str(),
+                    );
+                    return Ok(());
                 }
                 // Alicinin DO'suna per-device /notify (handlers::send paritesi).
                 let namespace = self.env.durable_object("USER_INBOX")?;
@@ -523,17 +504,14 @@ impl UserInbox {
                 // (`msg:send:{reader_id}`) 300/60s → ortak limit (HTTP+WS+send+read toplamı).
                 // Fire-and-forget: aşılırsa/KV-hata → sessizce yut (read kozmetik/idempotent;
                 // client viewport tetikler, ack beklemez). peer DO'ya forward'dan ÖNCE.
-                if let Ok(kv) = self.env.kv("RATE_LIMIT") {
-                    match crate::ratelimit::check_rate_limit(
-                        &kv, &format!("msg:send:{reader_id}"), 300, 60,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
-                        _ => return Ok(()), // limit aşıldı veya KV-hata → sessizce yut
-                    }
-                } else {
-                    return Ok(()); // KV binding yok → fail-closed (sessiz)
+                // ŞABLON-DİYETİ: KV binding OPSİYONEL — yoksa limitsiz devam (fail-open;
+                // eski davranış binding-yokta fail-closed'du ama binding artık şablonda yok).
+                if !crate::ratelimit::check_rate_limit_env(
+                    &self.env, &format!("msg:send:{reader_id}"), 300, 60,
+                )
+                .await
+                {
+                    return Ok(()); // limit aşıldı → sessizce yut
                 }
                 let namespace = self.env.durable_object("USER_INBOX")?;
                 let stub = namespace.id_from_name(peer_id)?.get_stub()?;

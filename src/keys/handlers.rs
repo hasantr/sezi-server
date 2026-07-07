@@ -1,6 +1,6 @@
 use crate::auth::middleware::require_auth;
 use crate::d1util::{d1_blob, d1_int, d1_prekey_id, d1_text};
-use crate::ratelimit::check_rate_limit;
+use crate::ratelimit::check_rate_limit_env;
 use crate::respond::{json_err, no_content};
 use crate::utils::{b64_decode, b64_encode, now_secs};
 use serde::Deserialize;
@@ -47,12 +47,13 @@ pub async fn bundle(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // zayıf-FS SPK'ya zorlayabilir. caller-başına 60/dk tavanı (first-contact nadirdir +
     // session kurulunca bundle hiç çekilmez → 60/dk fazlasıyla bol). Yalnız prod (local
     // dev throttle EDİLMEZ → saha-testi etkilenmez). 429 → client backoff/retry.
-    let env_name = ctx.env.var("ENV")?.to_string();
-    if env_name == "prod" {
-        let kv = ctx.env.kv("RATE_LIMIT")?;
-        if !check_rate_limit(&kv, &format!("bundle:fetch:{caller}"), 60, 60).await? {
-            return json_err(429, "rate_limited");
-        }
+    // ŞABLON-DİYETİ: ENV env-yoksa "prod" say (FAIL-SECURE); KV binding OPSİYONEL
+    // (yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env).
+    let env_name = crate::utils::var_or(&ctx.env, "ENV", "prod");
+    if env_name == "prod"
+        && !check_rate_limit_env(&ctx.env, &format!("bundle:fetch:{caller}"), 60, 60).await
+    {
+        return json_err(429, "rate_limited");
     }
     let target_id = match ctx.param("user_id") {
         Some(s) => s.clone(),

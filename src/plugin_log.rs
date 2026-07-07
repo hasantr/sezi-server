@@ -304,8 +304,8 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Err(resp) => return Ok(resp),
     };
     // Per-user append rate-limit (mesaj-send deseni; DoS/şişme guard).
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("plog:append:{user_id}"), 300, 60).await? {
+    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("plog:append:{user_id}"), 300, 60).await {
         return json_err(429, "rate_limited");
     }
     // Device-binding (S3 token-claim): kötü-üye başka cihaz adına yazamaz.

@@ -57,8 +57,8 @@ pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".into());
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("link:start:{ip}"), 10, 60).await? {
+    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:start:{ip}"), 10, 60).await {
         return json_err(429, "rate_limited");
     }
 
@@ -163,8 +163,7 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
         Err(resp) => return Ok(resp),
     };
 
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("devices:list:{auth_user}"), 20, 60).await? {
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("devices:list:{auth_user}"), 20, 60).await {
         return json_err(429, "rate_limited");
     }
 
@@ -312,8 +311,7 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".into());
-    let kv = ctx.env.kv("RATE_LIMIT")?;
-    if !crate::ratelimit::check_rate_limit(&kv, &format!("link:status:{ip}"), 90, 60).await? {
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:status:{ip}"), 90, 60).await {
         return json_err(429, "rate_limited");
     }
 

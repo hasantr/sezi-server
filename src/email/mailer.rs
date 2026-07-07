@@ -12,10 +12,9 @@ use worker::{console_log, Env, Result};
 /// TODO (#1-mailer-sprint): gerçek SES veya SendGrid HTTPS POST. Şu
 /// an log'a düşmesi solo kullanım için yeterli geçici çare.
 pub async fn send_verification_code(env: &Env, email: &str, code: &str) -> Result<()> {
-    let env_name = env
-        .var("ENV")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "unknown".into());
+    // ŞABLON-DİYETİ: ENV env-yoksa "prod" (fail-secure default; log-etiketi
+    // redeem/verify'ın fiili davranışıyla tutarlı kalsın).
+    let env_name = crate::utils::var_or(env, "ENV", "prod");
     console_log!(
         "[verify-mailer env={}] {} için kod: {}",
         env_name,
