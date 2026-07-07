@@ -129,8 +129,15 @@ thread_local! {
 /// İzolate-scope memoized: ilk çağrı işi yapar, sonrakiler no-op. env-secret'lı
 /// + wrangler-migrated kurulumda (bizim prod) TAMAMEN no-op'a düşer.
 pub async fn ensure_ready(env: &Env) {
-    ensure_migrations(env).await;
+    // ANAHTAR ÖNCE, MİGRATION SONRA (2026-07-07 free-plan vakası): free CF
+    // hesabında istek-başı subrequest bütçesi dar; anahtar-yolu ağır
+    // 25-migration-batch'iyle AYNI istekte yarışınca aç kalıp jwks/verify 500
+    // veriyordu (migration'lar tabloları kurar → bootstrap/welcome çalışır ama
+    // anahtar üretilemez). ensure_keys kendi `server_config` tablosunu kurar
+    // (migration 0025'e bağımlı DEĞİL) → birkaç subrequest'te BİTER; migration'lar
+    // sonra koşar, bütçeyi tüketse bile anahtar zaten hazırdır.
     ensure_keys(env).await;
+    ensure_migrations(env).await;
 }
 
 /// Yalnız anahtar bacağı — UserInbox DO'su (`ws_upgrade` token doğrulaması)
@@ -219,6 +226,15 @@ async fn resolve_from_db(
     validate: fn(&str) -> bool,
 ) -> Result<String> {
     let db = env.d1("DB")?;
+    // server_config'i anahtar-yolu KENDİSİ kurar (migration 0025'ten bağımsız)
+    // → ensure_keys migration'lardan ÖNCE koşabilir (bkz. ensure_ready sıra
+    // gerekçesi). IF NOT EXISTS → migration 0025 sonra koşarsa no-op.
+    db.prepare(
+        "CREATE TABLE IF NOT EXISTS server_config \
+         (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL)",
+    )
+    .run()
+    .await?;
     if let Some(v) = read_config(&db, db_key).await? {
         if validate(&v) {
             return Ok(v);
