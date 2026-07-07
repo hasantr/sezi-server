@@ -29,17 +29,25 @@ pub(crate) fn parse_signing_pem(raw: &str) -> Result<SigningKey> {
 }
 
 fn load_signing_key(env: &Env) -> Result<SigningKey> {
-    // Self-host Faz A çözüm zinciri: 1) env secret ÖNCE (bugünkü davranış
-    // BİT-AYNI; env-set HER ZAMAN kazanır — güvenlik-bilinçli owner anahtarı
-    // secret'a taşıyabilir), 2) yoksa self-provision cache (boot-guard'ın
-    // D1 `server_config`'ten çözdüğü/ürettiği PEM — hot-path'te D1-roundtrip
-    // YOK, izolate-memoize; bkz. src/self_provision.rs).
-    let raw = match env.secret("JWT_SIGNING_KEY") {
-        Ok(s) => s.to_string(),
-        Err(_) => crate::self_provision::cached_jwt_pem().ok_or_else(|| {
-            Error::RustError("jwt: signing key yok (env secret yok + self-provision hazir degil)".into())
-        })?,
-    };
+    // Çözüm zinciri: 1) env secret ÖNCE ama YALNIZ boş-değil + geçerli-parse
+    //    ise (güvenlik-bilinçli owner'ın gerçek key'i kazanır; prod bit-aynı),
+    //    2) aksi halde self-provision cache (D1'den çözülen/üretilen geçerli PEM).
+    // KRİTİK (2026-07-07 free-hesap vakası): buton-runtime KURULMAMIŞ secret'i
+    // `Ok("")` dönebiliyor → eski kod boş string'i parse edip "PEM label invalid"
+    // 500 veriyordu (self-provision'a hiç düşmeden). Artık boş/bozuk env-secret
+    // yok sayılır, self-provision'ın ürettiği geçerli key kullanılır.
+    if let Ok(s) = env.secret("JWT_SIGNING_KEY") {
+        let raw = s.to_string();
+        if !raw.trim().is_empty() {
+            if let Ok(k) = parse_signing_pem(&raw) {
+                return Ok(k);
+            }
+            // env-secret var ama parse-edilemez → self-provision'a düş.
+        }
+    }
+    let raw = crate::self_provision::cached_jwt_pem().ok_or_else(|| {
+        Error::RustError("jwt: signing key yok (env-secret boş/geçersiz + self-provision hazır değil)".into())
+    })?;
     parse_signing_pem(&raw)
 }
 

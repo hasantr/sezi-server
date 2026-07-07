@@ -193,10 +193,18 @@ async fn ensure_one_key(
     generate: fn() -> Result<String>,
     validate: fn(&str) -> bool,
 ) {
-    // 1) env secret → bugünkü davranış BİT-AYNI: okuma noktaları env'i zaten
-    //    doğrudan okur (jwt.rs), D1'e HİÇ gidilmez, cache gereksiz.
-    if env.secret(env_name).is_ok() {
-        return;
+    // 1) env secret → YALNIZ boş-değil VE validate geçerse kabul (D1'e gitme).
+    //    KRİTİK (2026-07-07 free-hesap vakası): buton-deploy runtime'ında (yeni
+    //    wrangler) KURULMAMIŞ secret `Ok("")` dönebiliyor (eski runtime `Err`);
+    //    `is_ok()` görünce boş/bozuk değer env-first dalına girip self-heal'i
+    //    ATLATIYORDU → jwks/verify "PEM type label invalid" 500. Artık boş/geçersiz
+    //    env-secret YOK SAYILIR → self-provision (D1/üretim) devreye girer.
+    //    (Geçerli env-secret'lı prod bit-aynı: non-empty+validate → erken dönüş.)
+    if let Ok(s) = env.secret(env_name) {
+        let v = s.to_string();
+        if !v.trim().is_empty() && validate(&v) {
+            return;
+        }
     }
     // 2) İzolate cache dolu → tamam (hot-path D1-roundtrip'siz).
     if cache.with(|c| c.borrow().is_some()) {
