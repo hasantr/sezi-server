@@ -12,9 +12,12 @@
 //! sonra** (cf_analytics `resolve_cfg` deseni). env set (bizim prod:
 //! wrangler.toml `FCM_PROJECT_ID` + secret `FCM_SERVICE_ACCOUNT`) → D1'e HİÇ
 //! gidilmez, bugünkü yol BİT-AYNI. env yoksa owner'ın `PATCH /admin/fcm-config`
-//! ile app'ten girdiği D1 değerleri kullanılır; o da yoksa → push sessiz no-op
-//! (FAIL-OPEN — FCM opsiyonel, worker normal çalışır; bugünkü "kurulu değil"
-//! davranışı). Ayrıntı `resolve_project_id` / `resolve_service_account`.
+//! ile app'ten girdiği D1 değerleri kullanılır; o da yoksa → **paylaşılan
+//! PUSH-RELAY** (default — SA getirmeyen self-host kurulumlar sıfır-ayar push
+//! alır; bkz `DEFAULT_PUSH_RELAY_URL` + `push-relay/` worker'ı). Relay `off`
+//! (env `PUSH_RELAY_URL` ya da D1 `push_relay_url`) → push sessiz no-op
+//! (FAIL-OPEN — FCM opsiyonel, worker normal çalışır). Ayrıntı
+//! `resolve_send_mode`.
 
 use std::sync::Mutex;
 
@@ -99,6 +102,27 @@ async fn read_db_config(db: &D1Database, key: &str) -> Option<String> {
     normalize(row?.value)
 }
 
+/// Paylaşılan push-relay (Hasan'ın CF worker'ı) — SA getirmeyen self-host
+/// kurulumların DEFAULT push yolu. URL sır DEĞİL (relay token-kapılı +
+/// rate-limit'li; worst-case içeriksiz-wake). Owner kendi SA'sını girerse
+/// (env/D1) relay HİÇ kullanılmaz (aşağıda `resolve_send_mode`).
+const DEFAULT_PUSH_RELAY_URL: &str = "https://sezi-push-relay.hsn-salihoglu.workers.dev";
+
+/// Relay URL çözümü: env `PUSH_RELAY_URL` → D1 `push_relay_url` → kod-default.
+/// `off` (env ya da D1) → None = relay kapalı (push tamamen devre-dışı bırakmak
+/// isteyen owner için tek anahtar).
+async fn resolve_relay_url(env: &Env, db: &D1Database) -> Option<String> {
+    let v = match env.var("PUSH_RELAY_URL").ok().and_then(|v| normalize(v.to_string())) {
+        Some(v) => Some(v),
+        None => read_db_config(db, "push_relay_url").await,
+    };
+    match v {
+        Some(u) if u.eq_ignore_ascii_case("off") => None,
+        Some(u) => Some(u),
+        None => Some(DEFAULT_PUSH_RELAY_URL.to_string()),
+    }
+}
+
 /// Firebase proje-id: env var ÖNCE (bugünkü yol — bizim prod D1'e hiç gitmeden
 /// BİT-AYNI), yoksa/boşsa D1 `fcm_project_id` (owner app'ten girdi). None =
 /// FCM kurulu değil → caller sessiz no-op (bugünkü davranış).
@@ -123,18 +147,20 @@ async fn resolve_service_account(env: &Env, db: &D1Database) -> Option<String> {
     read_db_config(db, "fcm_service_account").await
 }
 
-/// FCM kurulu mu (proje-id VE service-account ikisi de [env-veya-D1] mevcut) —
-/// `/admin/stats` `fcm_configured` alanı + `PATCH /admin/fcm-config` cevabı.
-/// WRITE-ONLY sözleşmenin okuma yüzü: değer değil yalnız bool sızar. HAFİF:
-/// Google'a ÇIKMAZ, yalnız varlığa bakar; fail-open false (D1 binding yok →
-/// kurulmamış say; stats ASLA 500 atmaz).
+/// FCM kurulu mu — `/admin/stats` `fcm_configured` alanı + `PATCH
+/// /admin/fcm-config` cevabı. Kurulu sayılır: (a) owner'ın KENDİ config'i tam
+/// (proje-id VE service-account, env-veya-D1) VEYA (b) paylaşılan relay açık
+/// (default). WRITE-ONLY sözleşmenin okuma yüzü: değer değil yalnız bool sızar.
+/// HAFİF: Google'a/relay'e ÇIKMAZ, yalnız varlığa bakar; fail-open false
+/// (D1 binding yok → kurulmamış say; stats ASLA 500 atmaz).
 pub async fn is_configured(env: &Env) -> bool {
     let db = match env.d1("DB") {
         Ok(d) => d,
         Err(_) => return false,
     };
-    resolve_project_id(env, &db).await.is_some()
-        && resolve_service_account(env, &db).await.is_some()
+    let own = resolve_project_id(env, &db).await.is_some()
+        && resolve_service_account(env, &db).await.is_some();
+    own || resolve_relay_url(env, &db).await.is_some()
 }
 
 /// Service-account JWT → OAuth2 access_token (cache'li). 60sn marj ile yeniler.
@@ -252,21 +278,75 @@ async fn send_wake(env: &Env, db: &D1Database, fcm_token: &str, project_id: &str
     Err(Error::RustError(format!("fcm: send {code}")))
 }
 
+/// Relay üzerinden içeriksiz wake (SA getirmeyen self-host default yolu).
+/// Sözleşme `send_wake` ile AYNI: Ok(true)=gönderildi, Ok(false)=STALE
+/// (caller push_tokens'tan siler — relay FCM'in UNREGISTERED sinyalini
+/// `stale:true` olarak geçirir), Err=geçici (429/5xx/ağ).
+async fn send_wake_relay(relay_url: &str, fcm_token: &str) -> Result<bool> {
+    let url = format!("{}/wake", relay_url.trim_end_matches('/'));
+    let payload = serde_json::json!({ "token": fcm_token }).to_string();
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    init.with_body(Some(payload.into()));
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    init.with_headers(headers);
+    let req = Request::new_with_init(&url, &init)?;
+    let mut resp = Fetch::Request(req).send().await?;
+    let code = resp.status_code();
+    if code == 200 {
+        #[derive(Deserialize)]
+        struct RelayResp {
+            #[serde(default)]
+            ok: bool,
+            #[serde(default)]
+            stale: bool,
+        }
+        let r: RelayResp = resp.json().await?;
+        if r.stale {
+            return Ok(false);
+        }
+        if r.ok {
+            return Ok(true);
+        }
+    }
+    Err(Error::RustError(format!("fcm relay: {code}")))
+}
+
+/// Push gönderim yolu: owner'ın KENDİ config'i (proje-id + SA) tamsa DOĞRUDAN
+/// FCM (bugünkü yol, relay'e hiç uğramaz — bizim prod BİT-AYNI); değilse
+/// paylaşılan RELAY (default, sıfır-ayar self-host); o da kapalıysa (`off`)
+/// push devre-dışı.
+enum SendMode {
+    Direct { project_id: String },
+    Relay { url: String },
+}
+
+async fn resolve_send_mode(env: &Env, db: &D1Database) -> Option<SendMode> {
+    // Kendi-config yolu proje-id + SA İKİSİNİ de ister; yarı-kurulu (yalnız
+    // proje-id) relay'e düşer — eski "SA yok → console_warn her mesajda"
+    // davranışından daha faydalı.
+    if let Some(project_id) = resolve_project_id(env, db).await {
+        if resolve_service_account(env, db).await.is_some() {
+            return Some(SendMode::Direct { project_id });
+        }
+    }
+    resolve_relay_url(env, db).await.map(|url| SendMode::Relay { url })
+}
+
 /// Alıcı OFFLINE (delivered_live=false) → kayıtlı push-token'larına içeriksiz wake yolla.
 /// `recipient_device_id` Some → yalnız o cihaz; None → kullanıcının TÜM cihazları (device-blind
-/// pending). Best-effort: config (env VEYA owner'ın app'ten girdiği D1) yoksa sessiz no-op
-/// (FCM opsiyonel — kurulmamışsa worker normal çalışır). Stale token (`Ok(false)`) →
-/// `push_tokens`'tan sil.
+/// pending). Best-effort: kendi-config → doğrudan FCM; yoksa paylaşılan relay (default);
+/// relay `off` → sessiz no-op (push opsiyonel — worker normal çalışır). Stale token
+/// (`Ok(false)`) → `push_tokens`'tan sil.
 pub async fn maybe_push_wake(
     env: &Env,
     db: &D1Database,
     recipient_id: &str,
     recipient_device_id: Option<&str>,
 ) {
-    // FCM kurulu değil (proje-id env'de de D1'de de yok) → sessiz no-op.
-    // env-first: bizim prod (wrangler.toml FCM_PROJECT_ID) D1'e hiç gitmez.
-    let project_id = match resolve_project_id(env, db).await {
-        Some(p) => p,
+    let mode = match resolve_send_mode(env, db).await {
+        Some(m) => m,
         None => return,
     };
 
@@ -299,7 +379,13 @@ pub async fn maybe_push_wake(
     // debounce redundant + zararlıydı. Storm'un asıl kökü WEDGE'ti (resend-loop) → Fix-2/3 (coalesce +
     // 5xx-retry + boot-401-expedite) ile çözüldü → her undelivered mesaj wake almalı (doğru teslim).
     for row in rows {
-        match send_wake(env, db, &row.fcm_token, &project_id).await {
+        let sent = match &mode {
+            SendMode::Direct { project_id } => {
+                send_wake(env, db, &row.fcm_token, project_id).await
+            }
+            SendMode::Relay { url } => send_wake_relay(url, &row.fcm_token).await,
+        };
+        match sent {
             Ok(true) => {}
             Ok(false) => {
                 // Stale token → temizle (sonraki mesajlarda boşa deneme yok).
