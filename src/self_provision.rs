@@ -112,6 +112,26 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0025_server_config",
         include_str!("../migrations/0025_server_config.sql"),
     ),
+    (
+        "0026_plugin_media",
+        include_str!("../migrations/0026_plugin_media.sql"),
+    ),
+    (
+        "0027_server_plugin_policy",
+        include_str!("../migrations/0027_server_plugin_policy.sql"),
+    ),
+    (
+        "0028_storage_backends",
+        include_str!("../migrations/0028_storage_backends.sql"),
+    ),
+    (
+        "0029_media_scope",
+        include_str!("../migrations/0029_media_scope.sql"),
+    ),
+    (
+        "0030_delete_window",
+        include_str!("../migrations/0030_delete_window.sql"),
+    ),
 ];
 
 thread_local! {

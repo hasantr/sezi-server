@@ -50,12 +50,26 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
     let name = row.map(|r| r.name).unwrap_or_else(|| "Sezi".into());
     let retention_days = fetch_retention_days(&ctx.env).await;
     let message_retention_days = fetch_message_retention_days(&ctx.env).await;
+    let delete_window_hours = fetch_delete_window_hours(&ctx.env).await;
     // Lite kurulum (R2 OPSİYONEL): MEDIA binding'ine bağımlı özellikler DİNAMİK ilan
     // edilir. Owner binding'i sonradan dashboard'dan eklerse (redeploy'suz) bir sonraki
     // /capabilities çağrısı true döner → client kartı kendini günceller.
-    let media_ok = crate::storage::MediaStore::available(&ctx.env);
+    // Faz 1: any_available == MEDIA binding VAR MI (eski MediaStore::available ile
+    // bit-aynı). Faz 3: router D1 harici depoları da görecek → Lite+B2 kurulumda true.
+    let media_ok = crate::storage::StorageRouter::from_env(&ctx.env)
+        .await
+        .map(|r| r.any_available())
+        .unwrap_or(false);
     Response::from_json(&serde_json::json!({
         "version": 1,
+        // Self-host güncelleme tespiti (2026-07-12): DERLEME-anı damgası
+        // (yyyyMMddHHmm int, monoton). `sync-template.ps1` worker-build ÖNCESİ
+        // `SEZI_BUILD` env'ini set eder + şablon köküne aynı değeri `VERSION`
+        // dosyasına yazar → damga + prebuilt-WASM AYNI koşudan çıkar (drift yok).
+        // Client mevcut-build'i upstream VERSION ile kıyaslar → "güncelleme var".
+        // env yoksa (monorepo prod / elle deploy) 0 = "bilinmiyor" (client rozet
+        // göstermez). `version` (protokol) AYRI kalır — karıştırma.
+        "build": option_env!("SEZI_BUILD").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
         "name": name,
         // M2-S2.3 (WIRE-CUT): protokol yetenek ilanı. device_addressing=1 →
         // server batch-wire (envelopes[]) + per-device OTK/bundle v2 destekler;
@@ -64,15 +78,27 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         "protocol": {
             "device_addressing": 1
         },
-        // Veri saklama ilanı (retention). Relay modeli: teslim edilen içerik
-        // teslimde silinir; medya teslim edilmezse en çok `media_days`,
-        // teslim edilmeyen mesaj en çok `message_days` tutulur.
+        // Veri saklama ilanı (retention). Relay modeli. Mesaj: DO-fanout teslimde
+        // silinir (`on_delivery`); teslim edilmeyen en çok `message_days`.
+        // ⚠️ MEDYA DÜRÜSTLÜK (2026-07-10 audit #3): medya ACK-delete zinciri
+        // istemcide BAĞLI DEĞİL → medya teslimde SİLİNMEZ, her hâlde en çok
+        // `media_days` TTL ile tutulur. Bu yüzden `media: "ttl"` (on_delivery
+        // DEĞİL) — ilan fiili davranışla birebir. Gerçek teslim-sonrası-sil
+        // recipient/room kaydı gerektirir (audit #2+#3 epic).
         "retention": {
             "model": "relay",
             "messages": "on_delivery",
+            "media": "ttl",
             "media_days": retention_days,
             "message_days": message_retention_days,
         },
+        // "Herkesten sil" penceresi (2026-07-12): bir mesaj GÖNDERİLDİKTEN sonra
+        // en çok kaç SAAT içinde "herkesten sil" yapılabilir (owner-ayarlı,
+        // DEFAULT 48). Alıcı-taraf ileride ZORLAR (mesaj-yaşı > pencere → red);
+        // server yalnız DEĞERİ ilan eder. retention deseninin ikizi (D1
+        // server_settings). Top-level (retention bloğu değil) — client
+        // `delete_window_hours` düz-alan bekler.
+        "delete_window_hours": delete_window_hours,
         // Sunucu özellik ilanı (C3). true=destekli, false=yapılandırılmamış/henüz yok.
         // R2-bağımlılık haritası (Lite kurulum, kod-kanıtlı 2026-07-06):
         //   - media/files → media/handlers.rs upload/download = R2 blob → media_ok.
@@ -91,8 +117,16 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
             "backup": true,
             "apps": media_ok
         },
+        // ⚠️ P2P DÜRÜSTLÜK (2026-07-10 audit #5): `supported:true` = yetenek VAR
+        // + istemci toggle'ları kaydedilebilir; AMA `available:false` = transport
+        // HENÜZ AKTİF DEĞİL (iroh-pending) → ham JSON'u doğrudan okuyan (denetçi/
+        // 3.taraf-istemci) "çalışıyor" sanmasın. İstemci zaten `transport=='iroh'`
+        // olmadıkça CF'ye düşer (p2p_router.shouldUseP2P). `available`/`status`
+        // additive → mevcut `supported`/`transport` parse'ı kırılmaz.
         "p2p": {
             "supported": true,
+            "available": false,
+            "status": "experimental",
             "kinds": ["message", "image", "attachment", "file"],
             "transport": "iroh-pending",
             "note": "scaffolding mode; client preferences saved, transport activates with P3"
@@ -139,4 +173,26 @@ pub async fn fetch_message_retention_days(env: &Env) -> i64 {
         .ok()
         .flatten();
     row.map(|r| r.message_retention_days).unwrap_or(30)
+}
+
+/// `server_settings.delete_window_hours` — "herkesten sil" penceresi (owner-ayarlı).
+/// Bir mesaj GÖNDERİLDİKTEN sonra en çok kaç SAAT içinde "herkesten sil"
+/// yapılabilir. Alıcı taraf ileride bunu ZORLAR; `/capabilities` yalnız DEĞERİ
+/// ilan eder. Tablo/satır/kolon yoksa veya hata olursa varsayılan 48
+/// (message_retention_days deseninin ikizi).
+pub async fn fetch_delete_window_hours(env: &Env) -> i64 {
+    let Ok(db) = env.d1("DB") else {
+        return 48;
+    };
+    #[derive(Deserialize)]
+    struct R {
+        delete_window_hours: i64,
+    }
+    let row: Option<R> = db
+        .prepare("SELECT delete_window_hours FROM server_settings WHERE id = 1 LIMIT 1")
+        .first(None)
+        .await
+        .ok()
+        .flatten();
+    row.map(|r| r.delete_window_hours).unwrap_or(48)
 }

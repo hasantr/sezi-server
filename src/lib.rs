@@ -15,12 +15,14 @@ mod media;
 mod messages;
 mod plugin_blob;
 mod plugin_log;
+mod plugin_media;
 mod push;
 mod quota;
 mod ratelimit;
 mod respond;
 mod self_provision;
 mod server;
+mod sigv4;
 mod storage;
 mod turn;
 mod usage;
@@ -53,6 +55,15 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // Lazy-maintenance damgası: cron çalışan kurulumda drain-damgası hep taze →
     // fetch-yolu lazy-drain HİÇ uyanmaz (prod bit-aynı).
     maintenance::stamp_drain(&env).await;
+    // Takılabilir-depolama Faz 4: draining-depo taşıma tick'i (≤4 blob/koşum;
+    // draining depo yokken tek ucuz SELECT ile sessiz çıkar). Fanout-drain gibi HER
+    // invocation'da koşar; damga cron'lu kurulumda lazy storage-move'u uyutur.
+    if let Err(e) = storage::drain::run_storage_move(&env).await {
+        let msg = e.to_string();
+        let truncated: String = msg.chars().take(80).collect();
+        console_log!("storage move error: {}", truncated);
+    }
+    maintenance::stamp_move(&env).await;
     // MINOR-2 (Fable+Codex): sık-cron ise erken-çık (cleanup/GC koşma). Günlük "0 4 * * *" VE
     // beklenmedik normalize-sürprizi → cleanup'a DÜŞER (fail-toward-running: gürültülü-ama-GÜVENLİ;
     // eski `!= "0 4"` yönü sürprizde cleanup+GC'yi SESSİZCE hiç koşturmazdı = media-GC+TTL-GC durur).
@@ -127,6 +138,20 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // Kota epic Faz-0: self-report kullanım istatistikleri (admin/owner-gated;
         // SHADOW-MODE — yalnız rapor, hiçbir limit zorlanmaz).
         .get_async("/admin/stats", admin::stats::stats)
+        // Server-çapı eklenti politikası. GET = HERHANGİ aktif üye (picker filtreler);
+        // POST = require_admin (admin|owner). DISABLED-only saklama (satır = disabled).
+        .get_async("/plugin-policy", admin::plugin_policy::get_plugin_policy)
+        .post_async("/admin/plugin-policy", admin::plugin_policy::set_plugin_policy)
+        // Takılabilir-Depolama (Faz 2+4) — owner harici blob-deposu bağlar/yönetir.
+        // GET/probe = require_admin; POST/PATCH/DELETE/drain = require_owner (secret güçlü).
+        // config_json (secret) HİÇBİR cevapta dönmez (WRITE-ONLY; cf/fcm-config emsali).
+        // drain (Faz 4): depoyu boşaltmaya al — taşıma motoru storage/drain.rs.
+        .get_async("/admin/storage", admin::storage::list)
+        .post_async("/admin/storage", admin::storage::add)
+        .patch_async("/admin/storage/:id", admin::storage::update)
+        .delete_async("/admin/storage/:id", admin::storage::remove)
+        .post_async("/admin/storage/:id/probe", admin::storage::probe)
+        .post_async("/admin/storage/:id/drain", admin::storage::drain)
         // Gruplar (Faz 1 — üyelik; üye-seviyesi, server-admin değil). Fan-out Faz 2.
         .post_async("/groups", groups::create_group)
         .get_async("/groups", groups::list_my_groups)
@@ -166,6 +191,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .get_async("/plugin-log/:room/:plugin/sync", plugin_log::sync)
         .post_async("/plugin-blob/:room/:id", plugin_blob::put_code)
         .get_async("/plugin-blob/:room/:id", plugin_blob::get_code)
+        // Üye-yüklenebilir KALICI eklenti-medya (plugin_blob'un üye-PUT'lu, 50 MiB'lik
+        // kardeşi): aktif-üye PUT/GET, room-scope R2, kota+usage media ile ORTAK sayaçlar.
+        .post_async("/plugin-media/:room/:id", plugin_media::put_media)
+        .get_async("/plugin-media/:room/:id", plugin_media::get_media)
         .post_async("/media/upload", media::handlers::upload)
         .get_async("/media/:id", media::handlers::download)
         .post_async("/media/:id/ack", media::handlers::ack)

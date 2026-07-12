@@ -131,6 +131,11 @@ struct UpdateSettingsBody {
     max_storage_bytes: Option<i64>,
     /// Kota Faz 1a: per-user depolama cap'i (byte) — aynı 0-temizle konvansiyonu.
     max_user_storage_bytes: Option<i64>,
+    /// "Herkesten sil" penceresi (saat) — bir mesaj GÖNDERİLDİKTEN sonra en çok
+    /// kaç saat içinde "herkesten sil" yapılabilir (owner-ayarlı, DEFAULT 48).
+    /// Alıcı taraf ileride ZORLAR; server yalnız değeri taşır. None → mevcut
+    /// korunur (retention deseninin ikizi).
+    delete_window_hours: Option<i64>,
 }
 
 pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -149,6 +154,7 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         && body.message_retention_days.is_none()
         && body.max_storage_bytes.is_none()
         && body.max_user_storage_bytes.is_none()
+        && body.delete_window_hours.is_none()
     {
         return json_err(400, "bad_request");
     }
@@ -172,6 +178,13 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
             return json_err(400, "bad_request");
         }
     }
+    // "Herkesten sil" penceresi (saat): min 1 (retention gibi 0-belirsizliğinden
+    // kaçın), max 8760 = 365 gün (message_retention 365-gün ruhunun saat-ikizi).
+    if let Some(h) = body.delete_window_hours {
+        if !(1..=8760).contains(&h) {
+            return json_err(400, "bad_request");
+        }
+    }
     // Kota cap doğrulaması: negatif anlamsız (0 = temizle, > 0 = set).
     if body.max_storage_bytes.is_some_and(|v| v < 0)
         || body.max_user_storage_bytes.is_some_and(|v| v < 0)
@@ -191,11 +204,12 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         // Kota cap'leri — NULLABLE kolon (NULL = sınırsız).
         max_storage_bytes: Option<i64>,
         max_user_storage_bytes: Option<i64>,
+        delete_window_hours: i64,
     }
     let cur: Option<CurRow> = db
         .prepare(
             "SELECT name, join_mode, retention_days, message_retention_days, \
-             max_storage_bytes, max_user_storage_bytes \
+             max_storage_bytes, max_user_storage_bytes, delete_window_hours \
              FROM server_settings WHERE id = 1 LIMIT 1",
         )
         .first(None)
@@ -209,6 +223,7 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
     let cur_msg_retention = cur.as_ref().map(|c| c.message_retention_days).unwrap_or(30);
     let cur_max_storage = cur.as_ref().and_then(|c| c.max_storage_bytes);
     let cur_max_user_storage = cur.as_ref().and_then(|c| c.max_user_storage_bytes);
+    let cur_delete_window = cur.as_ref().map(|c| c.delete_window_hours).unwrap_or(48);
     let new_name = body.name.unwrap_or(cur_name);
     let new_mode = body.join_mode.unwrap_or(cur_mode);
     let new_retention = body.retention_days.unwrap_or(cur_retention);
@@ -223,12 +238,13 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         .max_user_storage_bytes
         .map(|v| if v == 0 { None } else { Some(v) })
         .unwrap_or(cur_max_user_storage);
+    let new_delete_window = body.delete_window_hours.unwrap_or(cur_delete_window);
 
     db.prepare(
         "INSERT INTO server_settings \
             (id, name, join_mode, retention_days, message_retention_days, \
-             max_storage_bytes, max_user_storage_bytes, updated_at)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+             max_storage_bytes, max_user_storage_bytes, delete_window_hours, updated_at)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             join_mode = excluded.join_mode,
@@ -236,6 +252,7 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
             message_retention_days = excluded.message_retention_days,
             max_storage_bytes = excluded.max_storage_bytes,
             max_user_storage_bytes = excluded.max_user_storage_bytes,
+            delete_window_hours = excluded.delete_window_hours,
             updated_at = excluded.updated_at",
     )
     .bind(&[
@@ -245,6 +262,7 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         d1_int(new_msg_retention),
         d1_opt_int(new_max_storage),
         d1_opt_int(new_max_user_storage),
+        d1_int(new_delete_window),
         d1_int(now as i64),
     ])?
     .run()
@@ -257,6 +275,7 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         "message_retention_days": new_msg_retention,
         "max_storage_bytes": new_max_storage,
         "max_user_storage_bytes": new_max_user_storage,
+        "delete_window_hours": new_delete_window,
     }))
 }
 

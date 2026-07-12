@@ -95,11 +95,20 @@ pub async fn media_removed(db: &D1Database, removed: &[(String, i64)]) {
     .await;
 }
 
-/// Günlük authoritative reconcile — best-effort sayaçlardaki drift'i
-/// `media_objects` gerçeğinden yeniden-hesaplayarak onar (self-heal).
-/// `db.batch` = tek D1 transaction → tutarlı anlık-görüntü; tam yeniden-kurulum
-/// (DELETE+INSERT-SELECT) upsert-SELECT parse-ambiguity'sinden de kaçınır.
+/// Günlük authoritative reconcile — best-effort sayaçlardaki drift'i depolama
+/// gerçeğinden yeniden-hesaplayarak onar (self-heal). Gerçek = İKİ tablonun UNION'ı:
+/// `media_objects` (efemer kullanıcı-medyası) + `plugin_media_objects` (kalıcı üye
+/// eklenti-medyası, 0026). Her ikisi de user_storage/server_stats sayaçlarını
+/// `media_added` ile besler → cap iki kanalın TOPLAMINA uygulanır; reconcile'ın
+/// da iki tabloyu toplaması ŞART, yoksa günlük self-heal plugin-media katkısını SİLER
+/// (→ kota gerçeğin altına düşer). `db.batch` = tek D1 transaction (tutarlı anlık-görüntü).
 /// Günlük cron'dan çağrılır (lib.rs scheduled); hata orada loglanır, cron kırılmaz.
+///
+/// Takılabilir-depolama Faz 1 (EK, plan d): AYNI batch'e `storage_backends` per-depo
+/// used_bytes/object_count yeniden-hesabı — ÜÇ meta-tablodan (media ∪ plugin_media ∪
+/// plugin_code) `store_id` bazında. NOT: user_storage/server_stats hesabı DEĞİŞMEZ
+/// (plugin_code BİLİNÇLİ hariç → kota semantiği bit-aynı); plugin_code yalnız per-depo
+/// envanter gerçeğine girer. Tek-depo Faz 1: hepsi 'r2-primary' altında toplanır.
 pub async fn reconcile_storage(env: &Env) -> Result<()> {
     let db = env.d1("DB")?;
     let now = now_secs() as i64;
@@ -107,13 +116,39 @@ pub async fn reconcile_storage(env: &Env) -> Result<()> {
         db.prepare("DELETE FROM user_storage"),
         db.prepare(
             "INSERT INTO user_storage (user_id, bytes) \
-             SELECT uploader_id, COALESCE(SUM(size_bytes), 0) FROM media_objects \
-             GROUP BY uploader_id",
+             SELECT uploader_id, COALESCE(SUM(size_bytes), 0) FROM ( \
+               SELECT uploader_id, size_bytes FROM media_objects \
+               UNION ALL \
+               SELECT uploader_id, size_bytes FROM plugin_media_objects \
+             ) GROUP BY uploader_id",
         ),
         db.prepare("DELETE FROM server_stats WHERE id = 1"),
         db.prepare(
             "INSERT INTO server_stats (id, media_bytes, media_count, updated_at) \
-             SELECT 1, COALESCE(SUM(size_bytes), 0), COUNT(*), ? FROM media_objects",
+             SELECT 1, COALESCE(SUM(size_bytes), 0), COUNT(*), ? FROM ( \
+               SELECT size_bytes FROM media_objects \
+               UNION ALL \
+               SELECT size_bytes FROM plugin_media_objects \
+             )",
+        )
+        .bind(&[d1_int(now)])?,
+        // Per-depo envanter yeniden-hesabı (3 meta-tablo UNION, store_id bazında).
+        // Correlated subquery per backend-satırı → depo sayısı bir avuç olduğundan ucuz.
+        db.prepare(
+            "UPDATE storage_backends SET \
+               used_bytes = COALESCE(( \
+                 SELECT SUM(size_bytes) FROM ( \
+                   SELECT store_id, size_bytes FROM media_objects \
+                   UNION ALL SELECT store_id, size_bytes FROM plugin_media_objects \
+                   UNION ALL SELECT store_id, size_bytes FROM plugin_code_objects \
+                 ) u WHERE u.store_id = storage_backends.store_id), 0), \
+               object_count = ( \
+                 SELECT COUNT(*) FROM ( \
+                   SELECT store_id FROM media_objects \
+                   UNION ALL SELECT store_id FROM plugin_media_objects \
+                   UNION ALL SELECT store_id FROM plugin_code_objects \
+                 ) c WHERE c.store_id = storage_backends.store_id), \
+               updated_at = ?",
         )
         .bind(&[d1_int(now)])?,
     ])

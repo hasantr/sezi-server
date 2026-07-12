@@ -12,9 +12,10 @@
 //! taze kaldığından lazy uyur. (Monorepo-prod `wrangler.toml` [triggers]'a
 //! DOKUNULMADI — orada cron çalışır, bu modül sessiz kalır.)
 //!
-//! MEKANİZMA — `server_config` (0025 key-value) iki zaman-damgası:
-//!   - `maint_drain_at`  = son fanout-drain bakımının epoch-sn'si
-//!   - `maint_daily_at`  = son günlük-GC'nin epoch-sn'si
+//! MEKANİZMA — `server_config` (0025 key-value) üç zaman-damgası:
+//!   - `maint_drain_at`        = son fanout-drain bakımının epoch-sn'si
+//!   - `maint_daily_at`        = son günlük-GC'nin epoch-sn'si
+//!   - `maint_storage_move_at` = son depo-taşıma (drain) tick'inin epoch-sn'si (Faz 4)
 //!
 //! `scheduled()` HER koşuşta kendi damgasını tazeler → cron çalışan kurulumda
 //! damga hiç eskimez → lazy-yol HİÇ tetiklenmez (prod bit-aynı). Cron'suz
@@ -61,15 +62,24 @@ const DRAIN_LAZY_AFTER_SECS: i64 = 300;
 /// "0 4 * * *" damgası tam 86400sn'de tazelenir; paysız eşik sınırda yarışırdı).
 const DAILY_LAZY_AFTER_SECS: i64 = 90_000;
 
+/// Lazy depo-taşıma (Takılabilir-depolama Faz 4) eşiği — drain ile AYNI gerekçe/
+/// kadans (2dk cron × 2.5 jitter payı): cron'lu kurulumda scheduled her koşumda
+/// taşıma-tick'i + damga → lazy uyur; cron'suz kurulumda ~5dk kadansla koşar.
+/// Drain-endpoint'i damgayı 0'a çeker (`wake_storage_move`) → taşımanın BAŞLANGICI
+/// eşiği beklemez (ilk uygun istek ≤60sn gaz-kelebeği penceresinde claim'ler).
+const MOVE_LAZY_AFTER_SECS: i64 = 300;
+
 // Sözleşme-kilidi (derleme-zamanı): lazy eşikleri cron kadanslarının (drain
 // "*/2 * * * *"=120sn, günlük "0 4 * * *"=86400sn) ALTINA inmemeli — inerse
 // cron'lu prod'da lazy düzenli uyanır (çift-koşum zararsız ama "prod bit-aynı"
 // sözleşmesi bozulur).
 const _: () = assert!(DRAIN_LAZY_AFTER_SECS >= 2 * 120);
 const _: () = assert!(DAILY_LAZY_AFTER_SECS > 86_400);
+const _: () = assert!(MOVE_LAZY_AFTER_SECS >= 2 * 120);
 
 const KEY_DRAIN: &str = "maint_drain_at";
 const KEY_DAILY: &str = "maint_daily_at";
+const KEY_MOVE: &str = "maint_storage_move_at";
 
 thread_local! {
     /// Son D1 damga-kontrol zamanı (epoch-sn; 0 = izolat hiç bakmadı).
@@ -107,7 +117,7 @@ pub fn maybe_run_lazy(env: &Env, ctx: &Context) {
 async fn check_and_run(env: Env) {
     let Ok(db) = env.d1("DB") else { return };
     let now = now_secs() as i64;
-    let (drain_at, daily_at) = match read_stamps(&db).await {
+    let (drain_at, daily_at, move_at) = match read_stamps(&db).await {
         Ok(v) => v,
         // D1 geçici hatası → sonraki gaz-kelebeği penceresinde yeniden.
         Err(_) => return,
@@ -120,6 +130,22 @@ async fn check_and_run(env: Env) {
             now - drain_at
         );
         crate::messages::handlers::drain_fanout_retry(&env).await;
+    }
+    // Takılabilir-depolama Faz 4: draining-depo taşıma tick'i (≤4 blob/koşum).
+    // Cron'lu kurulumda scheduled her koşumda tick+damga → burası uyur. Draining
+    // depo yoksa run_storage_move ilk SELECT'te sessiz döner (tek ucuz sorgu).
+    if is_due(now, move_at, MOVE_LAZY_AFTER_SECS)
+        && claim(&db, KEY_MOVE, now, now - MOVE_LAZY_AFTER_SECS).await
+    {
+        console_log!(
+            "maintenance: lazy storage-move (damga {}sn eski)",
+            now - move_at
+        );
+        if let Err(e) = crate::storage::drain::run_storage_move(&env).await {
+            let msg = e.to_string();
+            let truncated: String = msg.chars().take(80).collect();
+            console_log!("storage move error: {}", truncated);
+        }
     }
     if is_due(now, daily_at, DAILY_LAZY_AFTER_SECS)
         && claim(&db, KEY_DAILY, now, now - DAILY_LAZY_AFTER_SECS).await
@@ -134,31 +160,33 @@ async fn check_and_run(env: Env) {
 
 // ── damga okuma / kazanan-deseni ────────────────────────────────────────────
 
-/// İki damgayı TEK SELECT'te oku (epoch-sn; satır-yok/bozuk-değer → 0 =
+/// Üç damgayı TEK SELECT'te oku (epoch-sn; satır-yok/bozuk-değer → 0 =
 /// "çok eski" → ilk uygun istekte bir kez koşar + damgalanır).
-async fn read_stamps(db: &D1Database) -> Result<(i64, i64)> {
+async fn read_stamps(db: &D1Database) -> Result<(i64, i64, i64)> {
     #[derive(Deserialize)]
     struct Row {
         key: String,
         value: String,
     }
     let rows: Vec<Row> = db
-        .prepare("SELECT key, value FROM server_config WHERE key IN (?, ?)")
-        .bind(&[d1_text(KEY_DRAIN), d1_text(KEY_DAILY)])?
+        .prepare("SELECT key, value FROM server_config WHERE key IN (?, ?, ?)")
+        .bind(&[d1_text(KEY_DRAIN), d1_text(KEY_DAILY), d1_text(KEY_MOVE)])?
         .all()
         .await?
         .results()?;
     let mut drain_at = 0i64;
     let mut daily_at = 0i64;
+    let mut move_at = 0i64;
     for r in rows {
         let v = parse_stamp(Some(&r.value));
         match r.key.as_str() {
             KEY_DRAIN => drain_at = v,
             KEY_DAILY => daily_at = v,
+            KEY_MOVE => move_at = v,
             _ => {}
         }
     }
-    Ok((drain_at, daily_at))
+    Ok((drain_at, daily_at, move_at))
 }
 
 /// Kazanan-deseni: damgayı işten ÖNCE ileri it — `UPDATE ... WHERE
@@ -214,6 +242,29 @@ pub(crate) async fn stamp_daily(env: &Env) {
     }
 }
 
+/// `scheduled()` her koşuşta taşıma-tick'i sonrası çağırır → cron'lu kurulumda
+/// lazy storage-move uyur (stamp_drain ikizi). Best-effort.
+pub(crate) async fn stamp_move(env: &Env) {
+    if let Ok(db) = env.d1("DB") {
+        stamp(&db, KEY_MOVE).await;
+    }
+}
+
+/// Faz 4 drain-endpoint'i çağırır: taşıma damgasını 0'a çek = "hemen koş" işareti.
+/// Cron'suz kurulumda ilk uygun istek (≤60sn gaz-kelebeği) claim'leyip taşımayı
+/// başlatır; cron'lu kurulumda zaten ≤2dk'da koşar (damga-0 orada da zararsız:
+/// claim tekilleştirir). Best-effort — hata drain-endpoint'ini kırmaz.
+pub(crate) async fn wake_storage_move(env: &Env) {
+    let Ok(db) = env.d1("DB") else { return };
+    let now = now_secs() as i64;
+    if let Ok(stmt) = db
+        .prepare("INSERT OR REPLACE INTO server_config (key, value, created_at) VALUES (?, '0', ?)")
+        .bind(&[d1_text(KEY_MOVE), d1_int(now)])
+    {
+        let _ = stmt.run().await;
+    }
+}
+
 async fn stamp(db: &D1Database, key: &str) {
     let now = now_secs() as i64;
     if let Ok(stmt) = db
@@ -249,6 +300,30 @@ pub(crate) async fn run_daily(env: &Env) {
         let truncated: String = msg.chars().take(80).collect();
         console_log!("usage reconcile error: {}", truncated);
     }
+    // Takılabilir-depolama Faz 1: eklenti-kodu (plugin-code/) envanterini R2'den
+    // geriye-doldur (bugüne dek meta'sız → "nerede" bilinemezdi). İdempotent
+    // (INSERT OR IGNORE, r2-primary); yeni put_code'lar zaten inline meta yazar —
+    // bu backfill yalnız ESKİ blob'ları toplar. Hata bakımın kalanını kırmaz.
+    if let Err(e) = crate::storage::maint::backfill_plugin_code(env).await {
+        let msg = e.to_string();
+        let truncated: String = msg.chars().take(80).collect();
+        console_log!("plugin-code backfill error: {}", truncated);
+    }
+    // Takılabilir-depolama Faz 3 (plan e kanal-1): tüm state!='disabled' depolara
+    // programlı probe → last_health_* tazelenir (panel cron-arası kızarmadan güncel).
+    // Hata bakımın kalanını kırmaz.
+    if let Err(e) = crate::storage::probe_all(env).await {
+        let msg = e.to_string();
+        let truncated: String = msg.chars().take(80).collect();
+        console_log!("storage probe error: {}", truncated);
+    }
+    // Takılabilir-depolama Faz 3 (plan c.4/f#4): öksüz-blob tombstone'larını yeniden-sil
+    // (≤50/koşum). Başaran satır düşer; depo hâlâ down → retry_count++ (sonraki günde tekrar).
+    if let Err(e) = crate::storage::maint::retry_orphans(env).await {
+        let msg = e.to_string();
+        let truncated: String = msg.chars().take(80).collect();
+        console_log!("orphan retry error: {}", truncated);
+    }
 }
 
 #[derive(Deserialize)]
@@ -257,6 +332,8 @@ struct ExpiredMediaRow {
     // Kota Faz-0 (SHADOW): silinen blob'un sayaç-düşümü için boyut + yükleyen.
     size_bytes: i64,
     uploader_id: String,
+    // Takılabilir-depolama: silme blob'un depo'suna yönlendirilir (Faz 1: hep 'r2-primary').
+    store_id: String,
 }
 
 /// Süresi dolmuş kalıntıların temizliği (lib.rs'ten saf-taşındı, davranış
@@ -269,23 +346,41 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
 
     // 1) expired media: R2 + D1 sil
     let rows: Vec<ExpiredMediaRow> = db
-        .prepare("SELECT blob_id, size_bytes, uploader_id FROM media_objects WHERE expires_at < ? LIMIT 500")
+        .prepare("SELECT blob_id, size_bytes, uploader_id, store_id FROM media_objects WHERE expires_at < ? LIMIT 500")
         .bind(&[d1_int(now)])?
         .all()
         .await?
         .results()?;
 
     if !rows.is_empty() {
-        // Tek choke-point (crate::storage) üzerinden; R2-bağımlılığı tek yerde.
-        // Lite kurulum (R2-binding'siz): blob-delete ATLANIR ama D1-meta silme +
-        // sayaç-düşümü DEVAM eder — aksi halde `from_env`in `?`sı temizliği her
-        // koşumda Err'letir ve SONRAKİ temizlik adımları (invite/verification GC)
-        // atlanırdı. (Meta satırı yalnız R2-sonradan-kaldırıldı kenarında var
-        // olabilir; upload Lite'ta D1-insert'ten önce 503'lenir.)
-        if crate::storage::MediaStore::available(env) {
-            let store = crate::storage::MediaStore::from_env(env)?;
+        // Tek choke-point (StorageRouter) üzerinden per-depo sil. Lite kurulum
+        // (R2-binding'siz): any_available()=false → blob-delete ATLANIR ama D1-meta silme +
+        // sayaç-düşümü DEVAM eder — aksi halde temizlik her koşumda Err'lerdi ve SONRAKİ
+        // temizlik adımları (invite/verification GC) atlanırdı.
+        // FAZ 3 (plan f#4): silinemeyen blob → `storage_orphans` tombstone (D1 meta YİNE
+        // silinir → cleanup akmaya devam eder); günlük `retry_orphans` yeniden dener →
+        // öksüz-blob harici depoda kalıcılaşmaz. router.delete TOPLU-yolda health-işaret
+        // YAPMAZ (≤500 satır × yazım = şişme) → burada başarısız depo başına TEK agregeli işaret.
+        let router = crate::storage::StorageRouter::from_env(env).await?;
+        let mut orphans: Vec<(String, String, i64)> = Vec::new(); // (store_id, key, size)
+        if router.any_available() {
             for row in &rows {
-                let _ = store.delete(&row.blob_id).await; // best-effort günlük temizlik
+                let key = crate::storage::media_key(&row.blob_id);
+                if router.delete(&row.store_id, &key).await.is_err() {
+                    orphans.push((row.store_id.clone(), key, row.size_bytes));
+                }
+            }
+        }
+        if !orphans.is_empty() {
+            crate::storage::maint::insert_orphans(&db, &orphans).await;
+            // Başarısız depo(lar) başına TEK health-işaret (agregeli; batch-şişmesi yok).
+            let mut marked: Vec<&str> = Vec::new();
+            for (sid, _, _) in &orphans {
+                if !marked.contains(&sid.as_str()) {
+                    marked.push(sid);
+                    crate::storage::write_health(env, sid, false, Some("delete_failed_cleanup"))
+                        .await;
+                }
             }
         }
         let placeholders: String =
@@ -408,4 +503,5 @@ mod tests {
         // Saat geri kaydı → bakma (underflow yok).
         assert!(!throttle_due(200, 150, CHECK_EVERY_SECS));
     }
+    // parse_code_key testi storage/maint.rs'e taşındı (fonksiyonla birlikte).
 }

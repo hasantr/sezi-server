@@ -41,6 +41,14 @@ struct CapsRow {
     max_user_storage_bytes: Option<i64>,
 }
 
+/// Takılabilir-depolama Faz 3 (v8) — `/admin/stats` kompakt depo rozeti.
+#[derive(Deserialize)]
+struct StorageSummaryRow {
+    total: i64,
+    unhealthy: i64,
+    draining: i64,
+}
+
 pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_auth(&req, &ctx.env) {
         Ok(uid) => uid,
@@ -178,6 +186,25 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .map(|c| (c.max_storage_bytes, c.max_user_storage_bytes))
         .unwrap_or((None, None));
 
+    // Takılabilir-depolama Faz 3 (plan e) — panel ana-kart ROZETİ (kompakt özet): depo
+    // sayısı + sağlıksız (last_health_ok=0; NULL=hiç-probe SAYILMAZ) + taşınıyor-mu. Detay
+    // (per-depo liste + secret'siz kimlik/sağlık) ayrı `GET /admin/storage`'tan gelir.
+    // Fail-open: tablo yok (migration eksik) / D1 hatası → 0/false (stats 500 atmaz).
+    let storage = db
+        .prepare(
+            "SELECT COUNT(*) AS total, \
+             COALESCE(SUM(CASE WHEN last_health_ok = 0 THEN 1 ELSE 0 END), 0) AS unhealthy, \
+             COALESCE(SUM(CASE WHEN state = 'draining' THEN 1 ELSE 0 END), 0) AS draining \
+             FROM storage_backends",
+        )
+        .first::<StorageSummaryRow>(None)
+        .await
+        .ok()
+        .flatten();
+    let (stores_total, stores_unhealthy, draining_count) = storage
+        .map(|s| (s.total, s.unhealthy, s.draining))
+        .unwrap_or((0, 0, 0));
+
     Response::from_json(&serde_json::json!({
         "members": members,
         "admins": admins,
@@ -221,6 +248,13 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         "cf_configured": cf_configured,
         // v7 (additive): FCM push kurulu-mu bool'u — DEĞERLER ASLA (write-only).
         "fcm_configured": fcm_configured,
-        "version": 7,
+        // v8 (additive, Takılabilir-depolama Faz 3): depo rozeti (kompakt). Detay = GET
+        // /admin/storage. draining = herhangi bir depo taşınıyor mu (Faz 4 drain).
+        "storage": {
+            "stores_total": stores_total,
+            "stores_unhealthy": stores_unhealthy,
+            "draining": draining_count > 0,
+        },
+        "version": 8,
     }))
 }

@@ -14,8 +14,10 @@
 
 use crate::auth::jwt::device_id_from_token;
 use crate::auth::middleware::{device_revoked, extract_bearer, require_auth};
+use crate::d1util::{d1_int, d1_text};
 use crate::groups::{group_role, is_group_admin};
 use crate::respond::json_err;
+use crate::utils::now_secs;
 use worker::*;
 
 /// Eklenti kodu blob tavanı — devasa-web bundle'a yeter (medya 50MB'ın altı), DoS-sınırı.
@@ -26,7 +28,11 @@ const MAX_CODE_SIZE: u64 = 8 * 1024 * 1024 + 64 * 1024;
 
 /// JWT + cihaz-revoked + path param'ları + aktif-üyelik kapısı (ortak ön-koşul).
 /// Ok → (user, room, id, role) — `role` PUT'ta admin-kontrolü için.
-async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::Result<(String, String, String, String), Response> {
+///
+/// `pub(crate)`: `plugin_media` (üye-PUT'lu kardeş kanal) AYNI kapıyı yeniden
+/// kullanır (device-revoked + aktif-üyelik) — admin-kontrolü orada YOK (role atlanır),
+/// böylece tek-yerde-tanımlı IDOR/revoke kapısı iki kanalda ayrışamaz.
+pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::Result<(String, String, String, String), Response> {
     let user_id = require_auth(req, &ctx.env)?;
     // Device-binding + revoked (B6 deseni): çıkarılmış/iptal cihaz token-TTL'i içinde
     // kod çekememeli/yükleyememeli.
@@ -77,7 +83,8 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     // Lite kurulum (R2 OPSİYONEL): eklenti-kod deposu = R2 → binding yoksa server-saklı
     // kod yüklenemez; medya hattıyla AYNI temiz 503 (client nonretryable sayar). Yetki
     // kontrolünden SONRA (önce 403, sonra servis-durumu) ama rate-limit/body'den ÖNCE.
-    if !crate::storage::MediaStore::available(&ctx.env) {
+    let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
+    if !router.any_available() {
         return json_err(503, "media_not_configured");
     }
     // Per-user upload rate-limit (medya-upload deseni; R2 depolama/egress DoS guard).
@@ -100,8 +107,46 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     if bytes.is_empty() || bytes.len() as u64 > MAX_CODE_SIZE {
         return json_err(413, "bad_size");
     }
-    let store = crate::storage::MediaStore::from_env(&ctx.env)?;
-    store.put_code(&room_id, &blob_id, bytes).await?;
+    // FAZ 3: priority-overflow + per-depo max_bytes + PUT-fallback. Kalıcı sınıf → dolu
+    // = 429 quota_exceeded/server_storage (asla otomatik-silme); tüm denemeler fail = 503.
+    let store_id = match router
+        .put_new(
+            crate::storage::StorageClass::PluginCode,
+            &crate::storage::code_key(&room_id, &blob_id),
+            bytes,
+            "application/octet-stream",
+        )
+        .await
+    {
+        Ok(sid) => sid,
+        Err(e) => return crate::storage::placement_err_response(e),
+    };
+    // Envanter (plugin_code_objects, migration 0028) — İLK kez eklenti-kodu meta'sı
+    // (bugüne dek "nerede" bilinemezdi). BEST-EFFORT: put zaten başarılı; meta-DB hatası
+    // upload'ı KIRMAZ (put_code'un meta'sı YOKtu → meta-fail upload'ı hiç etkilemezdi =
+    // davranış-değişmez). Eksik satırı günlük bakım backfill'i (R2 list → INSERT OR IGNORE)
+    // yakalar. Kota sayaçlarına DAHİL DEĞİL (plan c.3: user_storage/server_stats bit-aynı).
+    // ON CONFLICT DO UPDATE: kod overwrite'ında (yeni sürüm) size/store_id tazelenir.
+    if let Ok(db) = ctx.env.d1("DB") {
+        if let Ok(stmt) = db
+            .prepare(
+                "INSERT INTO plugin_code_objects (room_id, blob_id, uploader_id, size_bytes, store_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(room_id, blob_id) DO UPDATE SET \
+                   uploader_id = excluded.uploader_id, size_bytes = excluded.size_bytes, store_id = excluded.store_id",
+            )
+            .bind(&[
+                d1_text(&room_id),
+                d1_text(&blob_id),
+                d1_text(&user_id),
+                d1_int(size as i64),
+                d1_text(&store_id),
+                d1_int(now_secs() as i64),
+            ])
+        {
+            let _ = stmt.run().await;
+        }
+    }
     Response::from_json(&serde_json::json!({ "ok": true, "blob_id": blob_id }))
 }
 
@@ -113,17 +158,49 @@ pub async fn get_code(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Err(resp) => return Ok(resp),
     };
     // Lite kurulum (R2 OPSİYONEL): binding yoksa kod indirilemez → put_code ile simetrik 503.
-    if !crate::storage::MediaStore::available(&ctx.env) {
+    let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
+    if !router.any_available() {
         return json_err(503, "media_not_configured");
     }
-    let store = crate::storage::MediaStore::from_env(&ctx.env)?;
-    match store.get_code(&room_id, &blob_id).await? {
-        Some(bytes) => {
-            let mut resp = Response::from_bytes(bytes)?;
+    // Faz 2 çoklu-depo: blob'un depo'sunu meta'dan çöz. plugin_code_objects Faz 1'de
+    // YENİ (0028) → ESKİ kod-blob'ları günlük backfill'e kadar meta'SIZ olabilir: meta
+    // yok → 'r2-primary' FALLBACK (eski blob hep R2'de; backfill sonrası meta-driven olur).
+    // Yeni put_code'lar meta'yı inline yazar → anında meta-driven.
+    let store_id = code_store_id(&ctx, &room_id, &blob_id)
+        .await
+        .unwrap_or_else(|| crate::storage::PRIMARY_STORE_ID.to_string());
+    // FAZ 3 (plan f#2): depo erişilemez → 503 storage_backend_unavailable (retryable) +
+    // router içinde fırsatçı health-işaret; yok → 404.
+    match router
+        .get(&store_id, &crate::storage::code_key(&room_id, &blob_id))
+        .await
+    {
+        Ok(Some(obj)) => {
+            let mut resp = Response::from_bytes(obj.bytes)?;
             resp.headers_mut()
                 .set("content-type", "application/octet-stream")?;
             Ok(resp)
         }
-        None => json_err(404, "not_found"),
+        Ok(None) => json_err(404, "not_found"),
+        Err(_) => json_err(503, "storage_backend_unavailable"),
     }
+}
+
+/// Kod-blob'un depo'su (plugin_code_objects.store_id) — Faz 2 çoklu-depo GET çözümlemesi.
+/// Meta yok / D1-hata → None (çağıran 'r2-primary'ye fallback: eski un-backfill blob hep
+/// R2'de). Best-effort: hata GET'i kırmaz, yalnız fallback-depoya düşer.
+async fn code_store_id(ctx: &RouteContext<()>, room_id: &str, blob_id: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct StoreRow {
+        store_id: String,
+    }
+    let db = ctx.env.d1("DB").ok()?;
+    let row: Option<StoreRow> = db
+        .prepare("SELECT store_id FROM plugin_code_objects WHERE room_id = ? AND blob_id = ? LIMIT 1")
+        .bind(&[d1_text(room_id), d1_text(blob_id)])
+        .ok()?
+        .first(None)
+        .await
+        .ok()?;
+    row.map(|r| r.store_id)
 }
