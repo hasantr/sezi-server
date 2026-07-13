@@ -14,6 +14,8 @@
 Hepsi bu. İmza anahtarları ilk açılışta sunucu tarafından otomatik üretilir; veritabanı şeması ilk istekte kendini kurar. `wrangler secret` ya da migration komutu **gerekmez**. Kart bilgisi **istenmez**.
 
 > **Lite kurulum:** Bu şablon "hafif" kurulur — mesajlaşma, gruplar ve aramalar tam çalışır; **fotoğraf/dosya paylaşımı** için Cloudflare'da R2 depolamayı sonradan etkinleştirmen yeterlidir (kart doğrulaması ister; 10 GB'a kadar ücretsiz, üstü cüzi). Nasıl: dashboard'da R2'yi etkinleştir → `sezi-media` bucket'ı oluştur → Worker → Settings → **Bindings → R2 ekle** (`MEDIA` / `sezi-media`). Kod/komut gerekmez; uygulama özelliği kendiliğinden gösterir.
+> Kendi cihazında `wrangler dev` ile çalıştırıyorsan R2 aboneliği hiç gerekmez:
+> `wrangler.toml`'daki `[[r2_buckets]]` bloğunu aç — medya yerel diskte saklanır.
 
 ## Ne alırsın
 
@@ -22,6 +24,25 @@ Hepsi bu. İmza anahtarları ilk açılışta sunucu tarafından otomatik üreti
 - 📊 **Kullanım paneli** — depolama / arama (TURN) / günlük-aylık hacim; istersen CF API token'ıyla "faturayla birebir" mod (token'ı da uygulamadan girersin)
 - 💸 **Bütçe bekçileri** — TURN aylık tavanı + owner-ayarlı depolama kotaları: ücretsiz katmanda sürpriz fatura yok
 - 📱 Çoklu cihaz, gruplar (Megolm), sesli/görüntülü arama (LAN/STUN; istersen CF TURN), eklenti platformu
+- 🧲 **Takılabilir depolama** — medyayı R2 yerine/yanına KENDİ deponda tut (aşağıya bak)
+
+## 🧲 Takılabilir depolama: kendi bulutun ya da kendi diskin
+
+Medya deposu R2 ile sınırlı değil. **Her S3-uyumlu depoyu** sunucuya uygulamadan
+bağlayabilirsin — kod, komut, redeploy gerekmez:
+
+- **Bulut:** Backblaze B2, Wasabi, iDrive e2, MinIO-bulut, başka bir R2 hesabı…
+- **Kendi diskin (self-host):** aynı cihazda çalışan bir [MinIO](https://min.io)
+  (örn. Raspberry Pi + büyük HDD) → `http://localhost:9000`
+
+**Nasıl:** Uygulamada owner olarak → Sunucu → panel → **DEPOLAMA** bölümü →
+depo ekle (endpoint / bölge / bucket / erişim anahtarları) → **Sına**. Hepsi bu;
+yeni medya artık oraya yazılır. Aynı yerden depo **boşaltılır** (drain: blob'lar
+taşınır) ve **kaldırılır**; sağlık ve doluluk da panelde görünür.
+
+**Gizlilik notu:** Medya blob'ları uçtan-uca şifreli yazılır — bağladığın depo
+sağlayıcısı (Backblaze, MinIO, kim olursa) yalnız **şifreli çöp** görür.
+Anahtarlar hep cihazlarda.
 
 ## Alternatif: komut satırıyla kurulum
 
