@@ -51,7 +51,11 @@ pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 /// Owner var mı? (verify'daki ilk-kullanıcı=owner kuralı → owner-satırı =
 /// "kuruluş yapılmış" işareti; bootstrap.rs ile aynı sorgu ailesi.) Hafif:
 /// tek indexli SELECT, LIMIT 1. Hata → None (fail-open, sayfa yine döner).
-async fn owner_exists(env: &Env) -> Option<bool> {
+///
+/// TEK-OTORİTE: `owner_exists` bool'unu üreten TEK yer. Hoş-geldin sayfası
+/// (`GET /`) ile `/server/info` (onboarding "sahipli mi" ön-sorusu) AYNI
+/// SELECT'ten okur — iki farklı owner-tanımı = bug olduğundan kopyalama YOK.
+pub(crate) async fn owner_exists(env: &Env) -> Option<bool> {
     #[derive(Deserialize)]
     struct One {
         #[allow(dead_code)]

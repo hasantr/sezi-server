@@ -16,9 +16,19 @@ pub async fn info(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let (name, join_mode) = row
         .map(|r| (r.name, r.join_mode))
         .unwrap_or_else(|| ("Sezi".into(), "invite_only".into()));
+    // owner_exists: onboarding'in "sahipli mi sahipsiz mi" ön-sorusu — TEK
+    // yan-etkisiz alan. Aksi halde app /bootstrap 200-vs-410 probe'una düşer;
+    // o kapı hayalet-owner denetim SELECT'lerini (+ olası self-heal batch'i)
+    // koşar. Owner-tanımı welcome.rs ile TEK-OTORİTE (bit-aynı SELECT), kopya
+    // YOK. FAIL-SECURE: sorgu düşerse (None) `true` = "sahipli-say" → sahipsiz
+    // sunucuyu yanlışlıkla "sahiplenilebilir" ilan etme (app yine /bootstrap
+    // ile KESİN doğrular). Additive alan → eski /server/info tüketicilerinin
+    // name/join_mode parse'ı kırılmaz.
+    let owner_exists = crate::welcome::owner_exists(&ctx.env).await.unwrap_or(true);
     Response::from_json(&serde_json::json!({
         "name": name,
         "join_mode": join_mode,
+        "owner_exists": owner_exists,
     }))
 }
 

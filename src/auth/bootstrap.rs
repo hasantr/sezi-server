@@ -1,4 +1,5 @@
 use crate::d1util::{d1_int, d1_text};
+use crate::ratelimit::check_rate_limit_env;
 use crate::respond::json_err;
 use crate::utils::{now_secs, random_b64u};
 use serde::Deserialize;
@@ -25,7 +26,24 @@ const GENESIS_TTL_SEC: u64 = 100 * 365 * 24 * 60 * 60;
 /// **Güvenlik nüansı:** endpoint owner-yokken herkese açık → deploy ile
 /// claim arası minik yarış penceresi. Kişisel/küçük/self-host'ta kabul
 /// edilebilir; ileride deploy-sırrı (`ADMIN_INVITE_KEY`) ile kapı sağlamlaşır.
-pub async fn bootstrap(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn bootstrap(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    // SERTLEŞTİRME (2026-07-13): owner-YOKKEN /bootstrap public'tir (kendini-
+    // kapatan genesis kapısı) → tarayıcı-botu genesis-enumerasyonunu YAVAŞLAT.
+    // IP-başı sliding-window (invite redeem deseninin ikizi). KV binding
+    // OPSİYONEL (şablon-diyeti Lite-kurulum: RATE_LIMIT yok) → check_rate_limit_env
+    // binding-yokken FAIL-OPEN (izin verir) = rate-limit İSTEĞİ ENGELLEMEZ, kapı
+    // bozulmaz. Meşru onboarding /bootstrap'ı 1-3 kez çağırır → 10/5dk cömert.
+    let ip = req
+        .headers()
+        .get("cf-connecting-ip")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "local".into());
+    let key = format!("auth:bootstrap:{}", ip);
+    if !check_rate_limit_env(&ctx.env, &key, 10, 5 * 60).await {
+        return json_err(429, "rate_limited");
+    }
+
     let db = ctx.env.d1("DB")?;
 
     // Owner zaten var mı? → kapı kapalı. İSTİSNA (self-heal, 2026-07-06
