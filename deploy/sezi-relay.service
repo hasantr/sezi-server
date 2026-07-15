@@ -1,0 +1,59 @@
+# /etc/systemd/system/sezi-relay.service
+#
+# Sezi self-host relay (wrangler dev / lokal-workerd). 7/24 kalıcı servis.
+#
+# YERLEŞİM VARSAYIMI (kendi yoluna göre uyarla):
+#   Kod       : /opt/sezi-server        (fork'un klonu; `git pull` ile güncellenir)
+#   Kalıcı veri: /var/lib/sezi/state     (D1/DO/KV/R2 lokal SQLite — YEDEKLENECEK yer)
+#   Kullanıcı : sezi (sistem kullanıcısı; `useradd --system --home /var/lib/sezi sezi`)
+#
+# KURULUM (bir kez):
+#   sudo useradd --system --home /var/lib/sezi --shell /usr/sbin/nologin sezi || true
+#   sudo mkdir -p /opt/sezi-server /var/lib/sezi/state /var/lib/sezi/backups
+#   sudo git clone https://github.com/hasantr/sezi-server /opt/sezi-server   # veya kendi fork'un
+#   cd /opt/sezi-server && sudo -u sezi npm ci --omit=dev     # wrangler'ı LOCKFILE'dan bit-aynı kur
+#   sudo chown -R sezi:sezi /opt/sezi-server /var/lib/sezi
+#   sudo cp deploy/sezi-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sezi-relay
+#
+# NOT: `npm ci` KURULUM adımıdır, ExecStart'ta DEĞİL — restart'lar (watchdog dahil)
+# npm-registry erişimine BAĞLI olmamalı (offline-restart güvenli). Sürüm yükseltmek =
+# bilinçli: `git pull` sonrası tekrar `npm ci` çalıştır.
+
+[Unit]
+Description=Sezi self-host relay (wrangler dev / workerd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sezi
+Group=sezi
+WorkingDirectory=/opt/sezi-server
+# HOME yazılabilir olmalı (wrangler cache/config buraya yazar).
+Environment=HOME=/var/lib/sezi
+Environment=WRANGLER_SEND_METRICS=false
+Environment=NODE_ENV=production
+
+# ── GÜVENLİK-KRİTİK: BIND SADECE 127.0.0.1 ──────────────────────────────────
+# --ip 127.0.0.1 = relay yalnız localhost dinler. Dış dünya SADECE cloudflared
+# tüneli VEYA caddy/nginx TLS-reverse-proxy ÖNÜNDEN erişir. ASLA `--ip 0.0.0.0`:
+# o, düz-HTTP + JWT'yi (self-provision imza anahtarı) doğrudan internete açar =
+# GERÇEK AÇIK. Port 8788 = iç port (WS-shim/caddy buraya proxy'ler).
+ExecStart=/opt/sezi-server/node_modules/.bin/wrangler dev \
+  --config wrangler.selfhost.toml \
+  --ip 127.0.0.1 --port 8788 \
+  --persist-to /var/lib/sezi/state
+
+Restart=always
+RestartSec=5
+
+# ── systemd sertleştirme ─────────────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/sezi-server /var/lib/sezi
+
+[Install]
+WantedBy=multi-user.target

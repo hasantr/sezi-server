@@ -1,0 +1,17 @@
+# /etc/systemd/system/sezi-healthz.timer
+#
+# Her 2 dakikada bir /healthz yokla (asılı-relay backstop'u).
+# Kurulum:
+#   sudo cp deploy/sezi-healthz.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sezi-healthz.timer
+
+[Unit]
+Description=Sezi relay healthz bekçisi zamanlayıcı
+
+[Timer]
+# Açılıştan 2 dk sonra başla, sonra her 2 dk. (İlk boot'ta relay ısınsın diye gecikme.)
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

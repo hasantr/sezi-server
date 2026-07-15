@@ -7,7 +7,7 @@
 ## Kurulum (5 dakika, komut satırı gerekmez)
 
 1. **Cloudflare hesabı aç** (ücretsiz): <https://dash.cloudflare.com/sign-up>
-2. Yukarıdaki **Deploy to Cloudflare** butonuna bas — Cloudflare repo'yu senin hesabına kopyalar, veritabanını (D1) ve hız-limit deposunu (KV) otomatik oluşturur, deploy eder.
+2. Yukarıdaki **Deploy to Cloudflare** butonuna bas — Cloudflare repo'yu senin hesabına kopyalar, veritabanını (D1) otomatik oluşturur, deploy eder. (Not: hosted-deploy'da hız-limiti KV'si gelmez → istek-tavanları kapalı; açmak istersen dashboard → Worker → Settings → **Bindings → KV ekle** `RATE_LIMIT`. Kendi cihazında/VPS'te kurulumda bu **otomatik açık**tır.)
 3. Deploy bitince sana bir adres verilir: `https://sezi-server.<hesabın>.workers.dev`
 4. **Sezi uygulamasında** "Sunucu ekle → Kendi sunucunu kur" adımında bu adresi yapıştır. **İlk kayıt olan hesap sunucunun sahibi (owner) olur** — davetleri, limitleri, her şeyi uygulamadan yönetirsin.
 
@@ -55,6 +55,14 @@ npx wrangler deploy
 ```
 
 `build/` klasörü derlenmiş WASM içerir — **Rust kurmana gerek yok**. Kaynaktan kendin derlemek istersen: `cargo install worker-build && worker-build --release`.
+
+## Kendi cihazında / VPS'te çalıştırma (Cloudflare'siz, ileri düzey)
+
+Sunucuyu Cloudflare'e hiç bağlanmadan **kendi VPS'inde ya da cihazında (Raspberry Pi / mini-PC)** 7/24 çalıştırabilirsin. Bu, `wrangler dev` lokal-workerd'i systemd altında kalıcılaştırır ve dışarıya ya cloudflared tüneli ya da caddy TLS reverse-proxy ile açar.
+
+> ⚠️ **Güvenlik-kritik:** self-managed kurulumda relay **yalnız `127.0.0.1`** dinlemeli; dış erişim **sadece** tünel veya TLS-proxy önünden olmalı. `--ip 0.0.0.0` sunucuyu düz-HTTP olarak internete açar — **yapma**.
+
+Hazır sertleştirme paketi (wrangler EXACT-PIN, localhost-bind, WS-shim, atomik yedek, healthz-watchdog, ufw) [`deploy/`](deploy/) klasöründe adım-adım anlatılıyor → **[deploy/README.md](deploy/README.md)**. Self-host için ayrı bir config kullanılır (`wrangler.selfhost.toml`; hız-limiti KV'si açık) — "Deploy to Cloudflare" butonu bundan etkilenmez.
 
 ## Opsiyonel yapılandırma
 

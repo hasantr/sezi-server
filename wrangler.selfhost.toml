@@ -1,0 +1,66 @@
+# Sezi Server — SELF-HOST profili (kendi cihazın / VPS / Pi; `wrangler dev` lokal-workerd)
+#
+# NEDEN AYRI DOSYA: Kök `wrangler.toml` "Deploy to Cloudflare" BUTONU içindir —
+# butonun sadeliği için KV/R2/cron/vars bilinçli YOK (bkz. o dosyanın yorumları).
+# Butona KV eklersek deploy-ekranı id-alanı ister / provizyon karışır → o profili
+# BOZMADAN, self-host için ayrı bir config veriyoruz. Bunu `--config wrangler.selfhost.toml`
+# ile çağırırsın (systemd unit + `npm run relay` bunu yapar). Buton-deploy DEĞİŞMEZ.
+#
+# LOKAL-ID NOTU: `wrangler dev` lokal modda (workerd/miniflare) D1/KV/DO'yu tamamen
+# YEREL simüle eder — aşağıdaki database_id / kv id yalnız ETİKETTİR, hiçbir CF hesabına
+# bağlanmaz. Placeholder değerler kasıtlı (gerçek CF kaynağı gerekmez).
+
+name = "sezi-server"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+# workers_dev burada anlamsız (lokal dev) ama tutarlılık için bırakıldı.
+workers_dev = true
+
+# D1 — lokal SQLite (--persist-to <state>/v3/d1). id lokal-etiket.
+[[d1_databases]]
+binding = "DB"
+database_name = "sezi"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "./migrations"
+
+# KV — HIZ-LİMİTİ (self-host'ta AÇIK). Kök wrangler.toml'da buton-sadeliği için YOK;
+# burada AÇIYORUZ çünkü lokal miniflare-KV BEDAVA ve CF-günlük-limiti yok → rate-limit
+# gerçekten çalışır: /bootstrap enumerasyon-yavaşlatma (10/5dk) + auth/verify (5/5dk) +
+# mesaj/medya per-user tavanları aktif olur. Binding adı ratelimit.rs ile birebir:
+# kod `env.kv("RATE_LIMIT")` arar → binding = "RATE_LIMIT" ZORUNLU (isim eşleşmezse
+# fail-open'a düşer = limit yine kapalı). id lokal-etiket (32-hex placeholder).
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "00000000000000000000000000000000"
+
+# R2 (medya) — self-host'ta lokal-disk simülasyonu BEDAVA (CF aboneliği/kart gerekmez).
+# AÇMAK istersen aşağıyı yorumdan çıkar → medya --persist-to <state>/v3/r2'de tutulur.
+# (Kapalıyken mesajlaşma/grup/arama TAM çalışır; foto/dosya kapalı görünür.)
+# [[r2_buckets]]
+# binding = "MEDIA"
+# bucket_name = "sezi-media"
+
+# Durable Objects — kullanıcı-başına gelen-kutusu + oda-başına eklenti-log'u.
+[[durable_objects.bindings]]
+name = "USER_INBOX"
+class_name = "UserInbox"
+
+[[durable_objects.bindings]]
+name = "PLUGIN_ROOM_LOG"
+class_name = "PluginRoomLog"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UserInbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PluginRoomLog"]
+
+# [triggers]/cron YOK: lazy-maintenance (src/maintenance.rs) istek-sırtında çalışır.
+# Bakım penceresi zaten gece-yedek/restart timer'ıyla sağlanır (deploy/backup.sh).
+
+# [vars]: kodda güvenli default'lu (ENV=prod fail-secure, JWT_ISSUER="sezi-server").
+# İnce-ayar gerekirse buraya [vars] bloğu ekleyebilirsin; secret'lar için `.dev.vars`
+# kullan (ör. JWT_SIGNING_KEY) — girilmezse sunucu ilk açılışta kendisi üretir (D1'de saklar).

@@ -1,0 +1,13 @@
+# /etc/systemd/system/sezi-healthz.service
+# Oneshot: /healthz yokla, 200 değilse relay'i restart et. sezi-healthz.timer tetikler.
+# root çalışır (systemctl restart yetkisi).
+
+[Unit]
+Description=Sezi relay healthz bekçisi (probe + restart)
+After=sezi-relay.service
+
+[Service]
+Type=oneshot
+Environment=SEZI_HEALTHZ_URL=http://127.0.0.1:8788/healthz
+Environment=SEZI_SERVICE=sezi-relay
+ExecStart=/opt/sezi-server/deploy/sezi-healthz.sh

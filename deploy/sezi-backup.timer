@@ -1,0 +1,19 @@
+# /etc/systemd/system/sezi-backup.timer
+#
+# Gece 04:00 atomik yedek + relay-restart (deploy/backup.sh üzerinden).
+# Kurulum:
+#   sudo cp deploy/sezi-backup.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sezi-backup.timer
+
+[Unit]
+Description=Sezi gece yedek + restart zamanlayıcı
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+# Makine 04:00'te kapalıysa açılınca kaçırılan çalıştırmayı yap.
+Persistent=true
+# Aynı anda başka VPS'lerle CF-tepe çakışmasın diye küçük rastgele gecikme.
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

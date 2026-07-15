@@ -1,0 +1,17 @@
+# /etc/systemd/system/sezi-backup.service
+#
+# Oneshot: atomik yedek + gece-restart (deploy/backup.sh). sezi-backup.timer tetikler.
+# root çalışır (systemctl stop/start yetkisi gerekir).
+
+[Unit]
+Description=Sezi relay atomik yedek + gece-restart
+# Yedek relay'i durdurup başlattığı için relay'e "sıralı" bağlıyız (paralel çakışma yok).
+After=sezi-relay.service
+
+[Service]
+Type=oneshot
+Environment=SEZI_STATE_DIR=/var/lib/sezi/state
+Environment=SEZI_BACKUP_DIR=/var/lib/sezi/backups
+Environment=SEZI_BACKUP_KEEP=14
+Environment=SEZI_SERVICE=sezi-relay
+ExecStart=/opt/sezi-server/deploy/backup.sh

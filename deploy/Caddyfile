@@ -1,0 +1,47 @@
+# /etc/caddy/Caddyfile
+#
+# CF'SİZ TAM-BAĞIMSIZ YOL — caddy + otomatik Let's Encrypt TLS reverse-proxy.
+# cloudflared/Cloudflare'e HİÇ bağımlılık yok: kendi domain'in + kendi VPS'in.
+#
+# ÖN-KOŞUL:
+#   1. Bir domain'in A/AAAA kaydı bu VPS'in public IP'sine baksın (sezi.example.com).
+#   2. ufw: 80 + 443 inbound açık (ACME + HTTPS). Aşağıdaki ufw notuna bak.
+#   3. sezi-relay.service çalışıyor (127.0.0.1:8788).
+#
+# KURULUM:
+#   # caddy resmi repo (Debian/Ubuntu): https://caddyserver.com/docs/install
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#   # sezi.example.com'u KENDİ domain'inle değiştir:
+#   sudo sed -i 's/sezi.example.com/senin.domainin/' /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# caddy WebSocket'i (/sync 101 upgrade) DOĞAL proxy'ler → ayrı WS-shim GEREKMEZ.
+# Sertifikayı Let's Encrypt'ten otomatik alır/yeniler.
+
+sezi.example.com {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8788 {
+		# GÜVENLİK: cf-connecting-ip'yi GERÇEK istemci IP'siyle EZ. Neden:
+		#  · Worker per-IP rate-limit (bootstrap/verify/redeem/link) için yalnız
+		#    `cf-connecting-ip` başlığını okur. CF-yolunda CF bunu koyar; caddy-
+		#    yolunda KİMSE koymaz → hepsi "local" tek-kovaya düşer (limit çöker).
+		#  · {remote_host} = caddy'nin gördüğü GERÇEK TCP peer (caddy edge ise
+		#    gerçek istemci). caddy bunu EZDİĞİ için istemci sahte cf-connecting-ip
+		#    yollasa da geçmez (spoof-korumalı). → per-IP limit doğru çalışır.
+		#  (Caddy başka bir LB ARKASINDAysa {remote_host} o LB olur; o durumda
+		#   trusted_proxies + {http.request.header.X-Forwarded-For} kullan.)
+		header_up cf-connecting-ip {remote_host}
+	}
+}
+
+# ── ufw (CF'siz caddy yolu) ───────────────────────────────────────────────────
+#   sudo ufw default deny incoming
+#   sudo ufw default allow outgoing
+#   sudo ufw allow 22/tcp      # SSH (kendini kilitleme!)
+#   sudo ufw allow 80/tcp      # Let's Encrypt ACME + HTTP→HTTPS yönlendirme
+#   sudo ufw allow 443/tcp     # HTTPS + WSS
+#   sudo ufw enable
+#
+# NOT: cloudflared yolunu seçtiysen 80/443 inbound'a GEREK YOK — cloudflared
+# yalnız OUTBOUND bağlanır. O zaman en sıkı: `deny incoming` + yalnız `allow 22`.
