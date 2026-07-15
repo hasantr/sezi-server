@@ -220,6 +220,48 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         }
     }
 
+    // Kart↔davet KRİPTOGRAFİK bağı (Hamle A / Codex son-kontrol BLOCKER #1): davet
+    // token'ının SAHİBİnin user_id'si (owner_user_id) VE identity_ed_pub'ı çekilir →
+    // yanıtta `inviter_user_id` + `inviter_ed_pub` döner. Katılan client, zarftaki
+    // kişi-kartının HEM user_id'sini HEM ed_pub'ını BUNLARLA çapraz-doğrular. Yalnız
+    // UUID eşleştirmek YETMEZ: kart user_id'yi ed_pub ile imzalı bağlar ama saldırgan
+    // aynı UUID'yi iddia eden FARKLI-ed kart üretebilir → ed_pub çapraz-kontrolü şart
+    // (server'ın kayıtlı primary ed'i = güven kökü; server üyelik otoritesi). JOIN
+    // users: davet-eden owner_user_id'nin identity_ed_pub'ı. DELETE'ten ÖNCE oku.
+    // owner_user_id NULL (açık-mod/token-yok/eski-davet) ya da identity_ed_pub NULL
+    // (eski owner, 0012 öncesi) → None → client auto-intro'yu fail-closed atlar.
+    #[derive(Deserialize)]
+    struct InviterRow {
+        owner_user_id: Option<String>,
+        inviter_ed_pub: Option<String>,
+    }
+    // identity_ed_pub DB'de BLOB (ham 32 byte) → `hex()` ile DETERMİNİSTİK
+    // uppercase-hex string'e çevir (base64-varyant belirsizliği YOK). Client
+    // kart ed_pub'ını base64 taşır; core handler onu decode+hex_upper ile AYNI
+    // biçime getirip karşılaştırır (format-kesin eşleşme).
+    let inviter: Option<InviterRow> = db
+        .prepare(
+            // hex(NULL) SQLite'ta '' (boş string) döner, NULL değil → CASE ile
+            // gerçek NULL'a çevir (eski owner/ed-yok → Rust match None → fail-closed
+            // clear; boş-ed'i kv'ye yazma gereksizliği de önlenir).
+            "SELECT it.owner_user_id AS owner_user_id,
+                    CASE WHEN u.identity_ed_pub IS NULL THEN NULL ELSE hex(u.identity_ed_pub) END AS inviter_ed_pub
+             FROM invite_tokens it
+             LEFT JOIN users u ON u.id = it.owner_user_id
+             WHERE it.token = (SELECT invite_token FROM verification_codes WHERE email = ?)",
+        )
+        .bind(&[d1_text(&body.email)])?
+        .first(None)
+        .await?;
+    let (inviter_user_id, inviter_ed_pub) = match inviter {
+        // İkisi de dolu olmalı (ed_pub olmadan bağ kurulamaz → fail-closed None).
+        Some(InviterRow {
+            owner_user_id: Some(uid),
+            inviter_ed_pub: Some(ed),
+        }) => (Some(uid), Some(ed)),
+        _ => (None, None),
+    };
+
     // Davet→kullanıcı izi: redeem'de saklanan invite_token üzerinden used_by doldur.
     // (token yoksa subquery NULL → WHERE token=NULL hiçbir satırı etkilemez; açık modda zararsız.)
     db.prepare(
@@ -257,6 +299,12 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         "refresh_token": refresh,
         "token_type": "Bearer",
         "expires_in": ACCESS_TTL_SEC,
+        // Hamle A: davet edenin user_id'si + primary ed_pub'ı (kart↔davet
+        // KRİPTOGRAFİK çapraz-doğrulaması — client HEM user_id HEM ed_pub eşliğini
+        // arar). null = açık-mod/token-yok/eski-davet/ed-yok → client auto-intro'yu
+        // fail-closed atlar. Eski client bu alanları yok sayar (additive).
+        "inviter_user_id": inviter_user_id,
+        "inviter_ed_pub": inviter_ed_pub,
     }))
 }
 
