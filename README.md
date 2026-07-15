@@ -7,7 +7,7 @@
 ## Kurulum (5 dakika, komut satırı gerekmez)
 
 1. **Cloudflare hesabı aç** (ücretsiz): <https://dash.cloudflare.com/sign-up>
-2. Yukarıdaki **Deploy to Cloudflare** butonuna bas — Cloudflare repo'yu senin hesabına kopyalar, veritabanını (D1) otomatik oluşturur, deploy eder. (Not: hosted-deploy'da hız-limiti KV'si gelmez → istek-tavanları kapalı; açmak istersen dashboard → Worker → Settings → **Bindings → KV ekle** `RATE_LIMIT`. Kendi cihazında/VPS'te kurulumda bu **otomatik açık**tır.)
+2. Yukarıdaki **Deploy to Cloudflare** butonuna bas — Cloudflare repo'yu senin hesabına kopyalar, veritabanını (D1) ve hız-limiti deposunu (KV, brute-force freni) otomatik oluşturur, deploy eder.
 3. Deploy bitince sana bir adres verilir: `https://sezi-server.<hesabın>.workers.dev`
 4. **Sezi uygulamasında** "Sunucu ekle → Kendi sunucunu kur" adımında bu adresi yapıştır. **İlk kayıt olan hesap sunucunun sahibi (owner) olur** — davetleri, limitleri, her şeyi uygulamadan yönetirsin.
 

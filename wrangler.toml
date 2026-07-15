@@ -38,13 +38,17 @@ migrations_dir = "./migrations"
 # binding = "MEDIA"
 # bucket_name = "sezi-media"
 
-# KV (hız-limiti) — BİLİNÇLİ YOK (deploy-ekranı sadeliği + isim-çakışması):
-# binding yokken sunucu hız-limitlerini atlar (kapalı-üyelik modelinde davet
-# zaten kapı; fail-open kültürü). İstersen sonradan aç: KV namespace oluştur →
-# Worker → Settings → Bindings → KV → Variable name: RATE_LIMIT → Deploy.
-# [[kv_namespaces]]
-# binding = "RATE_LIMIT"
-# id = "..."
+# KV (hız-limiti / brute-force freni) — AÇIK. "Deploy to Cloudflare" butonu (D1
+# gibi) yeni KV namespace oluşturup bu ID'yi kendisi günceller (parser'ı alanın
+# MEVCUT olmasını ister — CF dokümanı). ratelimit.rs `env.kv("RATE_LIMIT")` arar →
+# binding adı RATE_LIMIT ZORUNLU. Kod FAIL-OPEN: KV günlük-yazma limiti (ücretsiz
+# katman 1000/gün) aşılırsa hız-limiti gevşer ama MESAJLAŞMA DURMAZ (saha-testli,
+# 2026-06-27 wedge dersi). Brute-force hedefleri (bootstrap/verify/invite, ~5-10/5dk)
+# seyrek → o koruma her zaman aktif; asıl fren buradan gelir. CLI ile kuruyorsan:
+# `wrangler kv namespace create RATE_LIMIT` → çıktıdaki gerçek id'yi yaz.
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "00000000000000000000000000000000"
 
 # Durable Objects — kullanıcı-başına gelen-kutusu + oda-başına eklenti-log'u.
 # Deploy'da otomatik oluşur, ön-hazırlık gerekmez.
