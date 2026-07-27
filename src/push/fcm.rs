@@ -416,9 +416,30 @@ pub async fn maybe_push_wake(
     recipient_id: &str,
     recipient_device_id: Option<&str>,
 ) {
+    // One verdict line per wake attempt.
+    //
+    // Every exit from this function used to be silent except a hard `Err`. "Push is switched off",
+    // "the device has no token", "the token was stale and has just been deleted" and "it went out
+    // fine" were indistinguishable from outside, which is why "notifications do not arrive when the
+    // app is closed" had no answer on 2026-07-27: the server correctly logged that it had chosen the
+    // FCM-wake path, and then nothing at all. The delivery decision was observable; its OUTCOME was
+    // not.
+    //
+    // `mode` also matters on its own. A self-hosted server with no FCM configuration silently falls
+    // back to the shared default relay, so the operator can be pushing through someone else's
+    // infrastructure without ever being told. Naming the mode here is what makes that visible.
     let mode = match resolve_send_mode(env, db).await {
         Some(m) => m,
-        None => return,
+        None => {
+            console_log!(
+                "[push] user={recipient_id} mode=off -> atlandı (FCM yapılandırılmamış ya da 'off')"
+            );
+            return;
+        }
+    };
+    let mode_name = match &mode {
+        SendMode::Direct { .. } => "direct",
+        SendMode::Relay { .. } => "relay",
     };
 
     #[derive(Deserialize)]
@@ -439,10 +460,27 @@ pub async fn maybe_push_wake(
     let rows: Vec<TokRow> = match query {
         Ok(stmt) => match stmt.all().await {
             Ok(r) => r.results().unwrap_or_default(),
-            Err(_) => return,
+            Err(e) => {
+                console_warn!("[push] user={recipient_id} mode={mode_name} token sorgusu FAIL: {e:?}");
+                return;
+            }
         },
-        Err(_) => return,
+        Err(e) => {
+            console_warn!("[push] user={recipient_id} mode={mode_name} token sorgusu FAIL: {e:?}");
+            return;
+        }
     };
+    if rows.is_empty() {
+        // Not an error, and the single most useful thing to know: this device never registered, or
+        // its token was deleted as stale. Without the line it cannot be told apart from a push that
+        // WAS sent and then lost somewhere downstream.
+        console_log!(
+            "[push] user={recipient_id} mode={mode_name} token=0 -> gonderilmedi (kayitli cihaz yok)"
+        );
+        return;
+    }
+    let total = rows.len();
+    let (mut ok, mut stale, mut failed) = (0usize, 0usize, 0usize);
 
     // NOTE (2026-06-26): wake debounce was REVERTED. A 20s per-recipient+device debounce was
     // suppressing LEGITIMATE follow-up messages that arrived just after a drain finished: no
@@ -459,9 +497,17 @@ pub async fn maybe_push_wake(
             SendMode::Relay { url } => send_wake_relay(url, &row.fcm_token).await,
         };
         match sent {
-            Ok(true) => {}
+            Ok(true) => ok += 1,
             Ok(false) => {
-                // Stale token → drop it, so later messages do not retry it for nothing.
+                stale += 1;
+                // Stale token → drop it, so later messages do not retry it for nothing. Logged per
+                // device on purpose: the deletion is correct but invisible, and it permanently ends
+                // push for that device. "Notifications just stopped" needs a trace to follow, and a
+                // bulk deletion after an FCM 400 has bitten this project before.
+                console_warn!(
+                    "[push] user={recipient_id} cihaz={} token BAYAT -> silindi (bu cihaz artik uyandirilamaz)",
+                    row.device_id
+                );
                 if let Ok(stmt) = db
                     .prepare("DELETE FROM push_tokens WHERE user_id = ? AND device_id = ?")
                     .bind(&[d1_text(recipient_id), d1_text(&row.device_id)])
@@ -470,10 +516,17 @@ pub async fn maybe_push_wake(
                 }
             }
             Err(e) => {
-                console_warn!("fcm: wake send fail user={recipient_id}: {e:?}");
+                failed += 1;
+                console_warn!(
+                    "[push] user={recipient_id} cihaz={} gonderim HATA: {e:?}",
+                    row.device_id
+                );
             }
         }
     }
+    console_log!(
+        "[push] user={recipient_id} mode={mode_name} token={total} ok={ok} bayat={stale} hata={failed}"
+    );
 }
 
 #[cfg(test)]
