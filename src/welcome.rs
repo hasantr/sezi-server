@@ -1,20 +1,23 @@
-//! Hoş-geldin sayfası — `GET /` (kesin-çözüm paketi 2026-07-06).
+//! Welcome page — `GET /` (part of the 2026-07-06 hardening package).
 //!
-//! SAHA GEREKÇESİ: taze kurulumda kullanıcı workers.dev adresine tarayıcıdan
-//! tıklayınca 404/çıplak-JSON görüyordu — "sunucum çalışıyor mu?" sorusuna
-//! güven vermiyor. Bu sayfa üç durumda insan-okur Türkçe cevap verir:
-//!   - Owner YOK (taze kurulum): "sunucun hazır" + adresi-kopyala + app'e
-//!     yapıştırma yönergesi + KURULUŞ KODU (Hasan-kararı 2026-07-07: app'in
-//!     otomatik-genesis-çekimi aksarsa görünür yedek-yol). Güvenlik-eşdeğer:
-//!     kod owner-yokken zaten `GET /bootstrap`'tan public (kendini-kapatan
-//!     kapı) → sayfada göstermek ek yüzey açmaz. Owner oluşunca kod bir daha
-//!     ASLA gösterilmez.
-//!   - Owner VAR: "sunucu aktif" + davet-kodu yönergesi.
-//!   - D1-hatası: FAIL-OPEN nötr metin (sayfa yine döner; durum iddiası yok).
+//! FIELD RATIONALE: on a fresh install, clicking the workers.dev address in a browser
+//! used to show a 404 or bare JSON, which answers "is my server running?" with zero
+//! confidence. This page gives a human-readable answer in three states (the rendered
+//! copy is Turkish):
+//!   - NO owner (fresh install): "your server is ready" + copy-the-address + paste-it
+//!     into-the-app instructions + the GENESIS CODE (Hasan's 2026-07-07 call: a visible
+//!     fallback for when the app's automatic genesis fetch fails). Security-equivalent:
+//!     while there is no owner that code is already public via `GET /bootstrap` — a gate
+//!     that closes itself — so showing it here opens no extra surface. Once an owner
+//!     exists the code is NEVER shown again.
+//!   - Owner EXISTS: "server is active" + how to get an invite code.
+//!   - D1 error: FAIL-OPEN neutral copy (the page still renders and claims nothing
+//!     about server state).
 //!
-//! Estetik: MurmurTokens sıcak-krem paleti (mobile palette.dart hex'leriyle
-//! bire-bir: page #F1E6D4 / paper #FAF1E6 / ink #201812 / accent #F97316),
-//! inline-CSS, dış kaynak yok (self-contained; dışa-kapalı sunucu felsefesi).
+//! Styling: the MurmurTokens warm-cream palette, matching mobile's palette.dart hexes
+//! exactly (page #F1E6D4 / paper #FAF1E6 / ink #201812 / accent #F97316), inline CSS
+//! and no external resources — self-contained, in keeping with the closed-server
+//! philosophy.
 
 use serde::Deserialize;
 use worker::*;
@@ -22,15 +25,15 @@ use worker::*;
 use crate::auth::bootstrap::ensure_genesis_token;
 use crate::d1util::d1_text;
 
-/// `GET /` — owner-durumuna göre hoş-geldin sayfası. `Response::from_html`
-/// `Content-Type: text/html; charset=utf-8` başlığını kendisi koyar.
+/// `GET /` — the welcome page, keyed on owner state. `Response::from_html` sets the
+/// `Content-Type: text/html; charset=utf-8` header itself.
 pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // FAIL-OPEN: owner-sorgusu düşerse (D1 yok/geçici hata) None → nötr metin.
+    // FAIL-OPEN: if the owner query fails (no D1, transient error) → None → neutral copy.
     let owner = owner_exists(&ctx.env).await;
-    // Kuruluş kodu YALNIZ owner-YOK durumunda çekilir (owner-var / D1-hata
-    // kollarında ASLA). /bootstrap ile aynı get-or-mint yolu (M10 yarış-deseni
-    // dahil). FAIL-OPEN: kod alınamazsa None → sayfa yine döner, kod kutusu
-    // yerine "birazdan yenile" satırı.
+    // The genesis code is fetched ONLY in the no-owner state, NEVER in the owner-exists
+    // or D1-error branches. Same get-or-mint path as /bootstrap, including the M10 race
+    // pattern. FAIL-OPEN: if the code cannot be obtained → None → the page still renders,
+    // with a "refresh in a moment" line in place of the code box.
     let genesis = if owner == Some(false) {
         match ctx.env.d1("DB") {
             Ok(db) => ensure_genesis_token(&db).await.ok(),
@@ -39,8 +42,8 @@ pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     } else {
         None
     };
-    // Adres = isteğin origin'i (scheme://host[:port]) — kullanıcının tarayıcıda
-    // gördüğü adresin aynısı; custom-domain'de de doğru kalır.
+    // The address is the request's own origin (scheme://host[:port]) — exactly what the
+    // user sees in the browser bar, so it stays correct behind a custom domain too.
     let origin = req
         .url()
         .map(|u| u.origin().ascii_serialization())
@@ -48,13 +51,15 @@ pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Response::from_html(render_welcome(owner, &origin, genesis.as_deref()))
 }
 
-/// Owner var mı? (verify'daki ilk-kullanıcı=owner kuralı → owner-satırı =
-/// "kuruluş yapılmış" işareti; bootstrap.rs ile aynı sorgu ailesi.) Hafif:
-/// tek indexli SELECT, LIMIT 1. Hata → None (fail-open, sayfa yine döner).
+/// Does an owner exist? (verify's first-user-becomes-owner rule means an owner row is
+/// the marker for "this server has been claimed"; same query family as bootstrap.rs.)
+/// Cheap: one indexed SELECT with LIMIT 1. On error → None (fail-open, the page still
+/// renders).
 ///
-/// TEK-OTORİTE: `owner_exists` bool'unu üreten TEK yer. Hoş-geldin sayfası
-/// (`GET /`) ile `/server/info` (onboarding "sahipli mi" ön-sorusu) AYNI
-/// SELECT'ten okur — iki farklı owner-tanımı = bug olduğundan kopyalama YOK.
+/// SINGLE AUTHORITY: this is the ONLY place that produces the `owner_exists` bool. The
+/// welcome page (`GET /`) and `/server/info` (onboarding's "is it claimed?" probe) read
+/// from the SAME SELECT — two divergent definitions of "owner" would be a bug, so
+/// nothing is copy-pasted.
 pub(crate) async fn owner_exists(env: &Env) -> Option<bool> {
     #[derive(Deserialize)]
     struct One {
@@ -72,9 +77,10 @@ pub(crate) async fn owner_exists(env: &Env) -> Option<bool> {
     Some(row.is_some())
 }
 
-/// Sayfa iskeleti — `format!` yerine `replace` (CSS `{}` süslü-parantezleriyle
-/// format-string çakışmasın). `__CONTENT__` tek enjeksiyon noktası; içerik
-/// `render_welcome`da kurulur, kullanıcı-girdisi (origin) HTML-escape'lenir.
+/// The page shell — `replace` instead of `format!` so the CSS braces cannot collide
+/// with format-string syntax. `__CONTENT__` is the single injection point; the content
+/// is assembled in `render_welcome`, and user-supplied input (the origin) is
+/// HTML-escaped.
 const PAGE: &str = r#"<!doctype html>
 <html lang="tr">
 <head>
@@ -144,23 +150,24 @@ __CONTENT__
 </html>
 "#;
 
-/// İçeriği kur (SAF → unit-testli). `owner`: `Some(false)`=taze kurulum,
-/// `Some(true)`=aktif sunucu, `None`=D1-hatası (nötr). `genesis`: kuruluş
-/// kodu — YALNIZ `Some(false)` kolunda gösterilir (o durumda kod zaten
-/// /bootstrap'tan public; görünür yedek-yol). Owner-var/D1-hata kollarında
-/// çağıran `None` geçer, kod ASLA gömülmez.
+/// Build the page content (PURE → unit-testable). `owner`: `Some(false)` = fresh
+/// install, `Some(true)` = active server, `None` = D1 error (neutral copy). `genesis`
+/// is the genesis code, rendered ONLY in the `Some(false)` branch — in that state the
+/// code is already public via /bootstrap, so this is just a visible fallback. In the
+/// owner-exists and D1-error branches the caller passes `None` and the code is NEVER
+/// embedded.
 fn render_welcome(owner: Option<bool>, origin: &str, genesis: Option<&str>) -> String {
     let addr = html_escape(origin);
-    // Kopyala-butonu adresi DOM'dan okur (`#addr`) → adres için ayrıca
-    // JS-string-escape gerekmez; pano API'siz eski tarayıcıda buton sessiz düşer,
-    // adres yine seçilip elle kopyalanabilir.
+    // The copy button reads the address back out of the DOM (`#addr`), so no separate
+    // JS-string escaping is needed. On an old browser without the clipboard API the
+    // button just does nothing, and the address can still be selected and copied by hand.
     let addr_box = format!(
         r#"<div class="addr"><code id="addr">{addr}</code><button onclick="navigator.clipboard.writeText(document.getElementById('addr').textContent).then(()=>{{this.textContent='Kopyalandı ✓'}})">Adresi kopyala</button></div>"#
     );
-    // Kuruluş-kodu kutusu (yalnız taze-kurulum kolunda kullanılır). Kod b64u
-    // olsa da savunmacı HTML-escape; kopyala-butonu adres-kopyala deseninin
-    // aynısı (DOM'dan okur, `#gcode`). FAIL-OPEN: kod yoksa kutu yerine
-    // "birazdan yenile" satırı — sayfa yine döner.
+    // The genesis-code box (used only in the fresh-install branch). The code is b64u,
+    // but it is HTML-escaped defensively anyway; the copy button follows the same
+    // read-from-DOM pattern as the address one (`#gcode`). FAIL-OPEN: with no code the
+    // box is replaced by a "refresh in a moment" line and the page still renders.
     let code_box = match genesis {
         Some(code) => {
             let code = html_escape(code);
@@ -185,7 +192,7 @@ fn render_welcome(owner: Option<bool>, origin: &str, genesis: Option<&str>) -> S
              <p>Katılmak için sunucu sahibinden <b>davet kodu</b> iste.</p>\
              {addr_box}"
         ),
-        // D1-hatası: durum iddiasız nötr metin (fail-open).
+        // D1 error: neutral copy that asserts nothing about state (fail-open).
         None => format!(
             "<div class=\"emoji\">🟠</div>\
              <h1>Sezi sunucusu</h1>\
@@ -196,9 +203,9 @@ fn render_welcome(owner: Option<bool>, origin: &str, genesis: Option<&str>) -> S
     PAGE.replace("__CONTENT__", &content)
 }
 
-/// Minimal HTML-escape (origin savunmacı olarak escape'lenir; origin ASCII
-/// scheme://host[:port] döndürür ama Host-header kaynaklı olduğundan körü
-/// körüne gömülmez).
+/// Minimal HTML escaping. The origin is escaped defensively: it resolves to an ASCII
+/// scheme://host[:port], but it ultimately derives from the Host header, so it is
+/// never embedded blindly.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -211,7 +218,7 @@ mod tests {
     use super::*;
 
     const ORIGIN: &str = "https://sezi-ornek.workers.dev";
-    /// Gerçek genesis 24-char b64u; test için ayırt-edici sabit yeter.
+    /// A real genesis code is 24 b64u chars; for tests any distinctive constant will do.
     const KOD: &str = "GENESIS_ORNEK_KOD_24chr0";
 
     #[test]
@@ -222,8 +229,8 @@ mod tests {
         assert!(html.contains(ORIGIN));
         assert!(html.contains("charset=\"utf-8\""));
         assert!(html.contains("otomatik alınır"), "app-yolu yönergesi kalır");
-        // Hasan-kararı 2026-07-07: owner-YOKKEN kuruluş kodu SAYFADA GÖRÜNÜR
-        // (görünür yedek-yol; kod bu durumda /bootstrap'tan zaten public).
+        // Hasan's 2026-07-07 call: while there is NO owner the genesis code IS shown on
+        // the page (visible fallback; in that state it is already public via /bootstrap).
         assert!(html.contains(KOD), "kuruluş kodu sayfada gösterilmeli");
         assert!(html.contains("Kuruluş kodu"));
         assert!(html.contains("ilk kaydolan"), "sahiplenme uyarısı");
@@ -231,7 +238,8 @@ mod tests {
         assert!(!html.contains("alınamadı"), "kod varken fail-open satırı yok");
     }
 
-    /// FAIL-OPEN: kod alınamazsa sayfa YİNE döner; kod kutusu yerine yenile-satırı.
+    /// FAIL-OPEN: if the code cannot be obtained the page STILL renders, with a
+    /// refresh line in place of the code box.
     #[test]
     fn taze_kurulum_kod_alinamazsa_yenile_satiri() {
         let html = render_welcome(Some(false), ORIGIN, None);
@@ -243,12 +251,12 @@ mod tests {
 
     #[test]
     fn aktif_sunucu_sayfasi_davet_yonergesi_icerir_kod_asla_sizmaz() {
-        // Savunmacı kilit: genesis yanlışlıkla Some geçse bile owner-VAR
-        // kolunda kod ASLA gömülmez (render tek-otorite).
+        // Defensive lock: even if genesis is accidentally passed as Some, the
+        // owner-exists branch NEVER embeds the code (render is the single authority).
         let html = render_welcome(Some(true), ORIGIN, Some(KOD));
         assert!(html.contains("Sezi sunucusu aktif"));
         assert!(html.contains("davet kodu"));
-        // Aktif sunucuda kurulum-yönergesi GÖSTERİLMEZ (genesis kapısı kapandı).
+        // An active server does NOT show the setup instructions (the genesis gate closed).
         assert!(!html.contains("Kendi sunucunu kur"));
         assert!(!html.contains(KOD), "owner-VAR: kuruluş kodu sızmaz");
         assert!(!html.contains("Kuruluş kodu"));
@@ -259,10 +267,10 @@ mod tests {
         let html = render_welcome(None, ORIGIN, Some(KOD));
         assert!(html.contains("Sezi sunucusu"));
         assert!(html.contains("okunamadı"));
-        // Nötr sayfa durum İDDİA ETMEZ: ne "hazır" ne "aktif".
+        // The neutral page CLAIMS nothing: neither "ready" nor "active".
         assert!(!html.contains("hazır ve çalışıyor"));
         assert!(!html.contains("sunucusu aktif"));
-        // D1-hata kolunda kod ASLA gömülmez (owner-durumu bilinmiyor).
+        // The D1-error branch NEVER embeds the code (owner state is unknown).
         assert!(!html.contains(KOD), "D1-hata: kuruluş kodu sızmaz");
     }
 

@@ -1,34 +1,34 @@
-//! `PUT /devices/list` + `GET /devices/list/:user_id` — M1 cihaz-listesi.
+//! `PUT /devices/list` + `GET /devices/list/:user_id` — the M1 device list.
 //!
-//! ## JWS bayt-imza modeli (KRİTİK)
-//! `doc_json`, dış gövdede bir JSON STRING alanıdır; değeri client'ın imzaladığı
-//! iç JSON metnin AYNEN kendisidir. serde dış gövdeyi parse edince `body.doc_json`
-//! o metnin verbatim UTF-8 baytlarını taşır → imza `body.doc_json.as_bytes()`
-//! üzerinde doğrulanır. İç dokümanı ASLA yeniden serileştirmeyiz (kanonikleştirme
-//! gerekmez; serileştirme-farkı bug sınıfı baştan yok). İç parse YALNIZ doğrulama
-//! için alanları (user_id, rev, primary ed_pub/x_pub) okumak amacıyladır.
+//! ## The JWS byte-signature model (CRITICAL)
+//! `doc_json` is a JSON STRING field in the outer body whose value is EXACTLY the inner JSON
+//! text the client signed. Once serde has parsed the outer body, `body.doc_json` holds that
+//! text's verbatim UTF-8 bytes, so the signature is verified over `body.doc_json.as_bytes()`.
+//! We NEVER re-serialize the inner document: no canonicalization is required, and the whole
+//! class of serialization-difference bugs simply cannot occur. The inner parse exists ONLY to
+//! read the fields verification needs (user_id, rev, the primary's ed_pub/x_pub).
 //!
-//! ## Kimlik doğrulama zinciri (relogin.rs deseni — KRİTİK)
-//! Liste, primary cihazın **Ed25519** anahtarıyla imzalanır. Ama bu Ed-key'i
-//! `users.identity_pubkey` ile DOĞRUDAN doğrulayamayız: o BLOB bir Curve25519/DH
-//! anahtarıdır (register `id.diffie_pubkey()` gönderir), Ed25519 imza anahtarı
-//! DEĞİL. Bunun yerine relogin.rs'teki bağlama desenini uygularız:
-//!   1) Doc'taki primary `ed_pub_b64`'ten `VerifyingKey` kur (bozuksa 400).
-//!   2) **Bağlama:** kullanıcının `signed_prekeys` EN YENİ satırını çek; SPK
-//!      pub'ı kayıt anında `account.sign(spk_pub)` ile gerçek kimlik tarafından
-//!      imzalandığı için, iddia edilen Ed-key bu imzayı doğrulayabiliyorsa
-//!      kayıtlı kimliğe KRİPTOGRAFİK bağlanmış olur (yoksa/başarısızsa 403).
-//!   3) **Liste imzası:** aynı Ed-key, doc_json'un verbatim baytlarını doğrular.
-//!   4) **Tutarlılık:** primary `x_pub_b64` decode'u == `users.identity_pubkey`.
+//! ## The identity binding chain (the relogin.rs pattern — CRITICAL)
+//! The list is signed with the primary device's **Ed25519** key. We cannot validate that Ed
+//! key DIRECTLY against `users.identity_pubkey`, because that blob is a Curve25519/DH key —
+//! register sends `id.diffie_pubkey()` — and NOT an Ed25519 signing key. So we apply the
+//! binding pattern from relogin.rs:
+//!   1) Build a `VerifyingKey` from the primary's `ed_pub_b64` in the doc (malformed → 400).
+//!   2) **Binding:** fetch the user's NEWEST `signed_prekeys` row. The SPK public key was
+//!      signed at registration time by the real identity via `account.sign(spk_pub)`, so if
+//!      the claimed Ed key can verify that signature it is CRYPTOGRAPHICALLY bound to the
+//!      registered identity (missing row or failed verification → 403).
+//!   3) **List signature:** the same Ed key verifies the verbatim bytes of doc_json.
+//!   4) **Consistency:** the decoded primary `x_pub_b64` == `users.identity_pubkey`.
 //!
-//! ## Ortak doğrulama-sakla yolu (M2-S3.2 B6)
-//! `put_list` + `link-approve` (bkz `link.rs`) AYNI `validate_and_store_signed_list`
-//! yolundan geçer → tek doğrulama kaynağı. `device_lists` yazımı **atomik
-//! rev-koşullu** (`WHERE excluded.rev > device_lists.rev` + RETURNING): eşzamanlı
-//! iki yazar (link-approve + put_list) read-then-write yarışına düşmez; kaybeden
-//! 409 alır.
+//! ## Shared validate-and-store path (M2-S3.2 B6)
+//! `put_list` and `link-approve` (see `link.rs`) both go through the SAME
+//! `validate_and_store_signed_list`, so there is a single source of verification. The
+//! `device_lists` write is **atomically rev-conditional** (`WHERE excluded.rev >
+//! device_lists.rev` plus RETURNING): two concurrent writers (link-approve and put_list)
+//! cannot fall into a read-then-write race, and the loser gets a 409.
 
-use crate::auth::middleware::require_auth;
+use crate::auth::middleware::{require_active_auth, require_auth};
 use crate::d1util::{d1_blob, d1_int, d1_opt_text, d1_text};
 use crate::respond::json_err;
 use crate::utils::{b64_decode, now_ms, now_secs};
@@ -37,12 +37,13 @@ use serde::Deserialize;
 use worker::*;
 
 const MAX_DEVICES: usize = 5; // 1 primary + ≤4 linked
-const MAX_DOC_BYTES: usize = 16 * 1024; // imzalı doküman üst sınırı (DoS bekçisi)
+const MAX_DOC_BYTES: usize = 16 * 1024; // ceiling on the signed document (DoS guard)
 
-/// device_id türetimi — core `devices::device_id_from_ed25519_b64` PARİTESİ:
-/// `hex(blake3(ed_pub_bytes)[..8])` → 16 küçük-hex. `ed_pub_32` 32 bayt olmalı
-/// (çağıran kontrol eder). Item 2: worker liste-yazımında her cihaz için bunu
-/// doğrular → sahte device_id'li entry route-state'e sızamaz (self-certifying).
+/// device_id derivation — at PARITY with core's `devices::device_id_from_ed25519_b64`:
+/// `hex(blake3(ed_pub_bytes)[..8])`, i.e. 16 lowercase hex chars. `ed_pub_32` must be 32
+/// bytes; the caller checks that. Item 2: on every list write the worker re-derives this for
+/// each device, so an entry with a forged device_id cannot leak into the routing state —
+/// the ids are self-certifying.
 fn derive_device_id(ed_pub_32: &[u8]) -> String {
     let hash = blake3::hash(ed_pub_32);
     hex::encode(&hash.as_bytes()[..8])
@@ -54,15 +55,16 @@ struct PutBody {
     sig_b64: String,
 }
 
-/// İç doküman — YALNIZ doğrulama-sonrası alan okuma için parse edilir.
+/// The inner document — parsed ONLY to read fields, never to re-serialize.
 #[derive(Deserialize)]
 pub(crate) struct DeviceListDoc {
     pub(crate) v: u32,
     pub(crate) user_id: String,
     pub(crate) rev: i64,
     pub(crate) devices: Vec<DeviceEntry>,
-    /// Model-B Layer-1: imzalı tombstone'lar (çıkarılan cihazlar). Eski doc'larda
-    /// yok → serde default (boş). İmza tüm doc'u kapsadığından server ekleyemez.
+    /// Model-B Layer-1: signed tombstones for removed devices. Older docs do not carry the
+    /// field, hence the serde default (empty). Because the signature covers the whole doc,
+    /// the server cannot add entries here.
     #[serde(default)]
     pub(crate) removed_devices: Vec<DeviceEntry>,
 }
@@ -81,9 +83,9 @@ pub(crate) struct DeviceEntry {
 #[derive(Deserialize)]
 struct UserRow {
     identity_pubkey: Vec<u8>,
-    /// Model-B Layer-1 BLOCKER fix: cihaz-listesi rev HIGH-WATER. `device_lists`
-    /// satırı D1-churn'de kaybolsa bile burada (users) KALIR → bayat re-PUT
-    /// (rev < high_water) reddedilir → revoked cihaz diriltilemez (resurrection-fix).
+    /// Model-B Layer-1 BLOCKER fix: the device-list rev HIGH-WATER mark. Even if the
+    /// `device_lists` row is lost to D1 churn, this one on `users` SURVIVES, so a stale
+    /// re-PUT (rev < high_water) is rejected and a revoked device cannot be resurrected.
     #[serde(default)]
     device_list_rev: i64,
 }
@@ -95,17 +97,31 @@ struct ListRow {
     rev: i64,
 }
 
-/// `PUT /devices/list` — birincil-imzalı cihaz-listesini yükle.
-/// İnce sarıcı: auth + rate-limit + gövde → `validate_and_store_signed_list`.
+/// Own-list reads are the bootstrap exception; peer-list reads require an
+/// already-active device plus the normal direct-contact policy.
+fn list_read_requires_active_device(caller: &str, target: &str) -> bool {
+    caller != target
+}
+
+/// `PUT /devices/list` — upload the primary-signed device list.
+/// A thin wrapper: auth + rate-limit + body → `validate_and_store_signed_list`.
 pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let auth_user = match require_auth(&req, &ctx.env) {
         Ok(uid) => uid,
         Err(resp) => return Ok(resp),
     };
 
-    // Rate-limit (nadir çağrı; ucuz koruma — mevcut KV sliding-window altyapısı).
-    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
-    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("devices:list:{auth_user}"), 20, 60).await {
+    // Rate-limit: a rarely called endpoint, so this is cheap protection built on the existing
+    // KV sliding window. The KV binding is OPTIONAL (template diet): with none we continue
+    // unlimited — see ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(
+        &ctx.env,
+        &format!("devices:list:{auth_user}"),
+        20,
+        60,
+    )
+    .await
+    {
         return json_err(429, "rate_limited");
     }
 
@@ -115,26 +131,38 @@ pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     };
 
     let db = ctx.env.d1("DB")?;
-    let rev =
-        match validate_and_store_signed_list(&db, &auth_user, &body.doc_json, &body.sig_b64).await? {
-            Ok(rev) => rev,
-            Err(resp) => return Ok(resp),
-        };
+    let rev = match validate_and_store_signed_list(&db, &auth_user, &body.doc_json, &body.sig_b64)
+        .await?
+    {
+        Ok(rev) => rev,
+        Err(resp) => return Ok(resp),
+    };
+    // The invite grant is created during verify, but the first device list only arrives
+    // afterwards. If the inviter's first pull hit a 404, this post-commit second nudge
+    // restarts the authoritative sync — no app restart needed.
+    crate::realtime::nudge_grant_counterparts_best_effort(&ctx.env, &auth_user).await;
     Response::from_json(&serde_json::json!({ "rev": rev }))
 }
 
-/// İmzalı cihaz-listesini doğrula + ATOMİK sakla. `put_list` + `link-approve` ortak
-/// yolu (tek doğrulama kaynağı). Tüm kontroller fail-closed. Başarı → `Ok(rev)`;
-/// red → `Err(Response)` (çağıran `return Ok(resp)` eder).
+/// Verify a signed device list and store it ATOMICALLY. The shared path of `put_list` and
+/// `link-approve`, so verification lives in exactly one place. Every check is fail-closed.
+/// Success → `Ok(rev)`; rejection → `Err(Response)`, which the caller returns as `Ok(resp)`.
 ///
-/// Hata kodları (makine-okunur): 400 bad_doc / doc_too_large / unsupported_version /
+/// Error codes (machine-readable): 400 bad_doc / doc_too_large / unsupported_version /
 ///   user_mismatch / no_primary / multiple_primary / primary_key_mismatch /
-///   bad_pubkey / too_many_devices / bad_signature · 401 user_not_found ·
+///   bad_pubkey / too_many_devices / bad_signature / device_id_mismatch /
+///   tombstone_device_id_mismatch / device_active_and_removed · 401 user_not_found ·
 ///   403 identity_mismatch / sig_invalid · 409 rev_conflict · 500 bad_spk_sig.
 ///
-/// **B6 atomiklik:** `device_lists` yazımı `ON CONFLICT DO UPDATE ... WHERE
-/// excluded.rev > device_lists.rev RETURNING rev` → eşzamanlı yazarda yalnız
-/// rev-ilerleten kazanır, kaybeden RETURNING-boş → 409 (read-then-write yarışı yok).
+/// The last three 400s were missing from this list, which matters more than a normal doc gap: a list
+/// that presents itself as MACHINE-READABLE invites a client to switch on it exhaustively, and a client
+/// that did would have treated three real rejections as unknown. Every `reject!` in this function is
+/// accounted for above — checked by enumerating them, not by reading.
+///
+/// **B6 atomicity:** the `device_lists` write is `ON CONFLICT DO UPDATE ... WHERE
+/// excluded.rev > device_lists.rev RETURNING rev`, so among concurrent writers only the one
+/// advancing rev wins; the loser sees an empty RETURNING and gets a 409. No read-then-write
+/// race exists.
 pub(crate) async fn validate_and_store_signed_list(
     db: &D1Database,
     auth_user: &str,
@@ -151,7 +179,7 @@ pub(crate) async fn validate_and_store_signed_list(
         reject!(400, "doc_too_large");
     }
 
-    // (a) doc_json parse — alanları OKUMAK için (imza yine ham baytlar üzerinde).
+    // (a) Parse doc_json to READ its fields; the signature is still checked over raw bytes.
     let doc: DeviceListDoc = match serde_json::from_str(doc_json) {
         Ok(d) => d,
         Err(_) => reject!(400, "bad_doc"),
@@ -160,17 +188,17 @@ pub(crate) async fn validate_and_store_signed_list(
         reject!(400, "unsupported_version");
     }
 
-    // (b) doc.user_id == auth'lu user_id.
+    // (b) doc.user_id must equal the authenticated user_id.
     if doc.user_id != auth_user {
         reject!(400, "user_mismatch");
     }
 
-    // (e) cihaz sayısı ≤ 5 (1 primary + ≤4 linked).
+    // (e) Device count ≤ 5 (1 primary + ≤4 linked); an empty list is rejected here too.
     if doc.devices.is_empty() || doc.devices.len() > MAX_DEVICES {
         reject!(400, "too_many_devices");
     }
 
-    // (c) TAM BİR adet role=="primary".
+    // (c) EXACTLY ONE entry with role == "primary".
     let primaries: Vec<&DeviceEntry> = doc.devices.iter().filter(|d| d.role == "primary").collect();
     let primary = match primaries.as_slice() {
         [] => reject!(400, "no_primary"),
@@ -188,7 +216,7 @@ pub(crate) async fn validate_and_store_signed_list(
         None => reject!(401, "user_not_found"),
     };
 
-    // (1) Primary entry'nin Ed25519 imza anahtarından VerifyingKey kur.
+    // (1) Build a VerifyingKey from the primary entry's Ed25519 signing key.
     let primary_ed = match b64_decode(&primary.ed_pub_b64) {
         Ok(b) if b.len() == 32 => b,
         _ => reject!(400, "bad_pubkey"),
@@ -199,18 +227,18 @@ pub(crate) async fn validate_and_store_signed_list(
         Err(_) => reject!(400, "bad_pubkey"),
     };
 
-    // (2) Bağlama: iddia edilen Ed-key, kullanıcının kayıtlı SPK'sını imzalamış
-    //     kimliğin anahtarı mı? (relogin.rs deseni). SPK yoksa fail-closed → 403.
+    // (2) Binding: is the claimed Ed key the one belonging to the identity that signed this
+    //     user's stored SPK? (The relogin.rs pattern.) No SPK → fail-closed 403.
     #[derive(Deserialize)]
     struct SpkRow {
         prekey_pub: Vec<u8>,
         signature: Vec<u8>,
     }
-    // M2-S3.2 (review HIGH): SPK seçimini PRIMARY cihazın device_id'siyle scope'la.
-    // Bağlı cihaz onboard olunca KENDİ SPK'sını yayınlar (append); device-id'siz "EN
-    // YENİ" seçim → birincilin liste-imza binding'i BAĞLI cihazın SPK'sına karşı
-    // doğrulanır → identity_mismatch → birincil ARTIK liste yayınlayamaz/cihaz-çıkaramaz
-    // (S3.5 revoke kırılır). Primary entry'nin device_id'siyle eşleşeni tercih et.
+    // M2-S3.2 (review HIGH): scope the SPK selection by the PRIMARY device's device_id.
+    // When a linked device onboards it appends its OWN SPK, so a device-id-agnostic "newest
+    // row" selection would check the primary's list-signature binding against the LINKED
+    // device's SPK → identity_mismatch → the primary could no longer publish lists or remove
+    // devices, breaking S3.5 revoke. Prefer the row matching the primary entry's device_id.
     let primary_dev = primary.device_id.as_str();
     let spk: Option<SpkRow> = db
         .prepare(
@@ -218,7 +246,11 @@ pub(crate) async fn validate_and_store_signed_list(
              WHERE user_id = ? AND (device_id = ? OR device_id IS NULL OR device_id = '')
              ORDER BY CASE WHEN device_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1",
         )
-        .bind(&[d1_text(auth_user), d1_text(primary_dev), d1_text(primary_dev)])?
+        .bind(&[
+            d1_text(auth_user),
+            d1_text(primary_dev),
+            d1_text(primary_dev),
+        ])?
         .first(None)
         .await?;
     let spk = match spk {
@@ -234,8 +266,8 @@ pub(crate) async fn validate_and_store_signed_list(
         reject!(403, "identity_mismatch");
     }
 
-    // (3) Liste imzası: aynı Ed-key, doc_json'un AYNEN GELEN UTF-8 baytlarını
-    //     doğrular. Yeniden serileştirme YASAK.
+    // (3) List signature: the same Ed key verifies the EXACT incoming UTF-8 bytes of
+    //     doc_json. Re-serializing is FORBIDDEN.
     let sig_bytes = match b64_decode(sig_b64) {
         Ok(b) if b.len() == 64 => b,
         _ => reject!(400, "bad_signature"),
@@ -246,7 +278,7 @@ pub(crate) async fn validate_and_store_signed_list(
         reject!(403, "sig_invalid");
     }
 
-    // (4) Tutarlılık: primary.x_pub_b64 (decode) == users.identity_pubkey (DH kökü).
+    // (4) Consistency: decoded primary.x_pub_b64 == users.identity_pubkey (the DH root).
     let primary_x = match b64_decode(&primary.x_pub_b64) {
         Ok(b) => b,
         Err(_) => reject!(400, "bad_pubkey"),
@@ -255,23 +287,25 @@ pub(crate) async fn validate_and_store_signed_list(
         reject!(400, "primary_key_mismatch");
     }
 
-    // (f) rev fresh-insert guard (>= 1). Conflict durumunu atomik WHERE ele alır.
+    // (f) rev fresh-insert guard (>= 1). The conflict case is handled by the atomic WHERE.
     if doc.rev < 1 {
         reject!(409, "rev_conflict");
     }
 
-    // Model-B Layer-1 BLOCKER fix (revoke-resurrection): rev HIGH-WATER kapısı.
-    // `device_lists` satırı D1-churn'de kaybolsa, eski (silme-öncesi, tombstone'suz)
-    // bir doc fresh-insert olarak kabul edilip aktif-cihaz upsert'i revoked_at=NULL ile
-    // çıkarılmış cihazı DİRİLTİYORDU. `users.device_list_rev` device_lists'ten BAĞIMSIZ
-    // (satır kaybına dayanıklı) → rev < high_water = bayat → reddet. EŞİT-rev (== high_water)
-    // RESTORE için izinli (imza zaten doğrulandı = gerçek primary doc, en-güncel). Kazanan
-    // yazar batch'te high_water'ı MAX ile ilerletir.
+    // Model-B Layer-1 BLOCKER fix (revoke resurrection): the rev HIGH-WATER gate. If the
+    // `device_lists` row was lost to D1 churn, an old doc — from before the removal, with no
+    // tombstone — was accepted as a fresh insert, and the active-device upsert with
+    // revoked_at=NULL RESURRECTED the removed device. `users.device_list_rev` is INDEPENDENT
+    // of device_lists and survives that row loss, so rev < high_water means stale and is
+    // rejected. An EQUAL rev (== high_water) is allowed so a RESTORE can work: the signature
+    // has already been verified, making it a genuine, current primary doc. The winning writer
+    // advances high_water with MAX inside the batch.
     if doc.rev < user.device_list_rev {
         reject!(409, "rev_conflict");
     }
 
-    // Tüm cihaz pubkey'lerini önceden decode et (her ihlal → reddet, atomiklik).
+    // Decode every device pubkey up front: any violation rejects the whole request, which is
+    // what keeps the write atomic.
     struct DecodedEntry<'a> {
         device_id: &'a str,
         role: &'a str,
@@ -290,10 +324,11 @@ pub(crate) async fn validate_and_store_signed_list(
             Ok(b) => b,
             Err(_) => reject!(400, "bad_pubkey"),
         };
-        // Item 2 (Codex): HER cihazın device_id'si ed_pub'tan TÜRETİMLE eşleşmeli
-        // (core verify §5 paritesi). Worker eskiden yalnız primary-binding'i kontrol
-        // ediyordu → sahte device_id'li linked entry `devices` route-state'e sızabiliyordu
-        // (core reddeder ama worker kabul → asimetri). Self-certifying kapı.
+        // Item 2 (Codex): EVERY device's device_id must equal the value derived from its
+        // ed_pub (parity with core verify §5). The worker used to check only the primary
+        // binding, so a linked entry with a forged device_id could leak into the `devices`
+        // routing state — core rejected it while the worker accepted it, an asymmetry. This
+        // gate makes the ids self-certifying.
         if derive_device_id(&ed) != d.device_id {
             reject!(400, "device_id_mismatch");
         }
@@ -307,11 +342,12 @@ pub(crate) async fn validate_and_store_signed_list(
         });
     }
 
-    // Item 1w (Model-B tombstone): removed_devices'ı doğrula — her tombstone self-
-    // consistent (device_id ← ed_pub) + AKTİF cihazlarla DISJOINT (bir cihaz aynı anda
-    // hem aktif hem tombstone OLAMAZ; core verify §6/§7 paritesi). Remove-wins ENFORCE:
-    // tombstone'lu cihaz `devices` (aktif) listesinde olmadığından aşağıdaki omission-
-    // revoke onu zaten `revoked_at=now` yapar → bayat re-PUT onu diriltemez.
+    // Item 1w (Model-B tombstones): validate removed_devices — every tombstone must be
+    // self-consistent (device_id derived from ed_pub) and DISJOINT from the active devices,
+    // because a device cannot be active and tombstoned at once (parity with core verify
+    // §6/§7). Remove-wins is ENFORCED implicitly: a tombstoned device is absent from the
+    // active `devices` array, so the omission-revoke below already sets `revoked_at=now`,
+    // and a stale re-PUT cannot resurrect it.
     for r in &doc.removed_devices {
         let red = match b64_decode(&r.ed_pub_b64) {
             Ok(b) if b.len() == 32 => b,
@@ -325,24 +361,30 @@ pub(crate) async fn validate_and_store_signed_list(
         }
     }
 
-    // ---- Başarı: TEK ATOMİK D1 BATCH (Item 4 — revoke güvenliği). ----
-    // ESKİ hâl: device_lists rev-bump SONRA devices-sync + token-delete AYRI sorgulardı
-    // → arada-hata = rev-ilerledi-AMA-token-silinmedi → çıkarılan cihazın token'ı KALIR
-    // + retry de 409 alır → revoked cihaz erişimi SÜREBİLİR (ciddi revoke-güvenlik açığı).
-    // ŞİMDİ: hepsi TEK transaction (`db.batch`, all-or-nothing).
+    // ---- Success: ONE ATOMIC D1 BATCH (Item 4 — revoke safety). ----
+    // How it used to be: the device_lists rev bump, then the devices sync and the token
+    // delete, as SEPARATE queries. A failure in between meant rev had advanced but the tokens
+    // had not been deleted, so a removed device KEPT its token while the retry also got a 409
+    // — a revoked device could retain access. That was a serious revoke-security hole.
+    // Now everything runs in ONE transaction (`db.batch`, all-or-nothing).
     //
-    // Eşzamanlı yazar yarışı: device_lists bump KOŞULLU (`excluded.rev > rev`) → kaybeden
-    // bump no-op. Türetilen mutasyonlar (devices upsert / omission-revoke / token-delete)
-    // `device_lists.doc_json == BENİM doc'um` KAPISIYLA gated → KAYBEDEN hiçbir şey mutate
-    // etmez (stale-liste cihaz diriltemez/yanlış-revoke yapamaz). Bump statement İLK →
-    // sonraki statement'lar post-bump doc_json'ı görür (aynı transaction).
+    // Concurrent-writer race: the device_lists bump is CONDITIONAL (`excluded.rev > rev`), so
+    // the loser's bump is a no-op. Every derived mutation (devices upsert, omission-revoke,
+    // token delete) is gated on `device_lists.doc_json == MY doc`, so the LOSER mutates
+    // nothing: a stale list can neither resurrect a device nor revoke the wrong one. The bump
+    // statement comes FIRST, so later statements in the same transaction observe the
+    // post-bump doc_json.
     let now_s = now_secs() as i64;
     let now_ms_v = now_ms() as i64;
-    let placeholders: String = (0..decoded.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders: String = (0..decoded.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
 
     let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(4 + decoded.len());
 
-    // 1) device_lists koşullu rev-bump (İLK — gated derived'lar bunun sonucunu okur).
+    // 1) Conditional device_lists rev bump — FIRST, since the gated derived statements read
+    //    its outcome.
     stmts.push(
         db.prepare(
             "INSERT INTO device_lists (user_id, rev, doc_json, sig_b64, updated_at)
@@ -361,8 +403,8 @@ pub(crate) async fn validate_and_store_signed_list(
         ])?,
     );
 
-    // 2) devices senkronu (her aktif entry insert-or-update, revoked_at=NULL) — yalnız
-    //    KAZANAN mutate eder (doc_json-gate: INSERT...SELECT...WHERE).
+    // 2) devices sync: insert-or-update every active entry with revoked_at=NULL. Only the
+    //    WINNER mutates, via the doc_json gate (INSERT ... SELECT ... WHERE).
     for e in &decoded {
         stmts.push(
             db.prepare(
@@ -388,7 +430,7 @@ pub(crate) async fn validate_and_store_signed_list(
         );
     }
 
-    // 3) omission-revoke: listede OLMAYAN mevcut satırlar → revoked_at=now (gated).
+    // 3) omission-revoke: existing rows ABSENT from the list get revoked_at=now (gated).
     let revoke_sql = format!(
         "UPDATE devices SET revoked_at = ?
          WHERE user_id = ? AND revoked_at IS NULL AND device_id NOT IN ({placeholders})
@@ -404,9 +446,10 @@ pub(crate) async fn validate_and_store_signed_list(
     revoke_binds.push(d1_text(doc_json));
     stmts.push(db.prepare(&revoke_sql).bind(&revoke_binds)?);
 
-    // 4) M2-S3.5 B4 (cihaz-çıkar): yeni listede OLMAYAN gerçek-device_id'lerin refresh
-    //    token'larını SİL → çıkarılan cihaz token-yenileyemez (15dk access-token TTL
-    //    dolunca oturum ölür) + relogin'de revoked-red. Legacy NULL/'' device_id KORUNUR.
+    // 4) M2-S3.5 B4 (device removal): DELETE the refresh tokens of every real device_id ABSENT
+    //    from the new list, so a removed device cannot renew its token — its session dies once
+    //    the 15-minute access-token TTL expires — and relogin rejects it as revoked. Legacy
+    //    NULL/'' device_ids are PRESERVED.
     let del_sql = format!(
         "DELETE FROM refresh_tokens
          WHERE user_id = ? AND device_id IS NOT NULL AND device_id != '' AND device_id NOT IN ({placeholders})
@@ -421,10 +464,33 @@ pub(crate) async fn validate_and_store_signed_list(
     del_binds.push(d1_text(doc_json));
     stmts.push(db.prepare(&del_sql).bind(&del_binds)?);
 
-    // 5) Model-B Layer-1 BLOCKER fix: rev HIGH-WATER'ı ilerlet (MAX → monoton; asla
-    //    gerilemez). device_lists satırı sonradan kaybolsa bile bu users'ta kalır →
-    //    bayat re-PUT reddedilir (yukarıdaki pre-check). Yalnız KAZANAN yazar (doc_json
-    //    gate) ilerletir → kaybeden high_water'ı bozamaz.
+    // 4b) A removed device's UNCONSUMED one-time keys are dead the moment it goes: nothing will
+    //     ever hold their private halves again, and only that device's own replenish would have
+    //     replaced them — which will never run. Measured 2026-07-27 on the live server: a device
+    //     revoked the day before still had 46 published OTKs waiting to be handed out. They are
+    //     device-scoped so the bundle handler does not serve them for the live device, which is
+    //     why this was a hygiene leak rather than a fault; it still means public keys for a dead
+    //     account sitting in the pool indefinitely. consumed=1 rows STAY: they are the record
+    //     that stops a key ever being issued twice.
+    let del_otk_sql = format!(
+        "DELETE FROM one_time_prekeys
+         WHERE user_id = ? AND consumed = 0
+           AND device_id IS NOT NULL AND device_id != '' AND device_id NOT IN ({placeholders})
+           AND (SELECT doc_json FROM device_lists WHERE user_id = ?) = ?"
+    );
+    let mut del_otk_binds: Vec<wasm_bindgen::JsValue> = Vec::with_capacity(3 + decoded.len());
+    del_otk_binds.push(d1_text(auth_user));
+    for e in &decoded {
+        del_otk_binds.push(d1_text(e.device_id));
+    }
+    del_otk_binds.push(d1_text(auth_user));
+    del_otk_binds.push(d1_text(doc_json));
+    stmts.push(db.prepare(&del_otk_sql).bind(&del_otk_binds)?);
+
+    // 5) Model-B Layer-1 BLOCKER fix: advance the rev HIGH-WATER mark. MAX keeps it monotonic
+    //    so it can never go backwards. Even if the device_lists row is lost later, this value
+    //    stays on `users`, so a stale re-PUT is rejected by the pre-check above. Only the
+    //    WINNING writer advances it (doc_json gate), so the loser cannot corrupt high_water.
     stmts.push(
         db.prepare(
             "UPDATE users SET device_list_rev = MAX(device_list_rev, ?)
@@ -438,11 +504,12 @@ pub(crate) async fn validate_and_store_signed_list(
         ])?,
     );
 
-    // Atomik çalıştır (all-or-nothing). Tek statement hata verse hepsi rollback.
+    // Run atomically (all-or-nothing): if a single statement fails, everything rolls back.
     db.batch(stmts).await?;
 
-    // KAZANDIM MI? device_lists artık BENİM doc'umu mu tutuyor? (D1 batch+RETURNING
-    // davranışına bağımlı olmamak için AYRI oku → sürüm-bağımsız sağlam 409 tespiti.)
+    // Did I win — does device_lists now hold MY doc? Read it back SEPARATELY rather than
+    // relying on D1's batch+RETURNING behaviour, so 409 detection stays robust across
+    // versions.
     let stored: Option<ListRow> = db
         .prepare("SELECT doc_json, sig_b64, rev FROM device_lists WHERE user_id = ? LIMIT 1")
         .bind(&[d1_text(auth_user)])?
@@ -450,25 +517,49 @@ pub(crate) async fn validate_and_store_signed_list(
         .await?;
     match stored {
         Some(r) if r.doc_json == doc_json => Ok(Ok(r.rev)),
-        // Bump kaybedildi (eşzamanlı yüksek-rev yazar / eski rev) → derived mutasyonlar
-        // da gate'lendiği için ÇALIŞMADI → tutarlı 409. Çağıran 409-retry'da taze GET eder.
+        // The bump was lost — a concurrent higher-rev writer, or an older rev. Because the
+        // derived mutations are gated too, none of them ran, so a 409 is consistent. On a 409
+        // the caller re-GETs a fresh list before retrying.
         _ => Ok(Err(json_err(409, "rev_conflict")?)),
     }
 }
 
-/// `GET /devices/list/:user_id` — kullanıcının güncel imzalı listesi.
+/// `GET /devices/list/:user_id` — a user's current signed list.
 /// 200 `{doc_json, sig_b64, rev}` | 404 not_found.
 pub async fn get_list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let _ = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
-        Err(resp) => return Ok(resp),
-    };
     let target = match ctx.param("user_id") {
         Some(s) => s.clone(),
         None => return json_err(400, "bad_request"),
     };
+    let caller = match crate::auth::middleware::require_existing_account_auth(&req, &ctx.env).await
+    {
+        Ok(auth) => auth.user_id,
+        Err(resp) => return Ok(resp),
+    };
+
+    // Fresh-registration bootstrap is intentionally GET-first: the client reads
+    // its own signed list and, on 404, publishes rev=1 with PUT /devices/list.
+    // At that point `devices` is still empty, so requiring an active device for
+    // the self-read creates a permanent deadlock (GET 401 => PUT never runs).
+    // A signed device list is public key material and PUT still verifies the
+    // primary signature/high-water; therefore a valid account token may read
+    // only its OWN list before activation. Reading another user's list keeps
+    // the active-device and direct-contact gates below.
+    let peer_read = list_read_requires_active_device(&caller, &target);
+    if peer_read {
+        let active = match require_active_auth(&req, &ctx.env).await {
+            Ok(auth) => auth,
+            Err(resp) => return Ok(resp),
+        };
+        debug_assert_eq!(active.user_id, caller);
+    }
 
     let db = ctx.env.d1("DB")?;
+    if peer_read {
+        if let Err(resp) = crate::contacts::require_direct(&db, &caller, &target).await {
+            return Ok(resp);
+        }
+    }
     let row: Option<ListRow> = db
         .prepare("SELECT doc_json, sig_b64, rev FROM device_lists WHERE user_id = ? LIMIT 1")
         .bind(&[d1_text(&target)])?
@@ -481,5 +572,23 @@ pub async fn get_list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             "rev": r.rev,
         })),
         None => json_err(404, "not_found"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_read_requires_active_device;
+
+    #[test]
+    fn fresh_registration_can_read_own_missing_list_before_device_activation() {
+        assert!(!list_read_requires_active_device(
+            "fresh-owner",
+            "fresh-owner"
+        ));
+    }
+
+    #[test]
+    fn peer_device_list_reads_still_require_an_active_device() {
+        assert!(list_read_requires_active_device("alice", "bob"));
     }
 }

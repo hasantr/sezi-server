@@ -1,21 +1,23 @@
-//! S3-uyumlu (SigV4) backend — **Faz 2 gerçek implementasyon** (2026-07-08).
+//! S3-compatible (SigV4) backend — **the real Faz 2 implementation** (2026-07-08).
 //!
-//! Bir implementasyonla en geniş aday kümesini açar: Backblaze B2 (kılavuz-önerilen),
-//! ikinci R2 bucket (S3-endpoint), MinIO/VPS, iDrive e2, Wasabi. Plan
-//! PLUGGABLE_STORAGE_PLAN.md (b) NET v1 kararı.
+//! One implementation unlocks the widest set of candidates: Backblaze B2 (the recommended
+//! option), a second R2 bucket (via its S3 endpoint), MinIO/VPS, iDrive e2, Wasabi. The v1
+//! decision in PLUGGABLE_STORAGE_PLAN.md (b).
 //!
-//! İmzalama çekirdeği `crate::sigv4` (Faz 0'da MinIO'ya karşı uçtan-uca doğrulandı):
-//!   - Gövde-hash'li imza (UNSIGNED-PAYLOAD DEĞİL) — SHA-256 ucuz, B2+MinIO kabul eder.
-//!   - `Host` header SET EDİLMEZ — workerd URL'den türetir; imzacı authority'yi URL'den
-//!     PORT DAHİL imzalar (Faz 0 workerd-fetch notu) → imza-host ↔ istek-host birebir.
-//!   - Yalnız `authorization` / `x-amz-date` / `x-amz-content-sha256` (+ opsiyonel imzalı
-//!     `x-amz-storage-class`) set edilir; `content-type` imzasız gönderilir (S3 imzasız
-//!     başlıkları yok sayar → uyumlu).
+//! Signing core: `crate::sigv4` (verified end-to-end against MinIO in Faz 0):
+//!   - Body-hash signatures, NOT UNSIGNED-PAYLOAD — SHA-256 is cheap and both B2 and MinIO
+//!     accept it.
+//!   - The `Host` header is never SET — workerd derives it from the URL, and the signer signs
+//!     the authority from the same URL INCLUDING the port (see the Faz 0 workerd-fetch note),
+//!     so the signed host and the request host match exactly.
+//!   - Only `authorization` / `x-amz-date` / `x-amz-content-sha256` are set (plus an optional
+//!     signed `x-amz-storage-class`); `content-type` is sent unsigned, which S3 tolerates
+//!     because it ignores unsigned headers.
 //!
-//! Adapter sözleşmesi (BlobStore doc + conformance): delete idempotent (204/404→Ok),
-//! get yok→None (404→None), put idempotent-overwrite. v1 = **path-style** (endpoint/bucket/key);
-//! `force_path_style=false` config'te kabul edilir ama v1 daima path-style kurar (MinIO şart,
-//! B2 destekler) — virtual-hosted Faz 6+.
+//! Adapter contract (BlobStore doc + conformance): delete is idempotent (204/404→Ok), a missing
+//! get is None (404→None), put is an idempotent overwrite. v1 is **path-style**
+//! (endpoint/bucket/key); `force_path_style=false` is accepted in the config but v1 always
+//! builds path-style URLs (required by MinIO, supported by B2) — virtual-hosted is Faz 6+.
 
 use serde::{Deserialize, Serialize};
 use worker::*;
@@ -26,8 +28,8 @@ fn default_true() -> bool {
     true
 }
 
-/// `storage_backends.config_json` şeması (plan c.2). Secret İÇERİR
-/// (`secret_access_key`) → WRITE-ONLY: hiçbir endpoint bu struct'ı geri döndürmez.
+/// Schema of `storage_backends.config_json` (plan c.2). CONTAINS a secret
+/// (`secret_access_key`) → WRITE-ONLY: no endpoint ever returns this struct.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct S3Config {
     pub endpoint: String,
@@ -43,19 +45,19 @@ pub struct S3Config {
     pub storage_class: Option<String>,
 }
 
-/// S3-uyumlu depo (Faz 2). `config_json`'dan kurulur; imzalama `crate::sigv4`.
+/// S3-compatible backend (Faz 2). Built from `config_json`; signing via `crate::sigv4`.
 pub struct S3Store {
-    endpoint: String, // normalize: trailing '/' yok
+    endpoint: String, // normalized: no trailing '/'
     region: String,
     bucket: String,
     access_key_id: String,
     secret_access_key: String,
-    prefix: String, // boş olabilir; doluysa anahtar-öneki (owner trailing '/'ten sorumlu)
+    prefix: String, // may be empty; when set it prefixes the key (the owner owns the trailing '/')
     storage_class: Option<String>,
 }
 
 impl S3Store {
-    /// Doğrulanmış config'ten kur (endpoint trailing-slash normalize edilir).
+    /// Build from a validated config (the endpoint's trailing slash is normalized away).
     pub fn from_config(cfg: S3Config) -> Self {
         S3Store {
             endpoint: cfg.endpoint.trim().trim_end_matches('/').to_string(),
@@ -68,15 +70,17 @@ impl S3Store {
         }
     }
 
-    /// D1 `config_json`'dan kur (router build-yolu). Parse hatası → Err (router o
-    /// depoyu ATLAR = fırsatçı health-degrade; blob'u o depoda olan get → 503).
+    /// Build from D1 `config_json` (the router's build path). A parse error → Err, on which the
+    /// router SKIPS this backend (opportunistic health degrade; a get for a blob stored there
+    /// becomes a 503).
     pub fn from_config_json(json: &str) -> Result<Self> {
         let cfg: S3Config = serde_json::from_str(json)
             .map_err(|e| Error::RustError(format!("s3 config parse: {e}")))?;
         Ok(Self::from_config(cfg))
     }
 
-    /// `prefix + key` (prefix boşsa key). Anahtar-şeması `storage::media_key` vb.
+    /// `prefix + key` (just key when the prefix is empty). Keys come from
+    /// `storage::media_key` and friends.
     fn full_key(&self, key: &str) -> String {
         if self.prefix.is_empty() {
             key.to_string()
@@ -85,16 +89,17 @@ impl S3Store {
         }
     }
 
-    /// Path-style obje URL'i: `{endpoint}/{bucket}/{full_key}` (imzacı path'i
-    /// uri-encode eder → '/' korunur, özel char %XY). Query yok.
+    /// Path-style object URL: `{endpoint}/{bucket}/{full_key}` (the signer uri-encodes the path,
+    /// keeping '/' and percent-encoding the rest). No query string.
     fn object_url(&self, key: &str) -> String {
         format!("{}/{}/{}", self.endpoint, self.bucket, self.full_key(key))
     }
 
-    /// İmzalı workerd fetch. `signed_extra` = SignedHeaders'a girecek EK başlıklar
-    /// (küçük-harf ad; değerleri imzalanır VE request'e set edilir); `unsigned` =
-    /// imzasız gönderilecek başlıklar (S3 yok sayar-veya-metadata: content-type).
-    /// `host` HİÇBİR yerde set edilmez (workerd URL'den türetir; imzacı da URL'den).
+    /// Signed workerd fetch. `signed_extra` = EXTRA headers that join SignedHeaders (lowercase
+    /// names; their values are both signed and set on the request); `unsigned` = headers sent
+    /// without being signed (S3 either ignores them or stores them as metadata, as with
+    /// content-type). `host` is never set anywhere — workerd derives it from the URL and so does
+    /// the signer.
     async fn signed_request(
         &self,
         method_str: &str,
@@ -144,8 +149,9 @@ impl S3Store {
         Fetch::Request(req).send().await
     }
 
-    /// Blob'u yaz (idempotent-overwrite). content-type imzasız header; storage_class
-    /// (varsa) imzalı `x-amz-storage-class`. 2xx → Ok, diğer → Err (gövde kırpık).
+    /// Write a blob (idempotent overwrite). content-type goes out as an unsigned header;
+    /// storage_class (when configured) as a signed `x-amz-storage-class`. 2xx → Ok, anything
+    /// else → Err with a truncated body.
     pub async fn put(&self, key: &str, bytes: Vec<u8>, content_type: &str) -> Result<()> {
         let url = self.object_url(key);
         let mut signed: Vec<(String, String)> = Vec::new();
@@ -168,8 +174,8 @@ impl S3Store {
         }
     }
 
-    /// Blob'u oku; yok (404) → None. content-type response header'ından (yoksa
-    /// octet-stream). 2xx-dışı/404-dışı → Err.
+    /// Read a blob; missing (404) → None. content-type comes from the response header, falling
+    /// back to octet-stream. Anything that is neither 2xx nor 404 → Err.
     pub async fn get(&self, key: &str) -> Result<Option<BlobObject>> {
         let url = self.object_url(key);
         let mut resp = self.signed_request("GET", &url, None, &[], &[]).await?;
@@ -194,8 +200,9 @@ impl S3Store {
         Ok(Some(BlobObject { bytes, content_type }))
     }
 
-    /// Blob'u sil — İDEMPOTENT: 2xx (S3=204) VEYA 404 → Ok. Gerçek hata (403/5xx)
-    /// → Err (çağıran D1-meta silmesin → öksüz-blob önlenir; mevcut R2 disiplini).
+    /// Delete a blob — IDEMPOTENT: 2xx (S3 returns 204) OR 404 → Ok. A real failure (403/5xx) →
+    /// Err, so the caller keeps the D1 meta row and no orphaned blob is created (the established
+    /// R2 discipline).
     pub async fn delete(&self, key: &str) -> Result<()> {
         let url = self.object_url(key);
         let mut resp = self.signed_request("DELETE", &url, None, &[], &[]).await?;
@@ -212,8 +219,9 @@ impl S3Store {
     }
 }
 
-/// `YYYYMMDDTHHMMSSZ` — şimdi (workerd `js_sys::Date`; SAF-imzacı bunu tüketir).
-/// Host'ta (cargo test) ÇAĞRILMAZ (S3 metotları workerd-only) → js-runtime yok sorunu olmaz.
+/// Current time as `YYYYMMDDTHHMMSSZ` (from workerd's `js_sys::Date`; fed to the pure signer).
+/// Never called on the host (`cargo test`) because the S3 methods are workerd-only, so the
+/// absent JS runtime is not a problem.
 fn amz_now() -> String {
     let iso = js_sys::Date::new_0()
         .to_iso_string()
@@ -236,14 +244,14 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// Kontrol-karakteri yok (header-enjeksiyon/DoS koruması; cf_config `field_ok` emsali).
+/// No control characters (header-injection / DoS guard; same rule as cf_config's `field_ok`).
 fn no_ctrl(s: &str) -> bool {
     !s.chars().any(|c| c.is_control())
 }
 
-/// POST/PATCH öncesi alan-doğrulama (cf_config `field_ok` deseni). `allow_http`
-/// = ENV!=prod (dev/MinIO); prod'da `http://` endpoint reddedilir. Hata → sabit
-/// alan-kodu (client hangi alanın hatalı olduğunu görür; secret DEĞERİ sızmaz).
+/// Field validation before a POST/PATCH (the cf_config `field_ok` pattern). `allow_http` means
+/// ENV != prod (dev/MinIO); in prod an `http://` endpoint is rejected. Errors are fixed field
+/// codes, so the client learns WHICH field is wrong without leaking any secret VALUE.
 pub fn validate_config(cfg: &S3Config, allow_http: bool) -> std::result::Result<(), &'static str> {
     let ep = cfg.endpoint.trim();
     let is_https = ep.starts_with("https://");
@@ -308,7 +316,7 @@ mod tests {
             s.object_url("media/abc"),
             "https://s3.us-west-004.backblazeb2.com/sezi-media/media/abc"
         );
-        // prefix uygulanır + endpoint trailing-slash normalize.
+        // The prefix is applied and the endpoint's trailing slash is normalized away.
         let mut c = valid_cfg();
         c.endpoint = "http://127.0.0.1:9000/".into();
         c.prefix = "sezi/".into();
@@ -319,24 +327,24 @@ mod tests {
 
     #[test]
     fn config_json_roundtrip_defaults() {
-        // Minimal JSON (opsiyonel alanlar yok) → serde default'ları dolar.
+        // Minimal JSON (no optional fields) → serde fills in the defaults.
         let json = r#"{"endpoint":"https://x","region":"r","bucket":"b","access_key_id":"k","secret_access_key":"s"}"#;
         let s = S3Store::from_config_json(json).expect("parse");
         assert_eq!(s.prefix, "");
         assert!(s.storage_class.is_none());
-        // Bozuk JSON → Err (router atlar).
+        // Malformed JSON → Err (the router skips the backend).
         assert!(S3Store::from_config_json("not json").is_err());
     }
 
     #[test]
     fn validate_config_https_ok_http_kilitli() {
         assert!(validate_config(&valid_cfg(), false).is_ok());
-        // http → prod'da red, dev'de ok.
+        // http → rejected in prod, allowed in dev.
         let mut c = valid_cfg();
         c.endpoint = "http://127.0.0.1:9000".into();
         assert_eq!(validate_config(&c, false), Err("endpoint_http_forbidden"));
         assert!(validate_config(&c, true).is_ok());
-        // scheme yok → red.
+        // No scheme → rejected.
         let mut c = valid_cfg();
         c.endpoint = "127.0.0.1".into();
         assert_eq!(validate_config(&c, true), Err("endpoint_scheme"));

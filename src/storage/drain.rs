@@ -1,27 +1,30 @@
-//! Drain/taşıma motoru (Faz 4, plan c.4 "TAŞIMA") — `draining` depodaki blob'ları
-//! kalan aktif depolara taşır; envanter 0'a inince depoyu otomatik `disabled` yapar.
+//! Drain/move engine (Faz 4, plan c.4 "TAŞIMA") — moves the blobs of a `draining`
+//! backend onto the remaining active ones; when its inventory reaches 0 the backend is
+//! flipped to `disabled` automatically.
 //!
-//! KOŞUM YOLU: 2dk-cron (`lib.rs scheduled`, her invocation) + lazy-maintenance sırtı
-//! (`maintenance.rs` claim-anahtarı `maint_storage_move_at`). Koşum başına
-//! ≤`MOVE_BATCH` blob — free-plan subrequest bütçesi: blob başına GET+PUT+2×D1+DELETE
-//! ≈ 5 çağrı → 4 blob ≈ 20, güvenli (plan c.4). Blob-bazlı idempotent: yarıda kalırsa
-//! sonraki koşum kaldığı yerden (meta'sı hâlâ kaynağı gösteren blob'lar aday kalır).
+//! RUN PATHS: the 2-minute cron (`lib.rs scheduled`, every invocation) plus the
+//! lazy-maintenance piggyback (`maintenance.rs`, claim key `maint_storage_move_at`).
+//! At most `MOVE_BATCH` blobs per run — free-plan subrequest budget: ~5 calls per blob
+//! (GET+PUT+2×D1+DELETE) → 4 blobs ≈ 20, safely inside the limit (plan c.4). Idempotent
+//! per blob: if a run dies halfway the next one picks up where it stopped, because a blob
+//! whose meta row still points at the source stays a candidate.
 //!
-//! GÜVENCELER:
-//! - **Yarış-koruması (plan f#8):** meta-güncelleme KOŞULLU
-//!   (`... AND store_id=<kaynak>` + RETURNING). 0 satır = ack/TTL blob'u bu arada
-//!   sildi → hedefe kopyalanan blob `storage_orphans` tombstone'una (günlük retry
-//!   siler) → çift-kopya/çift-sayım imkânsız. 0-satırın İKİNCİ olası nedeni (eşzamanlı
-//!   ikinci koşum aynı hedefe taşıdı / UPDATE geçici hata) için orphan'lamadan önce
-//!   meta'nın ŞU AN nereyi gösterdiğine bakılır (`race_action`): meta==hedef →
-//!   kopyamız kanonik, DOKUNMA (yanlış-orphan = kanonik blob'u tombstone'a yollamak
-//!   = veri kaybı; fail-safe yön = orphan'lamamak).
-//! - **Kaynak ölürse (plan f#7):** get-Err → blob atlanır (kalan sayaç düşmez →
-//!   panel `draining_remaining` üzerinden "taşıma takıldı" gösterir); depo dönünce
-//!   kaldığı yerden.
-//! - **Okuma kesintisiz (plan c.4):** meta hangi depoyu gösteriyorsa oradan okunur
-//!   (router draining/disabled depoları da yükler) → taşınana dek eski, taşınınca
-//!   yeni depodan; drain boyunca hiç 404 penceresi yok.
+//! GUARANTEES:
+//! - **Race protection (plan f#8):** the meta update is CONDITIONAL
+//!   (`... AND store_id=<source>` + RETURNING). 0 rows = ack/TTL deleted the blob
+//!   meanwhile → the copy already written to the target becomes a `storage_orphans`
+//!   tombstone (the daily retry removes it) → a double copy / double accounting is
+//!   impossible. 0 rows has a SECOND possible cause (a concurrent run moved it to the
+//!   same target, or the UPDATE hit a transient error), so before orphaning we check
+//!   where the meta row points RIGHT NOW (`race_action`): meta == target → our copy is
+//!   the canonical one, LEAVE IT ALONE (a wrong orphan tombstones the canonical blob =
+//!   data loss; the fail-safe direction is to not orphan).
+//! - **Source backend dies (plan f#7):** get-Err → skip the blob (the remaining counter
+//!   does not drop, so the panel shows "drain stuck" via `draining_remaining`); the next
+//!   run resumes once the backend is back.
+//! - **Reads never break (plan c.4):** a blob is read from whatever backend its meta row
+//!   names (the router loads draining/disabled backends too) → the old backend until it
+//!   moves, the new one afterwards; no 404 window anywhere in the drain.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -34,23 +37,23 @@ use super::{invalidate_storage_cache, write_health, StorageClass, StorageRouter}
 use crate::d1util::{d1_int, d1_text};
 use crate::utils::now_secs;
 
-/// Koşum başına azami taşınan blob (plan c.4 free-plan subrequest bütçesi).
+/// Max blobs moved per run (plan c.4 free-plan subrequest budget).
 const MOVE_BATCH: usize = 4;
 
-/// 3 meta-tablo UNION'ından gelen taşıma-adayı satırı (`candidates_sql`).
+/// A move candidate coming from the 3-way meta-table UNION (`candidates_sql`).
 #[derive(Deserialize)]
 struct MoveRow {
     chan: String, // 'media' | 'plugin_media' | 'plugin_code'
     room_id: String,
     blob_id: String,
     size_bytes: i64,
-    store_id: String, // kaynak (draining) depo
+    store_id: String, // source (draining) backend
 }
 
-/// Taşıma motoru tick'i — cron her invocation'da + lazy claim-kazananı çağırır.
-/// Draining depo yoksa TEK ucuz SELECT ile sessiz çıkar. Blob-düzeyi hatalar
-/// yutulur-atlanır (bir blob'un hatası batch'in kalanını kırmaz); yalnız D1/router
-/// kurulum hataları Err döner (çağıran loglar).
+/// Move-engine tick — called by the cron on every invocation and by the winner of the
+/// lazy claim. With no draining backend it exits silently after ONE cheap SELECT.
+/// Blob-level failures are swallowed and skipped (one bad blob does not kill the rest of
+/// the batch); only D1/router setup failures return Err (the caller logs them).
 pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
     let db = env.d1("DB")?;
     #[derive(Deserialize)]
@@ -67,7 +70,7 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
     }
     let ids: Vec<String> = draining.into_iter().map(|r| r.store_id).collect();
 
-    // Adaylar: 3 meta-tablo UNION'ından draining-depolu EN ESKİ ≤MOVE_BATCH blob.
+    // Candidates: the OLDEST ≤MOVE_BATCH blobs on a draining backend, over all 3 tables.
     let rows: Vec<MoveRow> = db
         .prepare(candidates_sql(ids.len()))
         .bind(&in_binds_x3(&ids))?
@@ -76,22 +79,23 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
         .results()?;
 
     if !rows.is_empty() {
-        // TAZE config ŞART (izolat-cache ≤60sn bayat olabilir): bayat cache draining
-        // depoyu hâlâ 'active' gösterirse put_new blob'u KAYNAĞA geri yazardı (anahtar
-        // aynı!) → ardından kaynak-delete = VERİ KAYBI. invalidate → from_env D1'den
-        // taze okur → draining yerleştirme-dışı (router classify_placement).
+        // FRESH config is MANDATORY (the isolate cache may be up to 60s stale): if a stale
+        // cache still reports the draining backend as 'active', put_new would write the
+        // blob back onto the SOURCE (same key!) and the following source-delete would be
+        // DATA LOSS. Invalidating makes from_env re-read D1, which excludes draining
+        // backends from placement (router classify_placement).
         invalidate_storage_cache();
         let router = StorageRouter::from_env(env).await?;
-        let mut moved: Vec<(String, String, i64)> = Vec::new(); // (kaynak, hedef, boyut)
+        let mut moved: Vec<(String, String, i64)> = Vec::new(); // (source, target, size)
         for row in &rows {
             match move_one(&db, &router, row).await {
                 MoveOutcome::Moved { target, size } => {
                     moved.push((row.store_id.clone(), target, size));
                 }
                 MoveOutcome::Skipped => {}
-                // Yerleştirme yok (kalan depolar dolu/kapalı): batch'in kalanı da aynı
-                // sonuca varır → kes; sonraki koşum yeniden dener (panel kalan-sayaç
-                // düşmediğinden "taşıma takıldı" gösterir — plan f#7 emsali).
+                // No placement left (remaining backends full/closed): the rest of the batch
+                // would hit the same wall → stop; the next run retries (with the remaining
+                // counter frozen the panel shows "drain stuck" — same as plan f#7).
                 MoveOutcome::NoTarget => break,
             }
         }
@@ -101,9 +105,9 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
         }
     }
 
-    // Bitiş-tespiti (plan c.4 "kalan 0"): envanteri boşalan draining depo otomatik
-    // `disabled` + son health-notu. UPDATE koşullu (`AND state='draining'`): owner bu
-    // arada PATCH'le durumu değiştirdiyse dokunulmaz.
+    // Completion check (plan c.4 "kalan 0"): a draining backend whose inventory ran empty
+    // is flipped to `disabled` and gets a final health note. The UPDATE is conditional
+    // (`AND state='draining'`) so an owner PATCH that changed the state meanwhile wins.
     let remaining = remaining_counts(&db, &ids).await?;
     let now = now_secs() as i64;
     for id in &ids {
@@ -119,7 +123,8 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
         {
             let _ = stmt.run().await;
         }
-        // Son health-notu (ok=true → panel kızarmaz; metin "taşıma bitti" izidir).
+        // Final health note (ok=true so the panel stays green; the text is the "drain
+        // finished" breadcrumb).
         write_health(env, id, true, Some("drain_complete")).await;
         invalidate_storage_cache();
         console_log!("storage drain: '{}' boşaldı → disabled", id);
@@ -127,9 +132,10 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
     Ok(())
 }
 
-/// Draining depo(lar)ın KALAN envanter sayıları (3 meta-tablo UNION sayımı).
-/// Bitiş-tespiti + `GET /admin/storage` `draining_remaining` + drain-endpoint cevabı
-/// ORTAK kullanır → "kalan" tanımı tek-yerde. İstenen her id sonuçta VAR (yoksa 0).
+/// REMAINING inventory count per draining backend (counted over the 3-table UNION).
+/// Shared by the completion check, `GET /admin/storage`'s `draining_remaining` and the
+/// drain endpoint's response → "remaining" is defined in exactly one place. Every
+/// requested id is present in the result (0 when it has no rows).
 pub(crate) async fn remaining_counts(
     db: &D1Database,
     store_ids: &[String],
@@ -155,55 +161,58 @@ pub(crate) async fn remaining_counts(
     Ok(out)
 }
 
-// ── Tek blob taşıma ───────────────────────────────────────────────────────────
+// ── Moving a single blob ──────────────────────────────────────────────────────
 
 enum MoveOutcome {
-    /// Taşındı: meta hedefi gösteriyor; kaynak silindi (ya da tombstone'da).
+    /// Moved: meta points at the target; the source copy is deleted (or tombstoned).
     Moved { target: String, size: i64 },
-    /// Bu blob atlandı (kaynak-hatası / hayalet-meta / yarış) — batch devam eder.
+    /// This blob was skipped (source error / phantom meta / race) — the batch continues.
     Skipped,
-    /// Hiç hedef yerleştirilemedi (kalan depolar dolu/kapalı) — batch kesilir.
+    /// No target could be placed (remaining backends full/closed) — the batch stops.
     NoTarget,
 }
 
 async fn move_one(db: &D1Database, router: &StorageRouter, row: &MoveRow) -> MoveOutcome {
     let Some((key, class)) = key_and_class(&row.chan, &row.room_id, &row.blob_id) else {
-        return MoveOutcome::Skipped; // bilinmeyen kanal (olmamalı) — atla
+        return MoveOutcome::Skipped; // unknown channel (should not happen) — skip
     };
-    // 1. Kaynaktan oku. Err = depo down / resolve-fail (plan f#7): blob atlanır
-    //    (router.get fırsatçı health-işaretini zaten yaptı); depo dönünce kaldığı yerden.
+    // 1. Read from the source. Err = backend down / resolve failure (plan f#7): skip the
+    //    blob (router.get already did the opportunistic health mark); resume when it is back.
     let obj = match router.get(&row.store_id, &key).await {
         Ok(Some(o)) => o,
         Ok(None) => {
-            // Hayalet-meta: satır var, blob fiziksel YOK (okuma da 404'lerdi). Koşullu
-            // meta-DELETE ile düşür → drain ilerler (yoksa created_at ASC hep aynı
-            // hayaletleri seçerdi = drain sonsuza dek takılırdı). Kota/per-depo sayaç
-            // drift'ini günlük reconcile onarır (meta-tabanlı yeniden-hesap).
+            // Phantom meta: the row exists but the blob physically does NOT (a read would
+            // 404 too). Drop it with a conditional meta-DELETE so the drain can progress —
+            // otherwise `created_at ASC` would keep picking the same phantoms and the drain
+            // would wedge forever. Any quota / per-backend counter drift is repaired by the
+            // daily reconcile (which recomputes from the meta tables).
             phantom_meta_delete(db, row).await;
             console_warn!("storage drain: kaynakta yok, meta düşürüldü: {key}");
             return MoveOutcome::Skipped;
         }
         Err(_) => return MoveOutcome::Skipped,
     };
-    let size = obj.bytes.len() as i64; // gerçek boyut (meta drift'ine karşı sayaç-aktarımı bunu kullanır)
-    // 2. Kalan depolara yerleştir — AYNI anahtar (mod.rs anahtar-şeması backend-agnostik
-    //    → taşıma = kopyala, anahtar değişmez). put_new yalnız 'active' depolara yazar
-    //    → draining kaynak aday DEĞİL.
+    let size = obj.bytes.len() as i64; // real size; counter transfer uses it, not the (drifty) meta
+    // 2. Place onto the remaining backends under the SAME key (the mod.rs key scheme is
+    //    backend-agnostic → a move is a copy, the key never changes). put_new only writes
+    //    to 'active' backends, so the draining source is not a candidate.
     let target = match router.put_new(class, &key, obj.bytes, &obj.content_type).await {
         Ok(t) => t,
         Err(_) => return MoveOutcome::NoTarget,
     };
     if target == row.store_id {
-        // Savunma-hattı (normalde imkânsız: draining 'active' değil): hedef=kaynak ise
-        // delete'e İNME — aynı-anahtar silme veri kaybı olurdu.
+        // Defence in depth (normally impossible: a draining backend is not 'active'): if
+        // target == source, do NOT fall through to the delete — deleting the one key we
+        // just wrote would be data loss.
         return MoveOutcome::Skipped;
     }
-    // 3. Koşullu meta-UPDATE (yarış-koruması, plan f#8): yalnız hâlâ kaynağı gösteren
-    //    satır güncellenir.
+    // 3. Conditional meta-UPDATE (race protection, plan f#8): only a row that still points
+    //    at the source is updated.
     match after_copy(conditional_meta_update(db, row, &target).await) {
         AfterCopy::OrphanTargetCopy => {
-            // 0 satır: meta ya silindi (ack/TTL yarışı) ya eşzamanlı koşum taşıdı ya da
-            // UPDATE geçici hata yedi → orphan kararını meta'nın ŞU ANKİ durumuna bağla.
+            // 0 rows: either the meta was deleted (ack/TTL race), or a concurrent run moved
+            // it, or the UPDATE hit a transient error → base the orphan decision on where
+            // the meta row points RIGHT NOW.
             if race_action(&meta_store_now(db, row).await, &target)
                 == RaceAction::OrphanTargetCopy
             {
@@ -212,8 +221,9 @@ async fn move_one(db: &D1Database, router: &StorageRouter, row: &MoveRow) -> Mov
             MoveOutcome::Skipped
         }
         AfterCopy::DeleteSource => {
-            // 4. Kaynaktan sil; silinemezse tombstone (plan c.4) — meta zaten hedefi
-            //    gösteriyor, kaynak kopyası öksüz-izlenir; taşıma İLERLEMİŞ sayılır.
+            // 4. Delete from the source; if that fails, tombstone it (plan c.4) — the meta
+            //    already points at the target, so the leftover source copy is tracked as an
+            //    orphan and the move still counts as PROGRESS.
             if router.delete(&row.store_id, &key).await.is_err() {
                 insert_orphans(db, &[(row.store_id.clone(), key.clone(), row.size_bytes)]).await;
             }
@@ -222,9 +232,10 @@ async fn move_one(db: &D1Database, router: &StorageRouter, row: &MoveRow) -> Mov
     }
 }
 
-/// Koşullu meta-UPDATE'i koş → tam 1 satır güncellendi mi (RETURNING sayımı —
-/// maintenance.rs claim kazanan-deseni). Hata → false (güncellenmedi say; karar
-/// `race_action` meta-bakışıyla verilir → yanlış yönde orphan üretmez).
+/// Run the conditional meta-UPDATE → did it update exactly 1 row (counted via RETURNING,
+/// the claim-winner pattern from maintenance.rs). On error → false (treated as "not
+/// updated"; the decision is then made by `race_action` looking at the meta row, so this
+/// never orphans in the wrong direction).
 async fn conditional_meta_update(db: &D1Database, row: &MoveRow, target: &str) -> bool {
     #[derive(Deserialize)]
     struct Ret {
@@ -245,8 +256,9 @@ async fn conditional_meta_update(db: &D1Database, row: &MoveRow, target: &str) -
     }
 }
 
-/// Hayalet-meta koşullu DELETE (best-effort): yalnız hâlâ kaynağı gösteren satır
-/// düşer — eşzamanlı koşum bu arada taşıdıysa (meta=hedef) DOKUNULMAZ.
+/// Conditional DELETE of a phantom meta row (best-effort): only a row still pointing at
+/// the source is dropped — if a concurrent run moved it meanwhile (meta == target) the row
+/// is LEFT ALONE.
 async fn phantom_meta_delete(db: &D1Database, row: &MoveRow) {
     let Some(sql) = meta_delete_sql(&row.chan) else {
         return;
@@ -256,7 +268,8 @@ async fn phantom_meta_delete(db: &D1Database, row: &MoveRow) {
     }
 }
 
-/// Meta satırı ŞU AN hangi depoyu gösteriyor? (yarış-sonrası orphan kararı için.)
+/// Which backend does the meta row point at RIGHT NOW? (Input to the post-race orphan
+/// decision.)
 async fn meta_store_now(db: &D1Database, row: &MoveRow) -> MetaNow {
     #[derive(Deserialize)]
     struct S {
@@ -280,8 +293,8 @@ async fn meta_store_now(db: &D1Database, row: &MoveRow) -> MetaNow {
     }
 }
 
-/// used_bytes/object_count sayaç-aktarımı (best-effort, plan c.4; drift'i günlük
-/// reconcile onarır). Tek `db.batch` = tek subrequest; 0-clamp (usage.rs disiplini).
+/// Transfer the used_bytes/object_count counters (best-effort, plan c.4; drift is repaired
+/// by the daily reconcile). One `db.batch` = one subrequest; clamped at 0 (usage.rs rule).
 async fn transfer_counters(db: &D1Database, moved: &[(String, String, i64)]) {
     let now = now_secs() as i64;
     let mut stmts: Vec<D1PreparedStatement> = Vec::new();
@@ -301,8 +314,8 @@ async fn transfer_counters(db: &D1Database, moved: &[(String, String, i64)]) {
     }
 }
 
-/// Kanalın anahtar-bindleri: media=[blob,kaynak]; plugin_*=[room,blob,kaynak]
-/// (`meta_update_sql`/`meta_delete_sql` WHERE sırasıyla birebir).
+/// Per-channel key binds: media=[blob,source]; plugin_*=[room,blob,source] — exactly the
+/// WHERE order of `meta_update_sql`/`meta_delete_sql`.
 fn key_binds(row: &MoveRow) -> Vec<JsValue> {
     if row.chan == "media" {
         vec![d1_text(&row.blob_id), d1_text(&row.store_id)]
@@ -315,7 +328,7 @@ fn key_binds(row: &MoveRow) -> Vec<JsValue> {
     }
 }
 
-/// IN-listesi bindleri 3 tablo için tekrarlı (candidates_sql/remaining_sql ile birebir).
+/// The IN-list binds repeated once per table (matches candidates_sql/remaining_sql).
 fn in_binds_x3(ids: &[String]) -> Vec<JsValue> {
     let mut binds = Vec::with_capacity(ids.len() * 3);
     for _ in 0..3 {
@@ -326,11 +339,11 @@ fn in_binds_x3(ids: &[String]) -> Vec<JsValue> {
     binds
 }
 
-// ── Saf çekirdek (unit-testli; worker türlerinden bağımsız) ───────────────────
+// ── Pure core (unit-tested; independent of the worker types) ──────────────────
 
-/// Taşıma-adayı → (depo-anahtarı, yerleştirme-sınıfı). Anahtar-şeması mod.rs'in
-/// tek-gerçeği (`media_key`/`plugin_media_key`/`code_key`) — her depo AYNI anahtarı
-/// kullanır. Bilinmeyen kanal → None (atla).
+/// Move candidate → (storage key, placement class). The key scheme lives solely in mod.rs
+/// (`media_key`/`plugin_media_key`/`code_key`) — every backend uses the SAME key. Unknown
+/// channel → None (skip).
 fn key_and_class(chan: &str, room_id: &str, blob_id: &str) -> Option<(String, StorageClass)> {
     match chan {
         "media" => Some((super::media_key(blob_id), StorageClass::Media)),
@@ -343,8 +356,8 @@ fn key_and_class(chan: &str, room_id: &str, blob_id: &str) -> Option<(String, St
     }
 }
 
-/// Kanal → koşullu meta-UPDATE (yarış-koruması: `AND store_id = ?` + RETURNING;
-/// binds: [hedef] + `key_binds`). Bilinmeyen kanal → None.
+/// Channel → conditional meta-UPDATE (race protection: `AND store_id = ?` + RETURNING;
+/// binds: [target] + `key_binds`). Unknown channel → None.
 fn meta_update_sql(chan: &str) -> Option<&'static str> {
     match chan {
         "media" => Some(
@@ -363,7 +376,7 @@ fn meta_update_sql(chan: &str) -> Option<&'static str> {
     }
 }
 
-/// Kanal → hayalet-meta koşullu DELETE (binds: `key_binds`).
+/// Channel → conditional DELETE of a phantom meta row (binds: `key_binds`).
 fn meta_delete_sql(chan: &str) -> Option<&'static str> {
     match chan {
         "media" => Some("DELETE FROM media_objects WHERE blob_id = ? AND store_id = ?"),
@@ -377,7 +390,8 @@ fn meta_delete_sql(chan: &str) -> Option<&'static str> {
     }
 }
 
-/// Kanal → meta şu-an-nerede SELECT'i (binds: media=[blob]; plugin_*=[room,blob]).
+/// Channel → "where does the meta point now" SELECT (binds: media=[blob];
+/// plugin_*=[room,blob]).
 fn meta_select_sql(chan: &str) -> Option<&'static str> {
     match chan {
         "media" => Some("SELECT store_id FROM media_objects WHERE blob_id = ? LIMIT 1"),
@@ -391,9 +405,9 @@ fn meta_select_sql(chan: &str) -> Option<&'static str> {
     }
 }
 
-/// Koşullu-UPDATE sonucu → kopya-sonrası eylem (SAF; plan f#8):
-/// 1 satır = meta artık hedefi gösteriyor → kaynak silinir;
-/// 0 satır = yarış-şüphesi → hedefteki kopyanın kaderi `race_action`la belirlenir.
+/// Conditional-UPDATE result → what to do after the copy (PURE; plan f#8):
+/// 1 row = the meta now points at the target → delete the source;
+/// 0 rows = suspected race → the fate of the target copy is decided by `race_action`.
 #[derive(Debug, PartialEq)]
 enum AfterCopy {
     DeleteSource,
@@ -408,22 +422,22 @@ fn after_copy(meta_updated: bool) -> AfterCopy {
     }
 }
 
-/// Meta satırının koşullu-UPDATE-sonrası anlık durumu.
+/// State of the meta row observed right after the conditional UPDATE.
 #[derive(Debug, PartialEq)]
 enum MetaNow {
-    /// Satır yok — ack/TTL yarışı blob'u sildi.
+    /// No row — an ack/TTL race deleted the blob.
     Gone,
-    /// Satır var, şu depoyu gösteriyor.
+    /// Row present, pointing at this backend.
     PointsTo(String),
-    /// D1 okunamadı (geçici hata).
+    /// D1 could not be read (transient error).
     Unknown,
 }
 
-/// 0-satır yarışında hedef-kopya kararı (SAF): yalnız meta'nın hedefi GÖSTERMEDİĞİ
-/// POZİTİF tespitle orphan'lanır. meta==hedef → eşzamanlı koşum aynı hedefe taşıdı,
-/// kopyamız KANONİK → dokunma. Unknown → fail-safe DOKUNMA (yanlış-orphan = kanonik
-/// blob'u tombstone'a yollamak = veri kaybı; sahipsiz kopya en kötü hedefte byte
-/// olarak kalır, veri kaybettirmez).
+/// Decide the fate of the target copy after a 0-row race (PURE): orphan it only on a
+/// POSITIVE observation that the meta does NOT point at the target. meta == target → a
+/// concurrent run moved it to the same place, our copy is CANONICAL → leave it. Unknown →
+/// fail-safe LEAVE IT (a wrong orphan tombstones the canonical blob = data loss; a stray
+/// copy merely wastes bytes on the target and loses nothing).
 #[derive(Debug, PartialEq)]
 enum RaceAction {
     OrphanTargetCopy,
@@ -439,13 +453,13 @@ fn race_action(meta_now: &MetaNow, target: &str) -> RaceAction {
     }
 }
 
-/// Bitiş-tespiti (SAF): draining depoda envanter kalmadı → otomatik `disabled`.
+/// Completion check (PURE): no inventory left on the draining backend → auto-`disabled`.
 fn drain_complete(remaining: i64) -> bool {
     remaining <= 0
 }
 
-/// n-adet draining depo için taşıma-adayı SQL'i: 3 meta-tablo UNION, en eski önce,
-/// ≤MOVE_BATCH. Binds = `in_binds_x3` (id listesi 3 kez).
+/// Move-candidate SQL for n draining backends: UNION over the 3 meta tables, oldest first,
+/// ≤MOVE_BATCH. Binds = `in_binds_x3` (the id list three times).
 fn candidates_sql(n_stores: usize) -> String {
     let marks = placeholders(n_stores);
     format!(
@@ -461,7 +475,7 @@ fn candidates_sql(n_stores: usize) -> String {
     )
 }
 
-/// n-adet depo için kalan-envanter SQL'i (store_id bazında sayım). Binds = `in_binds_x3`.
+/// Remaining-inventory SQL for n backends (counted per store_id). Binds = `in_binds_x3`.
 fn remaining_sql(n_stores: usize) -> String {
     let marks = placeholders(n_stores);
     format!(
@@ -477,8 +491,9 @@ fn placeholders(n: usize) -> String {
     (0..n).map(|_| "?").collect::<Vec<_>>().join(",")
 }
 
-/// Taşınan (kaynak, hedef, boyut) listesi → per-depo (Δbytes, Δcount): kaynak eksi,
-/// hedef artı; store_id-sıralı deterministik çıktı (SAF; `transfer_counters` tüketir).
+/// List of moved (source, target, size) → per-backend (Δbytes, Δcount): minus on the
+/// source, plus on the target; output sorted by store_id for determinism (PURE; consumed by
+/// `transfer_counters`).
 fn counter_deltas(moved: &[(String, String, i64)]) -> Vec<(String, i64, i64)> {
     let mut map: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
     for (source, target, size) in moved {
@@ -498,8 +513,8 @@ fn counter_deltas(moved: &[(String, String, i64)]) -> Vec<(String, i64, i64)> {
 mod tests {
     use super::*;
 
-    /// Taşıma-adayı anahtar/sınıf eşlemesi mod.rs anahtar-şemasıyla bit-aynı
-    /// (taşıma = kopyala, anahtar değişmez — Faz 4 ön-koşulu).
+    /// The candidate key/class mapping is bit-identical to the mod.rs key scheme
+    /// (a move is a copy, the key never changes — the precondition for Faz 4).
     #[test]
     fn aday_anahtar_ve_sinif_semasi() {
         let (k, c) = key_and_class("media", "", "b1").unwrap();
@@ -514,8 +529,8 @@ mod tests {
         assert!(key_and_class("bogus", "r", "b").is_none());
     }
 
-    /// Aday-SQL: 3 tablo × n placeholder (in_binds_x3 ile birebir), en-eski-önce,
-    /// koşum-tavanı MOVE_BATCH.
+    /// Candidate SQL: 3 tables × n placeholders (matching in_binds_x3), oldest first,
+    /// per-run ceiling MOVE_BATCH.
     #[test]
     fn aday_sql_placeholder_siralama_limit() {
         let sql = candidates_sql(2);
@@ -527,9 +542,9 @@ mod tests {
         assert!(sql.contains("FROM plugin_code_objects"));
     }
 
-    /// Koşullu-UPDATE semantiği: her kanal SQL'i kaynak-koşullu (`AND store_id = ?`)
-    /// ve RETURNING'li (0-satır yarış tespiti); hayalet-DELETE de koşullu.
-    /// Bilinmeyen kanal → None (hiçbir koşulsuz mutasyon yolu yok).
+    /// Conditional-UPDATE semantics: every channel's SQL is source-conditional
+    /// (`AND store_id = ?`) and uses RETURNING (0-row race detection); the phantom DELETE
+    /// is conditional too. Unknown channel → None (no unconditional mutation path exists).
     #[test]
     fn kosullu_update_yaris_korumasi() {
         for chan in ["media", "plugin_media", "plugin_code"] {
@@ -545,17 +560,17 @@ mod tests {
         assert!(meta_select_sql("bogus").is_none());
     }
 
-    /// Koşullu-UPDATE sonucu → eylem: 1 satır = kaynak silinir; 0 satır = hedef
-    /// kopya orphan-şüpheli (kararı race_action verir).
+    /// Conditional-UPDATE result → action: 1 row = delete the source; 0 rows = the target
+    /// copy is a suspected orphan (race_action makes the call).
     #[test]
     fn kopya_sonrasi_eylem() {
         assert_eq!(after_copy(true), AfterCopy::DeleteSource);
         assert_eq!(after_copy(false), AfterCopy::OrphanTargetCopy);
     }
 
-    /// Yarış-kararı (plan f#8 + eşzamanlı-koşum koruması): meta yok → orphan;
-    /// meta başka depoda → orphan; meta==HEDEF → kanonik, DOKUNMA; D1 okunamadı →
-    /// fail-safe DOKUNMA (yanlış-orphan = veri kaybı yönü).
+    /// Race decision (plan f#8 + concurrent-run protection): meta gone → orphan; meta on a
+    /// different backend → orphan; meta == TARGET → canonical, LEAVE IT; D1 unreadable →
+    /// fail-safe LEAVE IT (a wrong orphan is the data-loss direction).
     #[test]
     fn yaris_karari_fail_safe() {
         assert_eq!(
@@ -576,7 +591,7 @@ mod tests {
         );
     }
 
-    /// Bitiş-tespiti: kalan 0 → depo drain'i bitti (otomatik disabled).
+    /// Completion check: 0 remaining → the backend's drain is done (auto-disabled).
     #[test]
     fn bitis_tespiti() {
         assert!(drain_complete(0));
@@ -584,7 +599,8 @@ mod tests {
         assert!(!drain_complete(87));
     }
 
-    /// Sayaç-aktarımı: kaynak eksi / hedef artı, per-depo toplanır, store_id-sıralı.
+    /// Counter transfer: minus on the source / plus on the target, summed per backend,
+    /// ordered by store_id.
     #[test]
     fn sayac_aktarimi_toplanir() {
         let moved = vec![
@@ -604,7 +620,7 @@ mod tests {
         assert!(counter_deltas(&[]).is_empty());
     }
 
-    /// Kalan-envanter SQL'i: 3 tablo placeholder'ı + store bazında gruplama.
+    /// Remaining-inventory SQL: placeholders for all 3 tables + grouping per backend.
     #[test]
     fn kalan_sql_gruplu() {
         let sql = remaining_sql(1);

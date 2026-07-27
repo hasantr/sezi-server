@@ -13,68 +13,68 @@ mod ws;
 const FLUSH_INTERVAL_MS: i64 = 90 * 1000;
 const CLEANUP_INTERVAL_MS: i64 = 24 * 3600 * 1000;
 const LAST_CLEANUP_KEY: &str = "last_cleanup_at";
+const REMOVED_ACCOUNT_KEY: &str = "membership_removed";
 
-/// W1-backstop: DO storage key — bu inbox'ın sahibi ALICI user_id (alarm
-/// stuck-pending FCM-wake için; DO offline'da kendi user'ını başka türlü bilmez).
+/// W1 backstop: DO storage key holding the RECIPIENT user_id that owns this inbox (needed for the
+/// alarm's stuck-pending FCM wake; an offline DO has no other way to learn its own user).
 const RECIPIENT_UID_KEY: &str = "recipient_uid";
 
-/// W1-backstop: bir `pending` satırı bu kadar saniyeden eskiyse VE hâlâ ack'lenmemişse
-/// VE `push_wake_at` NULL ise (delivered_live=true idi → immediate-push atılmadı),
-/// "canlı-teslim başarısız" say → FCM-wake at. Grace, client'ın ack fırsatını korur
-/// (yeni-INSERT satırı hemen pushlamayız); alarm 90sn'de bir tarar → stuck satır
-/// 30-120sn içinde wake alır (nadir false-pozitif edge; yaygın offline zaten
-/// caller-side immediate-push alır).
+/// W1 backstop: once a `pending` row is older than this many seconds AND is still unacked AND its
+/// `push_wake_at` is NULL (no backstop wake has fired for it yet), treat the live delivery as
+/// failed and send an FCM wake. The grace period preserves the client's chance to ack (we do not
+/// push a freshly inserted row immediately); the alarm scans every 90s, so a stuck row gets its
+/// wake within 30-120s. This is the rare false-positive edge — the common offline case already
+/// gets the caller-side immediate push.
 const PUSH_BACKSTOP_GRACE_SECS: i64 = 30;
 
-/// M2-S2.2 — tek-seferlik NULL-device backfill bayrağı (DO storage).
-/// İlk device-bilen WS bağlantısında `pending.device_id IS NULL` satırlarını
-/// O cihazla damgalar; bayrak SET edilince sonraki reconnect'ler RE-STAMP
-/// ETMEZ (red-team HIGH #3: her reconnect stale-close → sık reconnect →
-/// bayraksız backfill yarış-tehlikesi). N=1'de DO tek-cihaza ait → backfill
-/// doğru; çok-cihaz S3.
+/// M2-S2.2 — one-shot NULL-device backfill flag (DO storage).
+/// On the first device-aware WS connection it stamps every `pending.device_id IS NULL` row with
+/// THAT device; once the flag is SET later reconnects do NOT RE-STAMP (red-team HIGH #3: every
+/// reconnect stale-closes the previous socket → frequent reconnects → without the flag the
+/// backfill would be racy). With N=1 the DO belongs to a single device so the backfill is correct;
+/// multi-device is S3.
 const DEVICE_BACKFILL_DONE_KEY: &str = "m2_device_backfill_done";
 
-/// Idempotency: aynı (sender_id, envelope_b64) bu süre içinde tekrar
-/// gelirse mevcut msg_id döndürülür, duplicate INSERT yapılmaz. Client
-/// network glitch retry'si DO storage'a çift kayıt yaratmasın + recipient
-/// WS frame'i 2 kez almasın. 60sn yeterli (HTTP timeout 15s + bir-iki retry).
+/// Idempotency: if the same (sender_id, envelope_b64) arrives again within this window, return the
+/// existing msg_id instead of INSERTing a duplicate, so a client retry after a network glitch
+/// neither writes a second row into DO storage nor makes the recipient receive the WS frame twice.
+/// 60s is plenty (a 15s HTTP timeout plus one or two retries).
 const DEDUP_TTL_SECS: i64 = 60;
 
-/// Dedup vektörü için bellek tavanı. DO uzun ömürlü; spam'a karşı koruma.
+/// Memory ceiling for the dedup vector. The DO is long-lived, so this guards against spam.
 const DEDUP_MAX_ENTRIES: usize = 256;
 
-/// Per-user inbox + WebSocket gateway. TS Worker'daki UserInbox'ın birebir
-/// portu. SQL storage'da pending mesaj kuyruğu, WS hibernation, periyodik
-/// alarm flush + cleanup, ack/typing/delivered/read RPC köprüsü.
+/// Per-user inbox + WebSocket gateway; a faithful port of the UserInbox from the TypeScript
+/// worker. Owns the pending message queue in SQL storage, WS hibernation, the periodic alarm
+/// flush + cleanup, and the ack/typing/delivered/read RPC bridge.
 #[durable_object]
 pub struct UserInbox {
     pub(crate) state: State,
     pub(crate) env: Env,
     pub(crate) initialized: std::cell::Cell<bool>,
-    /// Son DEDUP_TTL_SECS içinde işlenen (sender, envelope-hash) çiftleri.
-    /// DO restart'ta sıfırlanır; in-memory bilinçli (storage'a yazma maliyeti
-    /// yokken DO ömrü zaten saatler-günler mertebesinde). Restart sırasında
-    /// kısa süreli duplicate riski açık; client-side `hasIncomingRemoteId`
-    /// dedup'ı güvenlik ağı.
+    /// (sender, envelope-hash) pairs handled within the last DEDUP_TTL_SECS.
+    /// Reset on a DO restart; keeping it in memory is deliberate (it costs no storage writes and a
+    /// DO lives for hours or days anyway). That leaves a brief duplicate window across a restart,
+    /// for which the client-side `hasIncomingRemoteId` dedup is the safety net.
     pub(crate) dedup: std::sync::Mutex<Vec<DedupEntry>>,
-    /// W1-backstop: ALICI user_id storage'a yazıldı mı (bu DO instance'ında). Alarm,
-    /// stuck-pending için `maybe_push_wake` atarken user_id'ye ihtiyaç duyar ama DO
-    /// offline'da (WS-attachment yok) kendi user'ını başka türlü bilemez → notify
-    /// body'sindeki `recipient_id`'yi bir kez persist ederiz. Cell = redundant-write
-    /// önler; DO restart'ta sıfırlanır → restart sonrası ilk notify'da tekrar yazar.
+    /// W1 backstop: has the RECIPIENT user_id been written to storage in this DO instance? The
+    /// alarm needs the user_id to call `maybe_push_wake` for stuck pending rows, but while offline
+    /// (no WS attachment) the DO cannot learn its own user any other way, so we persist the
+    /// `recipient_id` from the notify body once. The Cell avoids redundant writes; it resets on a
+    /// DO restart, so the first notify after a restart writes it again.
     pub(crate) uid_persisted: std::cell::Cell<bool>,
 }
 
 #[derive(Clone)]
 pub(crate) struct DedupEntry {
     pub(crate) sender_id: String,
-    /// SHA256 ilk 16 byte — collision olasılığı ihmal edilebilir (2^64).
+    /// First 16 bytes of the SHA256 — collision probability is negligible (2^64 birthday bound).
     pub(crate) envelope_hash: [u8; 16],
     pub(crate) msg_id: i64,
     pub(crate) created_at: i64,
-    /// W4-a (Codex HIGH): İLK teslimin gerçek `delivered_live` sonucu. Dedup-hit
-    /// (W4 in-request retry veya client-retry) bunu döndürür → sabit `true`
-    /// varsayımının offline-wake'i sessizce bastırması engellenir.
+    /// W4-a (Codex HIGH): the FIRST delivery's real `delivered_live` result. A dedup hit (a W4
+    /// in-request retry or a client retry) returns this, which stops a hard-coded `true` from
+    /// silently suppressing the offline wake.
     pub(crate) delivered_live: bool,
 }
 
@@ -82,23 +82,24 @@ pub(crate) struct DedupEntry {
 struct NotifyBody {
     sender_id: String,
     envelope_b64: String,
-    /// W1-backstop: ALICI user_id (bu DO'nun sahibi). Caller (notify_recipient /
-    /// WS-send) zaten biliyor → body'de taşınır → notify_inner persist eder →
-    /// alarm stuck-pending FCM-wake'te kullanır. `#[serde(default)]` → eski
-    /// gövdeler (alan yok) `None`; o durumda persist atlanır (backstop no-op,
-    /// caller-side immediate-push zaten çalışır → regresyon yok).
+    /// W1 backstop: the RECIPIENT user_id (this DO's owner). The caller (notify_recipient /
+    /// WS-send) already knows it, so it rides in the body, notify_inner persists it, and the alarm
+    /// uses it for the stuck-pending FCM wake. `#[serde(default)]` makes older bodies (without the
+    /// field) `None`, in which case the persist is skipped — the backstop becomes a no-op while the
+    /// caller-side immediate push still works, so there is no regression.
     #[serde(default)]
     recipient_id: Option<String>,
-    /// Grup fan-out'unda (Faz 2) ait olduğu grup; 1:1'de yok (serde default None).
+    /// The group this message belongs to during a group fan-out (phase 2); absent for 1:1 (serde
+    /// defaults it to None).
     #[serde(default)]
     group_id: Option<String>,
-    /// M2-S2.2: gönderenin cihazı. `#[serde(default)]` → S2.3 fan-out bu alanı
-    /// doldurana kadar (ve S2-öncesi /notify gövdeleri için) eksikse `None`.
+    /// M2-S2.2: the sender's device. `#[serde(default)]` yields `None` while the S2.3 fan-out does
+    /// not populate it yet, and for pre-S2 /notify bodies.
     #[serde(default)]
     sender_device_id: Option<String>,
-    /// M2-S2.2: hedef ALICI cihazı. S2.2'de body bunu HENÜZ taşımaz (S2.3
-    /// `notify_recipient` gövdesine ekler) → şimdilik `None` = N=1 primary/uyum;
-    /// notify_inner imzası bugünden bu parametreyi alır (S2.2/S2.3 ayrımı).
+    /// M2-S2.2: the target RECIPIENT device. In S2.2 the body does NOT carry it yet (S2.3 adds it
+    /// to the `notify_recipient` body), so for now `None` means the N=1 primary / compatibility
+    /// path; notify_inner already takes the parameter today, which is what separates S2.2 from S2.3.
     #[serde(default)]
     recipient_device_id: Option<String>,
 }
@@ -112,32 +113,32 @@ struct ForwardTypingBody {
 struct ForwardIdsBody {
     from: String,
     ids: Vec<i64>,
-    /// M2-S2.2 — receipt'in scope'landığı cihaz. delivered/failed yönünde
-    /// `recipient_device_id` (hangi alıcı cihaz teslim aldı/decrypt edemedi);
-    /// read yönünde gönderen `sender_device_id` adıyla yollar (ters-yön
-    /// self-heal cihaz-çifti). İkisinden hangisi gelirse `device_for_forward`
-    /// onu seçer. `#[serde(default)]` → S2.3 doldurana kadar `None` (N=1 uyum).
+    /// M2-S2.2 — the device this receipt is scoped to. In the delivered/failed direction it is the
+    /// `recipient_device_id` (which recipient device received it, or failed to decrypt it); in the
+    /// read direction the sender sends it under the name `sender_device_id` (the reverse-direction
+    /// self-heal device pair). Whichever arrives, `device_for_forward` picks it.
+    /// `#[serde(default)]` keeps it `None` until S2.3 populates it (N=1 compatibility).
     #[serde(default)]
     recipient_device_id: Option<String>,
     #[serde(default)]
     sender_device_id: Option<String>,
-    /// #11 Layer-4b: `ids`'e PARALEL msg_uid'ler (gönderenin local_id'si; okuyan E2E
-    /// payload'dan sağlar). `apply_receipt` `receipt_state.msg_uid`'e yazar → kardeş
-    /// cihaz `oc-{msg_uid}` ile okundu-eşler. Eski client / delivered yolu → boş Vec.
+    /// #11 Layer-4b: msg_uids PARALLEL to `ids` (the sender's local_id, supplied by the reader from
+    /// the E2E payload). `apply_receipt` writes it into `receipt_state.msg_uid` so a sibling device
+    /// can match the read via `oc-{msg_uid}`. An old client or the delivered path sends an empty Vec.
     #[serde(default)]
     uids: Vec<String>,
 }
 
-/// Kardeş-okundu durable cursor (2026-06-28): U'nun bir cihazı okuduğu incoming mesajların
-/// `msg_uid`'lerini bildirir (peer/grup agnostik — tek global liste). `read_at` server-now.
+/// Sibling-read durable cursor (2026-06-28): a device of U reports the `msg_uid`s of the incoming
+/// messages it read (peer- and group-agnostic — one global list). `read_at` is the server's now.
 #[derive(Deserialize)]
 struct SelfReadBody {
     uids: Vec<String>,
 }
 
 impl ForwardIdsBody {
-    /// forward_signal'e geçilecek device boyutu: önce recipient_device_id
-    /// (delivered/failed), yoksa sender_device_id (read ters-yön).
+    /// The device to hand to forward_signal: recipient_device_id first (delivered/failed),
+    /// otherwise sender_device_id (the reverse read direction).
     fn device_for_forward(&self) -> Option<&str> {
         self.recipient_device_id
             .as_deref()
@@ -152,7 +153,7 @@ pub(crate) struct PendingRow {
     pub(crate) envelope_b64: String,
     #[serde(default)]
     pub(crate) group_id: Option<String>,
-    /// M2-S2.2: gönderenin cihazı (flush replay frame'i için).
+    /// M2-S2.2: the sender's device (needed for the flush replay frame).
     #[serde(default)]
     pub(crate) sender_device_id: Option<String>,
     pub(crate) created_at: i64,
@@ -170,7 +171,8 @@ pub(crate) struct ForwardQueueRow {
     pub(crate) kind: String,
     pub(crate) from_user: String,
     pub(crate) ids_json: String,
-    /// M2-S2.2: makbuzu üreten alıcı cihazı (replay payload reconstruction).
+    /// M2-S2.2: the recipient device that produced the receipt (needed to reconstruct the replay
+    /// payload).
     #[serde(default)]
     pub(crate) recipient_device_id: Option<String>,
 }
@@ -179,21 +181,21 @@ pub(crate) struct ForwardQueueRow {
 pub(crate) struct Attachment {
     #[serde(rename = "userId")]
     pub(crate) user_id: String,
-    /// M2-S2.2: bu WS bağlantısının CİHAZI (JWT device_id claim'inden).
-    /// S1-öncesi token (claim'siz) → `None`; per-device flush/ack o durumda
-    /// NULL-toleransına düşer. `#[serde(default)]` → eski serialize-edilmiş
-    /// attachment'lar (S2-öncesi WS hibernation) sorunsuz parse olur.
+    /// M2-S2.2: the DEVICE behind this WS connection (from the JWT's device_id claim).
+    /// A pre-S1 token (no claim) yields `None`, and per-device flush/ack then falls back to NULL
+    /// tolerance. `#[serde(default)]` lets attachments serialized earlier (pre-S2 WS hibernation)
+    /// parse without error.
     #[serde(rename = "deviceId", default)]
     pub(crate) device_id: Option<String>,
-    /// W1 (delivered_live yanlış-pozitif fix): bu socket'ten en son CLIENT→SERVER
-    /// frame'inin (ping/ack/read; client 5sn'de bir text-ping atar, ws_conn.rs)
-    /// alındığı an (ms). `notify_inner` CANLILIK AYRACI: yalnız son
-    /// `WS_LIVENESS_WINDOW_MS` içinde frame gelen socket "gerçekten canlı" sayılır.
-    /// Zombie/yarı-açık socket'e (MIUI arka-plan kill sonrası TCP yarı-açık)
-    /// `send_with_str` Ok döner ama client ALMAZ → last_seen bayatlar →
-    /// delivered_live SET EDİLMEZ → FCM-wake tetiklenir (sessiz teslim-gecikmesi
-    /// ve bildirim-kaybı kökü kapanır). `#[serde(default)]` → eski (W1-öncesi)
-    /// serialize-edilmiş attachment'lar `None` ile parse olur (ilk ping'te dolar).
+    /// W1 (delivered_live false-positive fix): when the last CLIENT→SERVER frame (ping/ack/read;
+    /// the client text-pings every 5s, see ws_conn.rs) was received on this socket, in ms.
+    /// `notify_inner` uses it as its LIVENESS TEST: only a socket that produced a frame within the
+    /// last `WS_LIVENESS_WINDOW_MS` counts as "genuinely live". On a zombie/half-open socket (TCP
+    /// left half-open by a MIUI background kill) `send_with_str` returns Ok while the client
+    /// receives NOTHING → last_seen goes stale → delivered_live is NOT set → an FCM wake fires,
+    /// which closes the root cause of silent delivery delays and lost notifications.
+    /// `#[serde(default)]` lets pre-W1 serialized attachments parse as `None` (the field fills in
+    /// on the first ping).
     #[serde(rename = "lastSeenMs", default)]
     pub(crate) last_seen_ms: Option<i64>,
 }
@@ -214,12 +216,68 @@ impl DurableObject for UserInbox {
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        self.ensure_init().await?;
         let url = req.url()?;
         let path = url.path().to_string();
         let method = req.method();
 
-        // WS upgrade (Worker tarafından /sync proxy ediliyor)
+        // Called after the D1 membership-deletion batch has committed the purge outbox.
+        // First a final status frame goes to the open sockets, then all SQL/KV/alarm storage is
+        // deleted, and finally a permanent DO tombstone is left behind. Calling it again is
+        // idempotent, so replaying it after a lost outbox response is safe.
+        if method == Method::Post && path == "/purge-account" {
+            let sockets = self.state.get_websockets();
+            for socket in sockets {
+                let _ = socket.send_with_str(r#"{"type":"membership_removed"}"#);
+                let _ = socket.close(Some(1008), Some("membership_removed"));
+            }
+            let storage = self.state.storage();
+            storage.delete_all().await?;
+            storage.put(REMOVED_ACCOUNT_KEY, true).await?;
+            self.initialized.set(false);
+            self.uid_persisted.set(false);
+            if let Ok(mut dedup) = self.dedup.lock() {
+                dedup.clear();
+            }
+            return Response::empty().map(|r| r.with_status(204));
+        }
+
+        if self
+            .state
+            .storage()
+            .get::<bool>(REMOVED_ACCOUNT_KEY)
+            .await?
+            .unwrap_or(false)
+        {
+            return Response::error("membership_removed", 410);
+        }
+
+        // An ephemeral nudge creates no storage and no SQL. An offline user does its
+        // authoritative pull on boot/resume; if a socket is open we merely poke it.
+        if method == Method::Post && path == "/contact-update" {
+            #[derive(Deserialize)]
+            struct ContactUpdateBody {
+                revision: i64,
+            }
+            let body: ContactUpdateBody = req.json().await?;
+            let frame = serde_json::json!({
+                "type": "contact_update",
+                "revision": body.revision,
+            })
+            .to_string();
+            for socket in self.state.get_websockets() {
+                let _ = socket.send_with_str(&frame);
+            }
+            return Response::empty().map(|r| r.with_status(204));
+        }
+        if method == Method::Post && path == "/group-update" {
+            for socket in self.state.get_websockets() {
+                let _ = socket.send_with_str(r#"{"type":"group_update"}"#);
+            }
+            return Response::empty().map(|r| r.with_status(204));
+        }
+        self.ensure_init().await?;
+
+        // WS upgrade (the worker proxies /sync here).
         if req
             .headers()
             .get("upgrade")
@@ -245,6 +303,11 @@ impl DurableObject for UserInbox {
                         body.group_id.as_deref(),
                     )
                     .await?;
+                // D-M10: a cheap `ensure_alarm` on the warm /notify path (a no-op get_alarm when
+                // already armed). If the recipient is OFFLINE and never reconnects over WS — and
+                // the alarm chain was broken earlier by a transient error — stuck pending messages
+                // must still get the FCM backstop, so a dead alarm is revived here on /notify.
+                self.ensure_alarm().await;
                 Response::from_json(
                     &serde_json::json!({ "id": id, "delivered_live": delivered_live }),
                 )
@@ -254,28 +317,36 @@ impl DurableObject for UserInbox {
                 self.forward_typing_inner(&body.sender_id);
                 Response::empty().map(|r| r.with_status(204))
             }
-            // Layer-4: delivered/read artık durable `receipt_state` + per-cihaz
-            // cursor senk (forward_queue consume-once DEĞİL). recipient_device_id
-            // delivered/read için ARTIK kullanılmaz: tik TÜM A-cihazlarına gider,
-            // aggregation client-tarafı mdd'de (remote_id ile). ts = server-alış.
+            // Layer-4: delivered/read are now durable `receipt_state` plus a per-device cursor
+            // sync, NOT the consume-once forward_queue. recipient_device_id is NO LONGER used for
+            // delivered/read: the tick goes to ALL of A's devices and the aggregation happens
+            // client-side in mdd (keyed by remote_id). ts is the server receive time.
             (Method::Post, "/forward-delivered") => {
                 let body: ForwardIdsBody = req.json().await?;
                 self.apply_receipt(
-                    "delivered", &body.from, &body.ids, &body.uids, (now_secs() * 1000) as i64,
+                    "delivered",
+                    &body.from,
+                    &body.ids,
+                    &body.uids,
+                    (now_secs() * 1000) as i64,
                 );
                 Response::empty().map(|r| r.with_status(204))
             }
             (Method::Post, "/forward-read") => {
                 let body: ForwardIdsBody = req.json().await?;
                 self.apply_receipt(
-                    "read", &body.from, &body.ids, &body.uids, (now_secs() * 1000) as i64,
+                    "read",
+                    &body.from,
+                    &body.ids,
+                    &body.uids,
+                    (now_secs() * 1000) as i64,
                 );
                 Response::empty().map(|r| r.with_status(204))
             }
             (Method::Post, "/forward-delivery-failed") => {
-                // Receiver decrypt fail (MAC mismatch) → sender'a bildir.
-                // Sender'da mesaj status: failedDelivery → UI 1.5-tik gibi
-                // göster + self-heal sonrası auto-retry tetikle.
+                // The receiver failed to decrypt (MAC mismatch) → tell the sender. On the sender
+                // the message moves to failedDelivery, so the UI shows something like a 1.5 tick
+                // and an auto-retry is triggered once the session has self-healed.
                 let body: ForwardIdsBody = req.json().await?;
                 self.forward_signal(
                     "delivery_failed",
@@ -285,10 +356,11 @@ impl DurableObject for UserInbox {
                 );
                 Response::empty().map(|r| r.with_status(204))
             }
-            // Ortak-kök #1: receipt-sync HTTP ikizi. WS `receipt_sync` frame'iyle AYNI
-            // `receipt_sync_payload` builder → BİT-AYNI {rows,more}. WS-Connected-değil
-            // cihaz (HTTP-send fallback) kendi tikini buradan cursor-pull eder → stuck-tik
-            // self-heal. SQL-hata → boş batch (cursor ilerlemez, sonraki event re-pull).
+            // Shared-root #1: the HTTP twin of receipt-sync. It uses the SAME
+            // `receipt_sync_payload` builder as the WS `receipt_sync` frame → BIT-IDENTICAL
+            // {rows, more}. A device that is not WS-connected (on the HTTP send fallback)
+            // cursor-pulls its own tick from here, which self-heals a stuck tick. A SQL error
+            // becomes an empty batch (the cursor does not advance and the next event re-pulls).
             (Method::Get, "/receipt-sync") => {
                 let since = url
                     .query_pairs()
@@ -300,15 +372,15 @@ impl DurableObject for UserInbox {
                     .unwrap_or_else(|| serde_json::json!({ "rows": [], "more": false }));
                 Response::from_json(&payload)
             }
-            // Kardeş-okundu durable cursor (2026-06-28): U'nun cihazı okuduğu msg_uid'leri bildirir
-            // → self_read_state set-once + seq bump + diğer U-cihazlarına self_read_update/delta.
+            // Sibling-read durable cursor (2026-06-28): a device of U reports the msg_uids it read
+            // → self_read_state set-once + seq bump + self_read_update/delta to U's other devices.
             (Method::Post, "/self-read") => {
                 let body: SelfReadBody = req.json().await?;
                 self.apply_self_read(&body.uids, (now_secs() * 1000) as i64);
                 Response::empty().map(|r| r.with_status(204))
             }
-            // self-read-sync HTTP ikizi (WS `self_read_sync` frame'iyle AYNI builder). Yeni cihaz
-            // cursor=0'dan tüm okundu-durumu çeker → backlog yakınsar.
+            // The HTTP twin of self-read-sync (the SAME builder as the WS `self_read_sync` frame).
+            // A new device pulls the whole read state from cursor=0 so its backlog converges.
             (Method::Get, "/self-read-sync") => {
                 let since = url
                     .query_pairs()
@@ -350,15 +422,15 @@ impl DurableObject for UserInbox {
     async fn alarm(&self) -> Result<Response> {
         self.ensure_init().await?;
         self.flush_pending_to_all();
-        // Sprint 8: forward queue alarm flush — sender reconnect'i kaçırırsa
-        // periyodik alarm her halükarda push'a deneyecek (idempotent: tekrar
-        // gelirse client `forward_ack` ile silinir, sender tarafı dedup yapar).
+        // Sprint 8: forward-queue alarm flush — if the sender misses the reconnect, the periodic
+        // alarm will attempt the push anyway (idempotent: a repeat is removed by the client's
+        // `forward_ack` and the sender side dedups it).
         self.flush_forwards_to_all();
-        // W1-backstop (Codex HIGH — W1 kesin closure): delivered_live=true sanılıp
-        // ack GELMEMİŞ (=aslında teslim olmamış) pending satırları için FCM-wake.
-        // W1'in canlılık-ayracı false-pozitif penceresini daraltır ama kapatmaz
-        // (ping'ten hemen sonra ölen socket); bu ground-truth backstop kapatır:
-        // pending'de duran = ack'lenmemiş = teslim olmamış → grace aşınca push.
+        // W1 backstop (Codex HIGH — the definitive closure of W1): FCM-wake the pending rows that
+        // were believed delivered_live=true but were never acked, i.e. were in fact not delivered.
+        // W1's liveness test narrows the false-positive window but cannot close it (a socket that
+        // dies right after a ping); this ground-truth backstop does: still sitting in pending means
+        // unacked means undelivered → push once the grace period is over.
         self.backstop_push_stale_pending().await;
         let now_ms_val = (now_secs() * 1000) as i64;
         let last: Option<i64> = self
@@ -370,52 +442,66 @@ impl DurableObject for UserInbox {
             .flatten();
         let last_val = last.unwrap_or(0);
         if now_ms_val - last_val >= CLEANUP_INTERVAL_MS {
-            // Mesaj bekletme süresi artık admin-ayarlı (D1 server_settings).
-            // Eski hard-coded 30 gün yerine her temizlikte tek SELECT ile okunur;
-            // hata/satır yoksa helper 30'a fallback yapar. CLEANUP_INTERVAL_MS
-            // (24h) sayesinde alarm başına en çok bir kez sorgulanır.
+            // The message retention period is now admin-configurable (D1 server_settings).
+            // Instead of a hard-coded 30 days it is read with a single SELECT per cleanup; on an
+            // error or a missing row the helper falls back to 30. Thanks to CLEANUP_INTERVAL_MS
+            // (24h) it is queried at most once per alarm.
             let days = crate::server::handlers::fetch_message_retention_days(&self.env).await;
             let cutoff = (now_secs() as i64) - days * 24 * 3600;
             let storage = self.state.storage();
-            storage.sql().exec_raw(
-                "DELETE FROM pending WHERE created_at < ?",
-                Some(vec![JsValue::from_f64(cutoff as f64)]),
-            )?;
-            // Layer-4: receipt_state retention (updated_at ms cinsinden → cutoff*1000).
-            // Eski tik zaten gösterilmiş; high-water (`receipt_meta`) purge edilmez →
-            // seq monoton kalır, cursor'lar tutarlı.
+            // D-M10: the pending purge is BEST-EFFORT (the same `let _ =` pattern as its siblings).
+            // It used to be a bare `?`, so a transient storage error aborted the alarm handler and
+            // SKIPPED the `ensure_alarm` re-arm at the end → a dead alarm chain, stopping the
+            // offline flush, the forward replay and the stuck-pending FCM backstop. The watermark
+            // (LAST_CLEANUP_KEY) advances ONLY on a successful purge, so a transient error does not
+            // skip retention for 24h — it is retried on the next alarm.
+            let purge_ok = storage
+                .sql()
+                .exec_raw(
+                    "DELETE FROM pending WHERE created_at < ?",
+                    Some(vec![JsValue::from_f64(cutoff as f64)]),
+                )
+                .is_ok();
+            // Layer-4: receipt_state retention (updated_at is in ms, hence cutoff*1000).
+            // An old tick has already been displayed, and the high-water mark (`receipt_meta`) is
+            // never purged → seq stays monotonic and cursors stay consistent.
             let _ = storage.sql().exec_raw(
                 "DELETE FROM receipt_state WHERE updated_at < ?",
                 Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
             );
-            // server-lean audit (2026-07-03): self_read_state RETENTION-PARİTE purge. Eskiden
-            // "PURGE EDİLMEZ" (Codex-Q8 full-pull korkusu) → "şişmez" ilkesinin TEK istisnasıydı.
-            // Q8-korkusu ASILSIZ çıktı (Fable-devri + Opus-doğrulama): yeni cihaz eski mesajları
-            // M4 kardeş-senk'ten alır ve M4 paketi (state_transfer.rs `Vec<MessageRow>`) `viewed_at`'i
-            // MESAJLA BİRLİKTE taşır → okundu-state self_read_state'ten BAĞIMSIZ akar. self_read_state
-            // = canlı-inkremental yakınsama cursor'u; retention-ötesi satır = ölü-metadata (o mesaj
-            // pending'den zaten silindi, M4 read-state'i taşıyor). receipt_state deseni birebir:
-            // high-water (self_read_meta) purge EDİLMEZ → seq monoton, cursor tutarlı. updated_at ms.
+            // server-lean audit (2026-07-03): purge self_read_state at RETENTION PARITY. It used to
+            // be exempt ("never purged", out of the Codex-Q8 fear of breaking full-pull), the ONLY
+            // exception to the "the server does not grow" principle. That fear turned out to be
+            // UNFOUNDED (Fable handover + Opus verification): a new device receives old messages via
+            // M4 sibling sync, and the M4 package (state_transfer.rs `Vec<MessageRow>`) carries
+            // `viewed_at` ALONGSIDE THE MESSAGE → read state flows INDEPENDENTLY of
+            // self_read_state. self_read_state is the live incremental convergence cursor; a row
+            // beyond retention is dead metadata (that message was already deleted from pending and
+            // M4 carries its read state). Exactly the receipt_state pattern: the high-water mark
+            // (self_read_meta) is NEVER purged → seq stays monotonic and cursors consistent.
+            // updated_at is in ms.
             let _ = storage.sql().exec_raw(
                 "DELETE FROM self_read_state WHERE updated_at < ?",
                 Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
             );
-            // M1 (Olm-WIPE tekrar-tetikleme): forward_queue retention. Eski orphan
-            // makbuz satırları (özellikle delivery_failed — client hiç forward_ack
-            // atmadıysa) süresiz birikip TAZE reconnect'te koşulsuz replay ediliyordu
-            // → alıcıda `delete_all_olm_blobs` (Olm WIPE) tekrar-tetikleniyordu. Aynı
-            // retention penceresiyle temizle. `created_at` MS cinsinden (forward_signal:
-            // `now_secs()*1000`) → ms cutoff (receipt_state ile aynı, pending'in
-            // saniye-cutoff'undan FARKLI).
+            // M1 (repeated Olm WIPE triggers): forward_queue retention. Old orphan receipt rows —
+            // especially delivery_failed ones the client never forward_acked — accumulated forever
+            // and were replayed unconditionally on a FRESH reconnect, re-triggering
+            // `delete_all_olm_blobs` (Olm WIPE) on the receiver. Clean them with the same retention
+            // window. `created_at` is in MS here (forward_signal writes `now_secs()*1000`), so the
+            // cutoff is in ms too — same as receipt_state, and DIFFERENT from pending's
+            // seconds-based cutoff.
             let _ = storage.sql().exec_raw(
                 "DELETE FROM forward_queue WHERE created_at < ?",
                 Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
             );
-            let _ = storage.put(LAST_CLEANUP_KEY, now_ms_val).await;
+            if purge_ok {
+                let _ = storage.put(LAST_CLEANUP_KEY, now_ms_val).await;
+            }
         }
-        // W11: alarm zincirini SAĞLAM re-arm et. Eski blind `let _ = set_alarm`
-        // tek transient storage-hatasında zinciri BU DO instance ömrü boyunca
-        // kırıp offline-flush/forward-replay/cleanup'i sessizce durduruyordu.
+        // W11: re-arm the alarm chain ROBUSTLY. The old blind `let _ = set_alarm` let a single
+        // transient storage error break the chain for the entire lifetime of this DO instance,
+        // silently stopping the offline flush, the forward replay and the cleanup.
         self.ensure_alarm().await;
         Response::empty()
     }
@@ -440,44 +526,63 @@ impl UserInbox {
             "CREATE INDEX IF NOT EXISTS idx_pending_created ON pending(created_at)",
             sql_no_args(),
         )?;
-        // Faz 2 (grup fan-out): pending'e group_id kolonu. Grup mesajıysa hangi
-        // gruba ait (alıcı Megolm decrypt yolunu seçer); 1:1'de NULL. Eski DO'lar
-        // için ALTER (zaten varsa hata IGNORE; forward_queue.pushed_at deseni).
+        // D-M9 (durable dedup): an env_hash column on pending + UNIQUE(sender_id, env_hash).
+        // The in-memory dedup (60s) is lost on a DO restart or once its TTL expires, so a retry of
+        // the same envelope would create a SECOND pending row (duplicate WS frame, notification and
+        // bubble). env_hash is the hex of the EXISTING 4-tuple hash
+        // (SHA256(sender|sender_dev|recipient_dev|envelope)), so when a group's single Megolm
+        // envelope is written for TWO devices of the same member the differing recipient_dev yields
+        // a DIFFERENT hash → the second device's row is NOT swallowed, i.e. no lost group message on
+        // a sibling device. Older rows have a NULL env_hash, and a SQLite UNIQUE index permits
+        // multiple NULLs (safe).
+        let _ = storage.sql().exec_raw(
+            "ALTER TABLE pending ADD COLUMN env_hash TEXT",
+            sql_no_args(),
+        );
+        let _ = storage.sql().exec_raw(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_env_hash ON pending(sender_id, env_hash)",
+            sql_no_args(),
+        );
+        // Phase 2 (group fan-out): a group_id column on pending, naming the group a message belongs
+        // to so the recipient picks the Megolm decrypt path; NULL for 1:1. ALTER for older DOs, with
+        // the error IGNORED if the column already exists (the forward_queue.pushed_at pattern).
         let _ = storage.sql().exec_raw(
             "ALTER TABLE pending ADD COLUMN group_id TEXT",
             sql_no_args(),
         );
-        // M2-S2.2 (çoklu-cihaz): pending'e device_id kolonu. Hangi ALICI
-        // CİHAZINA ait (per-device kuyruk + ack-izolasyonu). Backfill-öncesi
-        // satırlar + S2 öncesi DO'lar için ALTER (zaten varsa hata IGNORE;
-        // group_id ALTER deseni). N=1'de tek-primary; daha-eski NULL satırlar
-        // ilk-WS backfill ile damgalanır (bkz ws_upgrade NULL-backfill bayrağı).
+        // M2-S2.2 (multi-device): a device_id column on pending, naming which RECIPIENT DEVICE the
+        // row belongs to (per-device queue + ack isolation). ALTER for rows written before the
+        // backfill and for pre-S2 DOs, with the error IGNORED if it already exists (the group_id
+        // ALTER pattern). With N=1 there is a single primary; older NULL rows are stamped by the
+        // first-WS backfill (see the NULL-backfill flag in ws_upgrade).
         let _ = storage.sql().exec_raw(
             "ALTER TABLE pending ADD COLUMN device_id TEXT",
             sql_no_args(),
         );
-        // M2-S2.2: GÖNDERENİN cihazı. Alıcı frame'inde `sender_device_id`
-        // taşınmalı (1:1'de alıcı doğru Olm cihaz-oturumunu seçer; grupta tek
-        // Megolm zarfı). Live push notify_inner param'ından gelir; flush replay
-        // DB'den okur → ayrı kolon. NULL = sender_device bilinmiyor (eski/uyum).
+        // M2-S2.2: the SENDER's device. The recipient's frame must carry `sender_device_id` (for
+        // 1:1 the recipient uses it to pick the right Olm device session; a group has a single
+        // Megolm envelope). A live push gets it from the notify_inner parameter while a flush replay
+        // reads it back from the DB, hence a dedicated column. NULL means the sender device is
+        // unknown (older rows / compatibility).
         let _ = storage.sql().exec_raw(
             "ALTER TABLE pending ADD COLUMN sender_device_id TEXT",
             sql_no_args(),
         );
-        // W1-backstop: pending'e push_wake_at kolonu (ms). NULL = bu satır için henüz
-        // FCM-wake atılmadı (delivered_live=true idi → caller immediate-push atmadı) →
-        // alarm-backstop grace aşınca push atar. delivered_live=false satırlarda
-        // notify_inner bunu set eder (caller zaten immediate-push atar → backstop
-        // atlar). Eski DO'lar için ALTER (zaten varsa hata IGNORE; group_id deseni).
+        // W1 backstop: a push_wake_at column on pending (ms). NULL means no backstop FCM wake has
+        // been sent for this row yet, so once the grace period passes the alarm backstop pushes one.
+        // The column is written ONLY by the backstop itself, after its own push — notify_inner
+        // deliberately leaves it NULL (see the "W1 backstop NOTE" in message.rs), so every row gets
+        // at most one backstop wake. ALTER for older DOs, with the error IGNORED if it already
+        // exists (the group_id pattern).
         let _ = storage.sql().exec_raw(
             "ALTER TABLE pending ADD COLUMN push_wake_at INTEGER",
             sql_no_args(),
         );
-        // Sprint 8: forward_queue — receipt forward'lari (delivered/read/
-        // delivery_failed) WS push fire-and-forget yerine persistent kuyrukta.
-        // Bagli WS'lerden 0+ sender'a anlik push + bu tabloya yaz; sender
-        // reconnect olunca flush_forwards replay + sender `forward_ack`
-        // frame'i ile kuyrugu temizler.
+        // Sprint 8: forward_queue — receipt forwards (delivered / read / delivery_failed) live in a
+        // persistent queue instead of being fire-and-forget WS pushes. Each one is pushed
+        // immediately to however many connected sockets exist AND written to this table; when the
+        // sender reconnects, flush_forwards replays it, and the sender's `forward_ack` frame clears
+        // the queue.
         storage.sql().exec_raw(
             "CREATE TABLE IF NOT EXISTS forward_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -489,17 +594,17 @@ impl UserInbox {
             )",
             sql_no_args(),
         )?;
-        // Sprint 8.5a: pushed_at kolonu — Sprint 8'de tablonun ilk oluştuğu
-        // DO'lar için ALTER TABLE ADD COLUMN. Hata IGNORE (zaten varsa).
+        // Sprint 8.5a: the pushed_at column — an ALTER TABLE ADD COLUMN for DOs where the table was
+        // first created back in Sprint 8. The error is IGNORED if it already exists.
         let _ = storage.sql().exec_raw(
             "ALTER TABLE forward_queue ADD COLUMN pushed_at INTEGER",
             sql_no_args(),
         );
-        // M2-S2.2 (çoklu-cihaz): forward_queue'ya recipient_device_id kolonu.
-        // Receipt forward'ları (delivered/read/delivery_failed) HANGI ALICI
-        // CİHAZINDAN üretildi → replay'de device-doğru taşıma + dedup anahtarına
-        // girer (D3-verdict-2: WS-kapalı biriken makbuz replay'de device'sız →
-        // N:1 MISS). Eski DO'lar için ALTER (zaten varsa hata IGNORE).
+        // M2-S2.2 (multi-device): a recipient_device_id column on forward_queue, recording WHICH
+        // RECIPIENT DEVICE produced a receipt forward (delivered / read / delivery_failed). It makes
+        // the replay device-accurate and becomes part of the dedup key (D3 verdict 2: a receipt
+        // queued while the WS was down replayed without a device → N:1 MISS). ALTER for older DOs,
+        // with the error IGNORED if it already exists.
         let _ = storage.sql().exec_raw(
             "ALTER TABLE forward_queue ADD COLUMN recipient_device_id TEXT",
             sql_no_args(),
@@ -508,20 +613,20 @@ impl UserInbox {
             "CREATE INDEX IF NOT EXISTS idx_fwd_created ON forward_queue(created_at)",
             sql_no_args(),
         )?;
-        // Sprint 8.5a: dedup için (kind, from_user, ids_json) lookup hızlandır.
-        // M2-S2.2: dedup anahtarı artık recipient_device_id'yi de içerir →
-        // index'i de o kolonla genişlet (eski index zararsız kalır; yeni
-        // sorgu bu index'i kullanır).
+        // Sprint 8.5a: speed up the (kind, from_user, ids_json) lookup used by the dedup.
+        // M2-S2.2: the dedup key now also includes recipient_device_id, so widen the index with
+        // that column too (the old index stays harmlessly in place; the new query uses this one).
         let _ = storage.sql().exec_raw(
             "CREATE INDEX IF NOT EXISTS idx_fwd_dedup_dev ON forward_queue(kind, from_user, recipient_device_id, ids_json, created_at)",
             sql_no_args(),
         );
-        // Model-B Layer-4: hesap-düzeyi receipt durable log (delivered/read).
-        // forward_queue consume-once yerine — her A-cihazı `seq` cursor'undan
-        // idempotent senkronlar (kardeş-yarışı/zombie-socket/reconnect-gap fix).
-        // PK(peer_id, remote_id) = B'nin per-cihaz receipt id'si; tik aggregation
-        // client mdd'de. `seq` monoton hesap-global; `receipt_meta` high-water
-        // tablo purge'lense bile geri gitmez → cursor tutarlı. (bkz receipt.rs)
+        // Model-B Layer-4: the account-level durable receipt log (delivered/read). It replaces the
+        // consume-once forward_queue — every A device syncs idempotently from its own `seq` cursor
+        // (the fix for the sibling race, zombie sockets and reconnect gaps).
+        // PK(peer_id, remote_id) is B's per-device receipt id; rolling ticks up to a logical message
+        // happens client-side in mdd. `seq` is an account-global monotonic counter, and the
+        // `receipt_meta` high-water never goes backwards even if the table is purged → cursors stay
+        // consistent. (See receipt.rs.)
         storage.sql().exec_raw(
             "CREATE TABLE IF NOT EXISTS receipt_state (
                 peer_id TEXT NOT NULL,
@@ -538,9 +643,10 @@ impl UserInbox {
             "CREATE INDEX IF NOT EXISTS idx_receipt_seq ON receipt_state(seq)",
             sql_no_args(),
         )?;
-        // #11 Layer-4b: msg_uid kolonu (kardeş cihaz oc-satırı `oc-{msg_uid}` ile okundu
-        // korelasyonu). Mevcut DO'lara ADD COLUMN (idempotent: zaten varsa hata YUTULUR;
-        // `CREATE TABLE IF NOT EXISTS` eski DO'ya kolon eklemez → ayrı ALTER şart).
+        // #11 Layer-4b: the msg_uid column, which lets a sibling device correlate its `oc-{msg_uid}`
+        // row with the read. ADD COLUMN for existing DOs (idempotent: the error is SWALLOWED if it
+        // already exists). `CREATE TABLE IF NOT EXISTS` does not add columns to an existing table,
+        // so the separate ALTER is required.
         let _ = storage.sql().exec_raw(
             "ALTER TABLE receipt_state ADD COLUMN msg_uid TEXT",
             sql_no_args(),
@@ -553,13 +659,15 @@ impl UserInbox {
             "INSERT OR IGNORE INTO receipt_meta (k, v) VALUES ('seq', 0)",
             sql_no_args(),
         )?;
-        // ── KARDEŞ-OKUNDU durable cursor (2026-06-28, Codex-onaylı tasarım) ──────────────
-        // receipt_state'in (gönderen↔alıcı teslim/okundu) AYNADAN-kopyası AMA kardeş-okundu
-        // (U'nun KENDİ cihazları arası `viewed_at` yakınsaması) için AYRI eksen. Eski kırılgan
-        // ReadSelfSync (anlık Olm self-mesaj; wedge'de ölür, yalnız yeni-okuma, yeni-cihaz backlog
-        // yanlış) yerine durable+monoton+cursor. PK=msg_uid (global UUID; peer-agnostik). seq AYRI
-        // uzay (`self_read_meta`) → bir self-read gap'i receipt cursor'unu kilitlemez (Codex Q1).
-        // Retention: bu tablo PURGE EDİLMEZ (full-pull garantisi; Codex Q8).
+        // ── SIBLING-READ durable cursor (2026-06-28, Codex-approved design) ──────────────
+        // A mirror image of receipt_state (sender <-> recipient delivered/read) but on a SEPARATE
+        // axis for sibling reads: converging `viewed_at` across U's OWN devices. It replaces the old
+        // brittle ReadSelfSync (a live Olm self-message: dies on a wedged session, covers only fresh
+        // reads, gets a new device's backlog wrong) with something durable, monotonic and
+        // cursor-based. PK = msg_uid (a global UUID, hence peer-agnostic). `seq` lives in a SEPARATE
+        // space (`self_read_meta`) so a self-read gap cannot block the receipt cursor (Codex Q1).
+        // Retention: this table IS purged at retention parity — see the 2026-07-03 reversal of
+        // Codex Q8 in the alarm cleanup above and in self_read.rs.
         storage.sql().exec_raw(
             "CREATE TABLE IF NOT EXISTS self_read_state (
                 msg_uid TEXT PRIMARY KEY,
@@ -581,11 +689,16 @@ impl UserInbox {
             "INSERT OR IGNORE INTO self_read_meta (k, v) VALUES ('seq', 0)",
             sql_no_args(),
         )?;
-        // ── Codex#5: M4/msg_uid-only read receipt (gönderen↔alıcı; remote_id'siz) ────────
-        // M4-restore (msg_id=NULL) mesaj okununca core `msg_uids` (ids-boş) gönderir; receipt_state
-        // PK=(peer_id,remote_id) bunu taşıyamaz → düşerdi. AYRI uid-keyed tablo (sentetik remote_id
-        // DEĞİL — semantik-borç/çakışma riski; Codex Q6). Aynı `receipt_meta` seq-uzayını paylaşır
-        // (receipt akışıyla aynı eksen: gönderene tik) → tek cursor'dan senklenir.
+        // ── Codex#5: M4 / msg_uid-only read receipts (sender <-> recipient, without a remote_id) ──
+        // When an M4-restored message (msg_id = NULL) is read, core sends `msg_uids` with an empty
+        // `ids`, which receipt_state's PK(peer_id, remote_id) cannot represent, so it would be
+        // dropped. Hence a SEPARATE uid-keyed table rather than a synthetic remote_id (which would
+        // create semantic debt and collision risk; Codex Q6). It is designed to share the same
+        // `receipt_meta` seq space — the same axis as the receipt flow, a tick for the sender — so a
+        // single cursor covers both.
+        // STATUS: the table and index are created here, but nothing in the worker reads or writes
+        // `receipt_uid_state` yet, and apply_receipt still returns early on an empty `ids`, so
+        // uid-only receipts are still dropped. Schema groundwork only.
         storage.sql().exec_raw(
             "CREATE TABLE IF NOT EXISTS receipt_uid_state (
                 peer_id TEXT NOT NULL,
@@ -602,20 +715,21 @@ impl UserInbox {
             "CREATE INDEX IF NOT EXISTS idx_receipt_uid_seq ON receipt_uid_state(seq)",
             sql_no_args(),
         )?;
-        // Layer-4 cutover (Codex HIGH-3): delivered/read artık receipt_state'te.
-        // forward_queue'daki ESKİ (cutover-öncesi) delivered/read satırları consume-once
-        // + global-ack-DELETE kardeş-steal yarışına açık → DRAIN et (temiz kesik;
-        // in-flight olanlar StateDigest reconciliation + sonraki receipt ile onarılır).
-        // delivery_failed KALIR (hâlâ forward_queue yolunda). Yeni delivered/read
-        // forward_queue'ya GİRMEZ (apply_receipt'e gider) → bu DELETE idempotent.
+        // Layer-4 cutover (Codex HIGH-3): delivered/read now live in receipt_state. The OLD
+        // (pre-cutover) delivered/read rows still sitting in forward_queue are exposed to the
+        // consume-once + global-ack-DELETE sibling-steal race, so DRAIN them for a clean cut;
+        // anything in flight is repaired by StateDigest reconciliation and the next receipt.
+        // delivery_failed STAYS (it is still on the forward_queue path). New delivered/read never
+        // ENTER forward_queue (they go to apply_receipt), which makes this DELETE idempotent.
         let _ = storage.sql().exec_raw(
             "DELETE FROM forward_queue WHERE kind IN ('delivered', 'read')",
             sql_no_args(),
         );
-        // W11 HARDENING (2026-07-02, Codex-flag): ilk-arm'ı `ensure_alarm`'a yönlendir —
-        // eskiden `let _ = set_alarm` (tek deneme, sonuç YUTULUYORDU) → ilk-arm fail + hiç
-        // ws-reconnect yoksa backstop HİÇ çalışmazdı. `ensure_alarm` 3x bounded-retry + fail'de
-        // görünür log (get_alarm idempotent → zaten kurulu ise no-op).
+        // W11 HARDENING (2026-07-02, Codex flag): route the initial arm through `ensure_alarm`. It
+        // used to be `let _ = set_alarm` — one attempt whose result was SWALLOWED — so if the first
+        // arm failed and no WS reconnect ever happened, the backstop NEVER ran. `ensure_alarm` does
+        // 3 bounded retries and logs visibly on failure (get_alarm is idempotent, so an
+        // already-armed alarm is a no-op).
         self.ensure_alarm().await;
         self.initialized.set(true);
         Ok(())
@@ -625,15 +739,16 @@ impl UserInbox {
         let pair = WebSocketPair::new()?;
         let server = pair.server;
 
-        // M2-S2.2: token + device_id parse'ını accept_web_socket + stale-close
-        // ÖNCESİNE çek. Attachment{user_id, device_id} hazır olunca accept'lenir;
-        // backfill ÖNCE device'ı bilmeli. (Token: Sec-WebSocket-Protocol
-        // "sezgi.bearer.v1, <token>" — lib.rs sync_ws zaten doğrulayıp proxy
-        // etti; burada attachment için tekrar parse.)
-        // Self-host Faz A: DO fetch'i lib.rs `#[event(fetch)]` boot-guard'ından
-        // GEÇMEZ (ayrı izolate olabilir) → JWT anahtarını (env-secret yoksa D1
-        // self-provision cache'i) bu izolate'te de hazırla. Memoized + env-secret'lı
-        // kurulumda D1'e hiç gitmeden döner (bugünkü davranış bit-aynı).
+        // M2-S2.2: parse the token and device_id BEFORE accept_web_socket and the stale close. The
+        // socket is accepted once Attachment{user_id, device_id} is ready, because the backfill has
+        // to know the device FIRST. (The token arrives as Sec-WebSocket-Protocol
+        // "sezgi.bearer.v1, <token>"; lib.rs sync_ws already verified it before proxying, and we
+        // re-parse it here only to build the attachment.)
+        // Self-host phase A: a DO fetch does NOT pass through the lib.rs `#[event(fetch)]` boot
+        // guard (it may run in a different isolate), so prepare the JWT key in this isolate too —
+        // from the env secret, or from the D1 self-provision cache when there is none. It is
+        // memoized, so on an installation with the env secret set it returns without touching D1
+        // (bit-identical to today's behaviour).
         crate::self_provision::ensure_keys(&self.env).await;
 
         let mut attach_user: Option<String> = None;
@@ -641,24 +756,24 @@ impl UserInbox {
         if let Ok(t) = crate::extract_bearer_subprotocol(&req) {
             if let Ok(uid) = verify_access_token(&self.env, &t) {
                 attach_user = Some(uid);
-                // device_id claim — S1-öncesi token'da YOK → None (NULL-tolerans).
+                // The device_id claim is ABSENT from a pre-S1 token → None (NULL tolerance).
                 attach_device = device_id_from_token(&self.env, &t).ok().flatten();
             }
         }
 
-        // M2-S3.0 (B3): stale-close artık CİHAZ-FARKINDA. Aynı kullanıcının iki
-        // cihazı (birincil + bağlı) eşzamanlı WS açar; her biri YALNIZ kendi pending
-        // satırlarını flush/ack eder (S2.2 per-device izolasyonu) → eski tek-kuyruk
-        // yarışı (ilk ack'leyen satırı siler) artık yapısal olarak yok. Bu yüzden
-        // eski soketleri KOŞULSUZ kapatamayız: kapatırsak iki cihaz birbirinin WS'ini
-        // sürekli koparır → link akışı + çift-cihaz teslim çalışmaz. Yalnız AYNI
-        // device_id'nin eski soketini "superseded" kapat (reconnect/zombie temizliği,
-        // çift-push önleme). Option<String> eşitliği tam doğru semantik: None==None
-        // (S1-öncesi device'sız aynı-cihaz reconnect → kapat), Some==Some (aynı cihaz
-        // reconnect → kapat), None!=Some (cihaz-farkında yeni bağlantı, device'sız
-        // eski soketi KORUR — flush/ack "OR device_id IS NULL" toleranslı, o soket
-        // kuyruğunu yine alır). N=1: tek cihaz → tüm eski soketler aynı device →
-        // "tümünü kapat" davranışı birebir korunur. (Revoke-anında WS-red = S3.5.)
+        // M2-S3.0 (B3): the stale close is now DEVICE-AWARE. Two devices of the same user (primary +
+        // linked) hold sockets at the same time, and each one flushes/acks ONLY its own pending rows
+        // (S2.2 per-device isolation), so the old single-queue race — whoever acks first deletes the
+        // row — is structurally gone. That means we can no longer close old sockets
+        // UNCONDITIONALLY: doing so would have the two devices constantly tearing down each other's
+        // socket, breaking the linking flow and dual-device delivery. So only the previous socket of
+        // the SAME device_id is closed as "superseded" (reconnect/zombie cleanup, avoiding double
+        // pushes). Option<String> equality is exactly the right semantics here: None == None (a
+        // pre-S1 device-less reconnect of the same device → close), Some == Some (the same device
+        // reconnecting → close), None != Some (a new device-aware connection KEEPS the device-less
+        // old socket — flush/ack tolerate "OR device_id IS NULL", so that socket still gets its
+        // queue). With N=1 there is one device, so all old sockets share it and the "close them all"
+        // behaviour is preserved exactly. (Rejecting a socket at revoke time is S3.5.)
         let stale = self.state.get_websockets();
         self.state.accept_web_socket(&server);
         for old in stale {
@@ -676,59 +791,48 @@ impl UserInbox {
             let _ = server.serialize_attachment(Attachment {
                 user_id: uid,
                 device_id: attach_device.clone(),
-                // W1: taze accept edilen socket bir `WS_LIVENESS_WINDOW_MS` boyunca
-                // "canlı" sayılır (client ilk ping'ini atana kadar spurious-push
-                // olmasın). İlk inbound frame'de handle_ws_message tazeler.
+                // W1: a freshly accepted socket counts as "live" for one `WS_LIVENESS_WINDOW_MS`,
+                // so no spurious push happens before the client sends its first ping.
+                // handle_ws_message refreshes the stamp on the first inbound frame.
                 last_seen_ms: Some((now_secs() * 1000) as i64),
             });
         }
 
-        // M2-S2.2 İDEMPOTENT NULL-backfill (red-team HIGH #3, #18): S2-öncesi
-        // (device'sız) pending satırları bu ilk device-bilen WS'in cihazıyla
-        // damgala. DO-storage tek-seferlik bayrak → reconnect RE-STAMP ETMEZ.
-        // Backfill değeri Attachment.device_id'den (claim'den, TÜRETME DEĞİL).
+        // M2-S2.2 IDEMPOTENT NULL backfill (red-team HIGH #3, #18): stamp the pre-S2 (device-less)
+        // pending rows with the device of this first device-aware socket. A one-shot flag in DO
+        // storage means a reconnect does NOT RE-STAMP. The value comes from Attachment.device_id,
+        // i.e. straight from the claim and NEVER derived.
         if let Some(dev) = attach_device.as_deref() {
             self.backfill_null_device_once(dev).await;
         }
 
         self.flush_pending_to(&server);
-        // Sprint 8: WS reconnect replay — birikmiş receipt forward'ları sender bu
-        // yeni WS üzerinden alır. force=true: TAZE socket eski (ölü/zombie) socket'e
-        // push'lananı almadı → pushed_at'i yok say, kuyruktaki HEPSİNİ ver (saha
-        // 2026-06-02 "okundu aşırı gecikti" kök-neden fix; client forward_id dedup'lar).
+        // Sprint 8: WS reconnect replay — the sender receives the queued receipt forwards over this
+        // new socket. force=true because a FRESH socket by definition never received what was pushed
+        // to the old (dead/zombie) socket → ignore pushed_at and hand over EVERYTHING in the queue
+        // (the root-cause fix for the 2026-06-02 field report "read receipt hugely delayed"; the
+        // client dedups on forward_id).
         self.flush_forwards_to(&server, true);
-        // W11: periyodik alarm zinciri (transient set_alarm hatasıyla) kırılmışsa
-        // client reconnect'inde SELF-HEAL et → offline-flush/forward-replay/cleanup
-        // yeniden canlanır. Armed ise no-op (ucuz get_alarm).
+        // W11: if the periodic alarm chain was broken by a transient set_alarm error, SELF-HEAL it on
+        // a client reconnect → the offline flush, forward replay and cleanup come back to life.
+        // A no-op when already armed (a cheap get_alarm).
         self.ensure_alarm().await;
 
-        // WS upgrade response: client'ın gönderdiği subprotocol'ü echo et.
-        // tokio-tungstenite client tarafı server'ın seçtiği subprotocol'ü doğrular;
-        // echolanmazsa "no subprotocol selected" hatası alır.
+        // WS upgrade response: echo back the subprotocol the client offered. The tokio-tungstenite
+        // client validates the subprotocol the server selected and fails with
+        // "no subprotocol selected" if it is not echoed.
         let resp = Response::from_websocket(pair.client)?;
         let headers = resp.headers().clone();
         headers.set("Sec-WebSocket-Protocol", "sezgi.bearer.v1")?;
         Ok(resp.with_headers(headers))
     }
 
-    /// M2-S2.2: `pending.device_id IS NULL` satırlarını verilen cihazla TEK
-    /// SEFER damgalar (DEVICE_BACKFILL_DONE_KEY bayrağı arkasında). Bayrak set
-    /// edildiyse no-op → reconnect re-stamp etmez (red-team HIGH #3).
-    /// N=1'de DO tek-cihaza ait → tüm device'sız geçmiş satır o cihaza doğru.
-    /// FIX-2(b) NOTU: backfill yalnızca İLK device-bilen bağlantıdaki geçmiş
-    /// NULL'ları damgalar; sonradan oluşan NULL pending (grup-fallback FIX-1 →
-    /// cihaz yayınlamamış üye) bu bayraktan sonra gelirse backfill ATLANIR ama
-    /// flush/ack `OR device_id IS NULL` toleransı (FIX-2(b)) ile yine doğru cihaza
-    /// teslim edilir. İki mekanizma tamamlayıcı (NULL yalnız yayınlamamış-tek-cihaz
-    /// kullanıcıda → "tek mantıksal cihaz" = bağlanan cihaz). S3-TODO: çok-cihaz
-    /// kullanıcısı NULL'a sahip olabilirse hem backfill hem tolerans yeniden gözden
-    /// geçirilmeli.
-    /// W11: periyodik alarm zincirini sağlam tut. `set_alarm` sonucu eskiden
-    /// yutuluyordu (`let _ =`) → tek transient storage-hatası zinciri kırıp
-    /// offline-flush/forward-replay/cleanup'i o DO instance ömrü boyunca (evict+
-    /// reinit'e kadar) sessizce durduruyordu. Zaten armed ise no-op; değilse
-    /// bounded-retry ile kur. alarm() sonu (fire sonrası None → kurar) + her
-    /// ws_upgrade (client reconnect = doğal self-heal noktası) çağırır.
+    /// W11: keep the periodic alarm chain robust. The result of `set_alarm` used to be swallowed
+    /// (`let _ =`), so a single transient storage error broke the chain and silently stopped the
+    /// offline flush, forward replay and cleanup for the whole lifetime of that DO instance (until
+    /// it was evicted and re-initialised). A no-op when already armed; otherwise arm it with a
+    /// bounded retry. Called at the end of alarm() (after firing, get_alarm is None so it re-arms)
+    /// and from every ws_upgrade, since a client reconnect is the natural self-heal point.
     async fn ensure_alarm(&self) {
         let storage = self.state.storage();
         if storage.get_alarm().await.ok().flatten().is_some() {
@@ -740,29 +844,31 @@ impl UserInbox {
                 return;
             }
         }
-        console_log!("UserInbox: set_alarm 3x fail — alarm zinciri risk (sonraki ws_upgrade re-dener)");
+        console_log!(
+            "UserInbox: set_alarm 3x fail — alarm zinciri risk (sonraki ws_upgrade re-dener)"
+        );
     }
 
-    /// W1-backstop (Codex HIGH — W1 kesin closure). Ground-truth: `pending`'de duran
-    /// satır = ack'lenmemiş = teslim olmamış. `push_wake_at` NULL (delivered_live=true
-    /// sanıldı, immediate-push atılmadı) VE grace aşmış satırlar için FCM-wake at →
-    /// W1'in daralttığı ama kapatmadığı false-pozitif pencereyi (ping-sonrası-ölüm)
-    /// kapatır. distinct device_id başına tek push (maybe_push_wake None=tüm-cihaz);
-    /// sonra push_wake_at damgalanır → sonraki alarm re-push etmez. Idempotent/best-effort.
+    /// W1 backstop (Codex HIGH — the definitive closure of W1). Ground truth: a row still sitting in
+    /// `pending` is unacked, therefore undelivered. Send an FCM wake for rows whose `push_wake_at` is
+    /// NULL (no backstop wake has fired for them yet) and whose grace period has elapsed → this
+    /// closes the false-positive window W1 narrowed but could not eliminate (a socket dying right
+    /// after a ping). One push per distinct device_id (maybe_push_wake with None means all devices),
+    /// then push_wake_at is stamped so the next alarm does not re-push. Idempotent and best-effort.
     async fn backstop_push_stale_pending(&self) {
         let storage = self.state.storage();
         let uid: Option<String> = storage.get(RECIPIENT_UID_KEY).await.ok().flatten();
         let uid = match uid {
             Some(u) => u,
-            None => return, // ALICI user_id henüz bilinmiyor (hiç notify gelmedi) → no-op
+            None => return, // RECIPIENT user_id not known yet (no notify has arrived) → no-op
         };
         let db = match self.env.d1("DB") {
             Ok(d) => d,
             Err(_) => return,
         };
         let now = now_secs() as i64;
-        let cutoff = now - PUSH_BACKSTOP_GRACE_SECS; // pending.created_at SANİYE cinsinden
-        // Stuck satırların distinct alıcı-cihazları (None = cihaz-blind → tüm cihaz).
+        let cutoff = now - PUSH_BACKSTOP_GRACE_SECS; // pending.created_at is in SECONDS
+                                                     // Distinct recipient devices of the stuck rows (None = device-blind → all devices).
         let cursor = match storage.sql().exec_raw(
             "SELECT DISTINCT device_id FROM pending WHERE push_wake_at IS NULL AND created_at < ?",
             Some(vec![JsValue::from_f64(cutoff as f64)]),
@@ -782,10 +888,11 @@ impl UserInbox {
         if rows.is_empty() {
             return;
         }
-        // [deliv-telemetry] W1-backstop ateşledi = W1 canlılık-ayracının kaçırdığı
-        // (ping-sonrası-ölen / ws.rs-yanıt-kaybı) stuck-pending yakalandı. wrangler
-        // tail'de bu satırın SIKLIĞI W1 residual'ının saha-etkisini ölçer (Codex:
-        // sayaçsız kanıtlanamaz). Yüksek-sinyal/düşük-frekans → per-olay log OK.
+        // [deliv-telemetry] The W1 backstop fired = it caught a stuck pending row that W1's liveness
+        // test missed (a socket dying just after a ping, or a lost ws.rs response). How OFTEN this
+        // line appears in `wrangler tail` measures the field impact of W1's residual gap (per Codex,
+        // without a counter it cannot be proven). High signal and low frequency, so a per-event log
+        // is acceptable.
         console_log!(
             "[deliv] W1-backstop wake: {} device stale-unacked (uid={})",
             rows.len(),
@@ -794,8 +901,8 @@ impl UserInbox {
         for r in &rows {
             crate::push::fcm::maybe_push_wake(&self.env, &db, &uid, r.device_id.as_deref()).await;
         }
-        // Damgala → sonraki alarm aynı satırları re-push etmesin (best-effort; hata
-        // yutulursa en kötü ihtimalle sonraki alarmda tekrar wake = zararsız-fazla-push).
+        // Stamp the rows so the next alarm does not re-push them (best-effort; if the error is
+        // swallowed the worst case is another wake on the next alarm = a harmless extra push).
         let _ = storage.sql().exec_raw(
             "UPDATE pending SET push_wake_at = ? WHERE push_wake_at IS NULL AND created_at < ?",
             Some(vec![
@@ -805,6 +912,18 @@ impl UserInbox {
         );
     }
 
+    /// M2-S2.2: stamp every `pending.device_id IS NULL` row with the given device exactly ONCE,
+    /// behind the DEVICE_BACKFILL_DONE_KEY flag. Once the flag is set this is a no-op, so a
+    /// reconnect never re-stamps (red-team HIGH #3). With N=1 the DO belongs to a single device, so
+    /// every historical device-less row correctly belongs to it.
+    /// FIX-2(b) NOTE: the backfill only stamps the historical NULLs present at the FIRST
+    /// device-aware connection. A NULL pending row created later (group fallback FIX-1 → a member
+    /// who published no devices) arrives after the flag is set and is therefore SKIPPED by the
+    /// backfill, but flush/ack still deliver it to the right device through the
+    /// `OR device_id IS NULL` tolerance (FIX-2(b)). The two mechanisms are complementary: NULL only
+    /// occurs for an unpublished-single-device user, so "the one logical device" is the device that
+    /// connects. S3-TODO: if a multi-device user can ever own a NULL row, both the backfill and the
+    /// tolerance must be revisited.
     async fn backfill_null_device_once(&self, device_id: &str) {
         let storage = self.state.storage();
         let done: Option<bool> = storage

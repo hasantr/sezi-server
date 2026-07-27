@@ -1,20 +1,23 @@
-//! `POST /auth/relogin` — kimlik-imzalı oturum kurtarma (K5c).
+//! `POST /auth/relogin` — identity-signed session recovery (K5c).
 //!
-//! `refresh_token` öldüğünde (rotate/expire/revoke) oturum normalde kalıcı
-//! kaybolurdu (verify YENİ user_id üretir → pairing kopar). Bu endpoint
-//! kullanıcının **mevcut** Ed25519 kimlik anahtarına sahip olduğunu kanıtlatıp
-//! AYNI `user_id`'ye taze token verir → pairing/identity korunur.
+//! When the `refresh_token` dies (rotated, expired or revoked) the session used to be
+//! lost for good, because verify mints a NEW user_id and that breaks pairing. This
+//! endpoint makes the client prove possession of its **existing** Ed25519 identity key
+//! and then issues fresh tokens for the SAME `user_id`, preserving pairing and
+//! identity.
 //!
-//! Sunucu kullanıcının Ed25519 imza anahtarını AYRI saklamaz (`users.identity_pubkey`
-//! = Curve25519/DH). Ama `signed_prekeys` tablosunda kullanıcının SPK pub'ı +
-//! Ed25519 imzası kayıtlı (registration/rotation'da `account.sign(spk_pub_bytes)`).
-//! Doğrulama iki aşamalı:
-//!   1) **Bağlama:** client'ın gönderdiği Ed25519 pub, kayıtlı SPK imzasını
-//!      doğruluyor mu? → bu pub, kullanıcının kimlik imza anahtarıdır.
-//!   2) **Canlılık:** taze `sezgi-relogin:{user_id}:{ts}` challenge imzası aynı
-//!      pub ile doğrulanıyor mu? + `ts` tazelik penceresinde mi (replay sınırı).
+//! The server does not store the user's Ed25519 signing key separately
+//! (`users.identity_pubkey` is the Curve25519/DH key). What it does have is the
+//! `signed_prekeys` table, holding the user's SPK public key plus its Ed25519
+//! signature (produced by `account.sign(spk_pub_bytes)` at registration/rotation).
+//! Verification therefore has two stages:
+//!   1) **Binding:** does the Ed25519 public key the client sent verify the stored SPK
+//!      signature? If so, that key is the user's identity signing key.
+//!   2) **Liveness:** does the same key verify a fresh
+//!      `sezgi-relogin:{user_id}:{ts}` challenge signature, and is `ts` inside the
+//!      freshness window (the replay bound)?
 //!
-//! İkisi de geçerse → taze access + refresh.
+//! If both hold → fresh access + refresh tokens.
 
 use crate::auth::hashing::sha256_hex;
 use crate::auth::jwt::sign_access_token;
@@ -31,9 +34,10 @@ struct ReloginBody {
     ed25519_pub_b64: String,
     ts: u64,
     signature_b64: String,
-    // M2-S1 (opsiyonel): bu cihazın device_id'si + Ed25519 imza pub'ı. Eski
-    // gövde bunlarsız AYNEN çalışır. identity_ed_pub_b64 = ed25519_pub_b64 ile
-    // aynı anahtardır (zaten doğrulandı) → users.identity_ed_pub backfill.
+    // M2-S1 (optional): this device's device_id plus the Ed25519 signing public key.
+    // An older body without them works EXACTLY as before. identity_ed_pub_b64 is the
+    // same key as ed25519_pub_b64 (already verified above), so it is used to backfill
+    // users.identity_ed_pub.
     #[serde(default)]
     device_id: Option<String>,
     #[serde(default)]
@@ -42,7 +46,7 @@ struct ReloginBody {
 
 const REFRESH_TTL_SEC: u64 = 30 * 24 * 60 * 60;
 const ACCESS_TTL_SEC: u64 = 15 * 60;
-/// Challenge tazelik penceresi (saat kayması toleransı + replay sınırı).
+/// Challenge freshness window: clock-skew tolerance and replay bound in one.
 const CHALLENGE_WINDOW_SEC: u64 = 300;
 
 pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -57,7 +61,7 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         return json_err(401, "stale_challenge");
     }
 
-    // Sağlanan Ed25519 pub'ı parse et.
+    // Parse the supplied Ed25519 public key.
     let ed_bytes = match b64_decode(&body.ed25519_pub_b64) {
         Ok(b) if b.len() == 32 => b,
         _ => return json_err(400, "bad_ed25519"),
@@ -70,17 +74,18 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
 
     let db = ctx.env.d1("DB")?;
 
-    // Kullanıcının kayıtlı SPK pub + imzası (en yeni). Ed25519 ile imzalanmış.
+    // The user's stored SPK public key + signature (most recent), signed with Ed25519.
     #[derive(Deserialize)]
     struct SpkRow {
         prekey_pub: Vec<u8>,
         signature: Vec<u8>,
     }
-    // M2-S3.2 (review HIGH): SPK seçimini CİHAZ-SCOPE'lu yap. Çoklu-cihazda her cihaz
-    // KENDİ Account'unun SPK'sını yayınlar (append); device-id'siz "EN YENİ" seçim,
-    // bağlı cihaz onboard olunca birincilin relogin proof'unu BAĞLI cihazın SPK'sına
-    // karşı doğrulamaya çalışır → identity_mismatch → birincil oturum kurtaramaz. Bu
-    // cihazın device_id'siyle eşleşen SPK'yı TERCİH et (yoksa NULL legacy fallback).
+    // M2-S3.2 (review HIGH): scope the SPK selection PER DEVICE. With multiple devices,
+    // each device publishes the SPK of its OWN Account (append-only), so a device-blind
+    // "newest wins" selection would, right after a linked device onboards, check the
+    // primary's relogin proof against the LINKED device's SPK → identity_mismatch →
+    // the primary can no longer recover its session. PREFER the SPK matching this
+    // device's device_id, falling back to the legacy NULL/'' rows.
     let dev = body.device_id.as_deref();
     let spk: Option<SpkRow> = db
         .prepare(
@@ -99,16 +104,16 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         return json_err(500, "bad_spk_sig");
     }
 
-    // 1) Bağlama: sağlanan Ed25519 pub kullanıcının SPK'sını imzalamış kimliğin
-    //    anahtarı mı? SPK imzası ham SPK pub bytes'ı imzalar (client:
-    //    `account.sign(pub_key.as_bytes())` → ham 32 byte).
+    // 1) Binding: is the supplied Ed25519 public key the identity key that signed the
+    //    user's SPK? The SPK signature covers the raw SPK public bytes (on the client:
+    //    `account.sign(pub_key.as_bytes())` → the raw 32 bytes).
     let spk_sig_arr: [u8; 64] = spk.signature.as_slice().try_into().unwrap();
     let spk_sig = ed25519_dalek::Signature::from_bytes(&spk_sig_arr);
     if verifying.verify(&spk.prekey_pub, &spk_sig).is_err() {
         return json_err(401, "identity_mismatch");
     }
 
-    // 2) Canlılık: taze challenge imzası aynı pub ile doğrulanır.
+    // 2) Liveness: the fresh challenge signature is verified with the same key.
     let challenge = format!("sezgi-relogin:{}:{}", body.user_id, body.ts);
     let chal_bytes = match b64_decode(&body.signature_b64) {
         Ok(b) if b.len() == 64 => b,
@@ -120,10 +125,11 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         return json_err(401, "bad_challenge");
     }
 
-    // M2-S3.5 B4: ÇIKARILAN cihaz relogin ile geri DÖNEMESİN. body.device_id revoke
-    // edilmişse (birincil onu listeden düşürdü → put_list revoked_at=now) 401 → token
-    // verilmez (zaman-of-check; SPK-verify geçse bile). device_id'siz/bilinmeyen → eski
-    // davranış (N=1 birincil legacy token = device_id NULL → bu kontrolden muaf).
+    // M2-S3.5 B4: a REMOVED device must not come back through relogin. If
+    // body.device_id has been revoked (the primary dropped it from the list, so put_list
+    // set revoked_at=now) we answer 401 and issue no token — even though the SPK
+    // verification above passed. A missing or unknown device_id keeps the old behaviour:
+    // an N=1 primary with a legacy device_id-less token is exempt from this check.
     if let Some(dev) = body.device_id.as_deref() {
         #[derive(Deserialize)]
         struct RevRow {
@@ -139,9 +145,9 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         }
     }
 
-    // M2-S1: opsiyonel Ed25519 imza pub backfill. `verifying` zaten bu pub'ın
-    // kullanıcının kimliği olduğunu KRİPTOGRAFİK doğruladı → güvenle yazılır.
-    // Yalnız boşsa doldur (mevcut değeri ezme; idempotent).
+    // M2-S1: optional Ed25519 signing-key backfill. `verifying` has already proven
+    // CRYPTOGRAPHICALLY that this key is the user's identity, so it is safe to store.
+    // Only fill it when empty — never overwrite an existing value (idempotent).
     if let Some(ed_b64) = body.identity_ed_pub_b64.as_deref() {
         if let Ok(ed_pub) = b64_decode(ed_b64) {
             db.prepare(
@@ -154,7 +160,8 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         }
     }
 
-    // Geçti → mevcut user_id'ye taze token (YENİ kimlik YOK → pairing korunur).
+    // Proof accepted → fresh tokens for the EXISTING user_id. No new identity is
+    // minted, so pairing survives.
     let device_id = body.device_id.as_deref();
     let access_token = sign_access_token(&ctx.env, &body.user_id, device_id)?;
     let new_refresh = b64u_encode(&random_bytes(32));

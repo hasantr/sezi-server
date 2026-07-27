@@ -1,24 +1,27 @@
-//! Medya blob deposu — tek choke-point + BACKEND SOYUTLAMASI.
+//! Media blob storage — single choke-point + BACKEND ABSTRACTION.
 //!
-//! Takılabilir-Depolama epic Faz 1-2 (2026-07-08): `storage.rs` tek-dosya enum'u
-//! (`MediaStore`) → iki-katmanlı modül klasörü:
-//!   - `BlobStore` (backend tutamacı, ANAHTAR-tabanlı put/get/delete + probe) — `r2.rs`/`s3.rs`.
-//!   - `StorageRouter` (yerleştirme/çözümleme; handler'lar YALNIZ bununla konuşur) — `router.rs`.
-//!   - `s3.rs` = Faz 2 S3-uyumlu adaptör (SigV4 imzalı workerd fetch; B2/MinIO/ikinci-R2).
+//! Pluggable-Storage epic Faz 1-2 (2026-07-08): the single-file `storage.rs` enum
+//! (`MediaStore`) became a two-layer module directory:
+//!   - `BlobStore` (backend handle: KEY-based put/get/delete + probe) — `r2.rs`/`s3.rs`.
+//!   - `StorageRouter` (placement/resolution; the ONLY thing handlers talk to) — `router.rs`.
+//!   - `s3.rs` = the Faz 2 S3-compatible adapter (SigV4-signed workerd fetch;
+//!     B2/MinIO/second R2).
 //!
-//! TÜM blob get/put/delete BURADAN geçer; hiçbir handler doğrudan `env.bucket("MEDIA")`
-//! çağırmaz. Tek-depo (`r2-primary`, hiç S3 kaydı yokken) davranışı BUGÜNKÜYLE BİREBİR:
-//! router D1 `storage_backends`'i 60sn izolat-cache'le yükler; yalnız r2-primary satırı
-//! varsa okuma/yazma R2'ye çözülür. Faz 2 = D1-config + çoklu-depo çözümleme + S3 adaptörü;
-//! Faz 3 = yerleştirme politikası (priority/overflow/max_bytes/fallback) + health;
-//! Faz 4 = drain/taşıma motoru (`drain.rs`: draining depo → kalan depolara, otomatik disabled).
+//! EVERY blob get/put/delete goes through here; no handler calls `env.bucket("MEDIA")`
+//! directly. Single-backend behaviour (`r2-primary`, no S3 rows) is IDENTICAL to before: the
+//! router loads D1 `storage_backends` behind a 60s per-isolate cache, and with only the
+//! r2-primary row present reads/writes resolve to R2. Faz 2 = D1 config + multi-backend
+//! resolution + the S3 adapter; Faz 3 = placement policy
+//! (priority/overflow/max_bytes/fallback) + health; Faz 4 = the drain/move engine
+//! (`drain.rs`: draining backend → the remaining ones, then auto-disabled).
 //!
-//! Neden enum, `trait`+`dyn` değil: workers-rs WASM'ı `!Send` → `async_trait(?Send)` /
-//! boxed-dyn sürtünmesi. Sabit-küçük backend kümesi için enum-dispatch daha hafif.
+//! Why an enum instead of `trait`+`dyn`: the workers-rs WASM world is `!Send`, which drags in
+//! `async_trait(?Send)` / boxed-dyn friction. For a small fixed set of backends enum dispatch
+//! is lighter.
 //!
-//! ANAHTAR-ŞEMASI ARTIK backend'in değil bu modülün malı (`media_key`/`code_key`/
-//! `plugin_media_key`): her backend AYNI anahtarı kullanır → depolar arası taşıma =
-//! kopyala, anahtar değişmez (Faz 4 drain ön-koşulu).
+//! THE KEY SCHEME now belongs to this module, not to the backends (`media_key`/`code_key`/
+//! `plugin_media_key`): every backend uses the SAME key, so moving a blob between backends is
+//! a plain copy with an unchanged key (the precondition for the Faz 4 drain).
 
 pub mod drain;
 mod health;
@@ -32,34 +35,35 @@ pub use r2::R2Store;
 pub use router::{invalidate_storage_cache, placement_err_response, StorageRouter};
 pub use s3::{validate_config as validate_s3_config, S3Config, S3Store};
 
-/// Faz 1 tek-depo kimliği — migration 0028 default'u ('r2-primary'). Meta satırları
-/// (media_objects/plugin_media_objects/plugin_code_objects) bu store_id'yi taşır;
-/// tek-depo modunda TÜM okuma/yazma buraya çözülür. Faz 2+ çoklu-depo: 's3-<8hex>'.
+/// The Faz 1 single-backend id — migration 0028's default ('r2-primary'). Meta rows
+/// (media_objects/plugin_media_objects/plugin_code_objects) carry this store_id, and in
+/// single-backend mode ALL reads/writes resolve here. Faz 2+ multi-backend ids: 's3-<8hex>'.
 pub const PRIMARY_STORE_ID: &str = "r2-primary";
 
-/// Depodan çekilen blob: ham bytes + content-type.
+/// A blob fetched from a backend: raw bytes + content-type.
 pub struct BlobObject {
     pub bytes: Vec<u8>,
     pub content_type: String,
 }
 
-/// Yerleştirme sınıfı — v1'de politika sınıf-agnostik (hepsi aynı priority-sırasına
-/// düşer); API'de taşınır ki Faz 2+ sınıf-pinleme (örn. plugin-code hep r2'de) ekleyebilsin.
+/// Placement class — the v1 policy is class-agnostic (every class follows the same priority
+/// order); it is threaded through the API so Faz 2+ can add class pinning (e.g. keep
+/// plugin-code on r2).
 pub enum StorageClass {
     Media,
     PluginMedia,
     PluginCode,
 }
 
-/// Tek backend tutamacı. ANAHTAR-tabanlı (anahtar-şeması bu modülde: `media_key` vb.).
-/// Faz 2: `S3(S3Store)` varyantı bağlandı (`s3.rs` + `sigv4.rs`).
+/// A single backend handle. KEY-based (the key scheme lives in this module: `media_key` etc.).
+/// Faz 2 wired up the `S3(S3Store)` variant (`s3.rs` + `sigv4.rs`).
 pub enum BlobStore {
     R2(R2Store),
     S3(S3Store),
 }
 
 impl BlobStore {
-    /// Blob'u yaz (content-type backend metadata'sına işlenir). İdempotent-overwrite.
+    /// Write a blob (content-type goes into the backend's metadata). Idempotent overwrite.
     pub async fn put(&self, key: &str, bytes: Vec<u8>, content_type: &str) -> worker::Result<()> {
         match self {
             BlobStore::R2(s) => s.put(key, bytes, content_type).await,
@@ -67,7 +71,7 @@ impl BlobStore {
         }
     }
 
-    /// Blob'u oku; yoksa `None`.
+    /// Read a blob; `None` when it does not exist.
     pub async fn get(&self, key: &str) -> worker::Result<Option<BlobObject>> {
         match self {
             BlobStore::R2(s) => s.get(key).await,
@@ -75,8 +79,9 @@ impl BlobStore {
         }
     }
 
-    /// Blob'u sil. İDEMPOTENT ŞART (olmayan anahtar → Ok); gerçek depo hatası propagate
-    /// (D1 meta silinmesin → öksüz-blob önlenir — mevcut R2 disiplini).
+    /// Delete a blob. MUST be IDEMPOTENT (missing key → Ok); a genuine backend error is
+    /// propagated so the caller keeps the D1 meta row, which is what prevents orphaned blobs
+    /// (the established R2 discipline).
     pub async fn delete(&self, key: &str) -> worker::Result<()> {
         match self {
             BlobStore::R2(s) => s.delete(key).await,
@@ -84,17 +89,18 @@ impl BlobStore {
         }
     }
 
-    /// Canlı-doğrulama (plan e): `probe/<uuid>` anahtarına PUT→GET→(bit-doğrula)→DELETE.
-    /// Backend-agnostik (aynı put/get/delete choke-point'i) → R2 binding'i de S3
-    /// kimlik-bilgisi de aynı round-trip'le sınanır. Cleanup DELETE best-effort
-    /// (probe verdi/vermedi fark etmez; artık iz bırakmasın). Bit-uyuşmazlık → Err.
+    /// Live verification (plan e): PUT→GET→(byte compare)→DELETE on a `probe/<uuid>` key.
+    /// Backend-agnostic (it goes through the same put/get/delete choke-point), so an R2 binding
+    /// and a set of S3 credentials are exercised by the same round-trip. The cleanup DELETE is
+    /// best-effort (whatever the probe concluded, it should not leave a trace). A byte mismatch
+    /// → Err.
     pub async fn probe(&self) -> worker::Result<()> {
         let key = format!("probe/{}", uuid::Uuid::new_v4());
         let payload = b"sezi-probe".to_vec();
         self.put(&key, payload.clone(), "application/octet-stream")
             .await?;
         let got = self.get(&key).await;
-        let _ = self.delete(&key).await; // best-effort temizlik
+        let _ = self.delete(&key).await; // best-effort cleanup
         match got? {
             Some(o) if o.bytes == payload => Ok(()),
             Some(_) => Err(worker::Error::RustError("probe: bit-uyuşmazlık".into())),
@@ -103,31 +109,43 @@ impl BlobStore {
     }
 }
 
-// ── Anahtar-şeması (backend-agnostik; her depo AYNI anahtarı kullanır) ────────
+// ── Key scheme (backend-agnostic; every backend uses the SAME key) ────────────
 
-/// Efemer kullanıcı-medyası anahtarı (ack+TTL'li). `media_objects` meta.
+/// Key for ephemeral user media (ack + TTL). Meta lives in `media_objects`.
 pub fn media_key(blob_id: &str) -> String {
     format!("media/{blob_id}")
 }
 
-/// Eklenti KODU blob anahtarı — KALICI + room-scope'lu (IDOR: `/plugin-blob/:room/:id`
-/// path'i üyelik-doğrulı; başka odanın blob_id'sini bilse bile prefix açık değil).
+/// Key for plugin CODE blobs — PERSISTENT and room-scoped (anti-IDOR: the
+/// `/plugin-blob/:room/:id` path is membership-checked, so even knowing another room's blob_id
+/// gets you nowhere without its prefix).
 pub fn code_key(room_id: &str, blob_id: &str) -> String {
     format!("plugin-code/{room_id}/{blob_id}")
 }
 
-/// Üye-yüklenebilir eklenti-MEDYA anahtarı — KALICI + room-scope'lu (koddan AYRI namespace).
+/// Key for member-uploadable plugin MEDIA — PERSISTENT and room-scoped (a namespace separate
+/// from code).
 pub fn plugin_media_key(room_id: &str, blob_id: &str) -> String {
     format!("plugin-media/{room_id}/{blob_id}")
 }
 
-/// Tek deponun canlı `BlobStore` tutamacını kur — `kind`+`config_json`'dan. Router
-/// (build_stores), günlük health-probe (health::probe_all) ve elle-probe endpoint'i
-/// (admin/storage.rs) ORTAK kullanır → depo-kurma davranışı üç yolda ayrışamaz.
-///   - `r2_binding` → MEDIA binding (yok = Lite → `Err("binding_missing")` → depo atlanır).
-///   - `s3` → `config_json` parse (bozuk → `Err(kısa-neden)`; o depoya blob → get 503, plan f#9).
+/// Key for profile/group avatar blobs — PERSISTENT (no TTL) and user-scoped. `avatar_objects`
+/// is single-slot meta (one object_id per user_id); on a new upload the old object is pushed
+/// into `storage_orphans` under this key and the daily `retry_orphans` removes it from the
+/// backend.
+pub fn avatar_key(user_id: &str, object_id: &str) -> String {
+    format!("avatar/{user_id}/{object_id}")
+}
+
+/// Build one backend's live `BlobStore` from `kind` + `config_json`. Shared by the router
+/// (build_stores), the daily health probe (health::probe_all) and the manual probe endpoint
+/// (admin/storage.rs) → backend construction cannot diverge between the three paths.
+///   - `r2_binding` → the MEDIA binding (absent = Lite → `Err("binding_missing")` → the backend
+///     is skipped).
+///   - `s3` → parse `config_json` (malformed → `Err(short reason)`; a blob on that backend then
+///     gets a 503, plan f#9).
 ///
-/// Hata METNİ kısa + secret'sız (health `last_health_err`'e yazılabilir).
+/// The error TEXT is short and secret-free, so it can be stored in health `last_health_err`.
 pub(crate) fn build_store(
     env: &worker::Env,
     kind: &str,
@@ -149,12 +167,14 @@ pub(crate) fn build_store(
 mod tests {
     use super::*;
 
-    /// Anahtar-şeması mevcut R2Store::key/code_key/plugin_media_key ile BİT-AYNI olmalı
-    /// (davranış-değişmezlik: taşınan blob'lar aynı anahtardan okunur/yazılır).
+    /// The key scheme must stay BIT-IDENTICAL to the pre-existing
+    /// R2Store::key/code_key/plugin_media_key (behaviour invariance: a moved blob is read and
+    /// written under the same key).
     #[test]
     fn anahtar_semasi_mevcut_ile_bit_ayni() {
         assert_eq!(media_key("abc"), "media/abc");
         assert_eq!(code_key("room1", "blob1"), "plugin-code/room1/blob1");
         assert_eq!(plugin_media_key("room1", "blob1"), "plugin-media/room1/blob1");
+        assert_eq!(avatar_key("user1", "obj1"), "avatar/user1/obj1");
     }
 }

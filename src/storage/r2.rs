@@ -1,12 +1,14 @@
-//! Cloudflare R2 backend — `MediaStore::R2Store`'un (2026-07-06) ANAHTAR-tabanlı hâli.
+//! Cloudflare R2 backend — the KEY-based form of `MediaStore::R2Store` (2026-07-06).
 //!
-//! Faz 1 saf-taşıma: eski `R2Store` kanal-başına (media/code/plugin-media) ayrı metot +
-//! iç-anahtar hesaplıyordu; artık anahtar-şeması `storage::{media_key,code_key,
-//! plugin_media_key}`de → burada TEK put/get/delete, çağıran hazır anahtarı geçer.
-//! Davranış birebir korunur (aynı R2 çağrıları, aynı content-type disiplini).
+//! Faz 1 was a pure move: the old `R2Store` had a method per channel (media/code/plugin-media)
+//! and computed keys internally; the key scheme now lives in
+//! `storage::{media_key,code_key,plugin_media_key}`, so this file exposes ONE put/get/delete and
+//! the caller passes a ready-made key. Behaviour is unchanged (same R2 calls, same content-type
+//! discipline).
 //!
-//! **CF-kilit yalnız burada** — taşınabilir-sunucu geçişinde (VPS/Pi) yeni backend
-//! struct'ı yazılır (`s3.rs` gibi), `BlobStore` enum'una varyant eklenir; handler değişmez.
+//! **The CF lock-in is confined to this file** — moving to a portable server (VPS/Pi) means
+//! writing a new backend struct (like `s3.rs`) and adding a `BlobStore` variant; no handler
+//! changes.
 
 use worker::*;
 
@@ -17,14 +19,15 @@ pub struct R2Store {
 }
 
 impl R2Store {
-    /// MEDIA binding'inden kur. Binding-lookup UCUZ (ağa çıkmaz); router `from_env`
-    /// binding yoksa bu depoyu HİÇ eklemez (any_available=false → 503 media_not_configured).
+    /// Build from the MEDIA binding. The binding lookup is CHEAP (it never hits the network); if
+    /// the binding is absent, router `from_env` does not add this backend at all
+    /// (any_available=false → 503 media_not_configured).
     pub fn new(bucket: Bucket) -> Self {
         R2Store { bucket }
     }
 
-    /// Blob'u yaz — content-type R2 http_metadata'sına işlenir. İdempotent-overwrite
-    /// (aynı anahtara tekrar PUT üstüne yazar).
+    /// Write a blob — content-type goes into R2's http_metadata. Idempotent overwrite (a second
+    /// PUT on the same key replaces it).
     pub async fn put(&self, key: &str, bytes: Vec<u8>, content_type: &str) -> Result<()> {
         self.bucket
             .put(key, bytes)
@@ -37,7 +40,7 @@ impl R2Store {
         Ok(())
     }
 
-    /// Blob'u oku; yoksa `None`. content-type R2 metadata'sından (yoksa octet-stream).
+    /// Read a blob; `None` when absent. content-type comes from R2 metadata (else octet-stream).
     pub async fn get(&self, key: &str) -> Result<Option<BlobObject>> {
         let Some(obj) = self.bucket.get(key).execute().await? else {
             return Ok(None);
@@ -53,9 +56,10 @@ impl R2Store {
         Ok(Some(BlobObject { bytes, content_type }))
     }
 
-    /// Blob'u sil. R2 delete idempotent (yok ise hata VERMEZ) → ack/cleanup tekrarında
-    /// güvenli. GERÇEK R2 hatası (outage) propagate edilir ki çağıran D1 metasını
-    /// silmesin → öksüz-blob (D1-kayıtsız R2 objesi, cleanup hiç görmez) önlenir.
+    /// Delete a blob. R2's delete is idempotent (a missing key is NOT an error), which makes ack
+    /// and cleanup retries safe. A GENUINE R2 error (outage) is propagated so the caller keeps its
+    /// D1 meta row — otherwise we would create an orphan: an R2 object with no D1 record, which
+    /// cleanup can never see.
     pub async fn delete(&self, key: &str) -> Result<()> {
         self.bucket.delete(key).await?;
         Ok(())

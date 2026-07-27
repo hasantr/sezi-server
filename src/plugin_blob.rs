@@ -1,16 +1,19 @@
-//! Eklenti KODU blob deposu (Faz-4 server-code) — KALICI + grup-kapılı R2 blob.
+//! Plugin CODE blob storage (Faz-4 server-code) — a PERSISTENT, group-gated R2 blob.
 //!
-//! Eklenti kodu (html/bundle) artık wire'da inline taşınmaz (64KB envelope acısı +
-//! devasa-web imkânsızdı); server'da kalıcı R2 blob'da ŞİFRELİ durur, cihazlar indirir.
-//! Medya hattından (`media/handlers.rs`) AYRI çünkü semantik TERS:
-//!   - ack-delete YOK + TTL YOK: kod yıllarca yaşar, her yeni cihaz/üye tekrar indirir.
-//!   - IDOR kapatma: R2 anahtarı **room-scope'lu** (`plugin-code/{room}/{id}`) + her erişim
-//!     aktif-üyelik + device-revoked kapısından geçer → medya M11 IDOR'u KOPYALANMAZ
-//!     (medyada recipient/room ilişkisi serverda yok; burada path room'u var, üyelik kapılı).
+//! Plugin code (html/bundle) is no longer carried inline on the wire (the 64KB envelope pain made
+//! a large web app impossible); it sits ENCRYPTED in a persistent R2 blob on the server and devices
+//! download it. Kept SEPARATE from the media path (`media/handlers.rs`) because the semantics are
+//! the opposite:
+//!   - No ack-delete and no TTL: code lives for years and every new device/member downloads it again.
+//!   - IDOR closed: the R2 key is **room-scoped** (`plugin-code/{room}/{id}`) and every access
+//!     passes the active-membership + device-revoked gate → the media M11 IDOR is NOT reproduced
+//!     here (media has no recipient/room relation on the server; here the room is in the path and
+//!     membership-gated).
 //!
-//! Server KÖR: blob opak ciphertext (XChaCha20-Poly1305 STREAM, anahtar yalnız grup E2E
-//! kanalında — `PluginCodeRefV1.key_b64` Olm/epoch-key korumalı wire'da). Server kodu
-//! OKUYAMAZ; bütünlük client'ta `blob_hash` (BLAKE3) + AEAD-tag ile çift-doğrulanır.
+//! The server is BLIND: the blob is opaque ciphertext (XChaCha20-Poly1305 STREAM, with the key only
+//! ever on the group E2E channel — `PluginCodeRefV1.key_b64` inside the Olm/epoch-key protected
+//! wire). The server CANNOT read the code; integrity is double-checked on the client via
+//! `blob_hash` (BLAKE3) and the AEAD tag.
 
 use crate::auth::jwt::device_id_from_token;
 use crate::auth::middleware::{device_revoked, extract_bearer, require_auth};
@@ -20,22 +23,23 @@ use crate::respond::json_err;
 use crate::utils::now_secs;
 use worker::*;
 
-/// Eklenti kodu blob tavanı — devasa-web bundle'a yeter (medya 50MB'ın altı), DoS-sınırı.
-/// Core assign plaintext tavanı 8 MiB; XChaCha20-STREAM ciphertext'i chunk-başına ~16B tag
-/// overhead ekler (8 MiB için ~2KB) → 8 MiB plaintext sınırdaki geçerli kod yüklenebilsin diye
-/// 64 KiB pay (Codex#10: aksi sınırdaki kod worker'da 413 yerdi).
+/// Ceiling for a plugin-code blob — enough for a large web bundle, below the 50MB media limit, and a
+/// DoS bound. Core's assign path caps the plaintext at 8 MiB, while XChaCha20-STREAM ciphertext adds
+/// ~16B of tag overhead per chunk (~2KB for 8 MiB), so 64 KiB of headroom is added to make sure valid
+/// code sitting exactly at the 8 MiB plaintext limit can still be uploaded (Codex#10: without it,
+/// borderline code got a 413 from the worker).
 const MAX_CODE_SIZE: u64 = 8 * 1024 * 1024 + 64 * 1024;
 
-/// JWT + cihaz-revoked + path param'ları + aktif-üyelik kapısı (ortak ön-koşul).
-/// Ok → (user, room, id, role) — `role` PUT'ta admin-kontrolü için.
+/// The shared precondition gate: JWT + device-revoked + path params + active membership.
+/// Ok → (user, room, id, role) — `role` feeds the admin check in PUT.
 ///
-/// `pub(crate)`: `plugin_media` (üye-PUT'lu kardeş kanal) AYNI kapıyı yeniden
-/// kullanır (device-revoked + aktif-üyelik) — admin-kontrolü orada YOK (role atlanır),
-/// böylece tek-yerde-tanımlı IDOR/revoke kapısı iki kanalda ayrışamaz.
+/// `pub(crate)` because `plugin_media` (the member-PUT sibling channel) reuses the SAME gate
+/// (device-revoked + active membership); it has no admin check and simply ignores `role`. Defining
+/// the IDOR/revoke gate once keeps the two channels from diverging.
 pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::Result<(String, String, String, String), Response> {
     let user_id = require_auth(req, &ctx.env)?;
-    // Device-binding + revoked (B6 deseni): çıkarılmış/iptal cihaz token-TTL'i içinde
-    // kod çekememeli/yükleyememeli.
+    // Device binding + revoked (the B6 pattern): a removed or revoked device must not be able to
+    // fetch or upload code for the remaining lifetime of its token.
     let token_device =
         extract_bearer(req).and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
     let device_id = match token_device {
@@ -55,7 +59,7 @@ pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::
         Some(p) => p.clone(),
         None => return Err(json_err(400, "bad_request").unwrap_or_else(|_| Response::empty().unwrap())),
     };
-    // Aktif-üyelik kapısı (IDOR — üye-olmayan kodu çekemez/yükleyemez).
+    // Active-membership gate (anti-IDOR: a non-member can neither fetch nor upload code).
     let db = match ctx.env.d1("DB") {
         Ok(d) => d,
         Err(_) => return Err(json_err(500, "db_unavailable").unwrap_or_else(|_| Response::empty().unwrap())),
@@ -68,31 +72,35 @@ pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::
     Ok((user_id, room_id, blob_id, role))
 }
 
-/// `POST /plugin-blob/:room/:id` — eklenti kodu (şifreli) yükle. KALICI. Yalnız aktif üye.
+/// `POST /plugin-blob/:room/:id` — upload (encrypted) plugin code. PERSISTENT. Admins/owners only
+/// (see the `is_group_admin` gate below); plain members can only GET.
 pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let (user_id, room_id, blob_id, role) = match gate(&req, &ctx).await {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    // Yalnız admin/owner kod YÜKLER (eklenti atamak admin işidir). Üye yükleyebilseydi
-    // kötü-üye legit kodu garbage ile EZER → DoS (client hash-verify code-injection'ı keser
-    // ama yükleme-yetkisini sınırlamak DoS-overwrite'ı kapatır). Üye yalnız İNDİRİR (GET).
+    // Only an admin/owner may UPLOAD code (assigning a plugin is an admin action). If any member
+    // could upload, a malicious one would OVERWRITE legit code with garbage → DoS. The client's
+    // hash verification already stops code injection, but restricting upload rights is what closes
+    // the overwrite DoS. Members only DOWNLOAD (GET).
     if !is_group_admin(&role) {
         return json_err(403, "not_admin");
     }
-    // Lite kurulum (R2 OPSİYONEL): eklenti-kod deposu = R2 → binding yoksa server-saklı
-    // kod yüklenemez; medya hattıyla AYNI temiz 503 (client nonretryable sayar). Yetki
-    // kontrolünden SONRA (önce 403, sonra servis-durumu) ama rate-limit/body'den ÖNCE.
+    // Lite install (R2 is OPTIONAL): plugin code is stored in R2, so without the binding there is
+    // nowhere to put server-hosted code → the SAME clean 503 as the media path (the client treats it
+    // as nonretryable). AFTER the authorization check (403 before service state) but BEFORE the rate
+    // limit and the body read.
     let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
     }
-    // Per-user upload rate-limit (medya-upload deseni; R2 depolama/egress DoS guard).
-    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    // Per-user upload rate limit (the media-upload pattern; guards R2 storage/egress against DoS).
+    // The KV binding is OPTIONAL (template diet): without it we continue unlimited — see
+    // ratelimit::check_rate_limit_env.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("pcode:put:{user_id}"), 60, 5 * 60).await {
         return json_err(429, "rate_limited");
     }
-    // Boyut tavanı (content-length ön-kontrol → büyük gövdeyi okumadan reddet).
+    // Size ceiling (content-length pre-check → reject a huge body before reading it).
     let size: u64 = req
         .headers()
         .get("content-length")
@@ -107,8 +115,9 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     if bytes.is_empty() || bytes.len() as u64 > MAX_CODE_SIZE {
         return json_err(413, "bad_size");
     }
-    // FAZ 3: priority-overflow + per-depo max_bytes + PUT-fallback. Kalıcı sınıf → dolu
-    // = 429 quota_exceeded/server_storage (asla otomatik-silme); tüm denemeler fail = 503.
+    // FAZ 3: priority overflow + per-backend max_bytes + PUT fallback. This is a persistent class, so
+    // a full backend gives 429 quota_exceeded/server_storage (never an automatic delete) and
+    // "every attempt failed" gives 503.
     let store_id = match router
         .put_new(
             crate::storage::StorageClass::PluginCode,
@@ -121,12 +130,13 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         Ok(sid) => sid,
         Err(e) => return crate::storage::placement_err_response(e),
     };
-    // Envanter (plugin_code_objects, migration 0028) — İLK kez eklenti-kodu meta'sı
-    // (bugüne dek "nerede" bilinemezdi). BEST-EFFORT: put zaten başarılı; meta-DB hatası
-    // upload'ı KIRMAZ (put_code'un meta'sı YOKtu → meta-fail upload'ı hiç etkilemezdi =
-    // davranış-değişmez). Eksik satırı günlük bakım backfill'i (R2 list → INSERT OR IGNORE)
-    // yakalar. Kota sayaçlarına DAHİL DEĞİL (plan c.3: user_storage/server_stats bit-aynı).
-    // ON CONFLICT DO UPDATE: kod overwrite'ında (yeni sürüm) size/store_id tazelenir.
+    // Inventory (plugin_code_objects, migration 0028) — the FIRST meta record for plugin code; until
+    // now "where does this blob live" was unknowable. BEST-EFFORT: the put already succeeded, so a
+    // meta-DB failure does NOT break the upload (put_code had no meta at all before, so a meta
+    // failure never affected it = behaviour unchanged). A missing row is picked up by the daily
+    // maintenance backfill (R2 list → INSERT OR IGNORE). NOT included in the quota counters (plan
+    // c.3: user_storage/server_stats stay bit-identical). ON CONFLICT DO UPDATE refreshes
+    // size/store_id when the code is overwritten with a new version.
     if let Ok(db) = ctx.env.d1("DB") {
         if let Ok(stmt) = db
             .prepare(
@@ -150,27 +160,29 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     Response::from_json(&serde_json::json!({ "ok": true, "blob_id": blob_id }))
 }
 
-/// `GET /plugin-blob/:room/:id` — eklenti kodu (şifreli) indir. Yalnız aktif üye.
+/// `GET /plugin-blob/:room/:id` — download (encrypted) plugin code. Active members only.
 pub async fn get_code(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // İndirme: HER aktif üye (admin-şart değil — üye eklentiyi kullanır).
+    // Download is open to EVERY active member (no admin requirement — members are the ones who run
+    // the plugin).
     let (_user_id, room_id, blob_id, _role) = match gate(&req, &ctx).await {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    // Lite kurulum (R2 OPSİYONEL): binding yoksa kod indirilemez → put_code ile simetrik 503.
+    // Lite install (R2 is OPTIONAL): without the binding there is no code to download → the same 503
+    // as put_code.
     let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
     }
-    // Faz 2 çoklu-depo: blob'un depo'sunu meta'dan çöz. plugin_code_objects Faz 1'de
-    // YENİ (0028) → ESKİ kod-blob'ları günlük backfill'e kadar meta'SIZ olabilir: meta
-    // yok → 'r2-primary' FALLBACK (eski blob hep R2'de; backfill sonrası meta-driven olur).
-    // Yeni put_code'lar meta'yı inline yazar → anında meta-driven.
+    // Faz 2 multi-backend: resolve the blob's backend from the meta row. plugin_code_objects is NEW
+    // as of Faz 1 (0028), so OLD code blobs may have no meta row until the daily backfill runs: no
+    // meta → FALL BACK to 'r2-primary' (a legacy blob is always on R2, and after the backfill it
+    // becomes meta-driven). New put_code calls write the meta inline, so they are meta-driven at once.
     let store_id = code_store_id(&ctx, &room_id, &blob_id)
         .await
         .unwrap_or_else(|| crate::storage::PRIMARY_STORE_ID.to_string());
-    // FAZ 3 (plan f#2): depo erişilemez → 503 storage_backend_unavailable (retryable) +
-    // router içinde fırsatçı health-işaret; yok → 404.
+    // FAZ 3 (plan f#2): backend unreachable → 503 storage_backend_unavailable (retryable) plus the
+    // router's opportunistic health mark; blob absent → 404.
     match router
         .get(&store_id, &crate::storage::code_key(&room_id, &blob_id))
         .await
@@ -186,9 +198,9 @@ pub async fn get_code(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     }
 }
 
-/// Kod-blob'un depo'su (plugin_code_objects.store_id) — Faz 2 çoklu-depo GET çözümlemesi.
-/// Meta yok / D1-hata → None (çağıran 'r2-primary'ye fallback: eski un-backfill blob hep
-/// R2'de). Best-effort: hata GET'i kırmaz, yalnız fallback-depoya düşer.
+/// The code blob's backend (plugin_code_objects.store_id) — Faz 2 multi-backend GET resolution.
+/// No meta row / a D1 error → None, and the caller falls back to 'r2-primary' (a legacy, not-yet
+/// backfilled blob is always on R2). Best-effort: an error never breaks the GET, it just falls back.
 async fn code_store_id(ctx: &RouteContext<()>, room_id: &str, blob_id: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct StoreRow {

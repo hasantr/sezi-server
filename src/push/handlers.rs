@@ -18,10 +18,11 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         Ok(uid) => uid,
         Err(resp) => return Ok(resp),
     };
-    // SAĞLAMLAŞTIRMA (2026-06-25, Codex HIGH + denetim #10): token'daki `device_id`
-    // claim'i ile body.device_id EŞLEŞMELİ → kullanıcı kendi kimliğiyle BAŞKA cihaz
-    // adına push-token register edemez (cihaz kimliğine bürünme + yanlış-cihaz uyandırma).
-    // Claim YOK (legacy device-less token) → eski davranış (geriye-uyum).
+    // SAĞLAMLAŞTIRMA (2026-06-25, Codex HIGH + audit #10): the `device_id` claim in the token
+    // MUST match body.device_id, so a user cannot register a push token on behalf of ANOTHER
+    // device using their own identity (device impersonation plus waking the wrong device).
+    // With no claim at all (a legacy device-less token) we keep the old behaviour for
+    // backwards compatibility.
     let claim_dev = extract_bearer(&req)
         .and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
     let body: RegisterBody = match req.json().await {
@@ -41,11 +42,13 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
             return json_err(403, "device_mismatch");
         }
     }
-    // Çıkarılmış (revoked) cihaz push-token register edemez. FAIL-CLOSED (W7, 2026-07-02
-    // Codex-flag): eskiden `.unwrap_or(false)` = D1 hatasında "revoked değil" varsayıp
-    // register'a İZİN veriyordu (fail-OPEN) → send-yolu (`handlers.rs:167` `?`) + WS-upgrade
-    // (`lib.rs:262` Err→503) fail-closed'ıyla ÇELİŞİYORDU: iptal-edilmiş cihaz D1-hata
-    // penceresinde push-token kaydedip wake alabilirdi. Aynı fail-closed pariteye getir.
+    // A revoked device may not register a push token. FAIL-CLOSED (W7, flagged by Codex
+    // 2026-07-02): this used to be `.unwrap_or(false)`, i.e. a D1 error was read as "not
+    // revoked" and the register was ALLOWED (fail-OPEN). That contradicted the fail-closed
+    // stance of the send path (`messages::handlers::notify_recipient`'s `?`) and the WS upgrade
+    // (`lib.rs`'s `sync_ws` route,
+    // Err→503): during a D1 error window a revoked device could register a push token and
+    // keep receiving wakes. Now it is at fail-closed parity with both.
     match device_revoked(&ctx.env, &user_id, &body.device_id).await {
         Ok(true) => return json_err(403, "device_revoked"),
         Ok(false) => {}

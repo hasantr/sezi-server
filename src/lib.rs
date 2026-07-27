@@ -1,10 +1,13 @@
-use crate::auth::jwt::{public_jwk, verify_access_token};
+use crate::auth::jwt::public_jwk;
 use crate::respond::json_err;
 use worker::*;
 
 mod admin;
 mod auth;
 mod cf_analytics;
+mod contact_grant;
+mod contact_qr;
+mod contacts;
 mod d1util;
 mod devices;
 mod email;
@@ -12,6 +15,7 @@ mod groups;
 mod keys;
 mod maintenance;
 mod media;
+mod membership;
 mod messages;
 mod plugin_blob;
 mod plugin_log;
@@ -19,6 +23,7 @@ mod plugin_media;
 mod push;
 mod quota;
 mod ratelimit;
+mod realtime;
 mod respond;
 mod self_provision;
 mod server;
@@ -37,62 +42,70 @@ fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Günlük cleanup cron — wrangler.toml [triggers] crons. Günlük gövde
-/// `maintenance::run_daily` (cron + lazy-yol ORTAK fonksiyon; gövde oraya
-/// saf-taşındı). Cron her koşuşta damgasını tazeler → cron'lu kurulumda
-/// lazy-yol uyur (maintenance.rs modül başlığı; cron'suz şablon-kurulumda
-/// bakım tamamen lazy-yoldan yürür).
+/// Daily cleanup cron — driven by `[triggers] crons` in wrangler.toml. The daily
+/// body lives in `maintenance::run_daily`, the function SHARED by the cron and the
+/// lazy path (it was moved there verbatim). Every cron run refreshes its own
+/// timestamp, so on a cron-enabled deployment the lazy path stays asleep (see the
+/// maintenance.rs module header); on a cron-less template deployment all
+/// maintenance runs off the lazy path instead.
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    // Self-host Faz A boot-guard: cron, izolate'i fetch'ten ÖNCE cold-start
-    // edebilir (taze fork'ta drain 0021 fanout_retry tablosuna dokunur) →
-    // migration + anahtar provisioning burada da garanti. Memoized → sıcak
-    // izolate'te no-op; env-secret'lı + wrangler-migrated prod'da tamamen no-op.
+    // Self-host phase-A boot guard: the cron can cold-start an isolate BEFORE any
+    // fetch does (on a fresh fork the drain touches the 0021 fanout_retry table), so
+    // migrations and key provisioning must be guaranteed here as well. Memoized →
+    // no-op on a warm isolate, and a complete no-op on env-secret + wrangler-migrated
+    // prod.
     self_provision::ensure_ready(&env).await;
-    // W4-b: HER scheduled invocation'da durable-retry drain (Fable#4: cron-string match KIRILGAN
-    // → drain'i KOŞULSUZ çalıştır; "*/2 * * * *" sık-drain + "0 4 * * *" günlük ikisinde de koşar).
+    // W4-b: drain the durable retry queue on EVERY scheduled invocation (Fable #4:
+    // matching on the cron string is BRITTLE → run the drain UNCONDITIONALLY, so both
+    // the frequent "*/2 * * * *" trigger and the daily "0 4 * * *" one drain).
     crate::messages::handlers::drain_fanout_retry(&env).await;
-    // Lazy-maintenance damgası: cron çalışan kurulumda drain-damgası hep taze →
-    // fetch-yolu lazy-drain HİÇ uyanmaz (prod bit-aynı).
+    membership::drain_purge_outbox(&env).await;
+    // Lazy-maintenance stamp: with a live cron the drain stamp is always fresh, so
+    // the fetch-path lazy drain NEVER wakes up (prod stays bit-identical).
     maintenance::stamp_drain(&env).await;
-    // Takılabilir-depolama Faz 4: draining-depo taşıma tick'i (≤4 blob/koşum;
-    // draining depo yokken tek ucuz SELECT ile sessiz çıkar). Fanout-drain gibi HER
-    // invocation'da koşar; damga cron'lu kurulumda lazy storage-move'u uyutur.
+    // Pluggable storage phase 4: draining-backend move tick (≤4 blobs per run; exits
+    // quietly after one cheap SELECT when no backend is draining). Like the fanout
+    // drain it runs on EVERY invocation; the stamp keeps the lazy storage-move asleep
+    // on cron-enabled deployments.
     if let Err(e) = storage::drain::run_storage_move(&env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("storage move error: {}", truncated);
     }
     maintenance::stamp_move(&env).await;
-    // MINOR-2 (Fable+Codex): sık-cron ise erken-çık (cleanup/GC koşma). Günlük "0 4 * * *" VE
-    // beklenmedik normalize-sürprizi → cleanup'a DÜŞER (fail-toward-running: gürültülü-ama-GÜVENLİ;
-    // eski `!= "0 4"` yönü sürprizde cleanup+GC'yi SESSİZCE hiç koşturmazdı = media-GC+TTL-GC durur).
-    // cleanup idempotent → fazladan-koşum zararsız. drain ZATEN koşulsuz (yukarıda) → asla atlanmaz.
+    // MINOR-2 (Fable+Codex): bail out early on the frequent cron (no cleanup/GC). The
+    // daily "0 4 * * *" AND any unexpected normalization surprise FALL THROUGH to
+    // cleanup (fail-toward-running: noisy but SAFE; the old `!= "0 4"` direction would
+    // have SILENTLY skipped cleanup+GC on a surprise = media-GC and TTL-GC stall).
+    // cleanup is idempotent → an extra run is harmless. The drain already ran
+    // unconditionally above → it is never skipped.
     if event.cron() == "*/2 * * * *" {
         return;
     }
-    // Günlük set (cleanup + fanout-TTL-GC + kota-reconcile) — lazy-yol ile
-    // bit-aynı ortak gövde + günlük-damga (lazy günlük-GC'yi uyutur).
+    // Daily set (cleanup + fanout TTL-GC + quota reconcile) — the same body the lazy
+    // path runs, bit for bit, plus the daily stamp that puts lazy daily-GC to sleep.
     maintenance::run_daily(&env).await;
     maintenance::stamp_daily(&env).await;
 }
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    // Self-host Faz A boot-guard: D1 self-migration (A2) + anahtar
-    // self-provisioning (A1). İzolate-scope memoized → ilk istekte koşar,
-    // sonrası no-op (hot-path'e D1-roundtrip SOKULMAZ). env-secret'lı +
-    // wrangler-migrated kurulumda (bizim prod) tamamen no-op'a düşer.
-    // /sync'ten ÖNCE olmalı: sync_ws token doğrular → anahtar hazır olmalı.
+    // Self-host phase-A boot guard: D1 self-migration (A2) + key self-provisioning
+    // (A1). Memoized per isolate → runs on the first request, no-op afterwards (NO D1
+    // round-trip is added to the hot path). On an env-secret + wrangler-migrated
+    // deployment (our prod) it degenerates to a complete no-op. Must run BEFORE
+    // /sync: sync_ws validates a token, so the signing key has to be ready.
     self_provision::ensure_ready(&env).await;
 
-    // Lazy-maintenance (cron'suz kurulum): istek-sırtında bakım tetikleyicisi.
-    // İstek kritik-yoluna maliyeti thread_local zaman-karşılaştırması (D1'siz,
-    // await'siz); damga-kontrol + olası iş `ctx.wait_until` arka-planında.
+    // Lazy-maintenance (cron-less deployments): the request-piggybacked maintenance
+    // trigger. Cost on the request critical path is a thread_local time comparison
+    // (no D1, no await); the stamp check and any resulting work happen in the
+    // background via `ctx.wait_until`.
     maintenance::maybe_run_lazy(&env, &ctx);
 
-    // /sync WS upgrade direkt DO'ya geçilir (Router'dan önce ele alalım,
-    // çünkü WS upgrade için header passthrough şart).
+    // /sync WS upgrades are handed straight to the DO — handled before the Router
+    // because a WS upgrade requires header passthrough.
     let url = req.url()?;
     let path = url.path().to_string();
     if path == "/sync" {
@@ -100,8 +113,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 
     Router::new()
-        // Kök = hoş-geldin sayfası (insan-okur; taze kurulumda 404-güvensizliği
-        // yerine "sunucun hazır" + adres-kopyala yönergesi). API'ler dokunulmadı.
+        // Root = welcome page (human-readable; a fresh install shows "your server is
+        // ready" plus copy-the-address instructions instead of an alarming 404).
+        // The API surface is untouched.
         .get_async("/", welcome::welcome)
         .get("/healthz", |_, _| {
             Response::from_json(&serde_json::json!({"ok": true}))
@@ -115,6 +129,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/auth/refresh", auth::refresh::refresh)
         .post_async("/auth/relogin", auth::relogin::relogin)
         .get_async("/auth/me", auth::me::me)
+        .patch_async("/auth/profile", auth::profile::update)
+        .post_async("/auth/leave", membership::leave)
         .post_async("/admin/invites", admin::handlers::create_invite)
         .get_async("/admin/invites", admin::handlers::list_invites)
         .post_async("/admin/revoke-invite", admin::handlers::revoke_invite)
@@ -125,34 +141,59 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             "/admin/transfer-ownership",
             admin::handlers::transfer_ownership,
         )
-        .patch_async(
-            "/admin/server-settings",
-            admin::handlers::update_settings,
-        )
-        // CF Analytics config — owner self-service (YALNIZ owner; WRITE-ONLY:
-        // token buradan yalnız yazılır, hiçbir endpoint geri döndürmez).
+        .patch_async("/admin/server-settings", admin::handlers::update_settings)
+        // Virtual server directory + account-level contacts (V2). Directory
+        // pages never expose email, last-seen, devices or raw key material.
+        .get_async("/directory", contacts::directory)
+        .get_async("/directory/changes", contacts::directory_changes)
+        .get_async("/directory/visibility", contacts::get_visibility)
+        .patch_async("/directory/visibility", contacts::set_visibility)
+        .get_async("/contacts/state/:user_id", contacts::contact_state)
+        .get_async("/contacts/requests", contacts::list_requests)
+        .post_async("/contacts/requests", contacts::create_request)
+        .post_async("/contacts/requests/:id/respond", contacts::respond_request)
+        .post_async("/contacts/requests/:id/revoke", contacts::revoke_request)
+        .get_async("/contacts/grants", contacts::list_grants)
+        .post_async("/contacts/grants/:id/revoke", contacts::revoke_grant)
+        .get_async("/contacts/blocks", contacts::list_blocks)
+        .post_async("/contacts/blocks", contacts::block)
+        .delete_async("/contacts/blocks/:user_id", contacts::unblock)
+        .get_async("/contacts/changes", contacts::contact_changes)
+        // Short-lived, single-use mutual contact QR. The raw capability secret is
+        // never stored on the server; a claim atomically wins exactly once.
+        .post_async("/contacts/qr/offers", contact_qr::create_offer)
+        .post_async("/contacts/qr/claims", contact_qr::claim_offer)
+        .get_async("/contacts/qr/offers/:id/status", contact_qr::offer_status)
+        // CF Analytics config — owner self-service (owner ONLY; WRITE-ONLY: the token
+        // can only be written here, no endpoint ever hands it back).
         .patch_async("/admin/cf-config", admin::cf_config::set_cf_config)
-        // FCM push config — owner self-service (YALNIZ owner; WRITE-ONLY:
-        // service-account buradan yalnız yazılır, hiçbir endpoint geri döndürmez).
+        // FCM push config — owner self-service (owner ONLY; WRITE-ONLY: the service
+        // account can only be written here, no endpoint ever hands it back).
         .patch_async("/admin/fcm-config", admin::fcm_config::set_fcm_config)
-        // Kota epic Faz-0: self-report kullanım istatistikleri (admin/owner-gated;
-        // SHADOW-MODE — yalnız rapor, hiçbir limit zorlanmaz).
+        // Quota epic phase 0: self-reported usage statistics (admin/owner-gated;
+        // SHADOW MODE — reporting only, no limit is enforced).
         .get_async("/admin/stats", admin::stats::stats)
-        // Server-çapı eklenti politikası. GET = HERHANGİ aktif üye (picker filtreler);
-        // POST = require_admin (admin|owner). DISABLED-only saklama (satır = disabled).
+        // Server-wide plugin policy. GET = require_auth, i.e. any authenticated caller
+        // (their plugin picker filters on the result); POST = require_admin (admin|owner).
+        // DISABLED-only storage: a row means the plugin is disabled.
         .get_async("/plugin-policy", admin::plugin_policy::get_plugin_policy)
-        .post_async("/admin/plugin-policy", admin::plugin_policy::set_plugin_policy)
-        // Takılabilir-Depolama (Faz 2+4) — owner harici blob-deposu bağlar/yönetir.
-        // GET/probe = require_admin; POST/PATCH/DELETE/drain = require_owner (secret güçlü).
-        // config_json (secret) HİÇBİR cevapta dönmez (WRITE-ONLY; cf/fcm-config emsali).
-        // drain (Faz 4): depoyu boşaltmaya al — taşıma motoru storage/drain.rs.
+        .post_async(
+            "/admin/plugin-policy",
+            admin::plugin_policy::set_plugin_policy,
+        )
+        // Pluggable storage (phases 2+4) — the owner attaches and manages external blob
+        // backends. GET/probe = require_admin; POST/PATCH/DELETE/drain = require_owner
+        // (backend credentials are powerful). config_json (a secret) is returned by NO
+        // response — WRITE-ONLY, same contract as cf/fcm-config. drain (phase 4) marks
+        // a backend for evacuation; the move engine itself lives in storage/drain.rs.
         .get_async("/admin/storage", admin::storage::list)
         .post_async("/admin/storage", admin::storage::add)
         .patch_async("/admin/storage/:id", admin::storage::update)
         .delete_async("/admin/storage/:id", admin::storage::remove)
         .post_async("/admin/storage/:id/probe", admin::storage::probe)
         .post_async("/admin/storage/:id/drain", admin::storage::drain)
-        // Gruplar (Faz 1 — üyelik; üye-seviyesi, server-admin değil). Fan-out Faz 2.
+        // Groups (phase 1 — membership; member-level, not server-admin). Fan-out is
+        // phase 2.
         .post_async("/groups", groups::create_group)
         .get_async("/groups", groups::list_my_groups)
         .get_async("/groups/:id/members", groups::group_members)
@@ -163,44 +204,55 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/groups/:id/accept", groups::accept_invite)
         .post_async("/groups/:id/decline", groups::decline_invite)
         .delete_async("/groups/:id", groups::delete_group)
-        // Çoklu-cihaz (M1 — imzalı cihaz-listesi sakla/dağıt; additive).
+        // Multi-device (M1 — store and serve the signed device list; additive).
         .put_async("/devices/list", devices::handlers::put_list)
         .get_async("/devices/list/:user_id", devices::handlers::get_list)
-        // Çoklu-cihaz (M2-S3.2 — QR-link akışı; hepsi POST, bkz devices/link.rs).
+        // Multi-device (M2-S3.2 — QR link flow; all POST, see devices/link.rs).
         .post_async("/devices/link-start", devices::link::link_start)
         .post_async("/devices/link-approve", devices::link::link_approve)
         .post_async("/devices/link-status", devices::link::link_status)
         .get_async("/keys/:user_id/bundle", keys::handlers::bundle)
         .post_async("/keys/otks/replenish", keys::handlers::replenish)
-        .post_async(
-            "/keys/signed-prekey",
-            keys::handlers::rotate_signed_prekey,
-        )
+        .post_async("/keys/signed-prekey", keys::handlers::rotate_signed_prekey)
         .post_async("/messages/send", messages::handlers::send)
         .post_async("/messages/read", messages::handlers::read)
-        // Ortak-kök #1: receipt-sync HTTP ikizi (WS-Connected olmayan cihaz kendi tikini
-        // cursor-pull eder — WS `receipt_sync` frame'iyle bit-aynı {rows,more}).
+        // Shared-root #1: the HTTP twin of receipt-sync — a device without a live WS
+        // pulls its own ticks by cursor, returning {rows,more} bit-identical to the WS
+        // `receipt_sync` frame.
         .get_async("/messages/receipt-sync", messages::handlers::receipt_sync)
-        // Kardeş-okundu durable cursor (2026-06-28): U'nun cihazı okuduğu msg_uid'leri kendi
-        // inbox DO'suna bildirir (self_read_state) + cursor-pull. receipt-sync'in okundu-self ikizi.
+        // Durable sibling-read cursor (2026-06-28): a user's device reports the msg_uids
+        // it has read to its own inbox DO (self_read_state), plus a cursor pull. The
+        // read-your-own-messages twin of receipt-sync.
         .post_async("/messages/self-read", messages::handlers::self_read)
-        .get_async("/messages/self-read-sync", messages::handlers::self_read_sync)
-        // Eklenti/feed server-log (Faz-2): per-(room,plugin) append-only şifreli log.
-        // append = JWT+aktif-üye+author-binding → DO; sync = cursor-pull. Server KÖR.
+        .get_async(
+            "/messages/self-read-sync",
+            messages::handlers::self_read_sync,
+        )
+        // Plugin/feed server log (phase 2): per-(room, plugin) append-only encrypted
+        // log. append = JWT + active member + author binding → DO; sync = cursor pull.
+        // The server stays BLIND to the contents.
         .post_async("/plugin-log/:room/:plugin/append", plugin_log::append)
         .get_async("/plugin-log/:room/:plugin/sync", plugin_log::sync)
         .post_async("/plugin-blob/:room/:id", plugin_blob::put_code)
         .get_async("/plugin-blob/:room/:id", plugin_blob::get_code)
-        // Üye-yüklenebilir KALICI eklenti-medya (plugin_blob'un üye-PUT'lu, 50 MiB'lik
-        // kardeşi): aktif-üye PUT/GET, room-scope R2, kota+usage media ile ORTAK sayaçlar.
+        // Member-uploadable PERSISTENT plugin media — plugin_blob's member-PUT, 50 MiB
+        // sibling: active-member PUT/GET, room-scoped R2, and quota/usage counters
+        // SHARED with the regular media channel.
         .post_async("/plugin-media/:room/:id", plugin_media::put_media)
         .get_async("/plugin-media/:room/:id", plugin_media::get_media)
         .post_async("/media/upload", media::handlers::upload)
+        // Avatar blob (Profile Photo epic §2.3): E2E-encrypted, single-slot, exempt from
+        // retention. The static `avatar` segment sits at the same level as the `:id`
+        // param — matchit prefers static segments, exactly like the /media/upload +
+        // /media/:id/ack mix already in the POST tree, so there is no conflict.
+        .post_async("/media/avatar", media::avatar::upload)
+        .get_async("/media/avatar/:id", media::avatar::download)
         .get_async("/media/:id", media::handlers::download)
         .post_async("/media/:id/ack", media::handlers::ack)
         .post_async("/push/register", push::handlers::register)
         .post_async("/push/unregister", push::handlers::unregister)
-        // Arama TURN kimliği (calls Faz 1.5 — internet üstü relay; bütçe-bekçili).
+        // TURN credentials for calls (calls phase 1.5 — relaying over the internet;
+        // budget-gated).
         .post_async("/turn/credentials", turn::credentials)
         .run(req, env)
         .await
@@ -214,39 +266,24 @@ async fn jwks(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Ok(resp)
 }
 
-/// WS /sync upgrade: token doğrula, kullanıcının DO stub'ına orijinal request'i
-/// proxy et (DO içinde header passthrough ile WS pair kurulur).
+/// WS /sync upgrade: validate the token, then proxy the original request to the
+/// user's DO stub (the WS pair is established inside the DO via header passthrough).
 ///
 /// Auth pattern: `Sec-WebSocket-Protocol: sezgi.bearer.v1, <access_token>`.
-/// İlk subprotocol scheme adı, ikincisi credential. Bu standart "token via
-/// subprotocol" yöntemi — token URL query'sinde değil, böylece CF Workers tail
-/// debug log'unda görünmez (URL log'lara düşer, header düşmez).
+/// The first subprotocol is the scheme name, the second is the credential. This is
+/// the standard "token via subprotocol" technique — the token is not in the URL
+/// query, so it never surfaces in CF Workers tail debug logs (URLs are logged,
+/// headers are not).
 async fn sync_ws(req: Request, env: Env) -> Result<Response> {
     let token = match extract_bearer_subprotocol(&req) {
         Ok(t) => t,
         Err(e) => return json_err(400, e),
     };
-    let user_id = match verify_access_token(&env, &token) {
-        Ok(uid) => uid,
-        Err(_) => return json_err(401, "invalid_token"),
+    let auth = match crate::auth::middleware::validate_active_token(&env, &token).await {
+        Ok(auth) => auth,
+        Err(resp) => return Ok(resp),
     };
-    // İPTAL-KONTROLÜ (checkpoint 3): token-bound cihaz device-list'ten DÜŞÜRÜLMÜŞ ise YENİ
-    // WS oturumu AÇMA → çalınan cihaz, 15dk access-token TTL'i içinde bile canlı push/WS-send
-    // kanalı kuramaz. Event-driven (upgrade başına BİR sorgu; polling yok). Zaten-açık WS'in
-    // anlık kesimi (DO-side WS-1008) ayrı follow-up; bu yeni-oturumu kapatır.
-    if let Some(dev) = crate::auth::jwt::device_id_from_token(&env, &token)
-        .ok()
-        .flatten()
-    {
-        // FAIL-CLOSED (Codex cp3): DB hatasında `.unwrap_or(false)` WS'i AÇIYORDU → iptal-edilmiş
-        // cihaz D1-hatası penceresinde oturum kurabilirdi. Hata → 503 (oturum AÇMA); yalnız
-        // kesin Ok(false) geçer. (W1/HTTP send zaten `?` ile fail-closed.)
-        match crate::auth::middleware::device_revoked(&env, &user_id, &dev).await {
-            Ok(true) => return json_err(401, "device_revoked"),
-            Ok(false) => {}
-            Err(_) => return json_err(503, "revoke_check_unavailable"),
-        }
-    }
+    let user_id = auth.user_id;
     let upgrade = req.headers().get("upgrade").ok().flatten();
     if upgrade.as_deref().map(|s| s.to_lowercase()) != Some("websocket".into()) {
         return json_err(426, "expected_websocket");
@@ -257,9 +294,11 @@ async fn sync_ws(req: Request, env: Env) -> Result<Response> {
     stub.fetch_with_request(req).await
 }
 
-/// `Sec-WebSocket-Protocol: sezgi.bearer.v1, <token>` parse — token döndürür.
-/// Eski `?token=` query param desteklenmez (cutover).
-pub(crate) fn extract_bearer_subprotocol(req: &Request) -> std::result::Result<String, &'static str> {
+/// Parse `Sec-WebSocket-Protocol: sezgi.bearer.v1, <token>` and return the token.
+/// The legacy `?token=` query param is no longer supported (hard cutover).
+pub(crate) fn extract_bearer_subprotocol(
+    req: &Request,
+) -> std::result::Result<String, &'static str> {
     let raw = req
         .headers()
         .get("Sec-WebSocket-Protocol")

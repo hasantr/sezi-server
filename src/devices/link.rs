@@ -1,23 +1,25 @@
-//! M2-S3.2: QR-link akışı — ikinci cihazın birincile kriptografik bağlanması.
+//! M2-S3.2: the QR link flow — cryptographically binding a second device to the primary.
 //!
-//! Üç endpoint (hepsi POST; token URL-log'a düşmesin diye GET-query DEĞİL):
-//!   `link-start`  (PRE-AUTH)     yeni cihaz ed/x pub + device_id + PoP-imza →
-//!                                 `link_code` (TTL ~60s).
-//!   `link-approve`(BİRİNCİL-AUTH) birincil, yeni listeyi (rev+1) imzalar →
-//!                                 cross-check + atomik sakla + (user,device) token.
-//!   `link-status` (PoP-AUTH)     yeni cihaz, link_code'u ed-imzalayıp poll eder →
-//!                                 approved'da token'ı TEK SEFER alır (atomik consume).
+//! Three endpoints, all POST (never a GET query, so tokens never land in URL logs):
+//!   `link-start`   (PRE-AUTH)      new device's ed/x pubs + device_id + PoP signature →
+//!                                  a `link_code` (see `LINK_TTL_SEC`).
+//!   `link-approve` (PRIMARY-AUTH)  the primary signs the new list (rev+1) →
+//!                                  cross-check + atomic store + a (user, device) token.
+//!   `link-status`  (PoP-AUTH)      the new device ed-signs the link_code and polls →
+//!                                  once approved it receives the token EXACTLY ONCE
+//!                                  (atomic consume).
 //!
-//! ## Güvenlik (red-team B7/H5)
-//! - **PoP (link-start):** yeni cihaz `ed_priv.sign(ed_pub||x_pub)` → server ed_pub
-//!   ile doğrular → ed_priv sahipliği + key-bağlama (çalıntı ed_pub + yabancı x_pub
-//!   reddedilir).
-//! - **Status proof:** yeni cihaz `ed_priv.sign(link_code)` → server saklı new_ed_pub
-//!   ile doğrular → link_code SIZSA BİLE token'ı yalnız ed_priv sahibi alır.
-//! - **Cross-check (approve):** imzalı doc'un linked-entry'si link_requests'in TAM
-//!   keyleriyle (ed/x/device_id) eşleşmeli → server/MITM key substitüsyonu yapamaz.
-//! - **Atomik consume:** `DELETE ... WHERE status='approved' RETURNING` → token TEK
-//!   cihaza TEK SEFER teslim; satır anında gider (sızıntı yüzeyi minimal).
+//! ## Security (red-team B7/H5)
+//! - **PoP (link-start):** the new device sends `ed_priv.sign(ed_pub||x_pub)` and the server
+//!   verifies it with ed_pub. This proves possession of ed_priv and binds the two keys
+//!   together, so a stolen ed_pub paired with someone else's x_pub is rejected.
+//! - **Status proof:** the new device sends `ed_priv.sign(link_code)`, verified against the
+//!   stored new_ed_pub, so EVEN IF the link_code leaks only the holder of ed_priv gets a token.
+//! - **Cross-check (approve):** the linked entry in the signed doc must match the EXACT keys
+//!   recorded in link_requests (ed/x/device_id), so neither the server nor a MITM can
+//!   substitute keys.
+//! - **Atomic consume:** `DELETE ... WHERE status='approved' RETURNING` delivers the token to
+//!   ONE device ONCE, and the row disappears immediately, keeping the exposure window minimal.
 
 use crate::auth::hashing::sha256_hex;
 use crate::auth::jwt::sign_access_token;
@@ -31,10 +33,12 @@ use worker::*;
 
 use super::handlers::validate_and_store_signed_list;
 
-const LINK_TTL_SEC: i64 = 120; // start→approve→consume tüm akış (insan: tara+fingerprint+biyometrik); kısa→replay sınırı (H5)
+// Covers the whole start→approve→consume flow, which involves a human scanning, comparing a
+// fingerprint and passing biometrics. Deliberately short, to bound replay (H5).
+const LINK_TTL_SEC: i64 = 120;
 const REFRESH_TTL_SEC: i64 = 30 * 24 * 60 * 60;
 const ACCESS_TTL_SEC: u64 = 15 * 60;
-const MAX_PENDING: i64 = 50; // global bekleyen-link tavanı (DoS bekçisi)
+const MAX_PENDING: i64 = 50; // global ceiling on pending links (DoS guard)
 
 // ---------------------------------------------------------------- link-start
 
@@ -45,11 +49,11 @@ struct LinkStartBody {
     device_id: String,
     #[serde(default)]
     label: Option<String>,
-    /// PoP: `ed_priv.sign(ed_pub_bytes || x_pub_bytes)` (64B b64).
+    /// PoP: `ed_priv.sign(ed_pub_bytes || x_pub_bytes)` (64 bytes, base64).
     link_sig_b64: String,
 }
 
-/// `POST /devices/link-start` (PRE-AUTH) — yeni cihaz bağlama isteği başlatır.
+/// `POST /devices/link-start` (PRE-AUTH) — a new device starts a link request.
 pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let ip = req
         .headers()
@@ -57,8 +61,10 @@ pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".into());
-    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
-    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:start:{ip}"), 10, 60).await {
+    // The KV binding is OPTIONAL (template diet): with none we continue unlimited — see
+    // ratelimit::check_rate_limit_env.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:start:{ip}"), 10, 60).await
+    {
         return json_err(429, "rate_limited");
     }
 
@@ -79,7 +85,7 @@ pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
         return json_err(400, "bad_device_id");
     }
 
-    // PoP: ed_priv.sign(ed || x) → ed_priv sahipliği + key-bağlama.
+    // PoP: ed_priv.sign(ed || x) proves possession of ed_priv and binds the two keys.
     let ed_arr: [u8; 32] = ed.as_slice().try_into().unwrap();
     let verifying = match VerifyingKey::from_bytes(&ed_arr) {
         Ok(v) => v,
@@ -100,13 +106,15 @@ pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
     let db = ctx.env.d1("DB")?;
     let now = now_secs() as i64;
 
-    // Global bekleyen-link tavanı (DoS).
+    // Global ceiling on pending links (DoS).
     #[derive(Deserialize)]
     struct CountRow {
         c: i64,
     }
     let cnt: Option<CountRow> = db
-        .prepare("SELECT COUNT(*) AS c FROM link_requests WHERE status='pending' AND expires_at > ?")
+        .prepare(
+            "SELECT COUNT(*) AS c FROM link_requests WHERE status='pending' AND expires_at > ?",
+        )
         .bind(&[d1_int(now)])?
         .first(None)
         .await?;
@@ -156,14 +164,21 @@ struct LinkRow {
     expires_at: i64,
 }
 
-/// `POST /devices/link-approve` (BİRİNCİL-AUTH) — birincil yeni listeyi onaylar.
+/// `POST /devices/link-approve` (PRIMARY-AUTH) — the primary approves the new list.
 pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let auth_user = match require_auth(&req, &ctx.env) {
         Ok(u) => u,
         Err(resp) => return Ok(resp),
     };
 
-    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("devices:list:{auth_user}"), 20, 60).await {
+    if !crate::ratelimit::check_rate_limit_env(
+        &ctx.env,
+        &format!("devices:list:{auth_user}"),
+        20,
+        60,
+    )
+    .await
+    {
         return json_err(429, "rate_limited");
     }
 
@@ -193,8 +208,8 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
         return json_err(410, "link_expired");
     }
 
-    // Cross-check (B7): imzalı doc, link_requests'in TAM keylerini (ed/x/device_id)
-    // içeren bir entry barındırmalı → key substitüsyonu engellenir.
+    // Cross-check (B7): the signed doc must contain an entry carrying the EXACT keys recorded
+    // in link_requests (ed/x/device_id). That is what blocks key substitution.
     #[derive(Deserialize)]
     struct XDoc {
         devices: Vec<XEntry>,
@@ -211,30 +226,38 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
     };
     let matched = xdoc.devices.iter().any(|e| {
         e.device_id == link.new_device_id
-            && b64_decode(&e.ed_pub_b64).map(|b| b == link.new_ed_pub).unwrap_or(false)
-            && b64_decode(&e.x_pub_b64).map(|b| b == link.new_x_pub).unwrap_or(false)
+            && b64_decode(&e.ed_pub_b64)
+                .map(|b| b == link.new_ed_pub)
+                .unwrap_or(false)
+            && b64_decode(&e.x_pub_b64)
+                .map(|b| b == link.new_x_pub)
+                .unwrap_or(false)
     });
     if !matched {
         return json_err(400, "link_key_mismatch");
     }
 
-    // Listeyi atomik doğrula+sakla (B6): primary imzası + binding + rev-koşul burada.
-    let rev =
-        match validate_and_store_signed_list(&db, &auth_user, &body.doc_json, &body.sig_b64).await? {
-            Ok(rev) => rev,
-            Err(resp) => return Ok(resp),
-        };
+    // Validate and store the list atomically (B6): the primary signature, the identity
+    // binding and the rev condition all live in there.
+    let rev = match validate_and_store_signed_list(&db, &auth_user, &body.doc_json, &body.sig_b64)
+        .await?
+    {
+        Ok(rev) => rev,
+        Err(resp) => return Ok(resp),
+    };
 
-    // Token üret (bellekte): access (JWT) + refresh (düz-metin teslim + hash).
+    // Mint the tokens in memory only: an access JWT, plus a refresh token delivered in
+    // plaintext while only its hash is stored.
     let access = sign_access_token(&ctx.env, &auth_user, Some(&link.new_device_id))?;
     let refresh = b64u_encode(&random_bytes(32));
     let refresh_hash = sha256_hex(&refresh);
 
-    // ATOMİK CLAIM (review HIGH): ÖNCE link_requests'i pending→approved çek + token'ı
-    // teslime sakla. RETURNING boş → claim kaybedildi (arada approved/consumed/expired)
-    // → hesap-geçerli refresh_token'ı ASLA üretme → orphan-credential sızıntısı YOK
-    // (önceki sıra refresh_token'ı koşulsuz INSERT edip teslim-edemeyince yetim
-    // bırakıyordu). Token INSERT'i ANCAK claim kazanılınca.
+    // ATOMIC CLAIM (review HIGH): first move link_requests from pending→approved and stash the
+    // tokens for delivery. An empty RETURNING means the claim was lost — someone else approved,
+    // consumed or expired it in between — and in that case we must NEVER create an
+    // account-valid refresh_token, so no orphaned credential can leak. The previous ordering
+    // INSERTed the refresh_token unconditionally and orphaned it whenever delivery failed.
+    // The token INSERT happens ONLY after the claim is won.
     #[derive(Deserialize)]
     struct ClaimRow {
         #[allow(dead_code)]
@@ -258,7 +281,7 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
         return json_err(409, "link_not_pending");
     }
 
-    // Claim KAZANILDI → ancak ŞİMDİ hesap-geçerli refresh_token'ı (hashed) yaz.
+    // Claim WON → only NOW write the account-valid refresh_token (hashed).
     db.prepare(
         "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
          VALUES (?, ?, ?, 0, ?, ?)",
@@ -273,6 +296,7 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
     .run()
     .await?;
 
+    crate::realtime::nudge_grant_counterparts_best_effort(&ctx.env, &auth_user).await;
     Response::from_json(&serde_json::json!({ "rev": rev }))
 }
 
@@ -281,7 +305,8 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
 #[derive(Deserialize)]
 struct LinkStatusBody {
     link_code: String,
-    /// PoP: `ed_priv.sign(link_code_bytes)` (64B b64) — saklı new_ed_pub ile doğrulanır.
+    /// PoP: `ed_priv.sign(link_code_bytes)` (64 bytes, base64), verified against the stored
+    /// new_ed_pub.
     proof_b64: String,
 }
 
@@ -301,17 +326,19 @@ struct ConsumedRow {
     new_device_id: String,
 }
 
-/// `POST /devices/link-status` (PoP-AUTH) — yeni cihaz onay durumunu poll eder.
+/// `POST /devices/link-status` (PoP-AUTH) — the new device polls for approval.
 pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // Rate-limit (review HIGH): pre-auth poll endpoint — link_code'u bilen biri DB-SELECT
-    // + ed-verify + consume-yarışını sınırsız zorlamasın. ~1.5/sn meşru poll'u aşmaz.
+    // Rate-limit (review HIGH): this is a pre-auth poll endpoint, so anyone holding a
+    // link_code must not be able to hammer the DB SELECT, the ed verification and the consume
+    // race without limit. At ~1.5/s the cap stays above legitimate polling.
     let ip = req
         .headers()
         .get("cf-connecting-ip")
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".into());
-    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:status:{ip}"), 90, 60).await {
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:status:{ip}"), 90, 60).await
+    {
         return json_err(429, "rate_limited");
     }
 
@@ -335,8 +362,9 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         None => return json_err(404, "link_not_found"),
     };
 
-    // Proof (H5): yalnız ed_priv sahibi durum okuyabilir (link_code sızsa bile token
-    // çalınamaz). proof = ed_priv.sign(link_code); saklı new_ed_pub ile doğrula.
+    // Proof (H5): only the holder of ed_priv may read the status, so a leaked link_code cannot
+    // be turned into a stolen token. proof = ed_priv.sign(link_code), verified against the
+    // stored new_ed_pub.
     let ed_arr: [u8; 32] = match row.new_ed_pub.as_slice().try_into() {
         Ok(a) => a,
         Err(_) => return json_err(500, "bad_stored_key"),
@@ -351,13 +379,17 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     };
     let proof_arr: [u8; 64] = proof.as_slice().try_into().unwrap();
     let proof_sig = ed25519_dalek::Signature::from_bytes(&proof_arr);
-    if verifying.verify(body.link_code.as_bytes(), &proof_sig).is_err() {
+    if verifying
+        .verify(body.link_code.as_bytes(), &proof_sig)
+        .is_err()
+    {
         return json_err(401, "bad_proof");
     }
 
     if row.status == "pending" && row.expires_at <= now {
-        // Lazy-GC: süresi dolmuş pending satırı AN-BE-AN sil → plaintext-bekleme
-        // yüzeyini cron'a (günlük) bırakma. (approved satır consume'da silinir.)
+        // Lazy GC: delete an expired pending row the moment we notice it, instead of leaving
+        // the plaintext-waiting surface around until the daily cron. (An approved row is
+        // deleted on consume.)
         let _ = db
             .prepare("DELETE FROM link_requests WHERE link_code=? AND status='pending'")
             .bind(&[d1_text(&body.link_code)])?
@@ -372,8 +404,9 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
             Response::from_json(&serde_json::json!({ "status": "rejected", "reason": row.reason }))
         }
         "approved" => {
-            // Atomik consume: yalnız approved→sil geçişini yapan poll token alır
-            // (iki poll yarışı → biri satırı siler, diğeri "consumed" görür).
+            // Atomic consume: only the poll that performs the approved→deleted transition
+            // receives the token. If two polls race, one deletes the row and the other sees
+            // "consumed".
             let consumed: Option<ConsumedRow> = db
                 .prepare(
                     "DELETE FROM link_requests WHERE link_code=? AND status='approved'
@@ -386,8 +419,8 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
                 Some(c) => c,
                 None => return Response::from_json(&serde_json::json!({ "status": "consumed" })),
             };
-            // Güven-kökü fingerprint (H1): primary ed_pub'ı doc'tan çek (yeni cihaz
-            // kullanıcıya gösterir + signed_list ile cross-doğrular).
+            // Trust-root fingerprint (H1): pull the primary's ed_pub out of the doc. The new
+            // device shows it to the user and cross-checks it against the signed list.
             let primary_ed = match c.user_id.as_deref() {
                 Some(uid) => primary_ed_pub_b64(&db, uid).await?,
                 None => None,
@@ -407,8 +440,8 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     }
 }
 
-/// Kullanıcının saklı imzalı listesindeki PRIMARY cihazın ed_pub_b64'ünü çek
-/// (güven-kökü fingerprint). Kayıt/parse yok → `None`.
+/// Fetch the ed_pub_b64 of the PRIMARY device from the user's stored signed list — the
+/// trust-root fingerprint. Missing row or unparseable doc → `None`.
 async fn primary_ed_pub_b64(db: &D1Database, user_id: &str) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct DocRow {

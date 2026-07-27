@@ -1,28 +1,33 @@
-//! `GET /plugin-policy` (üye) + `POST /admin/plugin-policy` (admin/owner) —
-//! server-çapı eklenti kullanılabilirlik politikası.
+//! `GET /plugin-policy` (member) + `POST /admin/plugin-policy` (admin/owner) —
+//! server-wide plugin availability policy.
 //!
-//! MODEL: DEFAULT herkes ENABLED. `server_plugin_policy` (0027) tablosunda YALNIZ
-//! DISABLED eklentiler satır tutar (satır varlığı = disabled). Boş tablo = hepsi açık.
+//! MODEL: everything is ENABLED by default. The `server_plugin_policy` table
+//! (0027) holds rows ONLY for DISABLED plugins (row present = disabled), so an
+//! empty table means every plugin is available.
 //!
-//! - **GET /plugin-policy** — auth: `require_auth` (HERHANGİ aktif üye; admin DEĞİL).
-//!   Her client, eklenti-picker'ını filtrelemek için okur. Dönüş: `{"disabled":[...]}`.
+//! - **GET /plugin-policy** — auth: `require_active_auth` (ANY authenticated member, NOT
+//!   admin). Every client reads it to filter its plugin picker. Returns
+//!   `{"disabled":[...]}`.
 //! - **POST /admin/plugin-policy** — auth: `require_admin` (admin|owner). Body:
-//!   `{"plugin_id":"...","disabled":true|false}`. true → INSERT OR REPLACE (disable);
-//!   false → DELETE (enable). Dönüş: `{"ok":true,"disabled":[...]}` (güncel liste).
+//!   `{"plugin_id":"...","disabled":true|false}`. true → INSERT OR REPLACE
+//!   (disable); false → DELETE (enable). Returns `{"ok":true,"disabled":[...]}`
+//!   with the up-to-date list.
 //!
-//! Emsal: cf_config/fcm_config admin self-service deseni + stats.rs require_admin GET;
-//! plugin_epoch_floor'un "tablo yok → fail-open" okuma disiplini.
+//! Precedent: the cf_config/fcm_config admin self-service pattern plus the
+//! require_admin GET in stats.rs, and plugin_epoch_floor's "table missing →
+//! fail-open" read discipline.
 
-use crate::auth::middleware::{require_admin, require_auth};
+use crate::auth::middleware::{require_admin, require_active_auth};
 use crate::d1util::{d1_int, d1_text};
 use crate::respond::json_err;
 use crate::utils::now_secs;
 use serde::Deserialize;
 use worker::*;
 
-/// Güncel DISABLED plugin_id listesini oku (deterministik alfabetik sıra → stabil
-/// wire + test). Tablo YOKSA (migration henüz uygulanmadı) / D1 hatası → boş liste
-/// (fail-open; plugin_log::epoch_floor deseni) — picker "hepsi açık" görür.
+/// Read the current DISABLED plugin_id list. Deterministic alphabetical order
+/// keeps the wire format and the tests stable. Missing table (migration not
+/// applied yet) or a D1 error → empty list (fail-open, the
+/// plugin_log::epoch_floor pattern), so the picker sees "everything enabled".
 async fn read_disabled(db: &D1Database) -> Vec<String> {
     #[derive(Deserialize)]
     struct Row {
@@ -39,14 +44,16 @@ async fn read_disabled(db: &D1Database) -> Vec<String> {
     }
 }
 
-/// `GET /plugin-policy` — aktif üye okur (client picker filtreleme). Admin DEĞİL:
-/// her üye kendi picker'ını gizlemek için görmeli. Rate 600/5dk (media-download eş).
+/// `GET /plugin-policy` — read by any authenticated member so the client can
+/// filter its picker. Deliberately NOT admin-gated: every member needs the list
+/// to hide entries. Rate limit 600 per 5 min (same as media download).
 pub async fn get_plugin_policy(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
-    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit.
+    // The KV binding is OPTIONAL (slim template): without it we continue
+    // unlimited — see ratelimit.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("plugpol:get:{user_id}"), 600, 5 * 60).await {
         return json_err(429, "rate_limited");
     }
@@ -61,9 +68,10 @@ struct PolicyBody {
     disabled: Option<bool>,
 }
 
-/// plugin_id doğrulaması: boş-değil, ≤128 char, [A-Za-z0-9._-] (slug / ters-DNS id).
-/// Sıkı charset = SQL/log-enjeksiyon + kontrol-karakteri DoS koruması (cf_config
-/// field_ok sınıfı; PRIMARY KEY olduğu için ekstra sıkı).
+/// plugin_id validation: non-empty, ≤128 chars, [A-Za-z0-9._-] (slug or
+/// reverse-DNS id). The tight charset guards against SQL/log injection and
+/// control-character DoS (same class as cf_config's field_ok, but stricter
+/// because this is a PRIMARY KEY).
 fn plugin_id_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -71,13 +79,15 @@ fn plugin_id_ok(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// `POST /admin/plugin-policy` — admin|owner bir eklentiyi server-çapı disable/enable.
+/// `POST /admin/plugin-policy` — admin|owner disables/enables one plugin
+/// server-wide.
 pub async fn set_plugin_policy(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
-    // require_admin — owner DAHİL (owner her admin işini yapar; middleware ile tutarlı).
+    // require_admin includes owner (an owner can do every admin action;
+    // consistent with the middleware).
     if let Err(resp) = require_admin(&user_id, &ctx.env).await {
         return Ok(resp);
     }
@@ -93,8 +103,8 @@ pub async fn set_plugin_policy(mut req: Request, ctx: RouteContext<()>) -> Resul
 
     let db = ctx.env.d1("DB")?;
     if disabled {
-        // Satır varlığı = disabled. INSERT OR REPLACE → idempotent (tekrar-disable
-        // yalnız disabled_at damgasını tazeler).
+        // Row present = disabled. INSERT OR REPLACE keeps it idempotent:
+        // re-disabling only refreshes the disabled_at stamp.
         db.prepare(
             "INSERT OR REPLACE INTO server_plugin_policy (plugin_id, disabled_at) VALUES (?, ?)",
         )
@@ -102,14 +112,16 @@ pub async fn set_plugin_policy(mut req: Request, ctx: RouteContext<()>) -> Resul
         .run()
         .await?;
     } else {
-        // enable = satırı KALDIR (default'a dön). Yok-satır DELETE = no-op (idempotent).
+        // enable = REMOVE the row (back to the default). Deleting a missing row
+        // is a no-op, so this is idempotent too.
         db.prepare("DELETE FROM server_plugin_policy WHERE plugin_id = ?")
             .bind(&[d1_text(&plugin_id)])?
             .run()
             .await?;
     }
 
-    // Güncel liste ile yanıtla → client tek round-trip'te state'i tazeler.
+    // Answer with the fresh list so the client refreshes its state in one
+    // round-trip.
     let disabled_list = read_disabled(&db).await;
     Response::from_json(&serde_json::json!({ "ok": true, "disabled": disabled_list }))
 }
@@ -120,16 +132,16 @@ mod tests {
 
     #[test]
     fn plugin_id_dogrulama() {
-        // Geçerli: slug, ters-DNS, tire/altçizgi/nokta, tam-128.
+        // Valid: slug, reverse-DNS, dash/underscore/dot, exactly 128 chars.
         assert!(plugin_id_ok("echo"));
         assert!(plugin_id_ok("com.sezi.arena"));
         assert!(plugin_id_ok("my-plugin_2"));
         assert!(plugin_id_ok(&"a".repeat(128)));
-        // Boş → red.
+        // Empty → reject.
         assert!(!plugin_id_ok(""));
-        // 128 üstü → red (DoS/PRIMARY-KEY şişme koruması).
+        // Over 128 → reject (DoS / PRIMARY KEY bloat guard).
         assert!(!plugin_id_ok(&"a".repeat(129)));
-        // Yasak karakter (boşluk/enjeksiyon/kontrol/unicode/path) → red.
+        // Forbidden characters (space/injection/control/unicode/path) → reject.
         assert!(!plugin_id_ok("bad id"));
         assert!(!plugin_id_ok("drop;table"));
         assert!(!plugin_id_ok("a\nb"));

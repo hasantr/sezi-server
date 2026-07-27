@@ -1,4 +1,5 @@
-use crate::auth::hashing::hash_code;
+use crate::auth::hashing::{hash_code, sha256_hex};
+use crate::auth::invite_attribution::CLAIM_INVITE_SQL;
 use crate::d1util::{d1_int, d1_opt_text, d1_text};
 use crate::email::mailer::send_verification_code;
 use crate::ratelimit::check_rate_limit_env;
@@ -16,8 +17,9 @@ struct RedeemBody {
 const CODE_TTL_SEC: u64 = 10 * 60;
 
 pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // ŞABLON-DİYETİ: ENV env-yoksa "prod" say (FAIL-SECURE — dev-davranışına düşmesin:
-    // rate-limit aktif kalır + dev_code sızmaz). Env-set kurulumlar bit-aynı.
+    // Slim template: if the ENV var is missing, assume "prod" (FAIL-SECURE — never
+    // fall back to dev behaviour, so the rate limit stays on and dev_code does not
+    // leak). Deployments that do set ENV behave bit-identically.
     let env_name = crate::utils::var_or(&ctx.env, "ENV", "prod");
     if env_name == "prod" {
         let ip = req
@@ -26,7 +28,7 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             .ok()
             .flatten()
             .unwrap_or_else(|| "local".into());
-        // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam.
+        // The KV binding is OPTIONAL (slim template): without it, continue unlimited.
         let key = format!("auth:redeem:{}", ip);
         if !check_rate_limit_env(&ctx.env, &key, 5, 5 * 60).await {
             return json_err(429, "rate_limited");
@@ -49,6 +51,11 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 
     let now = now_secs();
     let db = ctx.env.d1("DB")?;
+    // Only a genuinely claimed invite_only token crosses the bridge into verify. In
+    // the old flow, a random token-shaped value in an open-mode request body could
+    // leak into verification_codes and forge an invite's inviter binding.
+    let mut claimed_token: Option<String> = None;
+    let mut claimed_token_hash: Option<String> = None;
 
     // join_mode
     #[derive(Deserialize)]
@@ -68,63 +75,94 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             Some(t) => t.clone(),
             None => return json_err(403, "invite_required"),
         };
+        let token_hash = sha256_hex(&token);
+        // Active tokens minted before 0031 have a NULL hash column. Before claiming,
+        // write the deterministic hash onto the source TTL row; newer invites already
+        // carry it. A hash mismatch means DB corruption, in which case the UPDATE and
+        // the claim are both no-ops — fail-closed.
+        db.prepare(
+            "UPDATE invite_tokens SET token_hash = COALESCE(token_hash, ?)
+              WHERE token = ? AND used = 0 AND expires_at > ?
+                AND (token_hash IS NULL OR token_hash = ?)",
+        )
+        .bind(&[
+            d1_text(&token_hash),
+            d1_text(&token),
+            d1_int(now as i64),
+            d1_text(&token_hash),
+        ])?
+        .run()
+        .await?;
         #[derive(Deserialize)]
-        struct InviteRow {
-            used: i32,
-            expires_at: i64,
+        struct ClaimRow {
+            #[allow(dead_code)] // read only for its presence (the single-writer result)
+            invite_token_hash: String,
         }
-        let invite: Option<InviteRow> = db
-            .prepare(
-                "SELECT used, expires_at FROM invite_tokens WHERE token = ? LIMIT 1",
-            )
-            .bind(&[d1_text(&token)])?
+        // P0: the ledger INSERT is the claim's LINEARIZATION POINT. Thanks to the
+        // token-hash primary key, only one of two parallel redeems gets a RETURNING
+        // row — the second loses even before the source invite is flipped to
+        // `used=1`. The same statement snapshots the inviter id, the Ed root and the
+        // metadata, so verify keeps the binding even if maintenance later deletes the
+        // token. The raw bearer token is never written to the ledger.
+        let claim: Option<ClaimRow> = db
+            .prepare(CLAIM_INVITE_SQL)
+            .bind(&[
+                d1_text(&token_hash),
+                d1_int(now as i64),
+                d1_text(&token),
+                d1_int(now as i64),
+                d1_text(&token_hash),
+            ])?
             .first(None)
             .await?;
-        let _invite = match invite {
-            Some(i) if i.used == 0 && (i.expires_at as u64) > now => i,
-            _ => return json_err(403, "invalid_invite"),
-        };
-        // NOT: `email_hint` artık kozmetik ETİKET/İSİM (create_invite serbest-metin) →
-        // redeem'de e-posta ile EŞLEŞTİRİLMEZ. Eski email-bind KALDIRILDI (sentetik
-        // u...@sezgi.local e-postalarıyla zaten işlevsizdi + isim-etiket 400/mismatch
-        // veriyordu). Davet kodu = tek sır; kod geçerliyse (used=0 + expiry) redeem olur.
-        // M10 (invite TOCTOU): SELECT(`used==0`) ile UPDATE arasında ikinci bir
-        // eşzamanlı redeem aynı tek-kullanımlık daveti tüketebiliyordu (iki e-posta
-        // aynı daveti redeem). UPDATE'i KOŞULLU-ATOMİK yap (`WHERE used = 0`) +
-        // etkilenen-satır=0 ise yarışı KAYBETTİK → "already used". (email_hint/expiry
-        // doğrulaması yine yukarıdaki SELECT'te; atomik kapı yalnız used-flag yarışını
-        // kapatır.) D1 `changes` = bu UPDATE'in etkilediği satır sayısı.
-        let used_changes = db
-            .prepare("UPDATE invite_tokens SET used = 1 WHERE token = ? AND used = 0")
-            .bind(&[d1_text(&token)])?
-            .run()
-            .await?
-            .meta()?
-            .and_then(|m| m.changes)
-            .unwrap_or(0);
-        if used_changes == 0 {
-            return json_err(403, "invalid_invite"); // yarışı kaybettik → zaten kullanıldı
+        if claim.is_none() {
+            return json_err(403, "invalid_invite");
         }
+        // NOTE: `email_hint` is now a cosmetic LABEL/NAME (free text from
+        // create_invite) and is NOT matched against the e-mail during redeem. The old
+        // email binding was REMOVED: it was useless against synthetic
+        // u...@sezgi.local addresses and turned name labels into 400/mismatch errors.
+        // The invite code is the single secret; if it is valid (used=0 and not
+        // expired) the redeem succeeds.
+        // Legacy/API compatibility: also flip the source token to used. Since the
+        // claim authority is now the ledger primary key, this UPDATE affecting 0 rows
+        // (an admin revoke or TTL-GC racing right after the claim) cannot undo a
+        // won redeem — the attribution is already snapshotted and verify proceeds
+        // safely.
+        db.prepare(
+            "UPDATE invite_tokens SET used = 1
+              WHERE token = ? AND token_hash = ? AND used = 0",
+        )
+            .bind(&[d1_text(&token), d1_text(&token_hash)])?
+            .run()
+            .await?;
+        claimed_token = Some(token);
+        claimed_token_hash = Some(token_hash);
     }
 
     let code = generate_code();
     let code_hash = hash_code(&code);
 
-    // invite_token: redeem'de doğrulanan davet, verify'da used_by doldurmak için saklanır.
+    // The raw invite_token is only a short-lived legacy bridge; the durable binding
+    // goes through invite_token_hash. When verify completes it deletes the VC row,
+    // and with it both values. In open mode both are always NULL.
     db.prepare(
-        "INSERT INTO verification_codes (email, code_hash, attempts, invite_token, expires_at, created_at)
-         VALUES (?, ?, 0, ?, ?, ?)
+        "INSERT INTO verification_codes
+           (email, code_hash, attempts, invite_token, invite_token_hash, expires_at, created_at)
+         VALUES (?, ?, 0, ?, ?, ?, ?)
          ON CONFLICT(email) DO UPDATE SET
             code_hash = excluded.code_hash,
             attempts = 0,
             invite_token = excluded.invite_token,
+            invite_token_hash = excluded.invite_token_hash,
             expires_at = excluded.expires_at,
             created_at = excluded.created_at",
     )
     .bind(&[
         d1_text(&body.email),
         d1_text(&code_hash),
-        d1_opt_text(body.token.as_deref()),
+        d1_opt_text(claimed_token.as_deref()),
+        d1_opt_text(claimed_token_hash.as_deref()),
         d1_int((now + CODE_TTL_SEC) as i64),
         d1_int(now as i64),
     ])?
@@ -133,11 +171,12 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 
     send_verification_code(&ctx.env, &body.email, &code).await?;
 
-    // invite_only modda davet ZATEN kayıt yetkisidir; istemci (onboarding) sahte
-    // `@sezgi.local` e-postası kullandığından gerçek gelen-kutusuna kod gönderimi
-    // işe yaramaz (kullanıcı kodu asla göremez). Davet doğrulandıysa dev_code'u
-    // prod'da da dön — davetsiz kayıt imkânsız olduğu için güvenli. Açık modda
-    // (davetsiz) prod e-posta doğrulaması korunur: kod yalnız gerçek e-postaya gider.
+    // In invite_only mode the invite IS the registration authority, and because the
+    // onboarding client uses a synthetic `@sezgi.local` address, mailing the code to
+    // a real inbox is pointless (the user would never see it). So once the invite is
+    // verified we return dev_code even in prod — safe, since registration without an
+    // invite is impossible. In open mode (no invite) prod e-mail verification stays
+    // intact: the code only goes to the real address.
     if env_name != "prod" || join_mode == "invite_only" {
         return Response::from_json(&serde_json::json!({
             "ok": true,

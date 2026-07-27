@@ -7,21 +7,22 @@ use worker::{Env, Error, Result};
 const ACCESS_TTL_SEC: u64 = 15 * 60;
 const KID: &str = "sezgi-1";
 
-/// ŞABLON-DİYETİ: `JWT_ISSUER` env-yoksa kod-default'u. Şablon wrangler.toml'dan
-/// `[vars]` satırı silinebilsin (deploy-ekranı sadeliği); env-set kurulumlar (prod)
-/// bit-aynı. Sign + verify + device_id-claim ÜÇÜ de bu tek helper'dan okur →
-/// issuer üretimi/denetimi asla ayrışamaz.
+/// Slim template: the code default for `JWT_ISSUER` when the env var is absent, so
+/// the `[vars]` line can be dropped from the template wrangler.toml to keep the
+/// deploy screen simple; deployments that set it (prod) behave bit-identically. All
+/// three paths — sign, verify and the device_id claim — read the issuer through this
+/// one helper, so minting and checking can never drift apart.
 const DEFAULT_ISSUER: &str = "sezi-server";
 
 fn issuer(env: &Env) -> String {
     crate::utils::var_or(env, "JWT_ISSUER", DEFAULT_ISSUER)
 }
 
-/// PKCS8-PEM → SigningKey. env-secret yolu ve self-provision yolu AYNI
-/// parser'dan geçer (self_provision üretim-roundtrip unit-testi bunu çağırır →
-/// üretilen anahtarın format uyumu kanıtlı). `\\n` replace: wrangler secret'a
-/// tek-satır kaçışlı PEM girilmiş olabilir (bkz .dev.vars.example); gerçek
-/// newline'lı PEM'de no-op.
+/// PKCS8 PEM → SigningKey. The env-secret path and the self-provision path go
+/// through the SAME parser (the self_provision generation round-trip unit test calls
+/// this, which proves a generated key is format-compatible). The `\\n` replacement
+/// covers a PEM pasted into a wrangler secret as a single escaped line (see
+/// .dev.vars.example); for a PEM with real newlines it is a no-op.
 pub(crate) fn parse_signing_pem(raw: &str) -> Result<SigningKey> {
     let pkcs8 = raw.replace("\\n", "\n");
     SigningKey::from_pkcs8_pem(&pkcs8)
@@ -29,20 +30,22 @@ pub(crate) fn parse_signing_pem(raw: &str) -> Result<SigningKey> {
 }
 
 fn load_signing_key(env: &Env) -> Result<SigningKey> {
-    // Çözüm zinciri: 1) env secret ÖNCE ama YALNIZ boş-değil + geçerli-parse
-    //    ise (güvenlik-bilinçli owner'ın gerçek key'i kazanır; prod bit-aynı),
-    //    2) aksi halde self-provision cache (D1'den çözülen/üretilen geçerli PEM).
-    // KRİTİK (2026-07-07 free-hesap vakası): buton-runtime KURULMAMIŞ secret'i
-    // `Ok("")` dönebiliyor → eski kod boş string'i parse edip "PEM label invalid"
-    // 500 veriyordu (self-provision'a hiç düşmeden). Artık boş/bozuk env-secret
-    // yok sayılır, self-provision'ın ürettiği geçerli key kullanılır.
+    // Resolution chain: 1) the env secret FIRST, but ONLY if it is non-empty and
+    //    parses — so a security-conscious owner's real key wins and prod stays
+    //    bit-identical; 2) otherwise the self-provision cache (a valid PEM resolved
+    //    from, or generated into, D1).
+    // CRITICAL (2026-07-07 free-account incident): the deploy-button runtime can
+    // return `Ok("")` for a secret that was never set. The old code parsed that empty
+    // string and 500'd with "PEM label invalid" without ever reaching
+    // self-provision. Now an empty or unparseable env secret is ignored and the valid
+    // self-provisioned key is used.
     if let Ok(s) = env.secret("JWT_SIGNING_KEY") {
         let raw = s.to_string();
         if !raw.trim().is_empty() {
             if let Ok(k) = parse_signing_pem(&raw) {
                 return Ok(k);
             }
-            // env-secret var ama parse-edilemez → self-provision'a düş.
+            // An env secret exists but does not parse → fall through to self-provision.
         }
     }
     let raw = crate::self_provision::cached_jwt_pem().ok_or_else(|| {
@@ -64,10 +67,11 @@ struct JwtClaims {
     sub: String,
     iat: u64,
     exp: u64,
-    // M2-S1: opsiyonel cihaz adresleme claim'i. `skip_serializing_if` →
-    // device_id verilmeyen token'larda alan HİÇ yazılmaz (eski wire birebir);
-    // `default` → eski token'lar (claim'siz) AYNEN parse olur (geriye-uyum).
-    // S1'de YAZILIR ama henüz TÜKETİLMEZ (auth user_id düzeyinde kalır).
+    // M2-S1: optional device-addressing claim. `skip_serializing_if` means the field
+    // is omitted entirely from tokens minted without a device_id (identical to the
+    // old wire format), and `default` means older claim-less tokens still parse
+    // (backwards compatibility). Since S2 the claim is also CONSUMED — see
+    // `device_id_from_token`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_id: Option<String>,
 }
@@ -128,12 +132,14 @@ pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
     Ok(claims.sub)
 }
 
-/// M2-S1: doğrulanmış token'dan opsiyonel `device_id` claim'ini döner.
+/// M2-S1: returns the optional `device_id` claim from a verified token.
 ///
-/// `verify_access_token`'ın imzasını/dönüş-tipini bozmamak için (6 çağıran;
-/// blast-radius S2'de açılmadı) onun yanında ayrı helper. Tam doğrulama yapar
-/// (imza + iss + exp); claim yoksa veya token eski/claim'siz ise `None`.
-/// S1'de device_id YAZILIR; S2'de `ws_upgrade` WS attachment'ı için TÜKETİLİR.
+/// It lives beside `verify_access_token` rather than changing that function's
+/// signature or return type, so the blast radius of S2 stayed small. It performs the
+/// full verification (signature + iss + exp) and returns `None` when the claim is
+/// absent or the token is an older, claim-less one. Written since S1; consumed since
+/// S2 — the WS upgrade path attaches it to the socket, and the send/keys/plugin/push
+/// routes use it for per-device checks.
 pub fn device_id_from_token(env: &Env, token: &str) -> Result<Option<String>> {
     let signing = load_signing_key(env)?;
     let verifying = signing.verifying_key();

@@ -1,13 +1,15 @@
-//! Eklenti/feed server-log — per-(room,plugin) append-only ŞİFRELİ log (Faz-2 / WORKER).
+//! Plugin/feed server log — an append-only ENCRYPTED log per (room, plugin) (Faz-2 / WORKER).
 //!
-//! `PLUGIN_FEED_LOG_SPEC.md` Faz-2. Server KÖR: entry `ciphertext`/`blob` opak, imzayı
-//! OKUMAZ; yalnız sıralar (server-atanmış monoton `seq`) + saklar + cursor'dan sunar.
-//! Akış: client → handler (JWT+aktif-üye+author-binding doğrula) → `PluginRoomLog` DO
-//! (id_from_name(room) → atomik seq + insert) → `sync(since)` cursor-pull.
+//! `PLUGIN_FEED_LOG_SPEC.md` Faz-2. The server is BLIND: an entry's `ciphertext`/`blob` is opaque
+//! and it never reads the signature; it only orders (a server-assigned monotonic `seq`), stores and
+//! serves from a cursor. Flow: client → handler (validates JWT + active membership + author
+//! binding) → the `PluginRoomLog` DO (id_from_name(room) → atomic seq + insert) → `sync(since)`
+//! cursor pull.
 //!
-//! Güvenlik iki-katman: (server-honest) handler `author_id==JWT.user && author_device_id==
-//! JWT.device` enforce → kötü-ÜYE forge edemez; (zero-trust) okuyan CLIENT `sig`'i doğrular
-//! → kötü-SERVER bile forge edemez (imza/decrypt CORE'da, Faz-3). DO = opak storage+sequencer.
+//! Security is two-layered: (server-honest) the handler enforces `author_id == JWT.user &&
+//! author_device_id == JWT.device`, so a malicious MEMBER cannot forge entries; (zero-trust) the
+//! reading CLIENT verifies `sig`, so not even a malicious SERVER can (signing/decryption live in
+//! CORE, Faz-3). The DO is nothing but opaque storage plus a sequencer.
 
 use crate::auth::jwt::device_id_from_token;
 use crate::auth::middleware::{device_revoked, extract_bearer, require_auth};
@@ -18,19 +20,21 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use worker::*;
 
-/// Inline ciphertext base64 tavanı (üstü R2 blob — sonraki dilim). Mesaj envelope
-/// sınırıyla uyumlu (~22KB ham → b64 genleşme payı).
+/// Base64 ceiling for inline ciphertext (anything larger goes to an R2 blob — a later slice).
+/// Sized to the message envelope limit (~22KB raw plus the base64 expansion margin).
 const MAX_INLINE_B64: usize = 32 * 1024;
-/// B4 (Codex HIGH): blob/meta alan tavanı. blob_id/blob_hash/aad/nonce/hash-zinciri kısa
-/// referanslardır (gerçek ağır içerik R2'de); 4KB fazlasıyla yeter → DO satırını HER
-/// content_kind'da bağlar (eski gate yalnız inline'ı sınırlıyordu → blob/diğer kind
-/// keyfi-büyük ciphertext ile DO log'unu + tüm okuyanların sync'ini şişirebiliyordu).
+/// B4 (Codex HIGH): ceiling for the blob/meta fields. blob_id/blob_hash/aad/nonce and the hash
+/// chain are short references (the real payload lives in R2), so 4KB is more than enough, and it
+/// bounds the DO row for EVERY content_kind. The old gate only limited inline entries, which let a
+/// `blob` (or any other) kind smuggle arbitrarily large ciphertext and inflate both the DO log and
+/// every reader's sync.
 const MAX_FIELD_B64: usize = 4 * 1024;
-/// Tek sync sayfası entry sınırı (receipt_sync deseni; `more` ile devam).
+/// Entry limit for one sync page (the receipt_sync pattern; `more` signals continuation).
 const SYNC_LIMIT: i64 = 500;
 
-/// Bir log entry'si — hem client→handler→DO gövdesi hem (seq dışı) DO satırı. Server KÖR:
-/// `ciphertext_b64`/`blob_id` opak; `author_*` server-honest enforce + okuyan imza-doğrular.
+/// One log entry — both the client→handler→DO body and (minus `seq`) the DO row. The server is
+/// BLIND: `ciphertext_b64`/`blob_id` are opaque; `author_*` is enforced server-honest and the reader
+/// verifies the signature.
 #[derive(Deserialize, Serialize, Clone)]
 pub struct PluginLogEntry {
     pub plugin_id: String,
@@ -48,7 +52,8 @@ pub struct PluginLogEntry {
     #[serde(default)]
     pub blob_hash: Option<String>,
     pub aad_hash: String,
-    // sig YOK: ciphertext İÇİNDE (server-blind authorship-proof; core open'da doğrulanır).
+    // No `sig` field: the signature lives INSIDE the ciphertext (server-blind authorship proof,
+    // verified when core opens the entry).
     #[serde(default)]
     pub prev_hash: Option<String>,
     #[serde(default)]
@@ -61,7 +66,7 @@ struct SeqRow {
     last_seq: i64,
 }
 
-/// Sync satırı (seq DAHİL) — DB'den okunup client'a JSON döner.
+/// A sync row (seq INCLUDED) — read from the DB and returned to the client as JSON.
 #[derive(Deserialize, Serialize)]
 struct PluginLogEntryRow {
     seq: i64,
@@ -88,14 +93,14 @@ fn js_opt(o: &Option<String>) -> JsValue {
     }
 }
 
-/// Per-room DO: odadaki TÜM eklentilerin append-only şifreli log'u. DO tek-thread →
-/// seq atanması atomik (UserInbox/receipt deseni). `id_from_name(room_id)` → oda başına
-/// tek instance; `plugin_id` oda-içi log'ları ayırır.
+/// Per-room DO: the append-only encrypted log of ALL plugins in that room. A DO is
+/// single-threaded, which makes seq assignment atomic (the UserInbox/receipt pattern).
+/// `id_from_name(room_id)` gives one instance per room; `plugin_id` separates the logs inside it.
 #[durable_object]
 pub struct PluginRoomLog {
     state: State,
-    /// Canlı-push (cross-DO `plugin_log_update` → üye UserInbox'larına) sonraki dilimde
-    /// kullanacak; `new(state, env)` zorunlu aldığı için şimdiden tutulur.
+    /// Reserved for live push (a cross-DO `plugin_log_update` into the members' UserInboxes) in a
+    /// later slice; held now only because `new(state, env)` hands it to us.
     #[allow(dead_code)]
     env: Env,
     initialized: std::cell::Cell<bool>,
@@ -160,8 +165,9 @@ impl PluginRoomLog {
         Ok(())
     }
 
-    /// Append: atomik seq ata + entry insert + head_hash güncelle. Caller (handler) JWT +
-    /// aktif-üyelik + author-binding'i ZATEN doğruladı → DO opak storage+sequencer (güven sınırı handler'da).
+    /// Append: assign an atomic seq, insert the entry, update head_hash. The caller (the handler)
+    /// has ALREADY validated the JWT, active membership and author binding → the DO is just opaque
+    /// storage plus a sequencer (the trust boundary sits in the handler).
     async fn do_append(&self, mut req: Request) -> Result<Response> {
         let e: PluginLogEntry = match req.json().await {
             Ok(b) => b,
@@ -173,7 +179,7 @@ impl PluginRoomLog {
             "INSERT OR IGNORE INTO plugin_log_meta (plugin_id, last_seq) VALUES (?, 0)",
             Some(vec![JsValue::from_str(&e.plugin_id)]),
         )?;
-        // Atomik seq (receipt.rs deseni: tek-statement bump+oku → benzersiz monoton).
+        // Atomic seq (the receipt.rs pattern: bump and read in one statement → unique, monotonic).
         let seq = match sql.exec_raw(
             "UPDATE plugin_log_meta SET last_seq = last_seq + 1 WHERE plugin_id = ? RETURNING last_seq",
             Some(vec![JsValue::from_str(&e.plugin_id)]),
@@ -220,8 +226,9 @@ impl PluginRoomLog {
         Response::from_json(&serde_json::json!({ "seq": seq }))
     }
 
-    /// Sync: cursor'dan sonraki entry'ler (`seq > since ORDER BY seq ASC LIMIT 500` + `more`).
-    /// receipt_sync deseni; client `rows`'u decrypt+verify+fold eder, cursor'u max(seq)'e taşır.
+    /// Sync: the entries after the cursor (`seq > since ORDER BY seq ASC LIMIT 500` + `more`).
+    /// The receipt_sync pattern; the client decrypts, verifies and folds `rows`, then advances its
+    /// cursor to max(seq).
     async fn do_sync(&self, url: &Url) -> Result<Response> {
         let mut plugin_id = String::new();
         let mut since: i64 = 0;
@@ -255,15 +262,17 @@ impl PluginRoomLog {
     }
 }
 
-// ───────────────────────── FORWARD-SECRECY epoch FLOOR (D1; server-kör) ─────────────────────────
+// ─────────────────────── FORWARD-SECRECY epoch FLOOR (D1; server-blind) ───────────────────────
 
-/// Bir oda için EPOCH FLOOR'u oku (D1 `plugin_epoch_floor`; satır yoksa 0). Server yalnız
-/// integer görür (anahtar/içerik DEĞİL). append-gate `key_epoch < floor` reddinde kullanılır.
+/// Read a room's EPOCH FLOOR (D1 `plugin_epoch_floor`; 0 when there is no row). The server only
+/// ever sees an integer, never a key or any content. Used by the append gate to reject
+/// `key_epoch < floor`.
 ///
-/// DAYANIKLI (fail-open=0): `plugin_epoch_floor` tablosu YOKSA (migration henüz uygulanmadı)
-/// veya sorgu hata verirse → floor=0 (kısıt yok) döner; append'i ASLA 500'leme. Floor en-kötü
-/// 0 olur (forward-secrecy enforcement migration gelene dek pasif) → veri-yolu kırılmaz.
-/// (Saha: worker yeni-kod + migration-pending → her append 500'lüyordu; bu onu kapatır.)
+/// RESILIENT (fail-open at 0): if the `plugin_epoch_floor` table does not exist yet (migration not
+/// applied) or the query errors, return floor=0 (no restriction) and NEVER 500 an append. The worst
+/// case is a floor of 0 — forward-secrecy enforcement stays passive until the migration lands —
+/// which keeps the data path intact. (Seen in the field: new worker code with the migration pending
+/// made every append 500; this closes that.)
 pub async fn epoch_floor(db: &D1Database, room_id: &str) -> Result<i64> {
     #[derive(Deserialize)]
     struct FloorRow {
@@ -277,13 +286,14 @@ pub async fn epoch_floor(db: &D1Database, room_id: &str) -> Result<i64> {
     };
     match stmt.first::<FloorRow>(None).await {
         Ok(row) => Ok(row.map(|r| r.floor).unwrap_or(0)),
-        Err(_) => Ok(0), // tablo yok / sorgu hata → floor=0 (fail-open, append 500'lemez)
+        Err(_) => Ok(0), // missing table / query error → floor=0 (fail-open; append never 500s)
     }
 }
 
-/// Bir odanın EPOCH FLOOR'unu +1 artır (üye-çıkışında: kick / self-leave / server-level).
-/// Atomik UPSERT (satır yoksa 1 ile başlar). FORWARD-SECRECY: çıkarılan üye atılma-SONRASI
-/// ESKİ epoch'a yeni-veri append edemez (append-gate floor'un altını 409 reddeder). Server KÖR.
+/// Raise a room's EPOCH FLOOR by 1 (whenever a member leaves: kick / self-leave / server-level).
+/// An atomic UPSERT (starts at 1 when there is no row). FORWARD SECRECY: after removal, an ejected
+/// member cannot append new data under an OLD epoch — the append gate rejects anything below the
+/// floor with 409. The server stays BLIND.
 pub async fn bump_epoch_floor(db: &D1Database, room_id: &str) -> Result<()> {
     db.prepare(
         "INSERT INTO plugin_epoch_floor (room_id, floor) VALUES (?, 1) \
@@ -295,20 +305,28 @@ pub async fn bump_epoch_floor(db: &D1Database, room_id: &str) -> Result<()> {
     Ok(())
 }
 
-// ───────────────────────── HTTP handler'ları (lib.rs router) ─────────────────────────
+// ───────────────────────── HTTP handlers (lib.rs router) ─────────────────────────
 
-/// `POST /plugin-log/:room/:plugin/append` — JWT + aktif-üye + author-binding doğrula → DO'ya forward.
+/// `POST /plugin-log/:room/:plugin/append` — validate JWT + active membership + author binding, then
+/// forward to the DO.
 pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_auth(&req, &ctx.env) {
         Ok(u) => u,
         Err(resp) => return Ok(resp),
     };
-    // Per-user append rate-limit (mesaj-send deseni; DoS/şişme guard).
-    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam — bkz. ratelimit::check_rate_limit_env.
+    // Per-user append rate limit (the message-send pattern; guards against DoS/log inflation).
+    // The KV binding is OPTIONAL (template diet): without it we continue unlimited — see
+    // ratelimit::check_rate_limit_env.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("plog:append:{user_id}"), 300, 60).await {
         return json_err(429, "rate_limited");
     }
-    // Device-binding (S3 token-claim): kötü-üye başka cihaz adına yazamaz.
+    // Device binding: the writer's device is taken from the TOKEN, never from the request body, so a
+    // malicious member cannot append as another device. A revoked device is refused below.
+    //
+    // (This used to be labelled "the S3 token claim". Nothing here touches S3 — `storage/s3.rs` is an
+    // unrelated subsystem that arrived later — and the label's original meaning is not recoverable from
+    // the code, so it is gone rather than guessed at. An initialism that collides with a real module
+    // name is worse than no initialism.)
     let token_device =
         extract_bearer(&req).and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
     let Some(device_id) = token_device else {
@@ -325,7 +343,8 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Some(p) => p.clone(),
         None => return json_err(400, "bad_request"),
     };
-    // Aktif-üyelik kapısı (E2E: server içeriği görmez, yalnız üyelik tablosundan kapılar).
+    // Active-membership gate (E2E: the server cannot see the content, it only gates on the
+    // membership table).
     let db = ctx.env.d1("DB")?;
     if group_role(&db, &room_id, &user_id).await?.is_none() {
         return json_err(403, "not_member");
@@ -334,27 +353,30 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Ok(b) => b,
         Err(_) => return json_err(400, "bad_request"),
     };
-    // Author-binding (server-honest katman): author = JWT-doğrulı gönderen + cihaz + path-plugin.
+    // Author binding (the server-honest layer): the author must equal the JWT-verified sender, its
+    // device, and the plugin named in the path.
     if entry.author_id != user_id
         || entry.author_device_id != device_id
         || entry.plugin_id != plugin_id
     {
         return json_err(403, "author_mismatch");
     }
-    // FORWARD-SECRECY (Faz-D) EPOCH-FLOOR kapısı: üye-çıkışında floor++ edildi. `key_epoch < floor`
-    // = ESKİ epoch'a yeni-veri yazma denemesi → REDDET (`409 epoch_stale`). Çıkarılan üye (ya da
-    // geride-kalan yazar) atılma-SONRASI eski-epoch ile forward-secrecy'yi delemez. Client 409'u
-    // yakalar → membership/device-list refresh + rotation → bekleyen yazımı YENİ epoch ile yeniden
-    // dener (yazım kaybolmaz). Server KÖR: yalnız INTEGER karşılaştırır (key_epoch plaintext meta).
+    // FORWARD-SECRECY (Faz-D) EPOCH-FLOOR gate: the floor was bumped when a member left, so
+    // `key_epoch < floor` is an attempt to write new data under an OLD epoch → REJECT with
+    // `409 epoch_stale`. Neither the ejected member nor a writer left behind can punch through
+    // forward secrecy with a stale epoch after the removal. The client catches the 409 → refreshes
+    // membership/device list, rotates, and retries the pending write under the NEW epoch, so nothing
+    // is lost. The server stays BLIND: it only compares INTEGERS (key_epoch is plaintext meta).
     let floor = epoch_floor(&db, &room_id).await?;
     if entry.key_epoch < floor {
         return json_err(409, "epoch_stale");
     }
-    // Boyut tavanları (B4 — Codex HIGH). Eski gate YALNIZ inline'a uygulanıyordu → blob/diğer
-    // content_kind tüm boyut-kontrolünden geçip DO log'unu + tüm okuyanların sync'ini şişirebiliyordu.
-    // Artık TÜM kind'lara: inline → ciphertext zorunlu + ≤ MAX_INLINE_B64; her kind → ciphertext
-    // ≤ MAX_INLINE_B64 (blob kind'ın ciphertext'le büyük-veri kaçırmasını kes) + kısa alanlar ≤
-    // MAX_FIELD_B64. Bu, DO satır boyutunu (≈ ciphertext + birkaç alan) deterministik bağlar.
+    // Size ceilings (B4 — Codex HIGH). The old gate applied ONLY to inline entries, so a `blob` (or
+    // any other) content_kind slipped past every size check and could inflate the DO log and every
+    // reader's sync. Now they apply to ALL kinds: inline → ciphertext is mandatory and
+    // ≤ MAX_INLINE_B64; any kind → ciphertext ≤ MAX_INLINE_B64 (stops a `blob` kind from smuggling
+    // bulk data through the ciphertext field) plus every short field ≤ MAX_FIELD_B64. Together these
+    // bound the DO row size (≈ ciphertext + a few fields) deterministically.
     if entry.content_kind == "inline" {
         let len = entry.ciphertext_b64.as_ref().map(|s| s.len()).unwrap_or(0);
         if len == 0 || len > MAX_INLINE_B64 {
@@ -375,7 +397,7 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     {
         return json_err(400, "bad_size");
     }
-    // Per-room DO'ya forward (id_from_name(room) → atomik seq + storage).
+    // Forward to the per-room DO (id_from_name(room) → atomic seq + storage).
     let namespace = ctx.env.durable_object("PLUGIN_ROOM_LOG")?;
     let stub = namespace.id_from_name(&room_id)?.get_stub()?;
     let body = serde_json::to_string(&entry).map_err(|_| Error::RustError("serialize".into()))?;
@@ -389,15 +411,16 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     stub.fetch_with_request(do_req).await
 }
 
-/// `GET /plugin-log/:room/:plugin/sync?since=` — JWT + aktif-üye → DO'dan cursor-sonrası entry'ler.
+/// `GET /plugin-log/:room/:plugin/sync?since=` — JWT + active membership → the entries after the
+/// cursor, from the DO.
 pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_auth(&req, &ctx.env) {
         Ok(u) => u,
         Err(resp) => return Ok(resp),
     };
-    // Device-binding + revoked gate (B6 — Codex HIGH: append'te VAR ama sync'te YOKtu →
-    // çıkarılmış/iptal cihaz, access-token TTL'i (kısa ama sıfır-değil) içinde server-log
-    // ciphertext'i ÇEKEBİLİYORDU. append desenini aynala: token-device çıkar + revoked→401).
+    // Device binding + revoked gate (B6 — Codex HIGH: append had it, sync did NOT, so a removed or
+    // revoked device could still PULL server-log ciphertext for as long as its access token lived —
+    // short, but not zero. Mirror the append pattern: extract the token device, revoked → 401).
     let token_device =
         extract_bearer(&req).and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
     let Some(device_id) = token_device else {
@@ -418,7 +441,7 @@ pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     if group_role(&db, &room_id, &user_id).await?.is_none() {
         return json_err(403, "not_member");
     }
-    // `since` client query'sinden — i64 parse (DO URL'ine güvenli enjeksiyon).
+    // `since` comes from the client query — parsed as i64, so it is safe to splice into the DO URL.
     let mut since: i64 = 0;
     let url = req.url()?;
     for (k, v) in url.query_pairs() {

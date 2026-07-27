@@ -1,25 +1,29 @@
-//! `/admin/storage` — Takılabilir-Depolama yönetim endpoint'leri (Faz 2, 2026-07-08).
-//! Owner CLIENT'tan harici blob-deposu (B2 / ikinci-R2 / MinIO / S3-uyumlu) bağlar,
-//! sınar, düzenler, kaldırır ("sıfır-CLI" felsefesi; cf/fcm-config emsali).
+//! `/admin/storage` — pluggable-storage management endpoints (Faz 2, 2026-07-08).
+//! From the CLIENT, the owner attaches, tests, edits and removes an external blob
+//! store (B2 / a second R2 / MinIO / any S3-compatible target) — the "zero CLI"
+//! philosophy, following cf-config and fcm-config.
 //!
-//! GÜVENLİK SÖZLEŞMESİ (cf_config.rs/fcm_config.rs ile birebir):
-//! - **Kapılar (plan e):** GET/probe = `require_admin`; POST/PATCH/DELETE/drain =
-//!   `require_owner` (depo kimlik-bilgisi güçlü secret → yalnız sunucu sahibi
-//!   ekler/değiştirir/siler/boşaltır).
-//! - **WRITE-ONLY:** `config_json` (secret `secret_access_key` içerir) HİÇBİR cevapta
-//!   dönmez — GET/PATCH/probe yalnız kimlik/durum/sağlık/sayaç taşır. Secret buradan
-//!   yalnız YAZILIR (rotasyon = PATCH config alanı; okunmaz).
-//! - **http:// endpoint yalnız dev:** `ENV!="prod"` (wrangler-dev + MinIO); prod'da
-//!   `https` zorunlu (plan Faz 0 notu; ortadaki-adam koruması).
-//! - **Ekleme = CANLI probe:** POST + PATCH-config, kaydetmeden ÖNCE PUT/GET/DELETE
-//!   round-trip'iyle kimlik-bilgisini doğrular → owner "kaydettim ama çalışmıyor" tuzağına
-//!   düşmez (fcm service-account erken-doğrulama emsali).
+//! SECURITY CONTRACT (identical to cf_config.rs / fcm_config.rs):
+//! - **Gates (plan e):** GET and probe use `require_admin`; POST/PATCH/DELETE/drain
+//!   use `require_owner`, because store credentials are strong secrets and only the
+//!   server's owner may add, change, delete or drain a store.
+//! - **WRITE-ONLY:** `config_json` (which contains the `secret_access_key`) is
+//!   returned in NO response — GET/PATCH/probe carry only identity, state, health
+//!   and counters. The secret is only ever written here; rotation means PATCHing
+//!   the config field, never reading it back.
+//! - **http:// endpoints are dev-only:** allowed when `ENV != "prod"`
+//!   (wrangler-dev + MinIO); in prod `https` is mandatory (plan Faz 0 note,
+//!   man-in-the-middle protection).
+//! - **Adding means a LIVE probe:** POST and a config PATCH verify the credentials
+//!   with a PUT/GET/DELETE round-trip BEFORE persisting, so the owner never falls
+//!   into "I saved it but it does not work" (same early-validation idea as the fcm
+//!   service account).
 
 use serde::Deserialize;
 use serde_json::json;
 use worker::*;
 
-use crate::auth::middleware::{require_admin, require_auth, require_owner};
+use crate::auth::middleware::{require_admin, require_active_auth, require_owner};
 use crate::d1util::{d1_int, d1_opt_int, d1_text};
 use crate::respond::json_err;
 use crate::storage::{
@@ -28,7 +32,7 @@ use crate::storage::{
 };
 use crate::utils::{now_secs, random_bytes, var_or};
 
-// ── GET /admin/storage (require_admin) — depo listesi (secret'siz) ─────────────
+// ── GET /admin/storage (require_admin) — store list, secret-free ───────────────
 
 #[derive(Deserialize)]
 struct ListRow {
@@ -46,15 +50,16 @@ struct ListRow {
 }
 
 pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
     if let Err(resp) = require_admin(&user_id, &ctx.env).await {
         return Ok(resp);
     }
     let db = ctx.env.d1("DB")?;
-    // config_json BİLİNÇLİ SELECT-DIŞI: secret asla cevaba girmez (write-only).
+    // config_json is DELIBERATELY not selected: the secret never reaches a response
+    // (write-only).
     let rows: Vec<ListRow> = db
         .prepare(
             "SELECT store_id, kind, label, state, priority, max_bytes, used_bytes, \
@@ -64,10 +69,11 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .all()
         .await?
         .results()?;
-    // Faz 4: draining depolar için kalan-envanter sayısı (3 meta-tablo UNION sayımı —
-    // taşıma motorunun bitiş-tespitiyle AYNI kaynak: storage/drain.rs). Draining depo
-    // yoksa EK SORGU YOK (boş liste → boş map). Hata → boş map (liste yine döner;
-    // alan null kalmaz, draining depo 0 gösterir — bir sonraki GET düzelir).
+    // Faz 4: remaining-inventory count for draining stores — a UNION count over the
+    // 3 metadata tables, the SAME source the move engine uses to detect completion
+    // (storage/drain.rs). With no draining store there is NO extra query (empty list
+    // → empty map). On error we return an empty map: the list still renders, the
+    // field is not null, a draining store just shows 0 and the next GET corrects it.
     let draining_ids: Vec<String> = rows
         .iter()
         .filter(|r| r.state == "draining")
@@ -91,7 +97,8 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 "last_health_at": r.last_health_at,
                 "last_health_ok": r.last_health_ok.map(|v| v != 0),
                 "last_health_err": r.last_health_err,
-                // Faz 4: yalnız draining depoda sayı, diğerlerinde null (taşıma-yok).
+                // Faz 4: a count only for a draining store, null otherwise (nothing
+                // is being moved).
                 "draining_remaining": (r.state == "draining")
                     .then(|| remaining.get(&r.store_id).copied().unwrap_or(0)),
             })
@@ -100,7 +107,7 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Response::from_json(&json!({ "stores": stores }))
 }
 
-// ── POST /admin/storage (require_owner) — ekle: doğrula + canlı probe + INSERT ──
+// ── POST /admin/storage (require_owner) — add: validate + live probe + INSERT ───
 
 #[derive(Deserialize)]
 struct AddBody {
@@ -114,8 +121,8 @@ struct AddBody {
 }
 
 pub async fn add(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
     if let Err(resp) = require_owner(&user_id, &ctx.env).await {
@@ -141,7 +148,7 @@ pub async fn add(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     };
     let max_bytes = body.max_bytes.filter(|&n| n > 0);
 
-    // CANLI probe — kaydetmeden ÖNCE kimlik-bilgisini uçtan-uca doğrula.
+    // LIVE probe — verify the credentials end to end BEFORE persisting them.
     let store = BlobStore::S3(S3Store::from_config(body.config.clone()));
     if let Err(e) = store.probe().await {
         return probe_failed(&e);
@@ -180,7 +187,7 @@ struct PatchBody {
     label: Option<String>,
     state: Option<String>,
     priority: Option<i64>,
-    /// None=koru, Some(0)=temizle(NULL/sınırsız), Some(n>0)=set.
+    /// None = keep, Some(0) = clear (NULL / unlimited), Some(n>0) = set.
     max_bytes: Option<i64>,
     config: Option<ConfigPatch>,
 }
@@ -207,8 +214,8 @@ struct ExistingRow {
 }
 
 pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
     if let Err(resp) = require_owner(&user_id, &ctx.env).await {
@@ -234,7 +241,7 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         None => return json_err(404, "not_found"),
     };
 
-    // Alan-bazlı efektif değerler (yok=koru).
+    // Per-field effective values (absent = keep).
     let label = match &body.label {
         Some(v) if label_ok(v) => v.trim().to_string(),
         Some(_) => return field_err("label"),
@@ -252,12 +259,13 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     };
     let max_bytes = match body.max_bytes {
         None => existing.max_bytes,
-        Some(0) => None,               // temizle → sınırsız
+        Some(0) => None,               // cleared → unlimited
         Some(n) if n > 0 => Some(n),
         Some(_) => return field_err("max_bytes"),
     };
 
-    // Config rotasyonu (yalnız s3; r2_binding'in config'i yok). Değiştiyse yeniden probe.
+    // Config rotation (s3 only; an r2_binding store has no config). If it changed,
+    // probe again.
     let (config_json, health_reprobed) = match &body.config {
         None => (existing.config_json, false),
         Some(patch) => {
@@ -281,7 +289,7 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     };
 
     let now = now_secs() as i64;
-    // Config yeniden-probe edildiyse sağlığı taze-yeşil işaretle.
+    // If the config was re-probed, stamp health as freshly green.
     if health_reprobed {
         db.prepare(
             "UPDATE storage_backends SET label=?, state=?, priority=?, max_bytes=?, \
@@ -320,7 +328,7 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     Response::from_json(&json!({ "ok": true }))
 }
 
-// ── DELETE /admin/storage/:id (require_owner) — yalnız boş depo ────────────────
+// ── DELETE /admin/storage/:id (require_owner) — empty stores only ──────────────
 
 #[derive(Deserialize)]
 struct CountOnlyRow {
@@ -328,8 +336,8 @@ struct CountOnlyRow {
 }
 
 pub async fn remove(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
     if let Err(resp) = require_owner(&user_id, &ctx.env).await {
@@ -339,7 +347,8 @@ pub async fn remove(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Some(s) => s.clone(),
         None => return json_err(400, "bad_request"),
     };
-    // r2-primary silinemez (binding-default) — owner isterse `disabled` yapabilir (PATCH).
+    // r2-primary cannot be deleted (it is the binding default); an owner who wants
+    // it out of rotation can PATCH it to `disabled`.
     if id == PRIMARY_STORE_ID {
         return json_err(400, "cannot_delete_primary");
     }
@@ -353,8 +362,9 @@ pub async fn remove(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Some(r) => r,
         None => return json_err(404, "not_found"),
     };
-    // Yalnız boş depo silinir (Faz 4 drain dolu-depoyu boşaltana kadar). object_count
-    // = D1-envanter gerçeği (reconcile besler); >0 → 409 (client "önce boşalt" der).
+    // Only an empty store may be deleted; draining a full one is Faz 4's job.
+    // object_count is the D1 inventory truth (maintained by reconcile); > 0 → 409, and
+    // the client tells the owner to drain it first.
     if row.object_count > 0 {
         return json_err(409, "store_not_empty");
     }
@@ -366,7 +376,7 @@ pub async fn remove(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Response::from_json(&json!({ "ok": true }))
 }
 
-// ── POST /admin/storage/:id/probe (require_admin) — elle health-check ──────────
+// ── POST /admin/storage/:id/probe (require_admin) — manual health check ────────
 
 #[derive(Deserialize)]
 struct ProbeRow {
@@ -375,8 +385,8 @@ struct ProbeRow {
 }
 
 pub async fn probe(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
     if let Err(resp) = require_admin(&user_id, &ctx.env).await {
@@ -397,40 +407,46 @@ pub async fn probe(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         None => return json_err(404, "not_found"),
     };
 
-    // Depoyu kur (router/günlük-probe ile ORTAK build_store) + canlı probe.
+    // Build the store (build_store is SHARED with the router and the daily probe)
+    // and probe it live.
     let (ok, err): (bool, Option<String>) = match build_store(&ctx.env, &row.kind, &row.config_json)
     {
         Ok(s) => match s.probe().await {
             Ok(()) => (true, None),
             Err(e) => (false, Some(truncate(&e.to_string(), 120))),
         },
-        // build_store Err zaten kısa neden (binding_missing / s3-parse / unsupported_kind).
+        // A build_store Err is already a short reason (binding_missing / s3-parse /
+        // unsupported_kind).
         Err(e) => (false, Some(e)),
     };
 
-    // last_health_* yaz (probe + fırsatçı-işaretleme ORTAK choke-point; best-effort).
+    // Write last_health_* through the choke-point SHARED by this probe and
+    // opportunistic marking (best-effort).
     write_health(&ctx.env, &id, ok, err.as_deref()).await;
 
     Response::from_json(&json!({ "ok": ok, "error": err }))
 }
 
-// ── POST /admin/storage/:id/drain (require_owner) — depoyu boşaltmaya al (Faz 4) ──
+// ── POST /admin/storage/:id/drain (require_owner) — start emptying a store (Faz 4) ──
 
 #[derive(Deserialize)]
 struct StateRow {
     state: String,
 }
 
-/// Depoyu `draining`'e al: yerleştirmeden çıkar (router yalnız `active`'e yazar;
-/// okuma/silme taşınana dek SÜRER) + taşıma job'unu uyandır. Motor (storage/drain.rs)
-/// 2dk-cron + lazy sırtında ≤4 blob/koşum taşır; envanter 0 → depo otomatik `disabled`.
-/// r2-primary DE drain edilebilir (plan e: "R2'den tamamen çıkmak isteyene").
-/// Hedef-pinleme v1'de YOK (plan c.4 `{target_store_id?}` opsiyoneli): hedef daima
-/// kalan aktif depolardan sığan-ilk (put_new politikası) → body okunmaz.
-/// İdempotent: zaten-draining depoya tekrar POST → yalnız uyandırma + güncel kalan.
+/// Move a store to `draining`: take it out of placement (the router only writes to
+/// `active` stores, while reads and deletes KEEP working until the data has moved)
+/// and wake the move job. The engine (storage/drain.rs) rides the 2-minute cron plus
+/// the lazy path and moves at most `MOVE_BATCH` (4) blobs per run; when the inventory
+/// reaches 0 the store is automatically set to `disabled`. r2-primary can be drained
+/// too (plan e: "for whoever wants to leave R2 entirely"). Target pinning is NOT in
+/// v1 (the optional `{target_store_id?}` from plan c.4): the target is always the
+/// first remaining active store with room (the put_new policy), so the body is not
+/// read at all. Idempotent — POSTing again to an already-draining store just wakes
+/// the job and returns the current remaining count.
 pub async fn drain(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
     if let Err(resp) = require_owner(&user_id, &ctx.env).await {
@@ -451,9 +467,10 @@ pub async fn drain(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         None => return json_err(404, "not_found"),
     };
     if row.state != "draining" {
-        // Kör-uç muhafızı: taşınacak HEDEF yoksa (başka hiç 'active' depo yok) drain
-        // asla ilerleyemez + yeni upload'lar da 503'e düşerdi → 409 (owner önce hedef
-        // depo ekler/aktifler). max_bytes-doluluk yerleştirme-anında zorlanır (put_new).
+        // Dead-end guard: with no TARGET to move to (no other 'active' store) the
+        // drain could never progress and new uploads would start failing with 503,
+        // so answer 409 and let the owner add or activate a target store first.
+        // max_bytes fullness is enforced at placement time (put_new).
         #[derive(Deserialize)]
         struct NRow {
             n: i64,
@@ -480,8 +497,9 @@ pub async fn drain(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .await?;
         invalidate_storage_cache();
     }
-    // Taşıma job'unu uyandır: damga 0 → lazy-yol ilk uygun istekte (≤60sn) claim'ler;
-    // cron'lu kurulumda zaten ≤2dk'da koşar. İdempotent-tekrar zararsız.
+    // Wake the move job: zeroing the stamp lets the lazy path claim it on the first
+    // eligible request (within ~60s), and a cron-enabled deployment runs it within
+    // 2 minutes anyway. Repeating this is harmless (idempotent).
     crate::maintenance::wake_storage_move(&ctx.env).await;
     let remaining = crate::storage::drain::remaining_counts(&db, std::slice::from_ref(&id))
         .await?
@@ -491,21 +509,24 @@ pub async fn drain(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Response::from_json(&json!({ "ok": true, "draining_remaining": remaining }))
 }
 
-// ── Yardımcılar ───────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Etiket: boş-değil, ≤120 char, kontrol-karakteri yok (cf_config `field_ok` deseni).
+/// Label: non-empty, ≤120 chars, no control characters (cf_config's `field_ok`
+/// pattern).
 fn label_ok(s: &str) -> bool {
     let t = s.trim();
     !t.is_empty() && t.len() <= 120 && !t.chars().any(|c| c.is_control())
 }
 
-/// PATCH/POST state: yalnız active/readonly/disabled (draining = ayrı drain endpoint, Faz 4).
+/// State accepted by PATCH/POST: active/readonly/disabled only. `draining` is set
+/// exclusively by the separate drain endpoint (Faz 4).
 fn state_ok(s: &str) -> bool {
     matches!(s, "active" | "readonly" | "disabled")
 }
 
-/// Yeni depo önceliği: owner verdiyse (0..=1_000_000) onu, yoksa mevcut MAX+10
-/// (r2-primary=0 → yeni depolar hep sonra yazılır; owner PATCH ile öne alabilir).
+/// Priority for a new store: whatever the owner passed (0..=1_000_000), otherwise
+/// the current MAX + 10. Since r2-primary is 0, new stores are always written after
+/// it; an owner can move one to the front with PATCH.
 async fn resolve_priority(
     env: &Env,
     requested: Option<i64>,
@@ -535,8 +556,9 @@ async fn resolve_priority(
     Ok(max_priority + 10)
 }
 
-/// Mevcut `config_json`'a PATCH alanlarını uygula (yok=koru; prefix/storage_class
-/// ''=temizle; diğerleri boş=validate reddeder). Merge sonrası validate + probe çağıran yapar.
+/// Apply the PATCH fields onto the existing `config_json`: absent = keep, '' clears
+/// prefix/storage_class, and an empty value for any other field is rejected by
+/// validation. The caller runs validate + probe on the merge result.
 fn merge_config(
     existing_json: &str,
     patch: &ConfigPatch,
@@ -556,11 +578,12 @@ fn merge_config(
         cfg.access_key_id = v.trim().to_string();
     }
     if let Some(v) = &patch.secret_access_key {
-        // '' → boş secret → validate `secret_invalid` (secret temizlenemez).
+        // '' → empty secret → validation returns `secret_invalid`; the secret cannot
+        // be cleared.
         cfg.secret_access_key = v.trim().to_string();
     }
     if let Some(v) = &patch.prefix {
-        cfg.prefix = v.clone(); // '' → prefix temizle
+        cfg.prefix = v.clone(); // '' → clear the prefix
     }
     if let Some(v) = &patch.storage_class {
         cfg.storage_class = if v.trim().is_empty() {
@@ -572,13 +595,15 @@ fn merge_config(
     Ok(cfg)
 }
 
-/// 400 + hangi alanın hatalı olduğu (secret DEĞERİ sızmaz; yalnız alan-adı).
+/// 400 plus which field was invalid. The secret VALUE never leaks — only the field
+/// name is reported.
 fn field_err(field: &str) -> Result<Response> {
     let resp = Response::from_json(&json!({ "error": "bad_request", "field": field }))?;
     Ok(resp.with_status(400))
 }
 
-/// 422 probe_failed + kısa detay (secret'siz, 200-char kırpık — plan e/g sözleşmesi).
+/// 422 probe_failed plus a short detail: secret-free and truncated to 200 chars
+/// (the plan e/g contract).
 fn probe_failed(e: &Error) -> Result<Response> {
     let resp = Response::from_json(&json!({
         "error": "probe_failed",
@@ -612,7 +637,7 @@ mod tests {
         assert!(state_ok("active"));
         assert!(state_ok("readonly"));
         assert!(state_ok("disabled"));
-        // draining PATCH'ten set edilemez (Faz 4 drain endpoint'i).
+        // draining cannot be set through PATCH (that is the Faz 4 drain endpoint).
         assert!(!state_ok("draining"));
         assert!(!state_ok("bogus"));
     }
@@ -620,7 +645,7 @@ mod tests {
     #[test]
     fn merge_config_alan_bazli() {
         let existing = r#"{"endpoint":"https://old","region":"r1","bucket":"b1","access_key_id":"k1","secret_access_key":"s1","prefix":"p/","storage_class":"STANDARD"}"#;
-        // Yalnız endpoint değiştir; gerisi korunur.
+        // Change only the endpoint; everything else is preserved.
         let patch = ConfigPatch {
             endpoint: Some("https://new".into()),
             region: None,
@@ -635,7 +660,7 @@ mod tests {
         assert_eq!(m.region, "r1");
         assert_eq!(m.secret_access_key, "s1", "secret korunur (rotasyon opsiyonel)");
         assert_eq!(m.prefix, "p/");
-        // storage_class '' → temizle; prefix '' → temizle.
+        // storage_class '' → clear; prefix '' → clear.
         let patch = ConfigPatch {
             endpoint: None,
             region: None,
@@ -648,8 +673,9 @@ mod tests {
         let m = merge_config(existing, &patch).unwrap();
         assert_eq!(m.prefix, "");
         assert!(m.storage_class.is_none());
-        // Bozuk mevcut config → config_corrupt. (S3Config secret taşır → Debug/PartialEq
-        // türetilmez [sızıntı riski]; assert_eq yerine matches!.)
+        // Corrupt stored config → config_corrupt. (S3Config carries a secret, so it
+        // derives neither Debug nor PartialEq to avoid leaking it — hence matches!
+        // instead of assert_eq!.)
         assert!(matches!(merge_config("not json", &patch), Err("config_corrupt")));
     }
 }

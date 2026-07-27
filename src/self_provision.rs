@@ -1,38 +1,41 @@
-//! Self-provisioning — self-host Faz A (zero-CLI deploy ön-koşulu).
+//! Self-provisioning — self-host phase A (the prerequisite for a zero-CLI deploy).
 //!
-//! Hedef: worker'ı GitHub'dan fork'layıp Deploy-to-Cloudflare ile KENDİ CF
-//! hesabına kuran kullanıcı, `wrangler secret put` ve `wrangler d1 migrations
-//! apply` BİLMEDEN çalışan bir server alsın. İki bacak:
+//! Goal: someone who forks the worker on GitHub and installs it into THEIR OWN CF
+//! account via Deploy-to-Cloudflare should get a working server WITHOUT ever learning
+//! `wrangler secret put` or `wrangler d1 migrations apply`. Two legs:
 //!
-//! **A1 — Anahtar self-provisioning** (`JWT_SIGNING_KEY` + `ADMIN_INVITE_KEY`):
-//! env-first / D1-fallback / yoksa-ÜRET-persist (cf_analytics `resolve_cfg`
-//! deseninin kalıcı-anahtar varyantı):
-//!   1. env secret varsa → o kullanılır (bugünkü davranış BİT-AYNI; env-set
-//!      HER ZAMAN kazanır — güvenlik-bilinçli owner anahtarı secret'a taşıyabilir).
-//!      Bu yolda D1'e HİÇ gidilmez, memoize da gerekmez (env okuma sync+ucuz).
-//!   2. Yoksa D1 `server_config` (0025) okunur → izolate-scope cache'e alınır
-//!      (JWT anahtarı HER istekte okunur = hot-path; D1-roundtrip'i her isteğe
-//!      SOKMAMAK için thread_local memoize — WASM izolate'i tek-thread).
-//!   3. O da yoksa (taze fork ilk boot) ÜRETİLİR + D1'e persist edilir.
-//!      Yarış guard'ı: `ON CONFLICT DO NOTHING` + persist-sonrası re-SELECT →
-//!      eşzamanlı iki cold-start ASLA farklı anahtar kullanmaz (D1 tek gerçek).
+//! **A1 — Key self-provisioning** (`JWT_SIGNING_KEY` + `ADMIN_INVITE_KEY`):
+//! env-first / D1-fallback / GENERATE-and-persist (the durable-key variant of
+//! cf_analytics's `resolve_cfg` pattern):
+//!   1. If the env secret exists it is used — today's behavior is BIT-IDENTICAL, and an
+//!      env-set value ALWAYS wins so a security-conscious owner can move the key into a
+//!      secret. This path NEVER touches D1 and needs no memoization (reading env is
+//!      synchronous and cheap).
+//!   2. Otherwise read D1 `server_config` (0025) and cache it per isolate. The JWT key
+//!      is read on EVERY request — a hot path — so a thread_local memo keeps the D1
+//!      round-trip out of it (a WASM isolate is single-threaded).
+//!   3. Failing that (a fresh fork's first boot) GENERATE the key and persist it to D1.
+//!      Race guard: `ON CONFLICT DO NOTHING` plus a re-SELECT after persisting, so two
+//!      concurrent cold starts NEVER end up using different keys (D1 is the one truth).
 //!
-//! GÜVENLİK NOTU: anahtar D1-at-rest durur (CF disk-şifreli) — self-host
-//! dürüst-server modeli. Anahtar HİÇBİR endpoint'te dönmez (yalnız worker-içi).
+//! SECURITY NOTE: the key sits at rest in D1 (on CF's encrypted disks) — this is the
+//! self-host honest-server model. The key is returned by NO endpoint; it stays inside
+//! the worker.
 //!
-//! **A2 — D1 self-migration**: `migrations/*.sql` gömülü (`include_str!`);
-//! ilk istekte `_sezi_migrations` tracking'ine göre eksikler TEK `db.batch`te
-//! uygulanır (2026-07-06 free-plan vakası: Workers free-planı istek-başına
-//! ~50 subrequest kapıyor; eski dosya-başına batch+track-INSERT deseni taze
-//! kurulum ilk-boot'unda ~50+ D1-çağrısıyla ortadan kesiliyordu → jwks/verify
-//! deterministik 500. Tek-batch ilk-boot'u ~4 D1-çağrısına indirir + tüm
-//! bekleyenler hepsi-ya-hiç atomik olur).
-//! wrangler-uyumu (KRİTİK): mevcut prod migration'ları `wrangler d1 migrations
-//! apply` ile uyguladı → wrangler'ın kendi `d1_migrations` tablosundaki kayıtlar
-//! uygulanmış-SAYILIR (prod'da hiçbir migration yeniden koşmaz). Ek kemer:
-//! benign şema-çakışması ("duplicate column name"/"already exists") →
-//! tolerant-apply (aşağıda `apply_one`). CLI yolu çalışmaya devam eder
-//! (`wrangler.toml migrations_dir` KALDI; self-migration ek güvence).
+//! **A2 — D1 self-migration**: `migrations/*.sql` are embedded via `include_str!`, and
+//! on the first request everything missing according to the `_sezi_migrations` tracking
+//! table is applied in ONE `db.batch`. (The 2026-07-06 free-plan incident: the Workers
+//! free plan caps subrequests at ~50 per request, and the old one-batch-plus-tracking-
+//! INSERT-per-file pattern needed ~50+ D1 calls on a fresh install's first boot, so it
+//! was cut off midway → deterministic 500s from jwks/verify. A single batch brings the
+//! first boot down to ~4 D1 calls and makes the whole pending set all-or-nothing.)
+//! wrangler compatibility (CRITICAL): our existing prod applied its migrations with
+//! `wrangler d1 migrations apply`, so the records in wrangler's own `d1_migrations`
+//! table COUNT as applied and no migration ever re-runs in prod. Extra belt: a benign
+//! schema conflict ("duplicate column name" / "already exists") falls back to
+//! tolerant-apply (see `apply_one` below). The CLI path keeps working —
+//! `wrangler.toml migrations_dir` is still there and self-migration is only an
+//! additional safety net.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -42,14 +45,17 @@ use worker::*;
 use crate::d1util::{d1_int, d1_text};
 use crate::utils::now_secs;
 
-// ── Gömülü migration listesi ────────────────────────────────────────────────
-// SIRALI + ELLE BAKIMLI (build-script yerine bilinçli sade çözüm): yeni bir
-// migrations/NNNN_*.sql eklendiğinde buraya da satır eklenmeli. Unit test
-// `migrations_listesi_klasorle_senkron` unutmayı derleme-sonrası yakalar
-// (cargo test klasörü okuyup listeyle karşılaştırır).
+// ── Embedded migration list ─────────────────────────────────────────────────
+// ORDERED and HAND-MAINTAINED (a deliberately simple choice over a build script): when
+// you add a migrations/NNNN_*.sql you must add a line here too. The
+// `migrations_listesi_klasorle_senkron` unit test catches the omission right after
+// compiling — cargo test reads the directory and compares it against this list.
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../migrations/0001_init.sql")),
-    ("0002_push_tokens", include_str!("../migrations/0002_push_tokens.sql")),
+    (
+        "0002_push_tokens",
+        include_str!("../migrations/0002_push_tokens.sql"),
+    ),
     (
         "0003_admin_and_settings",
         include_str!("../migrations/0003_admin_and_settings.sql"),
@@ -58,7 +64,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0004_owner_and_invite_tracking",
         include_str!("../migrations/0004_owner_and_invite_tracking.sql"),
     ),
-    ("0005_retention", include_str!("../migrations/0005_retention.sql")),
+    (
+        "0005_retention",
+        include_str!("../migrations/0005_retention.sql"),
+    ),
     ("0006_groups", include_str!("../migrations/0006_groups.sql")),
     (
         "0007_group_settings",
@@ -68,12 +77,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0008_group_join_consent",
         include_str!("../migrations/0008_group_join_consent.sql"),
     ),
-    ("0009_turn_usage", include_str!("../migrations/0009_turn_usage.sql")),
+    (
+        "0009_turn_usage",
+        include_str!("../migrations/0009_turn_usage.sql"),
+    ),
     (
         "0010_message_retention",
         include_str!("../migrations/0010_message_retention.sql"),
     ),
-    ("0011_devices", include_str!("../migrations/0011_devices.sql")),
+    (
+        "0011_devices",
+        include_str!("../migrations/0011_devices.sql"),
+    ),
     (
         "0012_device_addressing_s1",
         include_str!("../migrations/0012_device_addressing_s1.sql"),
@@ -82,7 +97,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0013_device_otk_cut",
         include_str!("../migrations/0013_device_otk_cut.sql"),
     ),
-    ("0014_device_link", include_str!("../migrations/0014_device_link.sql")),
+    (
+        "0014_device_link",
+        include_str!("../migrations/0014_device_link.sql"),
+    ),
     (
         "0015_signed_prekeys_device_pk",
         include_str!("../migrations/0015_signed_prekeys_device_pk.sql"),
@@ -95,7 +113,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0017_device_list_highwater",
         include_str!("../migrations/0017_device_list_highwater.sql"),
     ),
-    ("0018_one_owner", include_str!("../migrations/0018_one_owner.sql")),
+    (
+        "0018_one_owner",
+        include_str!("../migrations/0018_one_owner.sql"),
+    ),
     (
         "0019_plugin_epoch_floor",
         include_str!("../migrations/0019_plugin_epoch_floor.sql"),
@@ -104,10 +125,19 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0020_push_wake_debounce",
         include_str!("../migrations/0020_push_wake_debounce.sql"),
     ),
-    ("0021_fanout_retry", include_str!("../migrations/0021_fanout_retry.sql")),
+    (
+        "0021_fanout_retry",
+        include_str!("../migrations/0021_fanout_retry.sql"),
+    ),
     ("0022_quotas", include_str!("../migrations/0022_quotas.sql")),
-    ("0023_quota_caps", include_str!("../migrations/0023_quota_caps.sql")),
-    ("0024_cf_config", include_str!("../migrations/0024_cf_config.sql")),
+    (
+        "0023_quota_caps",
+        include_str!("../migrations/0023_quota_caps.sql"),
+    ),
+    (
+        "0024_cf_config",
+        include_str!("../migrations/0024_cf_config.sql"),
+    ),
     (
         "0025_server_config",
         include_str!("../migrations/0025_server_config.sql"),
@@ -132,37 +162,61 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0030_delete_window",
         include_str!("../migrations/0030_delete_window.sql"),
     ),
+    (
+        "0031_invite_attributions",
+        include_str!("../migrations/0031_invite_attributions.sql"),
+    ),
+    (
+        "0032_contacts_directory_v2",
+        include_str!("../migrations/0032_contacts_directory_v2.sql"),
+    ),
+    (
+        "0033_contact_qr_v2",
+        include_str!("../migrations/0033_contact_qr_v2.sql"),
+    ),
+    (
+        "0034_membership_cleanup_outbox",
+        include_str!("../migrations/0034_membership_cleanup_outbox.sql"),
+    ),
+    (
+        "0035_avatar_objects",
+        include_str!("../migrations/0035_avatar_objects.sql"),
+    ),
 ];
 
 thread_local! {
-    /// İzolate-scope "migration'lar kontrol edildi" bayrağı — her istekte D1'e
-    /// gitmemek için (WASM izolate'i tek-thread → thread_local = izolate-memoize).
+    /// Isolate-scoped "migrations have been checked" flag, so we do not hit D1 on every
+    /// request (a WASM isolate is single-threaded, so a thread_local is an isolate memo).
     static MIGRATIONS_CHECKED: Cell<bool> = const { Cell::new(false) };
-    /// D1'den çözülen/üretilen JWT PKCS8-PEM (YALNIZ env-secret yokken dolar;
-    /// jwt.rs `load_signing_key` fallback'i buradan okur — hot-path D1'siz).
+    /// The JWT PKCS8 PEM resolved from or generated for D1. Populated ONLY when there is
+    /// no env secret; jwt.rs's `load_signing_key` fallback reads it from here, keeping
+    /// the hot path free of D1.
     static JWT_PEM: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// D1'den çözülen/üretilen admin-invite anahtarı (b64url 32B).
+    /// The admin-invite key resolved from or generated for D1 (32 bytes, b64url).
     static ADMIN_INVITE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Boot-guard — `#[event(fetch)]` ve `#[event(scheduled)]` girişinde çağrılır.
-/// İzolate-scope memoized: ilk çağrı işi yapar, sonrakiler no-op. env-secret'lı
-/// + wrangler-migrated kurulumda (bizim prod) TAMAMEN no-op'a düşer.
+/// Boot guard — called at the top of `#[event(fetch)]` and `#[event(scheduled)]`.
+/// Memoized per isolate: the first call does the work, the rest are no-ops. On an
+/// env-secret + wrangler-migrated deployment (our prod) it degenerates to a COMPLETE
+/// no-op.
 pub async fn ensure_ready(env: &Env) {
-    // ANAHTAR ÖNCE, MİGRATION SONRA (2026-07-07 free-plan vakası): free CF
-    // hesabında istek-başı subrequest bütçesi dar; anahtar-yolu ağır
-    // 25-migration-batch'iyle AYNI istekte yarışınca aç kalıp jwks/verify 500
-    // veriyordu (migration'lar tabloları kurar → bootstrap/welcome çalışır ama
-    // anahtar üretilemez). ensure_keys kendi `server_config` tablosunu kurar
-    // (migration 0025'e bağımlı DEĞİL) → birkaç subrequest'te BİTER; migration'lar
-    // sonra koşar, bütçeyi tüketse bile anahtar zaten hazırdır.
+    // KEYS FIRST, MIGRATIONS SECOND (the 2026-07-07 free-plan incident): a free CF
+    // account has a tight per-request subrequest budget, and when the key path competed
+    // with the heavy migration batch inside the SAME request it starved and jwks/verify
+    // returned 500 — the migrations created the tables, so bootstrap/welcome worked, but
+    // no key could be generated. ensure_keys creates its own `server_config` table and
+    // does NOT depend on migration 0025, so it finishes in a handful of subrequests; the
+    // migrations run afterwards and even if they exhaust the budget the key is already
+    // in place.
     ensure_keys(env).await;
     ensure_migrations(env).await;
 }
 
-/// Yalnız anahtar bacağı — UserInbox DO'su (`ws_upgrade` token doğrulaması)
-/// için: DO fetch'i lib.rs `#[event(fetch)]`'ten GEÇMEZ → kendi izolate'inin
-/// cache'ini doldurmalı. Memoized; env-secret varsa D1'e hiç gitmez.
+/// The key leg on its own — needed by the UserInbox DO (`ws_upgrade` token validation):
+/// a DO fetch does NOT pass through lib.rs's `#[event(fetch)]`, so the DO has to
+/// populate its own isolate's cache. Memoized, and never touches D1 when an env secret
+/// exists.
 pub async fn ensure_keys(env: &Env) {
     ensure_one_key(
         env,
@@ -184,17 +238,18 @@ pub async fn ensure_keys(env: &Env) {
     .await;
 }
 
-/// jwt.rs `load_signing_key` fallback'i: boot'ta D1'den çözülen/üretilen PEM.
-/// env-secret varken HİÇ dolmaz (env yolu jwt.rs'te doğrudan, bugünkü gibi).
+/// The fallback for jwt.rs's `load_signing_key`: the PEM resolved from or generated for
+/// D1 at boot. It is NEVER populated while an env secret exists — in that case jwt.rs
+/// takes the env path directly, exactly as it does today.
 pub fn cached_jwt_pem() -> Option<String> {
     JWT_PEM.with(|c| c.borrow().clone())
 }
 
-/// ADMIN_INVITE_KEY çözümü — env-first, sonra self-provision cache.
-/// NOT: bugün (2026-07) bu anahtarı kod HİÇBİR yerde okumuyor (wrangler.toml'da
-/// dokümante, bootstrap.rs'te "ileride kapı sertleştirme" notu). Self-provision
-/// onu taze fork'ta da ÜRETİP hazır tutar; gelecekteki tüketici (bootstrap
-/// kapısı) bu fonksiyonu çağırır.
+/// Resolve ADMIN_INVITE_KEY — env first, then the self-provision cache.
+/// NOTE: as of 2026-07 NO code reads this key yet (it is documented in wrangler.toml and
+/// referenced by a "harden this gate later" note in bootstrap.rs). Self-provision
+/// GENERATES it on a fresh fork anyway so it is ready; the future consumer (the
+/// bootstrap gate) will call this function.
 #[allow(dead_code)]
 pub fn resolve_admin_invite_key(env: &Env) -> Option<String> {
     if let Ok(s) = env.secret("ADMIN_INVITE_KEY") {
@@ -203,7 +258,7 @@ pub fn resolve_admin_invite_key(env: &Env) -> Option<String> {
     ADMIN_INVITE.with(|c| c.borrow().clone())
 }
 
-// ── A1: anahtar çözüm zinciri ───────────────────────────────────────────────
+// ── A1: the key resolution chain ────────────────────────────────────────────
 
 async fn ensure_one_key(
     env: &Env,
@@ -213,40 +268,43 @@ async fn ensure_one_key(
     generate: fn() -> Result<String>,
     validate: fn(&str) -> bool,
 ) {
-    // 1) env secret → YALNIZ boş-değil VE validate geçerse kabul (D1'e gitme).
-    //    KRİTİK (2026-07-07 free-hesap vakası): buton-deploy runtime'ında (yeni
-    //    wrangler) KURULMAMIŞ secret `Ok("")` dönebiliyor (eski runtime `Err`);
-    //    `is_ok()` görünce boş/bozuk değer env-first dalına girip self-heal'i
-    //    ATLATIYORDU → jwks/verify "PEM type label invalid" 500. Artık boş/geçersiz
-    //    env-secret YOK SAYILIR → self-provision (D1/üretim) devreye girer.
-    //    (Geçerli env-secret'lı prod bit-aynı: non-empty+validate → erken dönüş.)
+    // 1) env secret → accepted ONLY if non-empty AND it passes validate (then skip D1).
+    //    CRITICAL (the 2026-07-07 free-account incident): on the button-deploy runtime
+    //    (newer wrangler) an UNSET secret can come back as `Ok("")` where the old runtime
+    //    returned `Err`. Checking `is_ok()` let an empty/corrupt value take the env-first
+    //    branch and BYPASS self-heal → jwks/verify 500 with "PEM type label invalid". Now
+    //    an empty or invalid env secret is IGNORED and self-provision (D1 or generation)
+    //    takes over. Prod with a valid env secret is bit-identical: non-empty + validate
+    //    → early return.
     if let Ok(s) = env.secret(env_name) {
         let v = s.to_string();
         if !v.trim().is_empty() && validate(&v) {
             return;
         }
     }
-    // 2) İzolate cache dolu → tamam (hot-path D1-roundtrip'siz).
+    // 2) Isolate cache is populated → done (hot path, no D1 round-trip).
     if cache.with(|c| c.borrow().is_some()) {
         return;
     }
-    // 3) D1'den oku (+VALIDATE; bozuksa yeniden-üret = self-heal) / 4) yoksa
-    //    üret+persist. Hata = console_error + cache boş kalır → SONRAKİ istek
-    //    yeniden dener (D1 geçici hatasında self-heal; bu yol zaten yalnız
-    //    env-secret'sız kurulumlarda çalışır).
+    // 3) Read from D1 (and VALIDATE; a corrupt value is regenerated = self-heal), or
+    //    4) generate and persist. On error: console_error and leave the cache empty, so
+    //    the NEXT request tries again (self-heal across transient D1 errors). This path
+    //    only ever runs on deployments without an env secret anyway.
     match resolve_from_db(env, db_key, generate, validate).await {
         Ok(v) => cache.with(|c| *c.borrow_mut() = Some(v)),
         Err(e) => console_error!("self_provision: {} cozulemedi: {}", db_key, e),
     }
 }
 
-/// D1 `server_config` oku + DOĞRULA; bozuksa/yoksa üret + persist.
+/// Read D1 `server_config` and VALIDATE it; if the value is corrupt or missing, generate
+/// and persist a new one.
 ///
-/// SELF-HEAL (2026-07-06 sezi-server2 vakası): eski/bozuk bir build D1'e
-/// GEÇERSİZ JWT-PEM yazmıştı → güncel kod onu körü körüne kullanıp her token
-/// imzasında/jwks'te 500 veriyordu (kayıt yarıda öldü → hayalet-owner →
-/// sunucu kalıcı-kilit). Kural: kullanıcı ASLA worker-içini elle temizlemez →
-/// D1'den okunan değer validate'i GEÇMEZSE yeniden üret + ÜSTÜNE yaz.
+/// SELF-HEAL (the 2026-07-06 sezi-server2 incident): an old/broken build had written an
+/// INVALID JWT PEM into D1, and current code used it blindly, so every token signature
+/// and every jwks request 500'd — registration died halfway, leaving a ghost owner and a
+/// permanently wedged server. The rule: a user must NEVER have to clean the worker's
+/// internals by hand, so any value read from D1 that FAILS validate is regenerated and
+/// overwritten.
 async fn resolve_from_db(
     env: &Env,
     db_key: &str,
@@ -254,9 +312,9 @@ async fn resolve_from_db(
     validate: fn(&str) -> bool,
 ) -> Result<String> {
     let db = env.d1("DB")?;
-    // server_config'i anahtar-yolu KENDİSİ kurar (migration 0025'ten bağımsız)
-    // → ensure_keys migration'lardan ÖNCE koşabilir (bkz. ensure_ready sıra
-    // gerekçesi). IF NOT EXISTS → migration 0025 sonra koşarsa no-op.
+    // The key path creates `server_config` ITSELF, independently of migration 0025, so
+    // ensure_keys can run BEFORE the migrations (see the ordering rationale in
+    // ensure_ready). IF NOT EXISTS makes migration 0025 a no-op when it runs later.
     db.prepare(
         "CREATE TABLE IF NOT EXISTS server_config \
          (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL)",
@@ -267,15 +325,15 @@ async fn resolve_from_db(
         if validate(&v) {
             return Ok(v);
         }
-        // Bozuk kayıt → yeniden üret + INSERT OR REPLACE (bilinçli: ON CONFLICT
-        // DO NOTHING bozuk kaydı KORURDU; burada üstüne yazmak ŞART).
+        // Corrupt record → regenerate and INSERT OR REPLACE. Deliberate: ON CONFLICT
+        // DO NOTHING would PRESERVE the corrupt record, and here overwriting is mandatory.
         console_warn!(
             "self_provision: {} D1 kaydi BOZUK (validate gecmedi) → yeniden uretiliyor (self-heal; 2026-07-06 sezi-server2 vakasi)",
             db_key
         );
         let candidate = generate()?;
-        // Paranoya: ürettiğimizi de yazmadan önce doğrula — üretici ile
-        // doğrulayıcı ayrışırsa bozuk değeri D1'e persist etmeyelim.
+        // Paranoia: validate even what we just generated, so that if the generator and
+        // the validator ever diverge we do not persist a corrupt value into D1.
         if !validate(&candidate) {
             return Err(Error::RustError(format!(
                 "self_provision: {db_key} uretilen deger validate'i gecemedi (uretici/dogrulayici uyumsuz?)"
@@ -284,28 +342,32 @@ async fn resolve_from_db(
         db.prepare(
             "INSERT OR REPLACE INTO server_config (key, value, created_at) VALUES (?, ?, ?)",
         )
-        .bind(&[d1_text(db_key), d1_text(&candidate), d1_int(now_secs() as i64)])?
+        .bind(&[
+            d1_text(db_key),
+            d1_text(&candidate),
+            d1_int(now_secs() as i64),
+        ])?
         .run()
         .await?;
         console_log!(
             "self_provision: {} yeniden uretildi + D1'e yazildi (bozuk kaydin ustune)",
             db_key
         );
-        // Yarış notu: iki izolate aynı anda self-heal ederse REPLACE'te
-        // son-yazan kazanır. İki değer de TAZE-ÜRETİM + validate'li olduğu
-        // için zararsız: kaybeden izolate kendi değerini kullanır, izolate
-        // recycle'ında herkes D1'deki kazanana yakınsar (bozuk-kayıt tekrar
-        // doğamaz — yazılan her değer validate'ten geçti).
+        // Race note: if two isolates self-heal at the same time, the last writer wins the
+        // REPLACE. That is harmless because both values are freshly generated and
+        // validated: the loser keeps using its own value, and once isolates recycle
+        // everyone converges on the winner in D1. A corrupt record cannot reappear —
+        // every value written passed validate.
         return Ok(candidate);
     }
 
-    // Taze fork ilk boot: ÜRET + persist. YARIŞ GUARD'ı: iki eşzamanlı
-    // cold-start aynı anda üretebilir → `ON CONFLICT DO NOTHING` (ilk yazan
-    // kazanır, kaybeden no-op) + persist-SONRASI re-SELECT ile kazanan değer
-    // geri okunur → iki instance ASLA farklı anahtar kullanmaz (son kullanılan
-    // = D1'deki tek gerçek).
+    // A fresh fork's first boot: GENERATE and persist. RACE GUARD: two concurrent cold
+    // starts may generate at the same time, so `ON CONFLICT DO NOTHING` lets the first
+    // writer win (the loser is a no-op) and a re-SELECT AFTER persisting reads the winning
+    // value back. Two instances therefore NEVER use different keys — whatever ends up in
+    // use is the single truth stored in D1.
     let candidate = generate()?;
-    // Paranoya (yukarıdakiyle aynı gerekçe): bozuk değer D1'e persist edilmesin.
+    // Paranoia (same rationale as above): never persist a corrupt value into D1.
     if !validate(&candidate) {
         return Err(Error::RustError(format!(
             "self_provision: {db_key} uretilen deger validate'i gecemedi (uretici/dogrulayici uyumsuz?)"
@@ -315,7 +377,11 @@ async fn resolve_from_db(
         "INSERT INTO server_config (key, value, created_at) VALUES (?, ?, ?)
          ON CONFLICT(key) DO NOTHING",
     )
-    .bind(&[d1_text(db_key), d1_text(&candidate), d1_int(now_secs() as i64)])?
+    .bind(&[
+        d1_text(db_key),
+        d1_text(&candidate),
+        d1_int(now_secs() as i64),
+    ])?
     .run()
     .await?;
     console_log!(
@@ -323,9 +389,9 @@ async fn resolve_from_db(
         db_key
     );
     match read_config(&db, db_key).await? {
-        // Kazanan da validate'ten geçmeli: yarışı eski/bozuk bir yazar
-        // kazandıysa (teorik) onu kullanma → kendi taze değerimize düş;
-        // sonraki boot'un bozuk-kayıt dalı D1'i onarır.
+        // The winner must pass validate too: if an old or broken writer won the race
+        // (theoretically possible), do not use its value — fall back to our own fresh one,
+        // and the next boot's corrupt-record branch will repair D1.
         Some(winner) if validate(&winner) => Ok(winner),
         Some(_) => {
             console_warn!(
@@ -334,22 +400,22 @@ async fn resolve_from_db(
             );
             Ok(candidate)
         }
-        // Beklenmedik (insert az önce başarılıydı) — kendi değerimize düş.
+        // Unexpected (the insert just succeeded) — fall back to our own value.
         None => Ok(candidate),
     }
 }
 
-// ── Anahtar doğrulayıcıları (saf → unit-testli) ─────────────────────────────
+// ── Key validators (pure → unit-tested) ─────────────────────────────────────
 
-/// D1'den okunan JWT-PEM geçerli mi? jwt.rs'in KULLANACAĞI parser'ın kendisiyle
-/// doğrulanır (`parse_signing_pem`) → "validate geçti ama imzada patladı"
-/// ayrışması imkânsız (aynı fonksiyon).
+/// Is a JWT PEM read from D1 valid? It is checked with the very parser jwt.rs WILL use
+/// (`parse_signing_pem`), so "passed validate but blew up while signing" is impossible —
+/// it is literally the same function.
 fn validate_jwt_pem(v: &str) -> bool {
     crate::auth::jwt::parse_signing_pem(v).is_ok()
 }
 
-/// Admin-invite anahtarı için makul kapı: boş/whitespace olmasın yeter
-/// (opak paylaşılan-sır; format zorunluluğu yok).
+/// A reasonable gate for the admin-invite key: not empty and not just whitespace is
+/// enough — it is an opaque shared secret with no required format.
 fn validate_invite_key(v: &str) -> bool {
     !v.trim().is_empty()
 }
@@ -367,10 +433,10 @@ async fn read_config(db: &D1Database, key: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.value))
 }
 
-/// Ed25519 JWT imza anahtarı üret — jwt.rs doğrulayıcısıyla AYNI crate
-/// (ed25519-dalek) + AYNI format (PKCS8 PEM; `from_pkcs8_pem` roundtrip'i
-/// unit-testli). `LineEnding::LF` → gerçek newline'lı PEM: jwt.rs'in env-secret
-/// için yaptığı `"\\n"→"\n"` replace'i bu değerde no-op kalır.
+/// Generate an Ed25519 JWT signing key — the SAME crate as jwt.rs's verifier
+/// (ed25519-dalek) and the SAME format (PKCS8 PEM; the `from_pkcs8_pem` round-trip is
+/// unit-tested). `LineEnding::LF` produces a PEM with real newlines, so the `"\\n"→"\n"`
+/// replacement jwt.rs performs for env secrets is a no-op on this value.
 fn generate_jwt_signing_pem() -> Result<String> {
     use ed25519_dalek::pkcs8::{spki::der::pem::LineEnding, EncodePrivateKey};
     let mut seed = [0u8; 32];
@@ -383,8 +449,8 @@ fn generate_jwt_signing_pem() -> Result<String> {
     Ok(pem.to_string())
 }
 
-/// ADMIN_INVITE_KEY üret: 32-byte CSPRNG → base64url (padding'siz, 43 char).
-/// worker'da RNG = getrandom (js feature; utils.rs `random_b64u` aynı yol).
+/// Generate an ADMIN_INVITE_KEY: 32 CSPRNG bytes → base64url, unpadded, 43 chars. In the
+/// worker the RNG is getrandom (js feature), the same path utils.rs `random_b64u` uses.
 fn generate_admin_invite_key() -> Result<String> {
     Ok(crate::utils::random_b64u(32))
 }
@@ -402,20 +468,21 @@ async fn ensure_migrations(env: &Env) {
             return;
         }
     };
-    // FAIL-SOFT (fail-open DEĞİL ama 500 de değil): migration başarısızsa
-    // istekleri 500'lemek yerine MEVCUT şema ile hizmete devam. Gerekçe:
-    // migration'lar batch-atomik (yarım-şema yok) → başarısızlık = şema eski
-    // kaldı; eski şemayla çalışan endpoint'ler çalışmaya devam eder, yenisini
-    // isteyenler zaten anlamlı hata verir. Tam-blokaj self-host operatörüne
-    // "server ölü" görünürdü; böyle yalnız yeni özellik aksar + log konuşur.
+    // FAIL-SOFT (not fail-open, but not a 500 either): if a migration fails, keep serving
+    // with the CURRENT schema instead of 500ing requests. Rationale: migrations are
+    // batch-atomic (there is no half-applied schema), so a failure just means the schema
+    // stayed old — endpoints that work on the old schema keep working, and the ones that
+    // need the new columns already return a meaningful error. A hard block would look like
+    // "the server is dead" to a self-host operator; this way only new features stall and
+    // the log explains why.
     //
-    // Bayrak YALNIZ BAŞARIDA set edilir (2026-07-06 free-plan vakası): eski
-    // "denemeden önce set" kararı, subrequest-limitinde ortadan kesilen bir
-    // ilk-boot'u izolat ömrü boyunca ZEHİRLİ bırakıyordu (migration'lar hiç
-    // bitmedi ama bir daha denenmedi → deterministik jwks/verify 500). Yeni
-    // kural: Err'de set ETME → sonraki istek yeniden dener (migration'lar
-    // tolerant + batch-atomik = tekrar-GÜVENLİ). Kalıcı-hata döngüsü riski,
-    // kesik-boot'ta kalıcı-zehirden iyidir; batch başarılıysa zaten tek-sefer.
+    // The flag is set ONLY ON SUCCESS (the 2026-07-06 free-plan incident): the old
+    // "set before trying" choice left a first boot that got cut off at the subrequest limit
+    // POISONED for the whole isolate lifetime — the migrations never finished and were
+    // never retried, giving deterministic jwks/verify 500s. New rule: do NOT set the flag
+    // on Err, so the next request tries again (migrations are tolerant and batch-atomic,
+    // hence SAFE to repeat). The risk of a persistent retry loop beats permanent poisoning
+    // after a truncated boot, and once the batch succeeds it is a single shot anyway.
     match run_migrations(&db).await {
         Ok(()) => MIGRATIONS_CHECKED.with(|c| c.set(true)),
         Err(e) => console_error!(
@@ -426,8 +493,8 @@ async fn ensure_migrations(env: &Env) {
 }
 
 async fn run_migrations(db: &D1Database) -> Result<()> {
-    // Tracking tablosu — wrangler'ın `d1_migrations`'ından BİLİNÇLİ ayrı isim:
-    // wrangler kendi tablosunu sahiplenir/şemasını değiştirebilir; karışmayız.
+    // Tracking table — DELIBERATELY named apart from wrangler's `d1_migrations`: wrangler
+    // owns its own table and may change its schema, so we stay out of it.
     db.prepare(
         "CREATE TABLE IF NOT EXISTS _sezi_migrations \
          (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)",
@@ -449,13 +516,13 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         .map(|r| r.name)
         .collect();
 
-    // wrangler-uyumu (KRİTİK): bizim prod migration'ları `wrangler d1 migrations
-    // apply` ile uyguladı; wrangler bunları kendi `d1_migrations` tablosunda
-    // tutar (name = "0001_init.sql" biçiminde). O kayıtları uygulanmış-SAY →
-    // prod'da ilk self-migration HİÇBİR migration'ı yeniden koşmaz (deploy
-    // no-op). FAIL-OPEN: tablo yok (taze fork, hiç wrangler görmemiş DB) →
-    // yok say. Her izolate-boot'ta merge edilir (ucuz tek SELECT): ileride
-    // biri CLI ile 0026 uygularsa self-migration onu da uygulanmış görür.
+    // wrangler compatibility (CRITICAL): our prod applied its migrations with
+    // `wrangler d1 migrations apply`, and wrangler records them in its own `d1_migrations`
+    // table with names like "0001_init.sql". COUNT those records as applied, so the first
+    // self-migration in prod re-runs NOTHING and the deploy is a no-op. FAIL-OPEN: if the
+    // table does not exist (a fresh fork whose DB never met wrangler) just ignore it. The
+    // merge happens on every isolate boot via one cheap SELECT, so if someone later applies
+    // a migration through the CLI, self-migration sees it as applied too.
     if let Ok(res) = db.prepare("SELECT name FROM d1_migrations").all().await {
         if let Ok(rows) = res.results::<NameRow>() {
             for r in rows {
@@ -469,20 +536,20 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         .filter(|(name, _)| !applied.contains(*name))
         .copied()
         .collect();
-    // Prod bit-aynı guard: wrangler-seed'li kurulumda bekleyen = 0 → tek-batch
-    // HİÇ kurulmaz (erken dönüş; bugünkü prod deploy no-op davranışı korunur).
+    // Prod bit-identity guard: on a wrangler-seeded deployment nothing is pending, so the
+    // single batch is NEVER built (early return, preserving today's no-op prod deploy).
     if pending.is_empty() {
         return Ok(());
     }
 
-    // TEK-BATCH (2026-07-06 free-plan subrequest bütçesi): bekleyen TÜM
-    // dosyaların statement'ları + her dosyanın tracking-INSERT'i dosya-sırasında
-    // tek `db.batch`e (= tek subrequest, implicit transaction) girer. Eski
-    // dosya-başına batch+INSERT deseni taze kurulumda ~50 D1-çağrısıydı →
-    // Workers free-planının ~50-subrequest kapısında ilk-boot ortadan
-    // kesiliyordu. Atomiklik de GÜÇLENDİ: 0017-tipi tuzak ("çıplak ALTER +
-    // ardıl UPDATE") artık yalnız dosya-içi değil, TÜM bekleyen küme için
-    // hepsi-ya-hiç — kesik/yarım şema durumu imkânsız.
+    // SINGLE BATCH (the 2026-07-06 free-plan subrequest budget): the statements of ALL
+    // pending files plus each file's tracking INSERT go into one `db.batch` in file order —
+    // one subrequest, one implicit transaction. The old batch-plus-INSERT-per-file pattern
+    // cost ~50 D1 calls on a fresh install and got cut off at the Workers free plan's
+    // ~50-subrequest gate during the first boot. Atomicity got STRONGER too: the 0017-style
+    // trap ("a bare ALTER followed by an UPDATE") is now all-or-nothing across the WHOLE
+    // pending set rather than just within a file, so a truncated/half-applied schema is
+    // impossible.
     let merged = merge_pending_statements(&pending);
     let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(merged.len());
     for m in &merged {
@@ -507,13 +574,13 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         Err(e) => {
             let msg = e.to_string();
             if is_benign_schema_conflict(&msg) {
-                // Şema-çakışması (duplicate-column / already-exists): iki
-                // eşzamanlı cold-start yarışı ya da "wrangler-uygulanmış ama
-                // d1_migrations tablosuna erişilemedi" DB'si. Tek-batch geri
-                // sarıldı (şemaya dokunulmadı) → DOSYA-DOSYA tolerant-apply
-                // fallback'ine düş: çakışan dosyalar uygulanmış-sayılır,
-                // gerçekten eksikler koşar. NADİR yol — subrequest maliyeti
-                // eski desenle aynı (dosya-başına ≤2 çağrı), kabul edildi.
+                // A schema conflict (duplicate column / already exists) means either two
+                // concurrent cold starts raced, or this DB was wrangler-migrated but its
+                // `d1_migrations` table was unreachable. The single batch rolled back and
+                // left the schema untouched, so fall back to FILE-BY-FILE tolerant-apply:
+                // conflicting files count as applied and genuinely missing ones run. A rare
+                // path whose subrequest cost matches the old pattern (≤2 calls per file),
+                // which was deemed acceptable.
                 console_warn!(
                     "self_provision: tek-batch sema-cakismasi ({}) → dosya-dosya tolerant fallback",
                     msg
@@ -523,10 +590,10 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
                 }
                 Ok(())
             } else {
-                // GERÇEK hata. Tek-batch'te "hangi dosya patladı" bilgisi yok →
-                // D1'in ham hata metnini aynen taşı (SQLite mesajı çoğu kez
-                // tablo/kolon adıyla dosyayı ele verir); dosya-bazlı teşhis
-                // gerekirse fallback yolu zaten dosya-adıyla raporlar.
+                // A REAL error. A single batch cannot tell us which file blew up, so pass
+                // D1's raw error text through verbatim — the SQLite message usually gives
+                // the file away via a table/column name — and if per-file diagnosis is
+                // needed, the fallback path already reports the file name.
                 Err(Error::RustError(format!(
                     "tek-batch migration ({} bekleyen): {msg}",
                     pending.len()
@@ -536,20 +603,20 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
     }
 }
 
-/// Tek migration'ı ATOMİK uygula — artık YALNIZ tek-batch'in benign
-/// şema-çakışması fallback'inde çağrılır (ana yol = `run_migrations` tek-batch;
-/// bu yol dosya-bazlı tolerant-apply gerektiğinde devreye girer). D1 batch =
-/// implicit transaction: bir statement bile hata verirse TAMAMI rollback —
-/// devices/handlers.rs deseninin aynısı. Atomiklik 0017-tipi tuzağı dosya-içi
-/// kapatır: "çıplak ALTER (duplicate column) + ardıl UPDATE" dosyasında ALTER
-/// hatası TÜM batch'i geri sarar → UPDATE tek başına ASLA koşmaz (koşsaydı
-/// canlı `device_list_rev` high-water'ını geri çekerdi = veri regresyonu;
-/// 2026-07-06 migration-denetim bulgusu). Tek-batch ana yolu bunu daha da
-/// güçlendirir: hepsi-ya-hiç TÜM bekleyen küme için geçerli.
+/// Apply one migration ATOMICALLY — now called ONLY from the single batch's benign
+/// schema-conflict fallback (the main path is `run_migrations`'s single batch; this one
+/// takes over when per-file tolerant-apply is needed). A D1 batch is an implicit
+/// transaction: if even one statement errors, ALL of it rolls back — the same pattern as
+/// devices/handlers.rs. That atomicity closes the 0017-style trap within a file: in a file
+/// with "a bare ALTER (duplicate column) followed by an UPDATE", the ALTER's error rolls
+/// the WHOLE batch back so the UPDATE NEVER runs on its own. If it did, it would drag the
+/// live `device_list_rev` high-water backwards — a data regression, found by the 2026-07-06
+/// migration audit. The single-batch main path strengthens this further: all-or-nothing
+/// applies to the ENTIRE pending set.
 async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
     let statements = split_sql_statements(sql);
     if statements.is_empty() {
-        // Savunmacı: boş/yorum-only dosya → uygulanmış say (koşacak şey yok).
+        // Defensive: an empty or comment-only file counts as applied (nothing to run).
         return record_applied(db, name).await;
     }
     let stmts: Vec<D1PreparedStatement> = statements.iter().map(|s| db.prepare(s)).collect();
@@ -562,14 +629,15 @@ async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
         Err(e) => {
             let msg = e.to_string();
             if is_benign_schema_conflict(&msg) {
-                // TOLERANT-APPLY: "duplicate column name" / "already exists" =
-                // şema bu migration'ı ZATEN içeriyor (wrangler-uygulanmış ama
-                // d1_migrations kaydına erişilemeyen DB, ya da iki eşzamanlı
-                // cold-start'ın migration yarışında kaybeden taraf). Batch geri
-                // sarıldı → mevcut şemaya DOKUNULMADI; uygulanmış-say + devam.
-                // (0001..0024 dökümü: idempotent-olmayan tek sınıf çıplak
-                // ALTER ADD COLUMN + 0014'ün IF-NOT-EXISTS'siz CREATE'i; ikisi
-                // de yalnız bu iki mesajı üretir.)
+                // TOLERANT-APPLY: "duplicate column name" / "already exists" means the
+                // schema ALREADY contains this migration — either a wrangler-migrated DB
+                // whose `d1_migrations` record was unreachable, or the losing side of a
+                // migration race between two concurrent cold starts. The batch rolled back,
+                // so the existing schema was NOT touched; count it as applied and continue.
+                // (Surveying the embedded files, the only non-idempotent classes are bare
+                // ALTER ADD COLUMN — SQLite has no IF NOT EXISTS for it — and the CREATEs
+                // without IF NOT EXISTS in 0014/0015/0016; both produce only these two
+                // messages.)
                 console_warn!(
                     "self_provision: migration zaten-uygulanmis sayildi ({}): {}",
                     name,
@@ -577,9 +645,9 @@ async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
                 );
                 record_applied(db, name).await
             } else {
-                // GERÇEK hata: kaydetme + zinciri DURDUR (sonraki migration'lar
-                // buna bağımlı olabilir). Çağıran fail-soft davranır; sonraki
-                // izolate boot yeniden dener.
+                // A REAL error: do not record it and STOP the chain (later migrations may
+                // depend on this one). The caller behaves fail-soft, and the next isolate
+                // boot retries.
                 Err(Error::RustError(format!("migration {name}: {msg}")))
             }
         }
@@ -594,24 +662,24 @@ async fn record_applied(db: &D1Database, name: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Saf yardımcılar (unit-testli) ───────────────────────────────────────────
+// ── Pure helpers (unit-tested) ──────────────────────────────────────────────
 
-/// Tek-batch birleştirmesinin bir öğesi: migration dosyasından ham SQL
-/// statement ya da o dosyanın `_sezi_migrations` tracking-INSERT işareti
-/// (INSERT'in kendisi bind'li — SQL metni çağıranda kurulur; burada yalnız
-/// dosya adı taşınır ki birleştirme SAF + unit-testli kalsın).
+/// One item of the single-batch merge: either a raw SQL statement from a migration file,
+/// or a marker for that file's `_sezi_migrations` tracking INSERT. The INSERT itself is
+/// bound by the caller, which builds the SQL text; only the file name travels through
+/// here, so the merge stays PURE and unit-testable.
 #[derive(Debug, PartialEq)]
 enum MergedStmt {
     Sql(String),
     Track(String),
 }
 
-/// Bekleyen dosyaları TEK batch vektörüne birleştir — sıra sözleşmesi:
-/// dosya1-stmt'leri, dosya1-track, dosya2-stmt'leri, dosya2-track, ...
-/// (track her zaman kendi dosyasının statement'larından SONRA: batch implicit
-/// transaction olsa da sıra, fallback teşhisi ve okunabilirlik için korunur).
-/// Boş/yorum-only dosya → yalnız track (apply_one'ın "uygulanmış say"
-/// savunmasıyla aynı sonuç). Boş bekleyen → boş vektör.
+/// Merge the pending files into ONE batch vector. Order contract: file1's statements,
+/// file1's track, file2's statements, file2's track, ... A file's track always comes AFTER
+/// its own statements: the batch is an implicit transaction anyway, but the order is kept
+/// for fallback diagnosis and readability. An empty or comment-only file yields just a
+/// track (the same outcome as apply_one's "count as applied" defense). No pending files
+/// yields an empty vector.
 fn merge_pending_statements(pending: &[(&str, &str)]) -> Vec<MergedStmt> {
     let mut out = Vec::new();
     for &(name, sql) in pending {
@@ -623,21 +691,22 @@ fn merge_pending_statements(pending: &[(&str, &str)]) -> Vec<MergedStmt> {
     out
 }
 
-/// wrangler `d1_migrations.name` = dosya adı (".sql" uzantılı) — bizim liste
-/// uzantısız. Normalize: trim + ".sql" soy.
+/// wrangler's `d1_migrations.name` is the file name including the ".sql" suffix, while our
+/// list is extension-free. Normalize by trimming and stripping ".sql".
 fn normalize_migration_name(raw: &str) -> &str {
     let t = raw.trim();
     t.strip_suffix(".sql").unwrap_or(t)
 }
 
-/// SQL dosyasını statement'lara böl. NAİF `;`-split DEĞİL: migration
-/// yorumlarının İÇİNDE `;` geçiyor (gerçek örnek: 0014 inline yorumu
-/// "... consume = satır DELETE; 'consumed' persist EDİLMEZ") — naif split
-/// CREATE TABLE'ı ortadan keserdi. Küçük state-machine: string-literal
-/// (`''` escape dahil) + `--` satır-yorumu + `/* */` blok-yorumu farkında;
-/// yorumlar ÇIKARILIR (D1 prepare'ine saf SQL gider), `;` yalnız normal
-/// bağlamda statement sonlandırır. Trigger (BEGIN...END içinde `;`) migration
-/// dosyalarında YOK — eklenirse bu splitter yetmez, o gün yeniden ele alınır.
+/// Split a SQL file into statements. NOT a naive `;` split: migration comments do contain
+/// `;` — a real example is 0014's inline column comment, which reads (in Turkish)
+/// "... consume = satır DELETE; 'consumed' persist EDİLMEZ" — and a naive split would cut
+/// that CREATE TABLE in half.
+/// This is a small state machine aware of string literals (including the `''` escape),
+/// `--` line comments and `/* */` block comments. Comments are STRIPPED so D1's prepare
+/// receives pure SQL, and a `;` only terminates a statement in normal context. Triggers
+/// (with `;` inside BEGIN...END) do NOT appear in the migration files; if one is ever
+/// added this splitter will not suffice and will have to be revisited then.
 fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -648,7 +717,7 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
             cur.push(c);
             if c == '\'' {
                 if chars.peek() == Some(&'\'') {
-                    // '' = escape'li tek-tırnak → string devam ediyor.
+                    // '' is an escaped single quote → the string continues.
                     cur.push(chars.next().unwrap());
                 } else {
                     in_string = false;
@@ -662,8 +731,8 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
                 cur.push(c);
             }
             '-' if chars.peek() == Some(&'-') => {
-                // Satır-yorumu: satır sonuna kadar at; newline koru (token
-                // bitişikliği bozulmasın).
+                // Line comment: drop everything to end of line, but keep a newline so
+                // adjacent tokens do not get glued together.
                 for n in chars.by_ref() {
                     if n == '\n' {
                         break;
@@ -672,7 +741,7 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
                 cur.push('\n');
             }
             '/' if chars.peek() == Some(&'*') => {
-                // Blok-yorum: `*/`e kadar at (bugünkü dosyalarda yok; savunmacı).
+                // Block comment: drop everything up to `*/` (none in today's files; defensive).
                 chars.next();
                 let mut prev = ' ';
                 for n in chars.by_ref() {
@@ -700,217 +769,17 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     out
 }
 
-/// Tolerant-apply sınıflandırması: YALNIZ "şema zaten böyle" hataları benign.
-/// SQLite mesajları: "duplicate column name: X" (çıplak ALTER ADD COLUMN
-/// re-run — 0003/0004/0005/0007/0008/0010/0012/0017/0022/0023/0024) ve
-/// "table/index X already exists" (IF-NOT-EXISTS'siz CREATE re-run — 0014).
-/// UNIQUE-violation / "no such table" / syntax vb. GERÇEK hatadır → yutulmaz.
+/// Tolerant-apply classification: ONLY "the schema is already like this" errors are benign.
+/// The SQLite messages are "duplicate column name: X" (re-running a bare ALTER ADD COLUMN,
+/// which many migrations from 0003 onward use — SQLite has no IF NOT EXISTS for it) and
+/// "table/index X already exists" (re-running a CREATE without IF NOT EXISTS, i.e.
+/// 0014/0015/0016). A UNIQUE violation, "no such table", a syntax error and the like are
+/// REAL errors and are never swallowed.
 fn is_benign_schema_conflict(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("duplicate column name") || m.contains("already exists")
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Elle bakımlı MIGRATIONS listesi ↔ migrations/ klasörü senkron mu?
-    /// (Yeni dosya ekleyip listeyi unutursan bu test kırılır.)
-    #[test]
-    fn migrations_listesi_klasorle_senkron() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
-        let mut files: Vec<String> = std::fs::read_dir(dir)
-            .expect("migrations klasoru okunamadi")
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter_map(|n| n.strip_suffix(".sql").map(str::to_string))
-            .collect();
-        files.sort();
-        let names: Vec<String> = MIGRATIONS.iter().map(|(n, _)| n.to_string()).collect();
-        assert_eq!(
-            names, files,
-            "migrations/*.sql <-> MIGRATIONS listesi uyusmuyor — yeni migration ekledin ama listeye satir eklemedin mi?"
-        );
-        // Sıralılık + benzersizlik (dosya-adı = versiyon anahtarı).
-        for w in names.windows(2) {
-            assert!(w[0] < w[1], "MIGRATIONS sirasiz: {} >= {}", w[0], w[1]);
-        }
-    }
-
-    /// Gömülü her dosya en az 1 statement üretmeli; hiçbir statement yorum
-    /// artığı içermemeli (splitter yorumları soymuş olmalı).
-    #[test]
-    fn tum_migrationlar_bolunebiliyor() {
-        for (name, sql) in MIGRATIONS {
-            let stmts = split_sql_statements(sql);
-            assert!(!stmts.is_empty(), "{name}: hic statement cikmadi");
-            for s in &stmts {
-                assert!(!s.trim().is_empty(), "{name}: bos statement");
-                assert!(
-                    !s.contains("--"),
-                    "{name}: statement icinde yorum artigi kaldi: {s}"
-                );
-            }
-        }
-    }
-
-    /// Gerçek tuzak vakası: 0014'ün CREATE TABLE'ında inline yorum içinde `;`
-    /// var — naif split tabloyu ortadan keserdi. Splitter 2 statement çıkarmalı
-    /// (CREATE TABLE + CREATE INDEX) ve CREATE TABLE bütün kalmalı.
-    #[test]
-    fn yorum_icindeki_noktali_virgul_statement_kesmiyor() {
-        let sql = MIGRATIONS
-            .iter()
-            .find(|(n, _)| *n == "0014_device_link")
-            .unwrap()
-            .1;
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2, "0014: CREATE TABLE + CREATE INDEX beklenir");
-        assert!(stmts[0].contains("expires_at") && stmts[0].contains("link_code"));
-        assert!(stmts[1].starts_with("CREATE INDEX"));
-    }
-
-    #[test]
-    fn splitter_string_literal_ve_blok_yorum() {
-        let sql = "INSERT INTO t VALUES ('a;b', 'it''s'); /* yorum; icinde */ SELECT 1;\n-- kuyruk yorumu\n";
-        let stmts = split_sql_statements(sql);
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "INSERT INTO t VALUES ('a;b', 'it''s')");
-        assert_eq!(stmts[1], "SELECT 1");
-    }
-
-    /// Tek-batch sıra sözleşmesi: dosya1-stmt'leri → dosya1-track →
-    /// dosya2-stmt'leri → dosya2-track... Yorum-only dosya yalnız track üretir.
-    #[test]
-    fn tek_batch_birlestirme_sirasi() {
-        let pending: [(&str, &str); 3] = [
-            (
-                "0001_a",
-                "CREATE TABLE a (id INTEGER); CREATE INDEX ia ON a(id);",
-            ),
-            ("0002_b", "-- yalniz yorum, statement yok\n"),
-            ("0003_c", "ALTER TABLE a ADD COLUMN x TEXT;"),
-        ];
-        let merged = merge_pending_statements(&pending);
-        assert_eq!(
-            merged,
-            vec![
-                MergedStmt::Sql("CREATE TABLE a (id INTEGER)".into()),
-                MergedStmt::Sql("CREATE INDEX ia ON a(id)".into()),
-                MergedStmt::Track("0001_a".into()),
-                MergedStmt::Track("0002_b".into()),
-                MergedStmt::Sql("ALTER TABLE a ADD COLUMN x TEXT".into()),
-                MergedStmt::Track("0003_c".into()),
-            ]
-        );
-    }
-
-    /// Bekleyen boş → boş vektör (run_migrations zaten erken döner ama saf
-    /// fonksiyonun sözleşmesi de net olsun).
-    #[test]
-    fn tek_batch_bos_bekleyen_bos_doner() {
-        assert!(merge_pending_statements(&[]).is_empty());
-    }
-
-    /// Gerçek gömülü liste üstünde bütünlük: birleştirilmiş uzunluk =
-    /// toplam-statement + dosya-başına-1-track; her dosyanın track'i kendi
-    /// statement'larından SONRA gelir (taze-fork ilk-boot senaryosunun aynısı).
-    #[test]
-    fn tek_batch_tum_migrationlar_stmt_arti_track() {
-        let pending: Vec<(&str, &str)> = MIGRATIONS.to_vec();
-        let merged = merge_pending_statements(&pending);
-        let stmt_toplam: usize = MIGRATIONS
-            .iter()
-            .map(|(_, sql)| split_sql_statements(sql).len())
-            .sum();
-        assert_eq!(merged.len(), stmt_toplam + MIGRATIONS.len());
-        // Track sırası = MIGRATIONS sırası; son öğe son dosyanın track'i.
-        let tracks: Vec<&String> = merged
-            .iter()
-            .filter_map(|m| match m {
-                MergedStmt::Track(n) => Some(n),
-                MergedStmt::Sql(_) => None,
-            })
-            .collect();
-        let beklenen: Vec<String> = MIGRATIONS.iter().map(|(n, _)| n.to_string()).collect();
-        assert_eq!(tracks, beklenen.iter().collect::<Vec<_>>());
-        assert_eq!(
-            merged.last(),
-            Some(&MergedStmt::Track(MIGRATIONS.last().unwrap().0.to_string()))
-        );
-    }
-
-    #[test]
-    fn benign_siniflandirma() {
-        // Benign: çıplak-ALTER re-run + IF-NOT-EXISTS'siz CREATE re-run.
-        assert!(is_benign_schema_conflict(
-            "D1_ERROR: duplicate column name: role: SQLITE_ERROR"
-        ));
-        assert!(is_benign_schema_conflict("table link_requests already exists"));
-        assert!(is_benign_schema_conflict(
-            "index idx_link_requests_expiry already exists"
-        ));
-        // Gerçek hatalar yutulMAZ.
-        assert!(!is_benign_schema_conflict("no such table: users"));
-        assert!(!is_benign_schema_conflict(
-            "UNIQUE constraint failed: users.email"
-        ));
-        assert!(!is_benign_schema_conflict("near \"CREATTE\": syntax error"));
-    }
-
-    #[test]
-    fn wrangler_isim_normalize() {
-        assert_eq!(normalize_migration_name("0001_init.sql"), "0001_init");
-        assert_eq!(normalize_migration_name("0001_init"), "0001_init");
-        assert_eq!(normalize_migration_name(" 0025_server_config.sql "), "0025_server_config");
-    }
-
-    /// Üretilen PEM, jwt.rs'in env-secret için kullandığı parser'la BİT-UYUMLU
-    /// olmalı (aynı fonksiyon: `parse_signing_pem` — format uyum kanıtı) ve
-    /// imza roundtrip'i geçmeli.
-    #[test]
-    fn jwt_pem_roundtrip_jwt_parser_ile_uyumlu() {
-        use ed25519_dalek::{Signer, Verifier};
-        let pem = generate_jwt_signing_pem().unwrap();
-        // Gerçek newline'lı PEM: jwt.rs'in `\\n`→`\n` replace'i no-op kalmalı.
-        assert!(pem.contains('\n') && !pem.contains("\\n"));
-        let key = crate::auth::jwt::parse_signing_pem(&pem).expect("jwt.rs parser'i kabul etmeli");
-        let msg = b"sezi self-provision roundtrip";
-        let sig = key.sign(msg);
-        key.verifying_key().verify(msg, &sig).unwrap();
-    }
-
-    #[test]
-    fn invite_key_uretimi_b64u_32_byte() {
-        let k = generate_admin_invite_key().unwrap();
-        // 32 byte → b64url padding'siz 43 karakter.
-        assert_eq!(k.len(), 43);
-        assert!(crate::utils::b64u_decode(&k).unwrap().len() == 32);
-    }
-
-    /// Self-heal kapısı (2026-07-06 sezi-server2 vakası): bozuk D1 kaydı
-    /// validate'i GEÇMEMELİ (→ yeniden-üretim yolu), üretilen taze anahtar
-    /// GEÇMELİ (→ körü körüne kullanım yerine doğrulanmış kullanım).
-    #[test]
-    fn validate_jwt_pem_bozuk_kaydi_reddediyor_tazeyi_kabul_ediyor() {
-        // Saha benzeri bozukluklar: boş, PEM-değil, gövdesi-çöp PEM, kırpılmış PEM.
-        assert!(!validate_jwt_pem(""));
-        assert!(!validate_jwt_pem("hic PEM degil"));
-        assert!(!validate_jwt_pem(
-            "-----BEGIN PRIVATE KEY-----\nQk9aVUsgS0FZSVQ=\n-----END PRIVATE KEY-----\n"
-        ));
-        let pem = generate_jwt_signing_pem().unwrap();
-        let truncated = &pem[..pem.len() / 2];
-        assert!(!validate_jwt_pem(truncated));
-        // Taze üretim geçer (üretici ↔ doğrulayıcı uyumu).
-        assert!(validate_jwt_pem(&pem));
-        // wrangler-secret tarzı kaçışlı-newline PEM de geçer (parser replace'li).
-        assert!(validate_jwt_pem(&pem.replace('\n', "\\n")));
-    }
-
-    #[test]
-    fn validate_invite_key_bos_reddediyor_tazeyi_kabul_ediyor() {
-        assert!(!validate_invite_key(""));
-        assert!(!validate_invite_key("   \n\t"));
-        assert!(validate_invite_key(&generate_admin_invite_key().unwrap()));
-    }
-}
+#[path = "self_provision_tests.rs"]
+mod tests;

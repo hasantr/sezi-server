@@ -1,38 +1,38 @@
-//! Lazy-maintenance — cron-bağımsız bakım (kesin-çözüm paketi 2026-07-06).
+//! Lazy maintenance — cron-independent upkeep (part of the 2026-07-06 hardening package).
 //!
-//! SAHA GEREKÇESİ: CF free-planında hesap-başına cron-tetikleyici limiti var —
-//! aynı hesaba kurulan İKİNCİ sezi-server `wrangler deploy`in schedules adımında
-//! "account-plan-limits" hatası alıyor ve CRON'SUZ kalıyor → günlük-GC +
-//! 2dk fanout-drain HİÇ çalışmıyor (retry-kuyruğu birikir, expired-media/token
-//! temizliği durur). Çözüm: bakım görevleri istek-sırtında (piggyback) da
-//! koşabilsin — cron yalnızca "bakımı taze tutan" bir yol olsun, TEK yol değil.
+//! FIELD RATIONALE: the CF free plan caps cron triggers per account. A SECOND sezi-server
+//! deployed into the same account fails `wrangler deploy`'s schedules step with
+//! "account-plan-limits" and ends up with NO CRON, so the daily GC and the 2-minute
+//! fanout drain NEVER run: the retry queue piles up and expired-media/token cleanup
+//! stops. The fix is to let maintenance tasks also run piggybacked on requests, making
+//! the cron just one way to keep maintenance fresh rather than the ONLY way.
 //!
-//! ŞABLON-UYUM NOTU: şablon-kurulumda `wrangler.toml` [triggers] YOK
-//! (hesap-cron-limiti) → bakım tamamen lazy-yoldan; cron'lu kurulumda damgalar
-//! taze kaldığından lazy uyur. (Monorepo-prod `wrangler.toml` [triggers]'a
-//! DOKUNULMADI — orada cron çalışır, bu modül sessiz kalır.)
+//! TEMPLATE COMPATIBILITY: the template deployment has no `[triggers]` in
+//! `wrangler.toml` (account cron limit), so maintenance runs entirely off the lazy path;
+//! on a cron-enabled deployment the stamps stay fresh and the lazy path sleeps. The
+//! monorepo prod `wrangler.toml` `[triggers]` was left UNTOUCHED — there the cron runs
+//! and this module stays quiet.
 //!
-//! MEKANİZMA — `server_config` (0025 key-value) üç zaman-damgası:
-//!   - `maint_drain_at`        = son fanout-drain bakımının epoch-sn'si
-//!   - `maint_daily_at`        = son günlük-GC'nin epoch-sn'si
-//!   - `maint_storage_move_at` = son depo-taşıma (drain) tick'inin epoch-sn'si (Faz 4)
+//! MECHANISM — three timestamps in `server_config` (the 0025 key-value table):
+//!   - `maint_drain_at`        = epoch seconds of the last fanout-drain pass
+//!   - `maint_daily_at`        = epoch seconds of the last daily GC
+//!   - `maint_storage_move_at` = epoch seconds of the last storage-move (drain) tick (phase 4)
 //!
-//! `scheduled()` HER koşuşta kendi damgasını tazeler → cron çalışan kurulumda
-//! damga hiç eskimez → lazy-yol HİÇ tetiklenmez (prod bit-aynı). Cron'suz
-//! kurulumda damga eskir → ilk uygun istek `ctx.wait_until` ile bakımı
-//! arka-planda koşar (yanıt gecikmez).
+//! `scheduled()` refreshes its own stamp on EVERY run, so with a working cron the stamp
+//! never goes stale and the lazy path is NEVER triggered (prod stays bit-identical).
+//! Without a cron the stamp ages, and the first eligible request runs maintenance in the
+//! background via `ctx.wait_until` — the response is never delayed.
 //!
-//! MALİYET DİSİPLİNİ: istek-başı EK D1-OKUMASI YOK — izolat-içi `thread_local`
-//! son-kontrol-zamanı ile D1'e en fazla ~60sn'de bir bakılır; o bakış da
-//! `wait_until` içinde (istek kritik-yolunda sıfır ek gecikme).
+//! COST DISCIPLINE: NO extra D1 read per request. An isolate-local `thread_local`
+//! last-checked timestamp limits D1 lookups to roughly one per 60s, and even that lookup
+//! happens inside `wait_until` (zero added latency on the request critical path).
 //!
-//! YARIŞ-DARALTMA (kazanan-deseni): damga stale görülünce ÖNCE
-//! `UPDATE ... WHERE CAST(value AS INTEGER) <= stale-eşik RETURNING key`
-//! ile damga ileri itilir — D1 UPDATE'i serialize eder, yalnız İLK kazanan
-//! satır döndürür; kaybeden izolat işi atlar. Kazanamama = başka izolat
-//! zaten koşuyor → görev tekilleşir. (Görevlerin kendisi de eşzamanlılığa
-//! dayanıklı — aşağıdaki fonksiyon yorumlarına bakınız — kazanan-deseni
-//! sadece gereksiz çift-işi keser.)
+//! RACE NARROWING (winner pattern): when a stamp looks stale, the stamp is pushed
+//! forward FIRST via `UPDATE ... WHERE CAST(value AS INTEGER) <= stale-cutoff RETURNING
+//! key`. D1 serializes UPDATEs, so only the FIRST winner gets a row back and the loser
+//! skips the work. Failing to win means another isolate is already running it, so each
+//! task executes once. (The tasks themselves are also concurrency-safe — see the
+//! per-function comments below — the winner pattern merely avoids pointless double work.)
 
 use std::cell::Cell;
 
@@ -40,39 +40,42 @@ use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use worker::*;
 
-use crate::d1util::d1_int;
-use crate::d1util::d1_text;
+use crate::auth::hashing::sha256_hex;
+use crate::d1util::{d1_blob, d1_int, d1_null, d1_opt_int, d1_opt_text, d1_text};
 use crate::utils::now_secs;
 
-/// İzolat-içi D1-bakış gaz-kelebeği: istek-başına damga-SELECT'i atmamak için
-/// en fazla bu aralıkta bir kez D1'e bakılır (WASM izolatı tek-thread →
-/// thread_local = izolat-memoize; self_provision ile aynı desen).
+/// Isolate-local throttle on D1 lookups: the stamp SELECT runs at most once per this
+/// interval, never per request (a WASM isolate is single-threaded, so a thread_local is
+/// an isolate-wide memo — the same pattern self_provision uses).
 const CHECK_EVERY_SECS: u64 = 60;
 
-/// Lazy drain eşiği. Cron aralığı 120sn ama eşik BİLİNÇLİ 300sn (2.5×):
-/// CF scheduled-event'leri saniye-hassas değil — cron birkaç sn/dk gecikebilir.
-/// Eşik = tam 120sn olsaydı cron'lu PROD'da "damga 120sn'yi yeni geçti, cron
-/// birazdan koşacak" penceresinde lazy düzenli tetiklenirdi (çift-drain zararsız
-/// ama "cron'lu kurulumda lazy uyur" sözleşmesi bozulurdu). 2.5× jitter payı =
-/// lazy yalnız cron GERÇEKTEN ölüyse uyanır; cron'suz kurulumda drain kadansı
-/// trafik varken ~5dk (retry-kuyruğu backoff'lu tampon — yeterli).
+/// Lazy drain threshold. The cron interval is 120s but the threshold is DELIBERATELY
+/// 300s (2.5×): CF scheduled events are not second-accurate and a cron can be seconds or
+/// minutes late. At exactly 120s, cron-enabled PROD would fire the lazy path routinely in
+/// the "the stamp just passed 120s, the cron is about to run" window — a double drain is
+/// harmless, but it would break the "lazy sleeps on cron-enabled deployments" contract.
+/// The 2.5× jitter margin means lazy only wakes when the cron is TRULY dead; on a
+/// cron-less deployment the drain cadence is ~5 minutes while traffic exists, which is
+/// enough given the retry queue's own backoff buffer.
 const DRAIN_LAZY_AFTER_SECS: i64 = 300;
 
-/// Lazy günlük-GC eşiği: 24s + 1s pay (aynı jitter gerekçesi — günlük cron
-/// "0 4 * * *" damgası tam 86400sn'de tazelenir; paysız eşik sınırda yarışırdı).
+/// Lazy daily-GC threshold: 24h plus a 1h margin (same jitter rationale — the daily
+/// "0 4 * * *" cron refreshes the stamp exactly every 86400s, so a threshold with no
+/// margin would race on the boundary).
 const DAILY_LAZY_AFTER_SECS: i64 = 90_000;
 
-/// Lazy depo-taşıma (Takılabilir-depolama Faz 4) eşiği — drain ile AYNI gerekçe/
-/// kadans (2dk cron × 2.5 jitter payı): cron'lu kurulumda scheduled her koşumda
-/// taşıma-tick'i + damga → lazy uyur; cron'suz kurulumda ~5dk kadansla koşar.
-/// Drain-endpoint'i damgayı 0'a çeker (`wake_storage_move`) → taşımanın BAŞLANGICI
-/// eşiği beklemez (ilk uygun istek ≤60sn gaz-kelebeği penceresinde claim'ler).
+/// Lazy storage-move threshold (pluggable storage phase 4) — SAME rationale and cadence
+/// as the drain (2-minute cron × 2.5 jitter margin): on a cron-enabled deployment every
+/// scheduled run does a move tick and stamps it, so lazy sleeps; without a cron it runs
+/// on a ~5-minute cadence. The drain endpoint pulls the stamp to 0 (`wake_storage_move`)
+/// so the START of a move does not wait out the threshold — the first eligible request
+/// claims it within the ≤60s throttle window.
 const MOVE_LAZY_AFTER_SECS: i64 = 300;
 
-// Sözleşme-kilidi (derleme-zamanı): lazy eşikleri cron kadanslarının (drain
-// "*/2 * * * *"=120sn, günlük "0 4 * * *"=86400sn) ALTINA inmemeli — inerse
-// cron'lu prod'da lazy düzenli uyanır (çift-koşum zararsız ama "prod bit-aynı"
-// sözleşmesi bozulur).
+// Compile-time contract lock: the lazy thresholds must not drop BELOW the cron cadences
+// (drain "*/2 * * * *" = 120s, daily "0 4 * * *" = 86400s) — if they did, lazy would wake
+// routinely on cron-enabled prod (a double run is harmless, but it breaks the "prod is
+// bit-identical" contract). The drain/move asserts lock in a 2× margin.
 const _: () = assert!(DRAIN_LAZY_AFTER_SECS >= 2 * 120);
 const _: () = assert!(DAILY_LAZY_AFTER_SECS > 86_400);
 const _: () = assert!(MOVE_LAZY_AFTER_SECS >= 2 * 120);
@@ -82,23 +85,23 @@ const KEY_DAILY: &str = "maint_daily_at";
 const KEY_MOVE: &str = "maint_storage_move_at";
 
 thread_local! {
-    /// Son D1 damga-kontrol zamanı (epoch-sn; 0 = izolat hiç bakmadı).
+    /// Time of the last D1 stamp check (epoch seconds; 0 = this isolate never looked).
     static LAST_CHECK: Cell<u64> = const { Cell::new(0) };
 }
 
-// ── fetch-yolu girişi ───────────────────────────────────────────────────────
+// ── fetch-path entry point ──────────────────────────────────────────────────
 
-/// `#[event(fetch)]` girişinden (ensure_ready ardından) çağrılır. İstek kritik
-/// yolundaki maliyeti: `Date.now()` + thread_local karşılaştırma (D1'siz,
-/// await'siz). Gaz-kelebeği açıksa damga-kontrol + olası bakım TAMAMEN
-/// `ctx.wait_until` arka-planında koşar → yanıt gecikmez. BEST-EFFORT: her
-/// hata loglanır-yutulur, istek asla etkilenmez.
+/// Called from the `#[event(fetch)]` entry point, right after ensure_ready. Its cost on
+/// the request critical path is `Date.now()` plus a thread_local comparison — no D1, no
+/// await. If the throttle window is open, the stamp check and any resulting maintenance
+/// run ENTIRELY in the background via `ctx.wait_until`, so the response is never delayed.
+/// BEST-EFFORT: every error is logged and swallowed; the request is never affected.
 pub fn maybe_run_lazy(env: &Env, ctx: &Context) {
     let now = now_secs();
     let due = LAST_CHECK.with(|c| {
         if throttle_due(c.get(), now, CHECK_EVERY_SECS) {
-            // Bayrağı HEMEN ileri al (tek-thread → yarışsız): aynı izolatın
-            // ardışık istekleri 60sn boyunca D1'e hiç bakmaz.
+            // Advance the marker IMMEDIATELY (single-threaded, so no race): subsequent
+            // requests on the same isolate touch D1 not at all for 60s.
             c.set(now);
             true
         } else {
@@ -112,14 +115,15 @@ pub fn maybe_run_lazy(env: &Env, ctx: &Context) {
     ctx.wait_until(async move { check_and_run(env).await });
 }
 
-/// Damgaları oku → stale görevler için kazanan-desenini dene → kazanılanı koş.
-/// Sıra: önce drain (sık/ucuz), sonra günlük-GC (nadir/ağır).
+/// Read the stamps → try the winner pattern for each stale task → run whatever we won.
+/// Order: drain first (frequent/cheap), then the storage-move tick, then the daily GC
+/// (rare/heavy).
 async fn check_and_run(env: Env) {
     let Ok(db) = env.d1("DB") else { return };
     let now = now_secs() as i64;
     let (drain_at, daily_at, move_at) = match read_stamps(&db).await {
         Ok(v) => v,
-        // D1 geçici hatası → sonraki gaz-kelebeği penceresinde yeniden.
+        // Transient D1 error → try again in the next throttle window.
         Err(_) => return,
     };
     if is_due(now, drain_at, DRAIN_LAZY_AFTER_SECS)
@@ -130,10 +134,16 @@ async fn check_and_run(env: Env) {
             now - drain_at
         );
         crate::messages::handlers::drain_fanout_retry(&env).await;
+        // On a Pi/workerd `wrangler dev` deployment the scheduled event may never fire.
+        // Even when the membership row is already gone from D1, if the first UserInbox
+        // purge call hit a transient error the account-purge outbox converges off this
+        // same lazy drain stamp.
+        crate::membership::drain_purge_outbox(&env).await;
     }
-    // Takılabilir-depolama Faz 4: draining-depo taşıma tick'i (≤4 blob/koşum).
-    // Cron'lu kurulumda scheduled her koşumda tick+damga → burası uyur. Draining
-    // depo yoksa run_storage_move ilk SELECT'te sessiz döner (tek ucuz sorgu).
+    // Pluggable storage phase 4: draining-backend move tick (≤4 blobs per run). On a
+    // cron-enabled deployment every scheduled run ticks and stamps, so this sleeps. With
+    // no draining backend, run_storage_move returns quietly after its first SELECT (one
+    // cheap query).
     if is_due(now, move_at, MOVE_LAZY_AFTER_SECS)
         && claim(&db, KEY_MOVE, now, now - MOVE_LAZY_AFTER_SECS).await
     {
@@ -158,10 +168,11 @@ async fn check_and_run(env: Env) {
     }
 }
 
-// ── damga okuma / kazanan-deseni ────────────────────────────────────────────
+// ── stamp reads / winner pattern ────────────────────────────────────────────
 
-/// Üç damgayı TEK SELECT'te oku (epoch-sn; satır-yok/bozuk-değer → 0 =
-/// "çok eski" → ilk uygun istekte bir kez koşar + damgalanır).
+/// Read all three stamps in ONE SELECT (epoch seconds; a missing row or a corrupt value
+/// becomes 0 = "very old" → the task runs once on the first eligible request and gets
+/// stamped).
 async fn read_stamps(db: &D1Database) -> Result<(i64, i64, i64)> {
     #[derive(Deserialize)]
     struct Row {
@@ -189,15 +200,16 @@ async fn read_stamps(db: &D1Database) -> Result<(i64, i64, i64)> {
     Ok((drain_at, daily_at, move_at))
 }
 
-/// Kazanan-deseni: damgayı işten ÖNCE ileri it — `UPDATE ... WHERE
-/// CAST(value AS INTEGER) <= stale-eşik RETURNING key` yalnız hâlâ-stale
-/// satırda 1 satır döndürür (D1 UPDATE'leri serialize eder → eşzamanlı iki
-/// izolattan yalnız biri kazanır, kaybeden görevi atlar). Satır yoksa (ilk
-/// boot) önce `INSERT OR IGNORE value='0'` ile açılır → '0' her eşiğin
-/// altında = claim'lenebilir. Hata → false (best-effort; iş koşulmaz,
-/// sonraki pencerede yeniden denenir).
+/// Winner pattern: push the stamp forward BEFORE doing the work — `UPDATE ... WHERE
+/// CAST(value AS INTEGER) <= stale-cutoff RETURNING key` returns a row only while the
+/// stamp is still stale (D1 serializes UPDATEs, so of two concurrent isolates exactly one
+/// wins and the loser skips the task). If the row does not exist yet (first boot) it is
+/// created with `INSERT OR IGNORE value='0'` first — '0' is below every threshold, hence
+/// claimable. On error → false (best-effort: the work is skipped and retried in the next
+/// window).
 async fn claim(db: &D1Database, key: &str, now: i64, stale_cutoff: i64) -> bool {
-    // Satırı garanti et (ilk boot). Idempotent + yalnız stale-şüphesinde koşar.
+    // Make sure the row exists (first boot). Idempotent, and only runs when a stamp is
+    // suspected stale.
     if let Ok(stmt) = db
         .prepare("INSERT OR IGNORE INTO server_config (key, value, created_at) VALUES (?, '0', ?)")
         .bind(&[d1_text(key), d1_int(now)])
@@ -215,45 +227,54 @@ async fn claim(db: &D1Database, key: &str, now: i64, stale_cutoff: i64) -> bool 
              WHERE key = ? AND CAST(value AS INTEGER) <= ?
              RETURNING key",
         )
-        .bind(&[d1_text(&now.to_string()), d1_text(key), d1_int(stale_cutoff)])
+        .bind(&[
+            d1_text(&now.to_string()),
+            d1_text(key),
+            d1_int(stale_cutoff),
+        ])
     else {
         return false;
     };
     match stmt.all().await {
-        Ok(res) => res.results::<KeyRow>().map(|r| r.len() == 1).unwrap_or(false),
+        Ok(res) => res
+            .results::<KeyRow>()
+            .map(|r| r.len() == 1)
+            .unwrap_or(false),
         Err(_) => false,
     }
 }
 
-// ── cron-yolu damgalama ─────────────────────────────────────────────────────
+// ── cron-path stamping ──────────────────────────────────────────────────────
 
-/// `scheduled()` her koşuşta çağırır (drain sonrası) → cron çalışan kurulumda
-/// `maint_drain_at` hep taze kalır = lazy-drain hiç uyanmaz. Best-effort.
+/// Called by `scheduled()` on every run (after the drain), so on a cron-enabled
+/// deployment `maint_drain_at` stays fresh and the lazy drain never wakes. Best-effort.
 pub(crate) async fn stamp_drain(env: &Env) {
     if let Ok(db) = env.d1("DB") {
         stamp(&db, KEY_DRAIN).await;
     }
 }
 
-/// `scheduled()` günlük dalı sonunda çağırır → lazy günlük-GC uyur. Best-effort.
+/// Called at the end of `scheduled()`'s daily branch, so the lazy daily GC sleeps.
+/// Best-effort.
 pub(crate) async fn stamp_daily(env: &Env) {
     if let Ok(db) = env.d1("DB") {
         stamp(&db, KEY_DAILY).await;
     }
 }
 
-/// `scheduled()` her koşuşta taşıma-tick'i sonrası çağırır → cron'lu kurulumda
-/// lazy storage-move uyur (stamp_drain ikizi). Best-effort.
+/// Called by `scheduled()` after every move tick, so the lazy storage-move sleeps on a
+/// cron-enabled deployment (the twin of stamp_drain). Best-effort.
 pub(crate) async fn stamp_move(env: &Env) {
     if let Ok(db) = env.d1("DB") {
         stamp(&db, KEY_MOVE).await;
     }
 }
 
-/// Faz 4 drain-endpoint'i çağırır: taşıma damgasını 0'a çek = "hemen koş" işareti.
-/// Cron'suz kurulumda ilk uygun istek (≤60sn gaz-kelebeği) claim'leyip taşımayı
-/// başlatır; cron'lu kurulumda zaten ≤2dk'da koşar (damga-0 orada da zararsız:
-/// claim tekilleştirir). Best-effort — hata drain-endpoint'ini kırmaz.
+/// Called by the phase-4 drain endpoint: pulling the move stamp to 0 is the "run now"
+/// signal. On a cron-less deployment the first eligible request (within the ≤60s throttle)
+/// claims it and starts the move; on a cron-enabled one it would run within ≤2 minutes
+/// anyway, and a 0 stamp is harmless there too since claim deduplicates. Best-effort — an
+/// error does not break the drain endpoint.
 pub(crate) async fn wake_storage_move(env: &Env) {
     let Ok(db) = env.d1("DB") else { return };
     let now = now_secs() as i64;
@@ -275,50 +296,53 @@ async fn stamp(db: &D1Database, key: &str) {
     }
 }
 
-// ── günlük bakım seti (cron + lazy ORTAK gövde) ─────────────────────────────
+// ── daily maintenance set (body SHARED by cron and lazy) ────────────────────
 
-/// Günlük-GC seti — `scheduled()` günlük dalıyla BİT-AYNI (gövde lib.rs'ten
-/// buraya saf-taşındı; cron da lazy de AYNI fonksiyonu çağırır → davranış
-/// ayrışamaz). Hepsi idempotent/eşzamanlılık-dayanıklı: cleanup DELETE'leri
-/// ikinci koşumda 0 satır etkiler; gc_fanout_retry cutoff-DELETE; reconcile
-/// gerçeği yeniden hesaplar (last-writer aynı değeri yazar).
+/// The daily GC set — BIT-IDENTICAL to `scheduled()`'s daily branch, because the body was
+/// moved here verbatim from lib.rs and both the cron and the lazy path call the SAME
+/// function, so their behavior cannot diverge. Everything here is idempotent and
+/// concurrency-safe: the cleanup DELETEs affect 0 rows on a second run, gc_fanout_retry is
+/// a cutoff DELETE, and reconcile recomputes the truth (the last writer writes the same
+/// value).
 pub(crate) async fn run_daily(env: &Env) {
     if let Err(e) = cleanup_expired(env).await {
-        // Debug-format kullanılmaz: error içinde SQL parametre/binding
-        // (user_id, email vb.) sızabiliyor. İlk 80 char yeter — hata
-        // kategorisi görünür, PII görünmez.
+        // Never use the Debug format: the error can carry SQL parameters/bindings
+        // (user_id, email, ...). The first 80 chars are enough — the error category shows
+        // up, the PII does not.
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("cleanup error: {}", truncated);
     }
     crate::messages::handlers::gc_fanout_retry(env).await;
-    // Kota Faz-0 (SHADOW): günlük authoritative reconcile — best-effort depolama
-    // sayaçlarındaki (user_storage/server_stats) drift'i media_objects gerçeğinden
-    // yeniden-hesapla (self-heal). Hata bakımın kalanını kırmaz — logla-devam.
+    // Quota phase 0 (SHADOW): the daily authoritative reconcile — recompute drift in the
+    // best-effort storage counters (user_storage/server_stats) from the media tables
+    // (self-heal). An error does not break the rest of maintenance: log and continue.
     if let Err(e) = crate::usage::reconcile_storage(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("usage reconcile error: {}", truncated);
     }
-    // Takılabilir-depolama Faz 1: eklenti-kodu (plugin-code/) envanterini R2'den
-    // geriye-doldur (bugüne dek meta'sız → "nerede" bilinemezdi). İdempotent
-    // (INSERT OR IGNORE, r2-primary); yeni put_code'lar zaten inline meta yazar —
-    // bu backfill yalnız ESKİ blob'ları toplar. Hata bakımın kalanını kırmaz.
+    // Pluggable storage phase 1: backfill the plugin-code (plugin-code/) inventory from
+    // R2 — until now those blobs had no metadata, so "where does this live" was
+    // unanswerable. Idempotent (INSERT OR IGNORE, r2-primary); new put_code calls already
+    // write their metadata inline, so this backfill only sweeps up OLD blobs. An error
+    // does not break the rest of maintenance.
     if let Err(e) = crate::storage::maint::backfill_plugin_code(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("plugin-code backfill error: {}", truncated);
     }
-    // Takılabilir-depolama Faz 3 (plan e kanal-1): tüm state!='disabled' depolara
-    // programlı probe → last_health_* tazelenir (panel cron-arası kızarmadan güncel).
-    // Hata bakımın kalanını kırmaz.
+    // Pluggable storage phase 3 (plan e, channel 1): scheduled probe of every backend
+    // whose state != 'disabled', refreshing last_health_* so the panel stays current
+    // instead of turning red between crons. An error does not break the rest of maintenance.
     if let Err(e) = crate::storage::probe_all(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("storage probe error: {}", truncated);
     }
-    // Takılabilir-depolama Faz 3 (plan c.4/f#4): öksüz-blob tombstone'larını yeniden-sil
-    // (≤50/koşum). Başaran satır düşer; depo hâlâ down → retry_count++ (sonraki günde tekrar).
+    // Pluggable storage phase 3 (plan c.4 / f#4): retry the deletion of orphan-blob
+    // tombstones (≤50 per run). A successful delete drops the row; if the backend is still
+    // down, retry_count++ and it is tried again the next day.
     if let Err(e) = crate::storage::maint::retry_orphans(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
@@ -329,22 +353,124 @@ pub(crate) async fn run_daily(env: &Env) {
 #[derive(Deserialize)]
 struct ExpiredMediaRow {
     blob_id: String,
-    // Kota Faz-0 (SHADOW): silinen blob'un sayaç-düşümü için boyut + yükleyen.
+    // Quota phase 0 (SHADOW): size and uploader, needed to decrement the counters for a
+    // deleted blob.
     size_bytes: i64,
     uploader_id: String,
-    // Takılabilir-depolama: silme blob'un depo'suna yönlendirilir (Faz 1: hep 'r2-primary').
+    // Pluggable storage: the delete is routed to the blob's own backend (in phase 1 that
+    // is always 'r2-primary').
     store_id: String,
 }
 
-/// Süresi dolmuş kalıntıların temizliği (lib.rs'ten saf-taşındı, davranış
-/// değişmedi). Recipient ack atınca medya zaten anında silinir; bu fallback
-/// "kimse almadı, 30 gün geçti" senaryosu için. Ayrıca expired invite_tokens
-/// ve verification_codes da temizlenir (D1 büyümesin).
+#[derive(Deserialize)]
+struct LegacyInviteAttributionRow {
+    token: String,
+    email_hint: Option<String>,
+    inviter_user_id: Option<String>,
+    inviter_ed_pub: Option<Vec<u8>>,
+    used_by: Option<String>,
+    created_at: i64,
+    expires_at: i64,
+}
+
+/// Backfill pre-0031 invites (`used = 1, token_hash = NULL`) into the attribution ledger,
+/// hashing with Rust SHA-256 so the raw bearer secret is never written to a persistent
+/// table. The daily cleanup calls this BEFORE it deletes tokens. Each pass moves at most
+/// 10 records in a single D1 batch (at most 30 statements); any remaining legacy `used`
+/// rows are protected by the cleanup predicate and migrate on a later pass.
+async fn backfill_legacy_invite_attributions(db: &D1Database) -> Result<usize> {
+    let rows: Vec<LegacyInviteAttributionRow> = db
+        .prepare(
+            "SELECT it.token, it.email_hint, it.owner_user_id AS inviter_user_id,
+                    u.identity_ed_pub AS inviter_ed_pub, it.used_by,
+                    it.created_at, it.expires_at
+               FROM invite_tokens it
+               LEFT JOIN users u ON u.id = it.owner_user_id
+              WHERE it.used = 1 AND it.token_hash IS NULL
+              ORDER BY it.created_at ASC LIMIT 10",
+        )
+        .all()
+        .await?
+        .results()?;
+    let done = rows.len();
+    let mut statements = Vec::with_capacity(done * 3);
+    for row in rows {
+        let token_hash = sha256_hex(&row.token);
+        let ed = match row.inviter_ed_pub.as_deref() {
+            Some(bytes) => d1_blob(bytes),
+            None => d1_null(),
+        };
+        let verified_at = row.used_by.as_ref().map(|_| row.created_at);
+        statements.extend([
+            db.prepare(
+                "INSERT OR IGNORE INTO invite_attributions
+                   (invite_token_hash, email_hint, inviter_user_id, inviter_ed_pub, used_by,
+                    created_at, expires_at, redeemed_at, verified_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&[
+                d1_text(&token_hash),
+                d1_opt_text(row.email_hint.as_deref()),
+                d1_opt_text(row.inviter_user_id.as_deref()),
+                ed,
+                d1_opt_text(row.used_by.as_deref()),
+                d1_int(row.created_at),
+                d1_int(row.expires_at),
+                d1_int(row.created_at),
+                d1_opt_int(verified_at),
+            ])?,
+            db.prepare(
+                "UPDATE invite_tokens SET token_hash = ?
+                  WHERE token = ? AND token_hash IS NULL",
+            )
+            .bind(&[d1_text(&token_hash), d1_text(&row.token)])?,
+            db.prepare(
+                "UPDATE verification_codes SET invite_token_hash = ?
+                  WHERE invite_token = ? AND invite_token_hash IS NULL",
+            )
+            .bind(&[d1_text(&token_hash), d1_text(&row.token)])?,
+        ]);
+    }
+    if !statements.is_empty() {
+        db.batch(statements).await?;
+    }
+    Ok(done)
+}
+
+/// Delete source invite tokens — which are authorization secrets — only once their TTL
+/// expires. `used = 1` is no longer a reason to GC immediately: the source API row must
+/// survive verify's 10-minute code window. The durable inviter/used_by trail lives in the
+/// `invite_attributions` ledger from 0031, so after the TTL this row can go safely.
+pub(crate) const INVITE_TOKEN_CLEANUP_SQL: &str = "DELETE FROM invite_tokens
+      WHERE expires_at < ? AND (used = 0 OR token_hash IS NOT NULL)";
+const RECONCILE_INVITE_CLAIMS_SQL: &str = "UPDATE invite_tokens SET used = 1
+      WHERE used = 0 AND token_hash IS NOT NULL AND EXISTS (
+        SELECT 1 FROM invite_attributions ia
+         WHERE ia.invite_token_hash = invite_tokens.token_hash
+      )";
+const CONTACT_QR_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+pub(crate) const CONTACT_QR_CLAIM_CLEANUP_SQL: &str = "DELETE FROM contact_qr_claims
+      WHERE offer_id IN (
+        SELECT offer_id FROM contact_qr_offers
+         WHERE expires_at_ms < ? LIMIT 500
+      )";
+pub(crate) const CONTACT_QR_OFFER_CLEANUP_SQL: &str = "DELETE FROM contact_qr_offers
+      WHERE offer_id IN (
+        SELECT offer_id FROM contact_qr_offers
+         WHERE expires_at_ms < ? LIMIT 500
+      )";
+
+/// Sweep up expired leftovers (moved here from lib.rs verbatim; behavior unchanged).
+/// Media is already deleted the moment the recipient acks, so the media leg here is the
+/// fallback for "nobody ever fetched it and the retention window elapsed" — that window is
+/// `server_settings.retention_days`, which defaults to 30. The remaining legs keep D1 from
+/// growing: expired invite_tokens, verification_codes, refresh_tokens, device-link requests
+/// and contact-QR records.
 async fn cleanup_expired(env: &Env) -> Result<()> {
     let now = now_secs() as i64;
     let db = env.d1("DB")?;
 
-    // 1) expired media: R2 + D1 sil
+    // 1) expired media: delete from R2 + D1
     let rows: Vec<ExpiredMediaRow> = db
         .prepare("SELECT blob_id, size_bytes, uploader_id, store_id FROM media_objects WHERE expires_at < ? LIMIT 500")
         .bind(&[d1_int(now)])?
@@ -353,14 +479,17 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         .results()?;
 
     if !rows.is_empty() {
-        // Tek choke-point (StorageRouter) üzerinden per-depo sil. Lite kurulum
-        // (R2-binding'siz): any_available()=false → blob-delete ATLANIR ama D1-meta silme +
-        // sayaç-düşümü DEVAM eder — aksi halde temizlik her koşumda Err'lerdi ve SONRAKİ
-        // temizlik adımları (invite/verification GC) atlanırdı.
-        // FAZ 3 (plan f#4): silinemeyen blob → `storage_orphans` tombstone (D1 meta YİNE
-        // silinir → cleanup akmaya devam eder); günlük `retry_orphans` yeniden dener →
-        // öksüz-blob harici depoda kalıcılaşmaz. router.delete TOPLU-yolda health-işaret
-        // YAPMAZ (≤500 satır × yazım = şişme) → burada başarısız depo başına TEK agregeli işaret.
+        // Delete per backend through the single choke point (StorageRouter). On a lite
+        // deployment (no R2 binding) any_available() is false → the blob delete is SKIPPED
+        // but the D1 metadata delete and the counter decrement still HAPPEN; otherwise
+        // cleanup would Err on every run and the LATER cleanup steps (invite/verification
+        // GC) would never be reached.
+        // PHASE 3 (plan f#4): a blob that cannot be deleted becomes a `storage_orphans`
+        // tombstone — the D1 metadata is STILL deleted so cleanup keeps flowing — and the
+        // daily `retry_orphans` tries again, so an orphan blob does not become permanent on
+        // an external backend. router.delete does NOT write health marks on the BULK path
+        // (≤500 rows × a write each would bloat it), so instead we write ONE aggregated mark
+        // per failing backend here.
         let router = crate::storage::StorageRouter::from_env(env).await?;
         let mut orphans: Vec<(String, String, i64)> = Vec::new(); // (store_id, key, size)
         if router.any_available() {
@@ -373,7 +502,7 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         }
         if !orphans.is_empty() {
             crate::storage::maint::insert_orphans(&db, &orphans).await;
-            // Başarısız depo(lar) başına TEK health-işaret (agregeli; batch-şişmesi yok).
+            // ONE health mark per failing backend (aggregated; no batch bloat).
             let mut marked: Vec<&str> = Vec::new();
             for (sid, _, _) in &orphans {
                 if !marked.contains(&sid.as_str()) {
@@ -383,20 +512,17 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
                 }
             }
         }
-        let placeholders: String =
-            (0..rows.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders: String = (0..rows.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "DELETE FROM media_objects WHERE blob_id IN ({})",
             placeholders
         );
-        let binds: Vec<JsValue> = rows
-            .iter()
-            .map(|r| JsValue::from_str(&r.blob_id))
-            .collect();
+        let binds: Vec<JsValue> = rows.iter().map(|r| JsValue::from_str(&r.blob_id)).collect();
         db.prepare(&sql).bind(&binds)?.run().await?;
         console_log!("cleanup: {} expired media blobs removed", rows.len());
-        // Kota Faz-0 (SHADOW, best-effort): süresi dolup silinen medyayı depolama
-        // sayaçlarından düş (0-clamp; hata temizliği kırmaz, günlük reconcile onarır).
+        // Quota phase 0 (SHADOW, best-effort): subtract the expired-and-deleted media from
+        // the storage counters (clamped at 0; an error does not break cleanup, and the daily
+        // reconcile repairs it).
         let removed: Vec<(String, i64)> = rows
             .iter()
             .map(|r| (r.uploader_id.clone(), r.size_bytes))
@@ -404,13 +530,28 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         crate::usage::media_removed(&db, &removed).await;
     }
 
-    // 2) expired invite tokens (used veya süresi dolmuş)
-    db.prepare(
-        "DELETE FROM invite_tokens WHERE expires_at < ? OR used = 1",
-    )
-    .bind(&[d1_int(now)])?
-    .run()
-    .await?;
+    // Move pre-0031 used tokens into the hash ledger first; the raw secret is never written
+    // to the audit trail. Anything outside this slice is protected by the cleanup predicate.
+    let legacy_backfilled = backfill_legacy_invite_attributions(&db).await?;
+    if legacy_backfilled > 0 {
+        console_log!(
+            "cleanup: {} legacy invite attribution hash-backfill",
+            legacy_backfilled
+        );
+    }
+
+    // Self-heal the legacy/API `used` flag from the claim ledger, which is authoritative.
+    // If a redeem's claim INSERT succeeded but the follow-up UPDATE hit a transient error,
+    // admin/stats/bootstrap must not keep reporting the invite as "unused" forever.
+    db.prepare(RECONCILE_INVITE_CLAIMS_SQL).run().await?;
+
+    // 2) expired invite-token secrets. A used token is kept until its TTL expires, so
+    // maintenance never cuts the redeem→verify window short. The attribution ledger is
+    // independent of the source token and outlives it.
+    db.prepare(INVITE_TOKEN_CLEANUP_SQL)
+        .bind(&[d1_int(now)])?
+        .run()
+        .await?;
 
     // 3) expired verification codes
     db.prepare("DELETE FROM verification_codes WHERE expires_at < ?")
@@ -419,44 +560,60 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         .await?;
 
     // 4) revoked / expired refresh tokens
-    db.prepare(
-        "DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1",
-    )
-    .bind(&[d1_int(now)])?
-    .run()
-    .await?;
+    db.prepare("DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1")
+        .bind(&[d1_int(now)])?
+        .run()
+        .await?;
 
-    // 5) süresi dolmuş link istekleri (M2-S3.2; consume zaten satırı siler →
-    //    'consumed' durumu persist edilmez, lazy-GC + bu temizlik expired'ları toplar)
+    // 5) expired device-link requests (M2-S3.2; consuming one already deletes the row, so
+    //    a 'consumed' state is never persisted — lazy GC plus this sweep collect the
+    //    expired ones)
     db.prepare("DELETE FROM link_requests WHERE expires_at < ?")
         .bind(&[d1_int(now)])?
+        .run()
+        .await?;
+
+    // 6) Single-use mutual QR records. They are kept for 24 hours so a client can still read
+    // the "expired" state for a while; the capability secret is never written to D1 in the
+    // first place. Deleting the claim before the offer leaves no orphan row even on an older
+    // D1 deployment with foreign-key enforcement off.
+    let qr_cutoff_ms = now
+        .saturating_mul(1000)
+        .saturating_sub(CONTACT_QR_RETENTION_MS);
+    db.prepare(CONTACT_QR_CLAIM_CLEANUP_SQL)
+        .bind(&[d1_int(qr_cutoff_ms)])?
+        .run()
+        .await?;
+    db.prepare(CONTACT_QR_OFFER_CLEANUP_SQL)
+        .bind(&[d1_int(qr_cutoff_ms)])?
         .run()
         .await?;
 
     Ok(())
 }
 
-// ── Saf yardımcılar (unit-testli) ───────────────────────────────────────────
+// ── Pure helpers (unit-tested) ──────────────────────────────────────────────
 
-/// `server_config.value` (TEXT) → epoch-sn. Satır-yok/boş/bozuk/negatif → 0
-/// ("çok eski" = ilk uygun istekte koşar). Claim'in SQL tarafı
-/// (`CAST(value AS INTEGER)`) bozuk-metni de 0'a CAST'ler → iki taraf tutarlı.
+/// `server_config.value` (TEXT) → epoch seconds. Missing row, empty, corrupt or negative
+/// all map to 0, i.e. "very old" = runs on the first eligible request. Claim's SQL side
+/// (`CAST(value AS INTEGER)`) also CASTs corrupt text to 0, so both sides agree.
 fn parse_stamp(v: Option<&str>) -> i64 {
     v.and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0)
         .max(0)
 }
 
-/// Damga eşiği aştı mı? Gelecekteki damga (saat-kayması) → due DEĞİL
-/// (saturating: negatif fark 0 sayılır; bozuk-gelecek-damga sonsuz kilitlemez —
-/// cron/lazy her başarılı koşumda damgayı şimdiye çeker).
+/// Has the stamp crossed the threshold? A stamp in the future (clock skew) is NOT due —
+/// saturating arithmetic treats the negative difference as 0. A bogus future stamp cannot
+/// lock things up forever, because every successful cron/lazy run pulls the stamp back to
+/// now.
 fn is_due(now: i64, stamp_at: i64, after: i64) -> bool {
     now.saturating_sub(stamp_at) >= after
 }
 
-/// İzolat-içi gaz-kelebeği: hiç bakılmadıysa (0) ya da pencere geçtiyse bak.
-/// `now < last` (saat geri kaydı) → saturating 0 → bakma (pencere yeniden dolana
-/// dek); izolat kısa-ömürlü, kalıcı-kilit riski yok.
+/// Isolate-local throttle: look if we never looked (0) or the window has elapsed.
+/// `now < last` (the clock moved backwards) saturates to 0 → do not look until the window
+/// fills again; isolates are short-lived, so there is no risk of a permanent lock.
 fn throttle_due(last: u64, now: u64, every: u64) -> bool {
     last == 0 || now.saturating_sub(last) >= every
 }
@@ -478,30 +635,48 @@ mod tests {
 
     #[test]
     fn is_due_esik_sinirlari() {
-        // Damga=0 (satır yok / ilk boot) → her zaman due.
+        // Stamp = 0 (no row / first boot) → always due.
         assert!(is_due(1_780_000_000, 0, DRAIN_LAZY_AFTER_SECS));
-        // Tam eşik → due (>=).
-        assert!(is_due(1000 + DRAIN_LAZY_AFTER_SECS, 1000, DRAIN_LAZY_AFTER_SECS));
-        // Eşiğin 1sn altı → değil.
-        assert!(!is_due(1000 + DRAIN_LAZY_AFTER_SECS - 1, 1000, DRAIN_LAZY_AFTER_SECS));
-        // Gelecekteki damga (saat-kayması) → değil (saturating).
+        // Exactly at the threshold → due (>=).
+        assert!(is_due(
+            1000 + DRAIN_LAZY_AFTER_SECS,
+            1000,
+            DRAIN_LAZY_AFTER_SECS
+        ));
+        // One second below the threshold → not due.
+        assert!(!is_due(
+            1000 + DRAIN_LAZY_AFTER_SECS - 1,
+            1000,
+            DRAIN_LAZY_AFTER_SECS
+        ));
+        // Stamp in the future (clock skew) → not due (saturating).
         assert!(!is_due(1000, 2000, DRAIN_LAZY_AFTER_SECS));
     }
 
     #[test]
     fn is_due_gunluk_esik() {
         let t0 = 1_780_000_000i64;
-        assert!(!is_due(t0 + 86_400, t0, DAILY_LAZY_AFTER_SECS), "24s = pay içinde, uyur");
+        assert!(
+            !is_due(t0 + 86_400, t0, DAILY_LAZY_AFTER_SECS),
+            "24s = pay içinde, uyur"
+        );
         assert!(is_due(t0 + 90_000, t0, DAILY_LAZY_AFTER_SECS), "25s → due");
     }
 
     #[test]
     fn throttle_ilk_bakis_ve_pencere() {
-        assert!(throttle_due(0, 5, CHECK_EVERY_SECS), "izolat ilk istekte bakar");
-        assert!(!throttle_due(100, 100 + CHECK_EVERY_SECS - 1, CHECK_EVERY_SECS));
+        assert!(
+            throttle_due(0, 5, CHECK_EVERY_SECS),
+            "izolat ilk istekte bakar"
+        );
+        assert!(!throttle_due(
+            100,
+            100 + CHECK_EVERY_SECS - 1,
+            CHECK_EVERY_SECS
+        ));
         assert!(throttle_due(100, 100 + CHECK_EVERY_SECS, CHECK_EVERY_SECS));
-        // Saat geri kaydı → bakma (underflow yok).
+        // Clock moved backwards → do not look (and do not underflow).
         assert!(!throttle_due(200, 150, CHECK_EVERY_SECS));
     }
-    // parse_code_key testi storage/maint.rs'e taşındı (fonksiyonla birlikte).
+    // The parse_code_key test moved to storage/maint.rs along with the function itself.
 }

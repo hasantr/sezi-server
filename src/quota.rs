@@ -1,18 +1,21 @@
-//! Kota **Faz 1a** — upload depolama-kotası ZORLAMASI (0022 shadow-sayaçlarını okur).
+//! Quota **phase 1a** — upload storage quota ENFORCEMENT, reading the shadow
+//! counters introduced in 0022.
 //!
-//! **FAIL-OPEN disiplini:** cap ya da sayaç OKUNAMAZSA (DB hatası / satır yok /
-//! migration eksik) trafik KESİLMEZ. Reddetme YALNIZ: set-edilmiş (non-null)
-//! cap ve `used + size > cap`. NULL cap = sınırsız — owner cap koymadıkça hiçbir
-//! mevcut sunucu sürpriz kesinti yemez. Server DUMB/E2E-kör kalır: yalnız boyut
-//! metadata'sı (content-length) sayılır, içerik asla.
+//! **FAIL-OPEN discipline:** if a cap or a counter CANNOT be read (DB error, missing
+//! row, migration not applied) traffic is NOT cut off. An upload is rejected ONLY
+//! when a cap is actually set (non-null) and `used + size > cap`. A NULL cap means
+//! unlimited, so no existing server gets a surprise outage until its owner sets a
+//! cap. The server stays DUMB and E2E-blind: only size metadata (content-length) is
+//! counted, never content.
 
 use crate::d1util::d1_text;
 use serde::Deserialize;
 use worker::*;
 
-/// Upload kota kararı — SAF/test-edilebilir (DB'siz). Cap `None` → sınırsız.
-/// Aşım = `used + size > cap` (tam-eşit SIĞAR, `>` kullanılır). Reddedilen
-/// scope döner (öncelik: sunucu-toplam, sonra per-user); `None` = izin.
+/// The upload quota decision — PURE and testable (no DB). A `None` cap means
+/// unlimited. Overflow is `used + size > cap`, so an exact fit is ALLOWED (`>`, not
+/// `>=`). Returns the scope that rejected the upload — server total is checked before
+/// per-user — or `None` to allow it.
 pub fn decide_upload(
     server_used: i64,
     user_used: i64,
@@ -49,12 +52,12 @@ struct UserBytesRow {
     bytes: i64,
 }
 
-/// Upload öncesi kota kontrolü — cap'ler + sayaçlar D1'den okunur, karar
-/// `decide_upload`'a devredilir. Her okuma fail-open: cap-SELECT hata/satır-yok
-/// → cap bilinmiyor → izin; sayaç hata/satır-yok → 0 (size tek başına cap'i
-/// aşıyorsa reddetmek yine doğru — size content-length'ten kesin biliniyor).
-/// İki cap da NULL ise sayaçlar HİÇ okunmaz (hızlı-yol: default kurulumda
-/// upload başına tek ek SELECT).
+/// Pre-upload quota check — reads the caps and counters from D1 and delegates the
+/// decision to `decide_upload`. Every read is fail-open: a failing cap SELECT or a
+/// missing row means the cap is unknown → allow; a failing counter read means 0
+/// (rejecting is still correct if size alone exceeds the cap, since size is known
+/// exactly from content-length). When both caps are NULL the counters are NEVER read
+/// — the fast path on a default install costs exactly one extra SELECT per upload.
 pub async fn check_upload(db: &D1Database, uploader_id: &str, size: i64) -> Option<&'static str> {
     let caps = match db
         .prepare(
@@ -65,15 +68,15 @@ pub async fn check_upload(db: &D1Database, uploader_id: &str, size: i64) -> Opti
         .await
     {
         Ok(Some(row)) => row,
-        // Satır yok / DB hatası / 0023 migrate edilmemiş → cap bilinmiyor → izin.
+        // Missing row / DB error / 0023 not applied → cap unknown → allow.
         _ => return None,
     };
     if caps.max_storage_bytes.is_none() && caps.max_user_storage_bytes.is_none() {
-        return None; // hızlı-yol: cap konmamış → sayaç okumaya gerek yok
+        return None; // fast path: no cap set → no need to read counters
     }
 
-    // Sayaçlar yalnız ilgili cap set'liyse okunur (gereksiz D1 sorgusu yok);
-    // decide_upload cap None iken sayaca zaten bakmaz → 0 zararsız.
+    // A counter is read only when its cap is set (no pointless D1 queries);
+    // decide_upload ignores the counter for a None cap anyway, so 0 is harmless.
     let server_used = if caps.max_storage_bytes.is_some() {
         db.prepare("SELECT media_bytes FROM server_stats WHERE id = 1 LIMIT 1")
             .first::<ServerBytesRow>(None)
@@ -144,7 +147,7 @@ mod tests {
 
     #[test]
     fn sinir_tam_esit_sigar() {
-        // used + size == cap → İZİN (karşılaştırma `>`, `>=` değil).
+        // used + size == cap → ALLOWED (the comparison is `>`, not `>=`).
         assert_eq!(decide_upload(190, 90, 10, Some(200), Some(100)), None);
     }
 }

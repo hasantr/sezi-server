@@ -1,20 +1,22 @@
-//! Üye-yüklenebilir KALICI eklenti-MEDYA blob kanalı — `plugin_blob` (eklenti KODU)
-//! deseninin ÜYE-PUT'lu, büyük-boyutlu kardeşi.
+//! Member-uploadable PERSISTENT plugin-MEDIA blob channel — the member-PUT, large-payload
+//! sibling of the `plugin_blob` (plugin CODE) pattern.
 //!
-//! İki mevcut kanalın ORTASI (kasıtlı melez):
-//!   - `plugin_blob`'dan MİRAS: room-scope R2 anahtarı (IDOR kapalı) + aktif-üyelik +
-//!     device-revoked kapısı (ORTAK `plugin_blob::gate`) + KALICI (TTL yok, ack-delete yok).
-//!   - `media`'dan MİRAS: 50 MiB tavan + kota+usage muhasebesi (AYNI `check_upload` /
-//!     `media_added` / `count_bump` sayaçları → depolama cap'i İKİ kanalın TOPLAMINA uygulanır).
+//! A deliberate hybrid sitting BETWEEN the two existing channels:
+//!   - INHERITED from `plugin_blob`: room-scoped R2 key (IDOR closed) + active-membership +
+//!     device-revoked gate (the SHARED `plugin_blob::gate`) + PERSISTENT (no TTL, no ack-delete).
+//!   - INHERITED from `media`: the 50 MiB ceiling + quota/usage accounting (the SAME
+//!     `check_upload` / `media_added` / `count_bump` counters → the storage cap applies to the SUM
+//!     of both channels).
 //!
-//! `plugin_blob`'dan AYRILAN tek nokta: admin-kapısı YOK. Herhangi bir aktif üye yükler
-//! (eklenti-içi kullanıcı-üretimli medya: fotoğraf/dosya). KOD'u yalnız admin yükler
-//! (legit kodu ezme-DoS'u kapatmak için); MEDYA kullanıcı-verisi → üye-PUT.
+//! The one place it DIVERGES from `plugin_blob`: there is NO admin gate. Any active member may
+//! upload, because this is user-generated media inside a plugin (photos/files). CODE is
+//! admin-only (to close the "overwrite legit code" DoS); MEDIA is user data → member PUT.
 //!
-//! Server KÖR: gövde/yanıt opak ciphertext (client E2E şifreler; anahtar grup kanalında).
-//! Meta `plugin_media_objects` (0026) — `media_objects`'ten AYRI: `expires_at` YOK
-//! (kalıcı; günlük cleanup cron'u bu tabloya DOKUNMAZ) → kota reconcile'ı iki tabloyu
-//! da toplar (bkz. `usage::reconcile_storage`).
+//! The server is BLIND: request and response bodies are opaque ciphertext (the client encrypts
+//! end-to-end; the key travels on the group channel). Meta lives in `plugin_media_objects` (0026),
+//! SEPARATE from `media_objects`: it has no `expires_at` (persistent, and the daily cleanup cron
+//! never touches this table) → the quota reconcile sums both tables (see
+//! `usage::reconcile_storage`).
 
 use crate::d1util::{d1_int, d1_text};
 use crate::plugin_blob::gate;
@@ -23,32 +25,36 @@ use crate::utils::now_secs;
 use serde::Deserialize;
 use worker::*;
 
-/// Üye eklenti-medyası blob tavanı — `media` kanalıyla AYNI (50 MiB). E2E-ciphertext
-/// gövde bu ham-tavana kadar (client zaten plaintext'i altında tutar).
+/// Blob ceiling for member plugin media — the SAME as the `media` channel (50 MiB). The
+/// end-to-end ciphertext body may fill this raw ceiling (the client keeps the plaintext below it
+/// anyway).
 const MAX_PLUGIN_MEDIA_SIZE: u64 = 50 * 1024 * 1024;
 
-/// `POST /plugin-media/:room/:id` — üye eklenti-medyası (şifreli) yükle. KALICI.
-/// Auth: o odanın HERHANGİ aktif üyesi (admin ŞART DEĞİL). Kota+usage `media` ile
-/// AYNI sayaçlara işlenir. İdempotent: aynı (room,id) tekrar → 200 (re-upload YOK).
+/// `POST /plugin-media/:room/:id` — upload (encrypted) member plugin media. PERSISTENT.
+/// Auth: ANY active member of that room (admin NOT required). Quota and usage land on the SAME
+/// counters as `media`. Idempotent: the same (room,id) again → 200 with NO re-upload.
 pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // Kapı: aktif-üye + device-revoked (plugin_blob ile ORTAK). `role` ATLANIR —
-    // admin şart değil (media gibi herhangi üye yükler); üyelik = gate'in Ok'u zaten kanıtlar.
+    // Gate: active member + device-revoked (SHARED with plugin_blob). `role` is IGNORED — admin is
+    // not required (like media, any member may upload); an Ok from the gate already proves
+    // membership.
     let (user_id, room_id, blob_id, _role) = match gate(&req, &ctx).await {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    // Lite kurulum (R2 OPSİYONEL): binding yoksa temiz 503 (media/plugin_blob ile simetrik;
-    // client nonretryable sayar). Yetki-kapısından SONRA, rate-limit/body'den ÖNCE.
+    // Lite install (R2 is OPTIONAL): with no binding, answer a clean 503 (symmetric with
+    // media/plugin_blob; the client treats it as nonretryable). AFTER the authorization gate,
+    // BEFORE the rate limit and the body read.
     let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
     }
-    // Per-user upload rate-limit — media-upload ile AYNI sabitler (60/5dk) + AYNI altyapı
-    // (KV opsiyonel; binding yoksa fail-open limitsiz). R2 depolama/egress DoS guard.
+    // Per-user upload rate limit — the SAME constants as media upload (60 per 5 min) on the SAME
+    // infrastructure (KV is optional; with no binding it fails open, i.e. unlimited). Guards
+    // against R2 storage/egress DoS.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("plugmedia:put:{user_id}"), 60, 5 * 60).await {
         return json_err(429, "rate_limited");
     }
-    // Boyut tavanı (content-length ön-kontrol → büyük gövdeyi okumadan reddet).
+    // Size ceiling (content-length pre-check → reject a huge body before reading it).
     let size: u64 = req
         .headers()
         .get("content-length")
@@ -60,16 +66,18 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         return json_err(413, "bad_size");
     }
     let db = ctx.env.d1("DB")?;
-    // İDEMPOTENT (retry-güvenli): aynı (room,id) zaten varsa 200 döner — client blob_id'yi
-    // RASTGELE üretir (metadata-privacy; içerik-adres değil) → çakışma pratikte yalnız retry.
-    // Re-upload YOK (50 MiB gövde okunmaz) + kota ÇİFT-SAYILMAZ (check_upload'a hiç girilmez).
-    // plugin_blob'un overwrite-idempotent'i + core client'ın "2xx=başarı" sözleşmesiyle uyumlu.
+    // IDEMPOTENT (retry-safe): if that (room,id) already exists, return 200 — the client generates
+    // blob_id RANDOMLY (metadata privacy; it is not content-addressed), so in practice a collision
+    // only ever means a retry. No re-upload (the 50 MiB body is never read) and no double counting
+    // of quota (check_upload is not even reached). Consistent with plugin_blob's overwrite
+    // idempotency and the core client's "2xx = success" contract.
     if let Some(existing) = existing_size(&db, &room_id, &blob_id).await? {
         return Response::from_json(&serde_json::json!({ "id": blob_id, "size": existing }));
     }
-    // Kota Faz-1a (ZORLAMA): `media` ile AYNI check_upload (server_stats + user_storage vs
-    // owner cap'leri). FAIL-OPEN: cap/sayaç okunamazsa reddetme YOK; NULL cap = sınırsız.
-    // Gövde buffer'lanmadan ÖNCE (reddedilecek 50 MiB'ı belleğe almanın anlamı yok).
+    // Quota Faz-1a (ENFORCEMENT): the SAME check_upload as `media` (server_stats + user_storage vs
+    // the owner's caps). FAIL-OPEN: if a cap or counter cannot be read, nothing is rejected; a NULL
+    // cap means unlimited. Runs BEFORE the body is buffered — no point holding 50 MiB we are about
+    // to reject.
     if let Some(scope) = crate::quota::check_upload(&db, &user_id, size as i64).await {
         let resp = Response::from_json(&serde_json::json!({ "error": "quota_exceeded", "scope": scope }))?;
         return Ok(resp.with_status(429));
@@ -78,16 +86,16 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     if bytes.is_empty() || bytes.len() as u64 > MAX_PLUGIN_MEDIA_SIZE {
         return json_err(413, "bad_size");
     }
-    // R2-ÖNCE, meta-SONRA (media'nın TERSİ — BİLİNÇLİ): plugin-media'nın TTL/cleanup
-    // cron'u YOK. media meta-önce yazar çünkü cleanup D1-tabanlı (R2-önce olsaydı
-    // meta'sız blob'u cron HİÇ görmez = öksüz). Burada cleanup HİÇ yok → phantom meta
-    // (R2 fail'i sonrası) kalıcı-kota-şişmesi + GET-404 üretirdi. R2 başarılıysa meta
-    // yazılır; meta fail → client retry (R2 idempotent-overwrite + meta yeniden-INSERT) self-heal.
-    // put_new → yazılan store_id döner (R2-önce/meta-sonra disiplini korunur: meta
-    // put'tan SONRA yazılır → phantom-meta yok). Faz 1 tek-depo: store_id='r2-primary'.
-    // FAZ 3: priority-overflow + per-depo max_bytes + PUT-fallback (degrade-yazma). Kalıcı
-    // sınıf → dolu = 429 quota_exceeded/server_storage; tüm denemeler PUT-fail = 503.
-    // R2-önce/meta-sonra disiplini korunur: hata'da meta HİÇ yazılmaz (phantom-meta yok).
+    // BLOB FIRST, meta second — deliberately the OPPOSITE of `media`, because plugin-media has no
+    // TTL/cleanup cron. `media` writes meta first since its cleanup is D1-driven (blob-first would
+    // leave a meta-less blob that the cron never sees = orphan). Here there is no cleanup at all,
+    // so a phantom meta row left behind by a failed PUT would mean permanent quota inflation plus a
+    // GET that 404s. Hence meta is written only after a successful put_new → no phantom meta can
+    // exist; a failed meta write self-heals on the client's retry (R2 overwrite is idempotent and
+    // the meta INSERT simply runs again). put_new returns the store_id it wrote to (Faz 1 single
+    // backend: 'r2-primary'). FAZ 3: priority overflow + per-backend max_bytes + PUT fallback
+    // (degraded write). This is a persistent class, so a full backend gives 429
+    // quota_exceeded/server_storage and "every attempt failed the PUT" gives 503.
     let store_id = match router
         .put_new(
             crate::storage::StorageClass::PluginMedia,
@@ -100,12 +108,13 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         Ok(sid) => sid,
         Err(e) => return crate::storage::placement_err_response(e),
     };
-    // Meta INSERT = kota gerçeğinin kaynağı (reconcile buradan hesaplar). ON CONFLICT
-    // DO NOTHING RETURNING → yalnız GERÇEKTEN eklenen satır sayaçlara işlenir: iki
-    // eşzamanlı PUT'tan (existence-check'i ikisi de geçse bile) biri kaybeder → çift-sayım yok.
+    // The meta INSERT is the source of truth for quota (reconcile recomputes from it). ON CONFLICT
+    // DO NOTHING RETURNING means only a row that was ACTUALLY inserted bumps the counters: of two
+    // concurrent PUTs — even if both passed the existence check — one loses, so nothing is counted
+    // twice.
     if insert_meta(&db, &room_id, &blob_id, &user_id, size as i64, &store_id).await? {
-        // Kota Faz-0 (SHADOW) + Faz-1c (SALT-SAYIM): media ile AYNI sayaçlar. BEST-EFFORT
-        // (sayaç hatası upload'ı KIRMAZ; günlük reconcile drift'i onarır).
+        // Quota Faz-0 (SHADOW) + Faz-1c (COUNTING ONLY): the SAME counters as media. BEST-EFFORT —
+        // a counter failure does NOT break the upload, and the daily reconcile repairs the drift.
         crate::usage::media_added(&db, &user_id, size as i64).await;
         crate::usage::count_bump(&db, "upload_bytes", size as i64).await;
         crate::usage::count_bump(&db, "upload_count", 1).await;
@@ -113,32 +122,34 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     Response::from_json(&serde_json::json!({ "id": blob_id, "size": size }))
 }
 
-/// `GET /plugin-media/:room/:id` — üye eklenti-medyası (şifreli) indir. Aktif üye +
-/// device-revoked kapılı (plugin_blob GET deseni). Rate 600/5dk (media-download eş).
+/// `GET /plugin-media/:room/:id` — download (encrypted) member plugin media. Gated on active
+/// membership + device-revoked (the plugin_blob GET pattern). Rate limit 600 per 5 min, matching
+/// media download.
 pub async fn get_media(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let (user_id, room_id, blob_id, _role) = match gate(&req, &ctx).await {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    // Lite kurulum: binding yoksa put ile simetrik 503.
+    // Lite install: with no binding, the same 503 as put.
     let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
     }
-    // Per-user download rate-limit — media-download ile AYNI (600/5dk; R2-egress DoS guard).
+    // Per-user download rate limit — the SAME as media download (600 per 5 min; R2-egress DoS guard).
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("plugmedia:get:{user_id}"), 600, 5 * 60).await {
         return json_err(429, "rate_limited");
     }
-    // Faz 2 çoklu-depo: blob'un depo'sunu meta'dan çöz (plugin_media_objects.store_id).
-    // Migration 0028 store_id kolonuna DEFAULT 'r2-primary' verdi → ESKİ satırlar da dolu;
-    // put HER ZAMAN store_id yazar (backfill'siz kanal) → meta yok = blob hiç yüklenmemiş → 404.
+    // Faz 2 multi-backend: resolve the blob's backend from the meta row
+    // (plugin_media_objects.store_id). Migration 0028 gave that column a DEFAULT of 'r2-primary', so
+    // OLD rows are populated too, and put ALWAYS writes a store_id (this channel needs no backfill)
+    // → no meta row means the blob was never uploaded → 404.
     let db = ctx.env.d1("DB")?;
     let store_id = match media_store_id(&db, &room_id, &blob_id).await? {
         Some(s) => s,
         None => return json_err(404, "not_found"),
     };
-    // FAZ 3 (plan f#2): depo erişilemez → 503 storage_backend_unavailable + fırsatçı
-    // health-işaret (router içinde); yok → 404.
+    // FAZ 3 (plan f#2): backend unreachable → 503 storage_backend_unavailable plus the router's
+    // opportunistic health mark; blob absent → 404.
     match router
         .get(
             &store_id,
@@ -148,8 +159,9 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     {
         Ok(Some(obj)) => {
             let bytes = obj.bytes;
-            // Kota Faz-1c (SALT-SAYIM): yalnız BAŞARILI indirme günlük sayaçlara — media ile
-            // AYNI. bytes zaten elde (ekstra sorgu yok). BEST-EFFORT (sayaç hatası indirmeyi kırmaz).
+            // Quota Faz-1c (COUNTING ONLY): only a SUCCESSFUL download hits the daily counters, as
+            // with media. The bytes are already in hand (no extra query). BEST-EFFORT — a counter
+            // failure never breaks the download.
             let n = bytes.len() as i64;
             crate::usage::count_bump(&db, "download_count", 1).await;
             crate::usage::count_bump(&db, "download_bytes", n).await;
@@ -164,8 +176,9 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     }
 }
 
-/// Blob'un depo'su (plugin_media_objects.store_id) — Faz 2 çoklu-depo GET çözümlemesi.
-/// Meta yok → None (blob hiç yüklenmemiş → çağıran 404). Tek-depoda hep 'r2-primary'.
+/// The blob's backend (plugin_media_objects.store_id) — Faz 2 multi-backend GET resolution.
+/// No meta row → None (the blob was never uploaded → the caller 404s). On a single-backend install
+/// this is always 'r2-primary'.
 async fn media_store_id(db: &D1Database, room_id: &str, blob_id: &str) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct StoreRow {
@@ -179,7 +192,8 @@ async fn media_store_id(db: &D1Database, room_id: &str, blob_id: &str) -> Result
     Ok(row.map(|r| r.store_id))
 }
 
-/// (room,id) meta satırı VAR MI? Varsa `size_bytes` döner (idempotent-PUT kısa-devresi).
+/// Does a meta row for (room,id) exist? Returns its `size_bytes` if so (the idempotent-PUT
+/// short-circuit).
 async fn existing_size(db: &D1Database, room_id: &str, blob_id: &str) -> Result<Option<i64>> {
     #[derive(Deserialize)]
     struct SizeRow {
@@ -193,8 +207,9 @@ async fn existing_size(db: &D1Database, room_id: &str, blob_id: &str) -> Result<
     Ok(row.map(|r| r.size_bytes))
 }
 
-/// Meta'yı yaz; GERÇEKTEN eklendi mi döner. `ON CONFLICT DO NOTHING RETURNING` →
-/// yarış-güvenli çift-sayım koruması (kaybeden izolat 0 satır alır → sayaç bump ATLANIR).
+/// Write the meta row; returns whether it was ACTUALLY inserted. `ON CONFLICT DO NOTHING
+/// RETURNING` gives race-safe double-count protection: the losing isolate gets 0 rows back and
+/// SKIPS the counter bump.
 async fn insert_meta(
     db: &D1Database,
     room_id: &str,

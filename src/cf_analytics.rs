@@ -1,69 +1,72 @@
-//! CF GraphQL Analytics — FATURA-DOĞRU kullanım rakamları (kota epic **Faz 3**).
-//! `/admin/stats` self-report sayaçlarının (Faz 1c) yanına Cloudflare'ın kendi
-//! ölçtüğü istek sayısı (workersInvocationsAdaptive) + R2 depolama
-//! (r2StorageAdaptiveGroups) eklenir → "authoritative" dual-logic.
+//! CF GraphQL Analytics — BILLING-ACCURATE usage numbers (quota epic **phase 3**).
+//! Alongside the self-reported counters in `/admin/stats` (phase 1c) this adds
+//! Cloudflare's own measurements: request count (workersInvocationsAdaptive) and R2
+//! storage (r2StorageAdaptiveGroups), giving stats its "authoritative" dual logic.
 //!
-//! ⚠️ FAIL-OPEN MUTLAK (bu modül CANLI test edilemeden yazıldı — CF_API_TOKEN
-//! henüz yok): HER hata yolu `None` döner → stats self-report'a düşer, endpoint
-//! ASLA 500 atmaz, mevcut alanlar ASLA bozulmaz. Zincir:
-//!   0. Config çözümü per-key **env-secret/var ÖNCE, D1 `server_settings`
-//!      sonra** (0024; owner `PATCH /admin/cf-config` ile app'ten girer —
-//!      env-set kazanır: account-id env'de + token UI'dan-D1'de karışık
-//!      kurulum çalışır). D1 okuma FAIL-OPEN: tablo/kolon yok (migration
-//!      öncesi) ya da D1 hatası → o kaynak yok sayılır (env-only, bugünkü
-//!      davranış). İki env key de set ise D1'e HİÇ gidilmez.
-//!   1. Token/account HİÇBİR kaynakta yok ya da boş → erken None (CF ağına
-//!      hiç çıkılmaz — VPS/standalone ya da token-kurulmamış CF = bugünkü
-//!      davranış BİT-AYNI).
-//!   2. fetch/ağ hatası → `console_warn` + o sorgu None.
-//!   3. HTTP status != 200 → `console_warn` (status + gövde) + o sorgu None.
-//!   4. Gövde JSON parse-fail → `console_warn` (ham gövde, kısaltılmış) + None.
-//!   5. GraphQL `errors` dolu → `console_warn` (CF'nin hata mesajı — token
-//!      gelince `wrangler tail`'de görülür) + yine de data parse denenir
-//!      (kısmi başarı mümkün).
-//!   6. Alan-bazlı SAVUNMACI parse: her metrik bağımsız `.get(..).and_then(..)`
-//!      zinciri — eksik/null/şema-değişti → o metrik None, diğerleri yaşar.
-//!   7. İstek-sayısı ve R2 sorguları AYRI POST'lar: R2 alt-sorgusu şema-uyumsuz
-//!      çıkarsa (validation hatası TÜM sorguyu düşürürdü) asıl metrik olan
-//!      istek sayıları ETKİLENMEZ.
-//!   8. TÜM metrikler None → None (hiç CF verisi yok = authoritative DEĞİL).
+//! ⚠️ FAIL-OPEN IS ABSOLUTE (this module was written without any LIVE testing — there
+//! was no CF_API_TOKEN yet): EVERY error path returns `None` → stats falls back to the
+//! self-reported numbers, the endpoint NEVER 500s, and existing fields are NEVER
+//! disturbed. The chain:
+//!   0. Config resolution is per key: **env secret/var FIRST, D1 `server_settings`
+//!      second** (0024; the owner enters it from the app via `PATCH /admin/cf-config`).
+//!      env wins, so a mixed setup works — account id in env, token entered in the UI
+//!      and stored in D1. The D1 read is FAIL-OPEN: a missing table/column (before the
+//!      migration) or any D1 error simply drops that source (env-only, today's
+//!      behavior). If both env keys are set, D1 is NEVER queried.
+//!   1. Token or account missing/empty in EVERY source → early None, without ever
+//!      touching the CF network (a VPS/standalone deployment, or CF without a token,
+//!      behaves EXACTLY as it does today).
+//!   2. fetch/network error → `console_warn` + None for that query.
+//!   3. HTTP status != 200 → `console_warn` (status + body) + None for that query.
+//!   4. Body fails to parse as JSON → `console_warn` (raw body, truncated) + None.
+//!   5. Non-empty GraphQL `errors` → `console_warn` with CF's message (visible in
+//!      `wrangler tail` once a token exists), then STILL attempt to parse data —
+//!      partial success is possible.
+//!   6. Per-field DEFENSIVE parsing: each metric is its own `.get(..).and_then(..)`
+//!      chain, so missing/null/schema-changed only nulls that one metric.
+//!   7. The request-count and R2 queries are SEPARATE POSTs: if the R2 subquery turns
+//!      out to be schema-incompatible (a validation error would sink the WHOLE query),
+//!      the primary metric — request counts — is UNAFFECTED.
+//!   8. ALL metrics None → None (no CF data at all means we are NOT authoritative).
 //!
-//! Kurulum: CF dashboard → API token (Account Analytics: Read) → ya owner
-//! Sezi uygulamasından girer (Sunucu kullanımı → CF Analytics; D1'e yazılır,
-//! WRITE-ONLY — hiçbir endpoint geri döndürmez) ya da CLI ile
-//! `wrangler secret put CF_API_TOKEN` + `CF_ACCOUNT_ID` (var ya da secret).
+//! Setup: CF dashboard → API token (Account Analytics: Read) → either the owner enters
+//! it in the Sezi app (Server usage → CF Analytics; stored in D1, WRITE-ONLY — no
+//! endpoint hands it back) or via CLI with `wrangler secret put CF_API_TOKEN` plus
+//! `CF_ACCOUNT_ID` (either a var or a secret).
 
 use worker::*;
 
-/// CF'nin ölçtüğü kullanım. Her alan bağımsız Option — sorgunun bir parçası
-/// şema-uyumsuz çıkarsa diğerleri yine gelir (alan-bazlı fail-open).
+/// Usage as measured by CF. Every field is an independent Option, so if one part of
+/// the query is schema-incompatible the rest still arrive (per-field fail-open).
 pub struct CfUsage {
-    /// Bugün (UTC 00:00'dan beri) worker istek sayısı — CF faturasıyla birebir.
+    /// Worker requests today (since 00:00 UTC) — matches the CF bill exactly.
     pub requests_today: Option<i64>,
-    /// Bu ay (ay-başı UTC'den beri) worker istek sayısı.
+    /// Worker requests this month (since the first of the month, UTC).
     pub requests_month: Option<i64>,
-    /// R2 depolama (payload byte) — CF'nin ölçtüğü; self-report `media.bytes`'ın
-    /// YANINA konur, onu değiştirmez.
+    /// R2 storage in payload bytes, as measured by CF. Reported ALONGSIDE the
+    /// self-reported `media.bytes`; it never overwrites it.
     pub r2_storage_bytes: Option<i64>,
 }
 
-/// wrangler.toml `name` — workersInvocationsAdaptive scriptName filtresi.
-/// Worker yeniden adlandırılırsa burası da güncellenmeli (tek yer).
+/// The `name` from wrangler.toml — the scriptName filter for
+/// workersInvocationsAdaptive. If the worker is renamed, this single spot must be
+/// updated too.
 const SCRIPT_NAME: &str = "sezgi-worker-rs";
 
-/// İstek-sayısı sorgusu (ASIL metrik) — SABİT, tek yer (CF şema değişirse
-/// yalnız burası oynar). Alias'lı iki pencere: bugün-00:00Z'den + ay-başından.
+/// The request-count query (the PRIMARY metric) — a constant, kept in one place so a
+/// CF schema change only has to be fixed here. Two aliased windows: since 00:00Z today
+/// and since the start of the month.
 ///
-/// ⚠️ CANLI-TUNING GEREKEBİLİR (token olmadan doğrulanamadı):
-/// - Değişken tipleri CF'nin dokümante örneğine göre lowercase `string`
-///   (CF Analytics şeması standart GraphQL `String`/`Time` DEĞİL kendi
-///   skalerlerini kullanır); CF reddederse ilk şüphe burası (`string!`
-///   varyantını dene).
-/// - Filtre alan adları (`scriptName`, `datetime_geq`) CF dokümanındaki
-///   workersInvocationsAdaptive örneğine göre; şema evrilirse `errors`
-///   bloğu `wrangler tail`'de görülür.
-/// - `limit` CF'nin zorunlu-limit kuralı için; sum tek satıra katlandığından
-///   değerin kendisi sonucu değiştirmez.
+/// ⚠️ MAY NEED LIVE TUNING (never verified without a token):
+/// - The variable types are lowercase `string`, following CF's documented example (the
+///   CF Analytics schema uses its own scalars, NOT the standard GraphQL
+///   `String`/`Time`). If CF rejects the query, suspect this first — try the `string!`
+///   variant.
+/// - The filter field names (`scriptName`, `datetime_geq`) come from CF's
+///   workersInvocationsAdaptive example; if the schema evolves, the `errors` block will
+///   say so in `wrangler tail`.
+/// - `limit` only satisfies CF's mandatory-limit rule; since the sum collapses to a
+///   single row, the value itself does not affect the result.
 const REQUESTS_QUERY: &str = r#"
 query SezgiRequests($accountTag: string, $scriptName: string, $todayStart: string, $monthStart: string) {
   viewer {
@@ -85,11 +88,12 @@ query SezgiRequests($accountTag: string, $scriptName: string, $todayStart: strin
 }
 "#;
 
-/// R2 depolama sorgusu (İKİNCİL, best-effort) — BİLEREK ayrı POST: bu dataset
-/// adaptif-örneklidir ve "anlık depolama = son gözlem max{payloadSize}" deseni
-/// canlıda doğrulanmalı. Şema-uyumsuz çıkarsa yalnız bu sorgu düşer (GraphQL
-/// validation hatası tüm sorguyu düşürdüğünden istek-sayısıyla AYNI gövdeye
-/// konmadı). Sorun çıkarsa r2_storage_bytes None kalır, zorlanmaz.
+/// The R2 storage query (SECONDARY, best-effort) — DELIBERATELY a separate POST: this
+/// dataset is adaptively sampled, and the "current storage = max{payloadSize} of the
+/// latest observation" pattern still needs live confirmation. If it turns out to be
+/// schema-incompatible only this query is lost; it is not in the SAME body as the
+/// request counts precisely because a GraphQL validation error sinks the whole query.
+/// When something goes wrong r2_storage_bytes simply stays None — never forced.
 const R2_QUERY: &str = r#"
 query SezgiR2($accountTag: string, $todayStart: string) {
   viewer {
@@ -105,9 +109,10 @@ query SezgiR2($accountTag: string, $todayStart: string) {
 }
 "#;
 
-/// `secret` ÖNCE, `var` sonra oku (token=secret beklenir; account-id var da
-/// olabilir). Yok/boş/whitespace → None (kurulmamış say). Yalnız ENV katmanı —
-/// D1 fallback `resolve_cfg`'de (env-set kazanır).
+/// Read `secret` FIRST, then `var` (the token is expected to be a secret; the account
+/// id may well be a var). Missing/empty/whitespace → None, i.e. treated as not
+/// configured. This is the ENV layer only — the D1 fallback lives in `resolve_cfg`,
+/// where env wins.
 fn read_cfg(env: &Env, key: &str) -> Option<String> {
     let raw = env
         .secret(key)
@@ -117,7 +122,7 @@ fn read_cfg(env: &Env, key: &str) -> Option<String> {
     normalize(raw)
 }
 
-/// Trim + boş → None (env ve D1 değerleri AYNI disiplinle normalize edilir).
+/// Trim, and map empty to None — env and D1 values are normalized with the SAME rule.
 fn normalize(raw: String) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -127,10 +132,11 @@ fn normalize(raw: String) -> Option<String> {
     }
 }
 
-/// D1 `server_settings` cf kolonları (0024) — owner'ın `PATCH /admin/cf-config`
-/// ile app'ten girdiği config. FAIL-OPEN MUTLAK: D1 binding yok / tablo-kolon
-/// yok (migration öncesi) / satır yok / sorgu hatası → (None, None) = o kaynak
-/// yok sayılır (env-only, bugünkü davranış; stats ASLA 500 atmaz).
+/// The cf columns of D1 `server_settings` (0024) — the config the owner entered from
+/// the app via `PATCH /admin/cf-config`. FAIL-OPEN IS ABSOLUTE: no D1 binding, missing
+/// table/column (before the migration), missing row or a query error all yield
+/// (None, None), i.e. the source is ignored (env-only, today's behavior; stats NEVER
+/// 500s).
 async fn read_db_cfg(env: &Env) -> (Option<String>, Option<String>) {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -148,8 +154,9 @@ async fn read_db_cfg(env: &Env) -> (Option<String>, Option<String>) {
     {
         Ok(r) => r,
         Err(e) => {
-            // Beklenen durum migration-öncesi "no such column" — sessiz düşmesin
-            // ama endpoint de kırılmasın (fail-open + iz).
+            // The expected case is a pre-migration "no such column" — it should not
+            // vanish silently, but it must not break the endpoint either
+            // (fail-open, with a trace).
             console_warn!("cf_analytics: D1 config okunamadı (fail-open): {e:?}");
             return (None, None);
         }
@@ -163,9 +170,10 @@ async fn read_db_cfg(env: &Env) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Efektif config — per-key **env ÖNCE, D1 sonra** (env-set kazanır; karışık
-/// kurulum: account-id env'de + token UI'dan-D1'de çalışır). İki env key de
-/// set ise D1'e HİÇ gidilmez (env-kurulu hızlı-yol bugünkü davranışla BİT-AYNI).
+/// The effective config — per key, **env FIRST, D1 second** (env wins, so a mixed
+/// setup works: account id in env, token entered in the UI and stored in D1). If both
+/// env keys are set, D1 is NEVER queried — the env-configured fast path is
+/// bit-identical to today's behavior.
 async fn resolve_cfg(env: &Env) -> (Option<String>, Option<String>) {
     let env_token = read_cfg(env, "CF_API_TOKEN");
     let env_account = read_cfg(env, "CF_ACCOUNT_ID");
@@ -176,10 +184,11 @@ async fn resolve_cfg(env: &Env) -> (Option<String>, Option<String>) {
     (env_token.or(db_token), env_account.or(db_account))
 }
 
-/// Token kurulu mu (env VEYA D1) — `/admin/stats` `cf_configured` alanı +
-/// `PATCH /admin/cf-config` cevabı için. HAFİF: CF ağına ÇIKMAZ (`fetch`
-/// 2 GraphQL POST = pahalı); yalnız token VARLIĞINA bakar. WRITE-ONLY
-/// sözleşmenin okuma yüzü: değer değil yalnız bool sızar.
+/// Is a token configured (in env OR D1)? Feeds the `cf_configured` field of
+/// `/admin/stats` and the `PATCH /admin/cf-config` response. CHEAP: it does NOT touch
+/// the CF network (`fetch` costs two GraphQL POSTs) and only checks whether a token
+/// EXISTS. This is the read side of the WRITE-ONLY contract: a bool leaks, never the
+/// value.
 pub async fn is_configured(env: &Env) -> bool {
     if read_cfg(env, "CF_API_TOKEN").is_some() {
         return true;
@@ -187,14 +196,14 @@ pub async fn is_configured(env: &Env) -> bool {
     read_db_cfg(env).await.0.is_some()
 }
 
-/// Log gövdesini kısalt — `wrangler tail` okunur kalsın (CF hata mesajları
-/// genelde ilk birkaç yüz karakterde).
+/// Truncate a body for logging so `wrangler tail` stays readable — CF error messages
+/// are usually within the first few hundred characters.
 fn truncate_for_log(s: &str) -> String {
     const MAX: usize = 600;
     if s.len() <= MAX {
         s.to_string()
     } else {
-        // char-sınırına yuvarla (UTF-8 ortasından kesme → panic olmasın).
+        // Round down to a char boundary so we never slice mid-UTF-8 and panic.
         let mut end = MAX;
         while !s.is_char_boundary(end) {
             end -= 1;
@@ -203,23 +212,23 @@ fn truncate_for_log(s: &str) -> String {
     }
 }
 
-/// Bugün 00:00Z — usage.rs `today_utc` ("YYYY-MM-DD", self-report sayaçlarla
-/// AYNI gün penceresi) → ISO8601.
+/// Today at 00:00Z as ISO 8601, derived from usage.rs `today_utc` ("YYYY-MM-DD") so
+/// the window matches the self-reported counters EXACTLY.
 fn today_start_utc() -> String {
     format!("{}T00:00:00Z", crate::usage::today_utc())
 }
 
-/// Ay başı 00:00Z — turn.rs `current_month_utc` ("YYYY-MM", TURN bütçesiyle
-/// AYNI ay penceresi) → ISO8601.
+/// The first of the month at 00:00Z as ISO 8601, derived from turn.rs
+/// `current_month_utc` ("YYYY-MM") so the window matches the TURN budget EXACTLY.
 fn month_start_utc() -> String {
     format!("{}-01T00:00:00Z", crate::turn::current_month_utc())
 }
 
-/// Tek GraphQL POST → `data.viewer.accounts[0]` düğümü. Her hata katmanı
-/// `console_warn` + None (fail-open; `tag` log'da hangi sorgu olduğunu söyler).
-/// fcm.rs Fetch/RequestInit deseni; gövde TEXT alınır → parse-fail'de ham
-/// gövde loglanabilir (canlı tuning kanıtı) + OTK-wedge dersi (resp.json
-/// yerine text+serde_json evde-desen).
+/// One GraphQL POST → the `data.viewer.accounts[0]` node. Every failure layer does
+/// `console_warn` + None (fail-open; `tag` tells the log which query it was). Follows
+/// fcm.rs's Fetch/RequestInit pattern. The body is taken as TEXT so that on a parse
+/// failure the raw body can be logged (evidence for live tuning) — and per the OTK
+/// wedge lesson, text + serde_json is the house pattern instead of resp.json.
 async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_json::Value> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
@@ -235,7 +244,7 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
     }
     init.with_headers(headers);
 
-    // (2) fetch/ağ hatası → yut + logla + None (stats 500 atmaz).
+    // (2) fetch/network error → swallow, log, return None (stats never 500s).
     let req = match Request::new_with_init("https://api.cloudflare.com/client/v4/graphql", &init) {
         Ok(r) => r,
         Err(e) => {
@@ -258,7 +267,7 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
         }
     };
 
-    // (3) HTTP hatası (401 token-yanlış / 403 izin-eksik / 5xx) → logla + None.
+    // (3) HTTP error (401 wrong token / 403 missing permission / 5xx) → log + None.
     if resp.status_code() != 200 {
         console_warn!(
             "cf_analytics[{tag}]: HTTP {} — {}",
@@ -268,7 +277,7 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
         return None;
     }
 
-    // (4) JSON parse-fail → logla + None.
+    // (4) JSON parse failure → log + None.
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
@@ -280,8 +289,8 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
         }
     };
 
-    // (5) GraphQL `errors` — CF şema/filtre uyuşmazlığında burada konuşur.
-    // Logla ama DEVAM et: data kısmi gelmiş olabilir.
+    // (5) GraphQL `errors` — where CF speaks up about a schema/filter mismatch.
+    // Log it but CONTINUE: `data` may have arrived partially.
     if let Some(errors) = v.get("errors").filter(|e| !e.is_null()) {
         if errors.as_array().map(|a| !a.is_empty()).unwrap_or(true) {
             console_warn!(
@@ -306,27 +315,27 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
     account
 }
 
-/// `<alias>[0].sum.requests` — savunmacı gezinme; herhangi bir seviye
-/// eksik/null/yanlış-tip → None (o metrik düşer, çağıran yaşar).
+/// `<alias>[0].sum.requests` — defensive traversal; any level missing, null or of the
+/// wrong type yields None, dropping that one metric while the caller survives.
 fn extract_requests(account: &serde_json::Value, alias: &str) -> Option<i64> {
     let v = account.get(alias)?.get(0)?.get("sum")?.get("requests")?;
-    // CF sum'ları tam sayı döner ama şema float verirse de kabul et (savunmacı).
+    // CF returns sums as integers, but accept a float if the schema ever emits one.
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
 }
 
-/// `r2[0].max.payloadSize` — aynı savunmacı desen.
+/// `r2[0].max.payloadSize` — the same defensive pattern.
 fn extract_r2_bytes(account: &serde_json::Value) -> Option<i64> {
     let v = account.get("r2")?.get(0)?.get("max")?.get("payloadSize")?;
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
 }
 
-/// CF Analytics'ten kullanım çek. `None` = CF yok/kurulmamış/hata → çağıran
-/// (admin/stats) self-report sayaçlara düşer (dual-logic'in fallback kolu).
-/// Ayrıntılı fail-open zinciri modül başlığında.
+/// Fetch usage from CF Analytics. `None` means no CF, not configured, or an error, and
+/// the caller (admin/stats) falls back to the self-reported counters — the fallback arm
+/// of the dual logic. The detailed fail-open chain is in the module header.
 pub async fn fetch(env: &Env) -> Option<CfUsage> {
-    // (0)+(1) Config çözümü env-first/D1-fallback (`resolve_cfg`); token ya da
-    // account HİÇBİR kaynakta yoksa CF ağına hiç çıkmadan None (kurulmamış =
-    // self-report, bugünkü davranış).
+    // (0)+(1) Config resolution, env-first with a D1 fallback (`resolve_cfg`). If the
+    // token or the account is missing from EVERY source, return None without ever
+    // touching the CF network (not configured = self-report, today's behavior).
     let (token, account_tag) = match resolve_cfg(env).await {
         (Some(t), Some(a)) => (t, a),
         _ => return None,
@@ -334,7 +343,7 @@ pub async fn fetch(env: &Env) -> Option<CfUsage> {
 
     let today_start = today_start_utc();
 
-    // ── ASIL metrik: istek sayıları (bugün + bu ay) ──────────────────────────
+    // ── PRIMARY metric: request counts (today + this month) ──────────────────
     let requests_body = serde_json::json!({
         "query": REQUESTS_QUERY,
         "variables": {
@@ -354,7 +363,7 @@ pub async fn fetch(env: &Env) -> Option<CfUsage> {
         None => (None, None),
     };
 
-    // ── İKİNCİL: R2 depolama (best-effort; ayrı POST — bkz. R2_QUERY notu) ──
+    // ── SECONDARY: R2 storage (best-effort; separate POST — see the R2_QUERY note) ──
     let r2_body = serde_json::json!({
         "query": R2_QUERY,
         "variables": {
@@ -368,8 +377,9 @@ pub async fn fetch(env: &Env) -> Option<CfUsage> {
         None => None,
     };
 
-    // (8) Hepsi None = CF'den TEK gerçek rakam yok → authoritative DEĞİLİZ;
-    // None dön ki stats `authoritative:false` + self-report bassın.
+    // (8) All None = not a SINGLE real number came back from CF → we are NOT
+    // authoritative; return None so stats reports `authoritative:false` and prints the
+    // self-reported figures.
     if requests_today.is_none() && requests_month.is_none() && r2_storage_bytes.is_none() {
         console_warn!("cf_analytics: hiç metrik çıkmadı (şema-tuning gerek? — üstteki loglara bak)");
         return None;

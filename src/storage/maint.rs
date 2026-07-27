@@ -1,9 +1,9 @@
-//! Depo-envanteri bakım işleri — günlük bakımdan (`maintenance::run_daily`) çağrılır.
-//! `maintenance.rs`'in lazy-scheduling/cleanup çekirdeğinden AYRILDI (dosya-bütçesi + tek
-//! sorumluluk): burada yalnız takılabilir-depolamaya özgü envanter işleri toplanır.
-//!   - `insert_orphans` — TTL-cleanup'ta silinemeyen blob'lar → `storage_orphans` tombstone.
-//!   - `retry_orphans`  — öksüz-blob tombstone'larını yeniden-sil (başaran düşer). Plan f#4.
-//!   - `backfill_plugin_code` — eski `plugin-code/` blob'larını `plugin_code_objects`'e doldur.
+//! Storage-inventory maintenance jobs — invoked from the daily run (`maintenance::run_daily`).
+//! Split out of the lazy-scheduling/cleanup core in `maintenance.rs` (file budget + single
+//! responsibility): only inventory work specific to pluggable storage lives here.
+//!   - `insert_orphans` — blobs that could not be deleted → a `storage_orphans` tombstone.
+//!   - `retry_orphans`  — re-delete orphan tombstones (rows that succeed are dropped). Plan f#4.
+//!   - `backfill_plugin_code` — backfill legacy `plugin-code/` blobs into `plugin_code_objects`.
 
 use serde::Deserialize;
 use worker::*;
@@ -12,9 +12,10 @@ use super::StorageRouter;
 use crate::d1util::{d1_int, d1_text};
 use crate::utils::now_secs;
 
-/// TTL-cleanup'ta silinemeyen blob'ları `storage_orphans` tombstone'una yaz (Faz 3, plan f#4).
-/// İdempotent (`ON CONFLICT DO NOTHING` — aynı blob ikinci koşumda çift-satır üretmez).
-/// Tek `db.batch` = tek subrequest. Best-effort: orphan-yazımı temizliği KIRMAZ.
+/// Tombstone blobs that could not be deleted into `storage_orphans` (Faz 3, plan f#4). Callers:
+/// TTL cleanup, avatar replacement and the drain engine. Idempotent (`ON CONFLICT DO NOTHING`,
+/// so a second run does not duplicate a row). One `db.batch` = one subrequest. Best-effort: a
+/// failed orphan write never breaks the caller.
 pub(crate) async fn insert_orphans(db: &D1Database, orphans: &[(String, String, i64)]) {
     let now = now_secs() as i64;
     let mut stmts: Vec<D1PreparedStatement> = Vec::new();
@@ -34,11 +35,12 @@ pub(crate) async fn insert_orphans(db: &D1Database, orphans: &[(String, String, 
     }
 }
 
-/// Öksüz-blob tombstone retry (Faz 3, plan f#4). En eski ≤50 orphan'ı router üzerinden
-/// yeniden-sil: başarı (idempotent 204/404→Ok) → satır DÜŞER; başarısız (depo hâlâ down /
-/// silinmiş-depo resolve-Err) → `retry_count++` (satır kalır, sonraki günde tekrar). Tek
-/// batch = kaldır+artır tek subrequest. Router.delete TOPLU-yolda health-işaret yapmaz →
-/// gürültü yok (owner elle/probe ile sağlığı görür).
+/// Retry orphan-blob tombstones (Faz 3, plan f#4). Re-delete the oldest ≤50 orphans through
+/// the router: success (idempotent 204/404→Ok) DROPS the row; failure (backend still down, or a
+/// deleted backend that no longer resolves) does `retry_count++` and keeps the row for the next
+/// day. One batch turns all the drops and increments into a single subrequest. Router.delete
+/// does no health marking on the bulk path, so this stays quiet (the owner sees health via the
+/// manual probe).
 pub(crate) async fn retry_orphans(env: &Env) -> Result<()> {
     #[derive(Deserialize)]
     struct OrphanRow {
@@ -75,19 +77,20 @@ pub(crate) async fn retry_orphans(env: &Env) -> Result<()> {
     Ok(())
 }
 
-/// plugin-code/ R2 blob'larını `plugin_code_objects` envanterine geriye-doldur (Faz 1).
-/// İdempotent (INSERT OR IGNORE → mevcut satırlar, örn. inline put_code meta'sı,
-/// KORUNUR; yalnız eksikler eklenir; hepsi 'r2-primary'). R2 list sayfalı → cursor'la
-/// sınırlı sayfa/koşum (free-plan subrequest bütçesi); günlük tekrar convergence sağlar.
-/// Sayfa başına tek `db.batch` = tek subrequest (blob-başına ayrı INSERT değil).
+/// Backfill the `plugin-code/` R2 blobs into the `plugin_code_objects` inventory (Faz 1).
+/// Idempotent (INSERT OR IGNORE PRESERVES existing rows such as the inline put_code meta and
+/// only fills the gaps; everything lands on 'r2-primary'). R2 list is paginated, so a run walks
+/// a bounded number of pages with the cursor (free-plan subrequest budget) and the daily repeat
+/// converges. One `db.batch` per page = one subrequest, not an INSERT per blob.
 pub(crate) async fn backfill_plugin_code(env: &Env) -> Result<()> {
-    // Binding yoksa (Lite kurulum) R2 list imkânsız → sessiz çık (öksüz-envanter yok).
+    // No binding (a Lite install) makes an R2 list impossible → exit quietly (nothing to index).
     let Ok(bucket) = env.bucket("MEDIA") else {
         return Ok(());
     };
     let db = env.d1("DB")?;
     let now = now_secs() as i64;
-    // ≤5×1000 blob/koşum; eklenti-kodu pratikte az (admin-yükler) → çoğu kurulumda 1 sayfa.
+    // ≤5×1000 blobs per run; plugin code is rare in practice (only admins upload it), so most
+    // installs finish in a single page.
     const MAX_PAGES: usize = 5;
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
@@ -100,10 +103,11 @@ pub(crate) async fn backfill_plugin_code(env: &Env) -> Result<()> {
         for obj in page.objects() {
             let key = obj.key();
             let Some((room_id, blob_id)) = parse_code_key(&key) else {
-                continue; // beklenmedik biçim → atla
+                continue; // unexpected shape → skip
             };
-            // uploader_id backfill'de bilinmiyor → boş (NOT NULL'ı sağlar; envanter yeter).
-            // INSERT OR IGNORE: gerçek uploader'lı inline-meta satırı varsa DOKUNULMAZ.
+            // uploader_id is unknown during a backfill → empty string (satisfies NOT NULL; the
+            // inventory alone is what matters here). INSERT OR IGNORE leaves an existing
+            // inline-meta row with the real uploader untouched.
             let stmt = db
                 .prepare(
                     "INSERT OR IGNORE INTO plugin_code_objects \
@@ -122,7 +126,7 @@ pub(crate) async fn backfill_plugin_code(env: &Env) -> Result<()> {
         if !stmts.is_empty() {
             db.batch(stmts).await?;
         }
-        // Sonraki sayfa yalnız truncated + cursor varsa; yoksa bitti.
+        // Continue only while the listing is truncated AND hands back a cursor; otherwise done.
         match (page.truncated(), page.cursor()) {
             (true, Some(c)) => cursor = Some(c),
             _ => break,
@@ -131,8 +135,9 @@ pub(crate) async fn backfill_plugin_code(env: &Env) -> Result<()> {
     Ok(())
 }
 
-/// "plugin-code/{room}/{blob}" R2 anahtarından (room,blob) çıkar — `storage::code_key`
-/// şemasıyla birebir. Beklenmedik biçim (eksik parça / blob'da '/') → None (atla).
+/// Extract (room, blob) from a "plugin-code/{room}/{blob}" R2 key — exactly the
+/// `storage::code_key` scheme. Unexpected shapes (missing segment, a '/' inside blob) → None
+/// (skip).
 fn parse_code_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix("plugin-code/")?;
     let (room, blob) = rest.split_once('/')?;
@@ -146,15 +151,15 @@ fn parse_code_key(key: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
 
-    /// plugin-code backfill anahtar-ayrıştırması: `storage::code_key` şemasıyla birebir
-    /// ("plugin-code/{room}/{blob}"); beklenmedik biçimler atlanır (None).
+    /// Key parsing for the plugin-code backfill: exactly the `storage::code_key` scheme
+    /// ("plugin-code/{room}/{blob}"); unexpected shapes are skipped (None).
     #[test]
     fn parse_code_key_semasi() {
         assert_eq!(
             parse_code_key("plugin-code/room1/blob1"),
             Some(("room1", "blob1"))
         );
-        // Prefix yok / eksik parça / boş parça / blob'da fazladan '/' → None.
+        // Wrong prefix / missing segment / empty segment / extra '/' inside blob → None.
         assert_eq!(parse_code_key("media/abc"), None);
         assert_eq!(parse_code_key("plugin-code/roomonly"), None);
         assert_eq!(parse_code_key("plugin-code//blob"), None);

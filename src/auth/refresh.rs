@@ -9,8 +9,8 @@ use worker::*;
 #[derive(Deserialize)]
 struct RefreshBody {
     refresh_token: String,
-    // M2-S1 (opsiyonel): bu cihazın device_id'si. Verilmezse eski refresh
-    // satırından devralınır (yoksa NULL = legacy). Eski gövde AYNEN çalışır.
+    // M2-S1 (optional): this device's device_id. When absent it is inherited from the
+    // old refresh row (NULL there means legacy). An older body works EXACTLY as before.
     #[serde(default)]
     device_id: Option<String>,
 }
@@ -35,7 +35,7 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
     struct Row {
         user_id: String,
         expires_at: i64,
-        // M2-S1: eski satırdaki device_id (legacy satırlarda NULL).
+        // M2-S1: the device_id stored on the old row (NULL on legacy rows).
         device_id: Option<String>,
     }
     let row: Option<Row> = db
@@ -57,13 +57,16 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         .await?;
 
     let user_id = row.user_id;
-    // device_id: gövdede verildiyse onu kullan, yoksa eski satırdan devral.
+    // device_id: use the one from the body if present, otherwise inherit it from the
+    // old row.
     let device_id = body.device_id.or(row.device_id);
-    // M2-S3.5: ÇIKARILAN cihaz /auth/refresh ile oturumu DİRİLTMESİN (relogin.rs
-    // paritesi). device_id'li token + o cihaz revoke ise 401 → cihaz yeni access-token
-    // alamaz → oturum access-TTL (15dk) içinde düşer. NULL device_id (legacy/birincil)
-    // → ayırt edilemez → atla (birincili kilitleme). Yeni-build cihazlar device_id'li
-    // token alır → bu kapı revoke'u uçtan-uca tamamlar (eski token-delete'e ek savunma).
+    // M2-S3.5: a REMOVED device must not RESURRECT its session through /auth/refresh
+    // (parity with relogin.rs). If the token carries a device_id and that device is
+    // revoked → 401, so it gets no new access token and the session dies within the
+    // access TTL (15 min). A NULL device_id (legacy/primary) cannot be told apart, so
+    // the check is skipped rather than locking the primary out. Newly built devices do
+    // carry a device_id, so this gate completes revocation end to end — defence on top
+    // of the older token deletion.
     if let Some(dev) = device_id.as_deref() {
         #[derive(Deserialize)]
         struct RevRow {

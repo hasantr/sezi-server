@@ -1,12 +1,15 @@
-//! Depo sağlık-izleme (Faz 3, plan e) — iki kanal:
-//!   1. **Programlı probe:** günlük bakım (`maintenance::run_daily`) `probe_all` çağırır →
-//!      `state!='disabled'` HER depoya `probe()` (PUT+GET+DELETE `probe/<uuid>`) + `last_health_*`.
-//!      Owner elle de tetikler: `POST /admin/storage/:id/probe` (admin/storage.rs, `write_health` ORTAK).
-//!   2. **Fırsatçı işaretleme:** gerçek trafikte put/get `Err` verince `write_health(false)`
-//!      (router.rs; best-effort, 120-char kırpık, secret'sız) → panel cron beklemeden kızarır.
+//! Backend health monitoring (Faz 3, plan e) — two channels:
+//!   1. **Scheduled probe:** the daily maintenance run (`maintenance::run_daily`) calls
+//!      `probe_all`, which runs `probe()` (PUT+GET+DELETE on `probe/<uuid>`) against EVERY backend
+//!      with `state!='disabled'` and records `last_health_*`. The owner can also trigger it by
+//!      hand: `POST /admin/storage/:id/probe` (admin/storage.rs, sharing `write_health`).
+//!   2. **Opportunistic marking:** when real traffic gets an `Err` out of put/get, router.rs calls
+//!      `write_health(false)` (best-effort, truncated to 120 chars, secret-free) → the panel turns
+//!      red without waiting for the cron.
 //!
-//! `write_health` TEK choke-point: probe endpoint'i, router fırsatçı-işaret, günlük probe,
-//! cleanup agregeli-işaret hepsi buradan yazar → sağlık-yazımı davranışı ayrışamaz.
+//! `write_health` is the ONE choke-point: the probe endpoint, the router's opportunistic mark, the
+//! daily probe and cleanup's aggregated mark all write through it → health-write behaviour cannot
+//! diverge.
 
 use serde::Deserialize;
 use worker::*;
@@ -15,8 +18,8 @@ use super::build_store;
 use crate::d1util::{d1_int, d1_opt_text, d1_text};
 use crate::utils::now_secs;
 
-/// `last_health_at/ok/err` best-effort yaz (probe + fırsatçı-işaretleme ORTAK). Hata
-/// yutulur: sağlık-yazımı hiçbir gerçek op'u (upload/download/bakım) kırmaz.
+/// Best-effort write of `last_health_at/ok/err` (shared by the probe and the opportunistic mark).
+/// Errors are swallowed: a health write never breaks a real op (upload/download/maintenance).
 pub async fn write_health(env: &Env, store_id: &str, ok: bool, err: Option<&str>) {
     let Ok(db) = env.d1("DB") else {
         return;
@@ -39,11 +42,12 @@ pub async fn write_health(env: &Env, store_id: &str, ok: bool, err: Option<&str>
     }
 }
 
-/// Günlük programlı probe (plan e kanal-1): `state!='disabled'` TÜM depoları D1'den oku,
-/// her birine canlı `probe()` (3 subrequest/depo) + `last_health_*` yaz. build_store-fail
-/// (Lite binding-yok / s3 config-parse-fail) da unhealthy işaretlenir (o depoda blob olan
-/// get 503 verecek — plan f#9). Depo sayısı bir avuç → günlük bakımda ucuz. Hata bakımın
-/// kalanını KIRMAZ (run_daily logla-devam).
+/// The daily scheduled probe (plan e, channel 1): read every backend with `state!='disabled'`
+/// from D1, run a live `probe()` against each (3 subrequests per backend) and record
+/// `last_health_*`. A build_store failure (Lite without the binding / an s3 config that fails to
+/// parse) is marked unhealthy too, since a get for a blob on that backend will 503 (plan f#9).
+/// There are only ever a handful of backends, so this is cheap for the daily run. Failures do NOT
+/// break the rest of maintenance (run_daily logs and continues).
 pub async fn probe_all(env: &Env) -> Result<()> {
     #[derive(Deserialize)]
     struct Row {
@@ -65,7 +69,8 @@ pub async fn probe_all(env: &Env) -> Result<()> {
                 Ok(()) => (true, None),
                 Err(e) => (false, Some(e.to_string().chars().take(120).collect())),
             },
-            // build_store Err zaten kısa neden (binding_missing / s3-parse / unsupported_kind).
+            // A build_store Err is already a short reason (binding_missing / s3-parse /
+            // unsupported_kind).
             Err(e) => (false, Some(e)),
         };
         write_health(env, &r.store_id, ok, err.as_deref()).await;

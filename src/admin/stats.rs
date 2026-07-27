@@ -1,19 +1,20 @@
-//! `GET /admin/stats` — sunucu kullanım istatistikleri (kota epic **Faz 0**
-//! SHADOW-MODE; **Faz 1c** genişletme; **Faz 3** CF Analytics dual-logic).
-//! Admin/owner-gated tek-bakış özeti: üye/davet sayıları + medya depolama
-//! (server_stats sayacı) + retention ilanı + video-arama (TURN) aylık
-//! kullanımı + günlük medya hacmi. Yalnız RAPOR — bu endpoint hiçbir limit
-//! zorlamaz.
+//! `GET /admin/stats` — server usage statistics (quota epic **Faz 0**
+//! SHADOW-MODE, **Faz 1c** widening, **Faz 3** CF Analytics dual logic).
+//! An admin/owner-gated at-a-glance summary: member and invite counts, media
+//! storage (the server_stats counter), the advertised retention, monthly video
+//! call (TURN) usage and daily media volume. REPORTING ONLY — this endpoint
+//! enforces no limit.
 //!
-//! Faz 3 dual-logic: CF_API_TOKEN kuruluysa istek sayıları CF GraphQL
-//! Analytics'ten (fatura-doğru, `authoritative:true`); değilse/hatada
-//! self-report sayaçlar aynen çalışır (`authoritative:false` — VPS/standalone
-//! yolu). cf_analytics.rs her katmanda fail-open.
+//! Faz 3 dual logic: with CF_API_TOKEN installed, request counts come from CF
+//! GraphQL Analytics (billing-accurate, `authoritative:true`); without it, or on
+//! error, the self-report counters are used unchanged (`authoritative:false`, the
+//! VPS/standalone path). cf_analytics.rs fails open at every layer.
 //!
-//! Yeni sayaç tabloları (0022/0009) henüz migrate edilmemişse fail-open 0 döner
-//! (turn.rs sayaç-okuma deseni) — stats-lite her zaman çalışır.
+//! If the newer counter tables (0022/0009) have not been migrated yet, the reads
+//! fail open with 0 (the turn.rs counter-read pattern), so stats-lite always
+//! works.
 
-use crate::auth::middleware::{require_admin, require_auth};
+use crate::auth::middleware::{require_admin, require_active_auth};
 use crate::d1util::{d1_int, d1_text};
 use crate::utils::now_secs;
 use serde::Deserialize;
@@ -41,7 +42,7 @@ struct CapsRow {
     max_user_storage_bytes: Option<i64>,
 }
 
-/// Takılabilir-depolama Faz 3 (v8) — `/admin/stats` kompakt depo rozeti.
+/// Pluggable storage Faz 3 (v8) — compact store badge for `/admin/stats`.
 #[derive(Deserialize)]
 struct StorageSummaryRow {
     total: i64,
@@ -50,8 +51,8 @@ struct StorageSummaryRow {
 }
 
 pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let user_id = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
     if let Err(resp) = require_admin(&user_id, &ctx.env).await {
@@ -60,8 +61,9 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
     let now = now_secs();
 
-    // Üye sayıları (list_users ile aynı tablo: users). admins = yükseltilmiş
-    // roller, owner DAHİL (owner her admin işini yapar — middleware ile tutarlı).
+    // Member counts, from the same table list_users uses. `admins` counts every
+    // elevated role INCLUDING owner (an owner can do every admin action —
+    // consistent with the middleware).
     let members: i64 = db
         .prepare("SELECT COUNT(*) AS n FROM users")
         .first::<CountRow>(None)
@@ -74,18 +76,28 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .await?
         .map(|r| r.n)
         .unwrap_or(0);
-    // Bekleyen davetler: kullanılmamış + süresi geçmemiş (list_invites tablosu;
-    // used/expired satırlar zaten aksiyon-değersiz + cron temizler).
+    // Pending invites: unused, unexpired and not yet claimed in the attribution
+    // ledger (same table list_invites reads). Used/expired rows are not actionable
+    // anyway and cron eventually prunes them; the ledger check keeps an invite
+    // whose `used` flip lost a race from being counted as still pending.
     let invites: i64 = db
-        .prepare("SELECT COUNT(*) AS n FROM invite_tokens WHERE used = 0 AND expires_at > ?")
+        .prepare(
+            "SELECT COUNT(*) AS n FROM invite_tokens it
+              WHERE it.used = 0 AND it.expires_at > ?
+                AND NOT EXISTS (
+                  SELECT 1 FROM invite_attributions ia
+                   WHERE ia.invite_token_hash = it.token_hash
+                )",
+        )
         .bind(&[d1_int(now as i64)])?
         .first::<CountRow>(None)
         .await?
         .map(|r| r.n)
         .unwrap_or(0);
 
-    // Medya depolama — server_stats SHADOW sayacı (0022; upload/ack/cron hook'ları
-    // + günlük reconcile besler). Tablo/satır yok veya hata → 0 (fail-open).
+    // Media storage — the server_stats SHADOW counter (0022), fed by the
+    // upload/ack/cron hooks plus the daily reconcile. Missing table/row or an
+    // error → 0 (fail-open).
     let media = db
         .prepare("SELECT media_bytes, media_count FROM server_stats WHERE id = 1 LIMIT 1")
         .first::<MediaStatsRow>(None)
@@ -96,51 +108,61 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .map(|m| (m.media_bytes, m.media_count))
         .unwrap_or((0, 0));
 
-    // Retention — /capabilities ilanıyla AYNI kaynak (ilan = davranış disiplini).
+    // Retention — the SAME source /capabilities advertises (what we advertise is
+    // what we do).
     let media_days = crate::server::handlers::fetch_retention_days(&ctx.env).await;
     let message_days = crate::server::handlers::fetch_message_retention_days(&ctx.env).await;
 
-    // Faz 3 — CF Analytics dual-logic. `fetch` fail-open: token/account yok
-    // (env VE D1'de — VPS/standalone ya da hiç girilmedi) → HIZLI None (CF
-    // ağına çıkmaz, bugünkü davranış bit-aynı); CF hata/parse-fail →
-    // console_warn + None. None = self-report koluna düş; stats ASLA 500 atmaz.
+    // Faz 3 — CF Analytics dual logic. `fetch` fails open: with no token/account
+    // (neither env nor D1 — VPS/standalone, or simply never entered) it returns
+    // None FAST without touching the CF network (today's behaviour, bit for bit);
+    // a CF error or parse failure logs a console_warn and returns None. None means
+    // "use the self-report branch"; stats NEVER 500s.
     let cf = crate::cf_analytics::fetch(&ctx.env).await;
 
-    // v6: cf_configured — owner UI'ı "token girilmiş mi" bilir (env-secret VEYA
-    // owner'ın app'ten girdiği D1 değeri). WRITE-ONLY SÖZLEŞME: token DEĞERİ bu
-    // endpoint dahil HİÇBİR yerden dönmez; yalnız bu bool. `is_configured`
-    // hafif (CF ağına çıkmaz; fail-open false). `authoritative`den farkı:
-    // token girili ama CF hatalıysa configured=true + authoritative=false
-    // (UI "bağlı ama veri gelmiyor" ayrımını yapabilir).
+    // v6: cf_configured lets the owner UI know whether a token was entered (env
+    // secret OR the D1 value the owner typed in the app). WRITE-ONLY CONTRACT: the
+    // token VALUE is returned nowhere, this endpoint included — only this bool.
+    // `is_configured` is cheap (no CF network call; fails open to false). How it
+    // differs from `authoritative`: a token that is present but failing yields
+    // configured=true + authoritative=false, so the UI can say "connected but no
+    // data".
     let cf_configured = crate::cf_analytics::is_configured(&ctx.env).await;
 
-    // v7: fcm_configured — owner UI'ı "push kurulu mu" bilir (env VEYA owner'ın
-    // app'ten girdiği D1 değeri; proje-id VE service-account İKİSİ de gerek).
-    // WRITE-ONLY SÖZLEŞME (cf_configured ile aynı): değerler bu endpoint dahil
-    // HİÇBİR yerden dönmez, yalnız bu bool. `is_configured` hafif (Google'a
-    // çıkmaz, yalnız varlığa bakar; fail-open false).
+    // v7: fcm_configured tells the owner UI whether push can be delivered at all.
+    // CAREFUL — it is true when project-id AND service-account are both present
+    // (env, or the D1 values the owner typed in the app) OR when a push relay URL
+    // resolves, and the relay falls back to a built-in default unless explicitly
+    // `off`. So this is NOT proof that the owner installed their own FCM
+    // credentials. WRITE-ONLY CONTRACT (as with cf_configured): the values are
+    // returned nowhere, this endpoint included — only this bool. `is_configured`
+    // is cheap (no call to Google, presence check only; fails open to false).
     let fcm_configured = crate::push::fcm::is_configured(&ctx.env).await;
 
-    // requests_today — CF varsa CF'nin fatura-doğru sayısı; yoksa self-report
-    // usage_counters 'requests' (per-istek D1-sayım pahalı → satır yazılmaz →
-    // 0-stub). Wire tipi HER ZAMAN sayı (null asla) — eski client'ın i64
-    // parse'ı kırılmaz (CF-var-ama-bugün-parse-None ucunda da self-report'a
-    // düşer, alan-bazlı fail-open).
+    // requests_today — CF's billing-accurate number when available, otherwise the
+    // self-report usage_counters 'requests' row. Counting every request in D1 is
+    // too expensive, so nothing writes that row and it is effectively a 0 stub. The
+    // wire type is ALWAYS a number, never null, so an older client's i64 parse
+    // cannot break; even "CF present but today's field parsed as None" falls back to
+    // self-report (per-field fail-open).
     let requests_today_self = crate::usage::read_today(&db, "requests").await;
     let requests_today = cf
         .as_ref()
         .and_then(|c| c.requests_today)
         .unwrap_or(requests_today_self);
-    // requests_month — YENİ alan (v4): yalnız CF verebilir (self-report aylık
-    // sayaç yok) → CF yoksa null (client Option; '—' basar).
+    // requests_month — new in v4: only CF can supply it (there is no monthly
+    // self-report counter), so it is null without CF (the client treats it as an
+    // Option and renders '—').
     let requests_month = cf.as_ref().and_then(|c| c.requests_month);
-    // CF'nin ölçtüğü R2 depolama — self-report `media.bytes`'ın YANINA (onu
-    // değiştirmez; karşılaştırma/mutabakat için). CF yoksa null.
+    // R2 storage as measured by CF, reported ALONGSIDE the self-report
+    // `media.bytes` (it never replaces it) so the two can be reconciled. Null
+    // without CF.
     let storage_cf_bytes = cf.as_ref().and_then(|c| c.r2_storage_bytes);
 
-    // Video-arama (TURN) — bu ayın kimlik-üretim sayacı (turn.rs bütçe-bekçisi
-    // `turn_usage` tablosu, 0009) + ilan edilen tavan (bekçiyle AYNI kaynak:
-    // turn::monthly_cap). Fail-open: tablo yok / D1 hatası → 0 (stats 500 atmaz).
+    // Video calls (TURN) — this month's credential-issue counter (the `turn_usage`
+    // table from 0009 that turn.rs's budget guard maintains) plus the advertised
+    // cap, read from the SAME source as the guard (turn::monthly_cap). Fail-open:
+    // missing table or D1 error → 0, so stats never 500s.
     let turn_issued: i64 = match db
         .prepare("SELECT issued FROM turn_usage WHERE month = ? LIMIT 1")
         .bind(&[d1_text(&crate::turn::current_month_utc())])
@@ -156,23 +178,25 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     };
     let turn_cap = crate::turn::monthly_cap(&ctx.env);
 
-    // Günlük medya hacmi (Faz 1c) — media/handlers.rs count_bump hook'ları
-    // besler; read_today fail-open (tablo/satır yok → 0).
+    // Daily media volume (Faz 1c) — fed by the count_bump hooks in
+    // media/handlers.rs; read_today fails open (missing table/row → 0).
     let upload_bytes_today = crate::usage::read_today(&db, "upload_bytes").await;
     let upload_count_today = crate::usage::read_today(&db, "upload_count").await;
     let download_count_today = crate::usage::read_today(&db, "download_count").await;
     let download_bytes_today = crate::usage::read_today(&db, "download_bytes").await;
 
-    // Aylık medya hacmi (v5, aylık-detay) — usage_counters gün satırlarının
-    // bu-ay SUM'u (read_month, ay-prefix LIKE; TURN bütçesiyle aynı ay
-    // penceresi). read_month fail-open (tablo yok / D1 hatası → 0).
+    // Monthly media volume (v5, month detail) — the SUM of this month's
+    // usage_counters day rows (read_month uses a month-prefix LIKE, the same month
+    // window as the TURN budget). read_month fails open (missing table or D1 error
+    // → 0).
     let upload_bytes_month = crate::usage::read_month(&db, "upload_bytes").await;
     let upload_count_month = crate::usage::read_month(&db, "upload_count").await;
     let download_count_month = crate::usage::read_month(&db, "download_count").await;
     let download_bytes_month = crate::usage::read_month(&db, "download_bytes").await;
 
-    // Kota cap'leri (Faz 1a) — server_settings NULLABLE kolonları. NULL =
-    // sınırsız; hata/satır-yok/migration-eksik → null (fail-open, stats 500 atmaz).
+    // Quota caps (Faz 1a) — NULLABLE columns of server_settings. NULL means
+    // unlimited; an error, a missing row or a missing migration also yields null
+    // (fail-open, so stats never 500s).
     let caps = db
         .prepare(
             "SELECT max_storage_bytes, max_user_storage_bytes \
@@ -186,10 +210,12 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .map(|c| (c.max_storage_bytes, c.max_user_storage_bytes))
         .unwrap_or((None, None));
 
-    // Takılabilir-depolama Faz 3 (plan e) — panel ana-kart ROZETİ (kompakt özet): depo
-    // sayısı + sağlıksız (last_health_ok=0; NULL=hiç-probe SAYILMAZ) + taşınıyor-mu. Detay
-    // (per-depo liste + secret'siz kimlik/sağlık) ayrı `GET /admin/storage`'tan gelir.
-    // Fail-open: tablo yok (migration eksik) / D1 hatası → 0/false (stats 500 atmaz).
+    // Pluggable storage Faz 3 (plan e) — the BADGE on the panel's main card: store
+    // count, unhealthy count (last_health_ok=0 only; NULL = never probed is NOT
+    // counted) and whether anything is draining. The detail view (per-store list
+    // with secret-free identity/health) comes from `GET /admin/storage`. Fail-open:
+    // missing table (migration not applied) or D1 error → 0/false, so stats never
+    // 500s.
     let storage = db
         .prepare(
             "SELECT COUNT(*) AS total, \
@@ -216,9 +242,9 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             "max_storage_bytes": max_storage,
             "max_user_storage_bytes": max_user_storage,
         },
-        // Faz 1c: video-arama (TURN) aylık kullanım + günlük medya hacmi.
-        // Mevcut alanlar AYNEN korunur (eski client v2 alanlarını okumaya
-        // devam eder; yeni bloklar additive).
+        // Faz 1c: monthly video-call (TURN) usage + daily media volume. The
+        // existing fields are untouched (an older client keeps reading the v2
+        // fields; the new blocks are additive).
         "turn": { "issued_month": turn_issued, "cap": turn_cap },
         "today": {
             "upload_bytes": upload_bytes_today,
@@ -226,30 +252,35 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             "download_count": download_count_today,
             "download_bytes": download_bytes_today,
         },
-        // Aylık-detay (v5, additive): "BU AY" kartı için bu ayın medya hacmi
-        // (usage_counters SUM'u). requests_month (CF-only) top-level'da,
-        // TURN issued_month turn bloğunda ZATEN var — burada tekrarlanmaz.
+        // Month detail (v5, additive): this month's media volume for the "THIS
+        // MONTH" card (a usage_counters SUM). requests_month (CF-only) already
+        // lives at top level and TURN issued_month inside the turn block, so
+        // neither is repeated here.
         "month": {
             "upload_bytes": upload_bytes_month,
             "upload_count": upload_count_month,
             "download_count": download_count_month,
             "download_bytes": download_bytes_month,
         },
-        // Faz 3 (v4, additive): dual-logic sözleşme alanları. `backend` = bu
-        // binary'nin çalıştığı yer (VPS/standalone port ileride "standalone"
-        // gönderecek); `authoritative` true = rakamlar CF faturasıyla birebir
-        // (GraphQL Analytics), false = self-report (token yok / CF hatası).
-        // `storage_cf_bytes` CF-ölçümü; self-report media.bytes'ı DEĞİŞTİRMEZ.
+        // Faz 3 (v4, additive): the dual-logic contract fields. `backend` is where
+        // this binary runs (a future VPS/standalone port will send "standalone");
+        // `authoritative` true means the numbers match the CF bill exactly (GraphQL
+        // Analytics), false means self-report (no token, or a CF error).
+        // `storage_cf_bytes` is CF's measurement and never replaces the self-report
+        // media.bytes.
         "backend": "cf",
         "authoritative": cf.is_some(),
         "requests_month": requests_month,
         "storage_cf_bytes": storage_cf_bytes,
-        // v6 (additive): token var-mı bool'u — DEĞERİ ASLA (write-only sözleşme).
+        // v6 (additive): "is a token present" bool — NEVER the value (write-only
+        // contract).
         "cf_configured": cf_configured,
-        // v7 (additive): FCM push kurulu-mu bool'u — DEĞERLER ASLA (write-only).
+        // v7 (additive): "can push be delivered" bool — NEVER the values
+        // (write-only).
         "fcm_configured": fcm_configured,
-        // v8 (additive, Takılabilir-depolama Faz 3): depo rozeti (kompakt). Detay = GET
-        // /admin/storage. draining = herhangi bir depo taşınıyor mu (Faz 4 drain).
+        // v8 (additive, pluggable storage Faz 3): the compact store badge. Detail
+        // lives at GET /admin/storage. draining = is any store being emptied
+        // (Faz 4 drain).
         "storage": {
             "stores_total": stores_total,
             "stores_unhealthy": stores_unhealthy,

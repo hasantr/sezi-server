@@ -1,11 +1,12 @@
 use super::*;
 
-/// M1 (Olm-WIPE tekrar-tetikleme daraltma): TAZE-reconnect force-replay yalnız
-/// son 48 saatlik forward'ları verir. Daha eski orphan satırlar (client hiç
-/// `forward_ack` atmamış `delivery_failed` vb.) her reconnect'te koşulsuz replay
-/// edilip alıcıda `delete_all_olm_blobs` (Olm WIPE) tekrar-tetikliyordu. 48h =
-/// makul teslim penceresi (cleanup retention zaten daha eskileri siler; bu sabit
-/// retention beklemeden replay-yüzeyini daraltır). MS cinsinden (created_at ms).
+/// M1 (narrowing repeated Olm WIPE triggers): a FRESH-reconnect force-replay hands
+/// out only the last 48 hours of forwards. Older orphan rows (e.g. a `delivery_failed`
+/// the client never `forward_ack`ed) used to be replayed unconditionally on every
+/// reconnect, re-triggering `delete_all_olm_blobs` (Olm WIPE) on the receiver. 48h is
+/// a generous delivery window (cleanup retention deletes anything older anyway; this
+/// constant shrinks the replay surface without waiting for retention). Milliseconds,
+/// matching `created_at`.
 const FORCE_REPLAY_WINDOW_MS: i64 = 48 * 3600 * 1000;
 
 impl UserInbox {
@@ -19,16 +20,16 @@ impl UserInbox {
         if ids.is_empty() {
             return;
         }
-        // Sprint 8.5a: persistent forward_queue + WS push, çift teslimat
-        // korumalı.
-        // - Sender çift gönderirse (R1 bypass + OpHub race) → 10s dedup
-        //   penceresi aynı (kind, from, recipient_device, ids) için INSERT atla.
-        // - flush_forwards (replay) push'tan sonra 10sn skip → forward_signal
-        //   push + alarm flush_forwards yarışı yok.
-        // M2-S2.2 (D3-verdict-2): recipient_device_id artık kalıcı kolon + dedup
-        // anahtarının parçası → WS-kapalı biriken makbuz replay'de device taşır
-        // (aksi halde N:1 MISS). recipient_device None ise (N=1/S2.3-öncesi)
-        // anahtar bugünkü davranışla aynı (NULL).
+        // Sprint 8.5a: persistent forward_queue + WS push, guarded against double
+        // delivery.
+        // - Sender sends twice (R1 bypass + OpHub race) → a 10s dedup window skips the
+        //   INSERT for the same (kind, from, recipient_device, ids).
+        // - flush_forwards (replay) skips a row for 10s after it was pushed → no race
+        //   between the forward_signal push and the alarm-driven flush_forwards.
+        // M2-S2.2 (D3 verdict 2): recipient_device_id is now a persisted column and part
+        // of the dedup key → a receipt queued while the WS was down carries its device
+        // through replay (otherwise N:1 MISS). With recipient_device None (N=1 / pre-S2.3)
+        // the key is NULL, i.e. identical to the previous behaviour.
         let ids_json = match serde_json::to_string(ids) {
             Ok(s) => s,
             Err(_) => return,
@@ -40,10 +41,10 @@ impl UserInbox {
             None => JsValue::NULL,
         };
 
-        // Dedup: aynı receipt son 10sn'de zaten kuyrukta + henüz silinmemiş
-        // mi? (forward_ack DELETE yapıyor → satır kayıpsa client zaten ack
-        // atmış demektir, yeni INSERT meşru.) M2-S2.2: recipient_device_id de
-        // anahtarda — NULL karşılaştırması için `IS` (=? NULL'da eşleşmez).
+        // Dedup: is the same receipt already queued within the last 10s and not yet
+        // deleted? (forward_ack DELETEs, so a missing row means the client already
+        // acked and a fresh INSERT is legitimate.) M2-S2.2: recipient_device_id is
+        // part of the key — compared with `IS` because `= ?` never matches NULL.
         let dedup_window = now - 10_000;
         let recent: Option<i64> = match storage.sql().exec_raw(
             "SELECT id FROM forward_queue
@@ -66,13 +67,13 @@ impl UserInbox {
             Err(_) => None,
         };
         if recent.is_some() {
-            // Sender çift gönderdi → skip; ilk INSERT push'u zaten attı.
+            // Sender sent twice → skip; the first INSERT already pushed.
             return;
         }
 
-        // INSERT — pushed_at başlangıçta NULL. WS push başarılı olursa aşağıda
-        // UPDATE. WS yoksa NULL kalır → alarm() flush_forwards_to_all replay'i
-        // hemen push'lar.
+        // INSERT with pushed_at NULL; the UPDATE below stamps it if a WS push lands.
+        // With no socket it stays NULL → the next alarm() flush_forwards_to_all replay
+        // pushes it immediately.
         let id_opt: Option<i64> = match storage.sql().exec_raw(
             "INSERT INTO forward_queue (kind, from_user, ids_json, recipient_device_id, created_at, pushed_at)
              VALUES (?, ?, ?, ?, ?, NULL) RETURNING id",
@@ -92,7 +93,7 @@ impl UserInbox {
         };
         let forward_id = match id_opt {
             Some(i) => i,
-            None => return, // INSERT fail → push'u atla, fresh replay sonra
+            None => return, // INSERT failed → skip the push; a fresh replay covers it later
         };
         let payload = serde_json::json!({
             "type": kind,
@@ -104,18 +105,19 @@ impl UserInbox {
         .to_string();
         let mut any_pushed = false;
         for ws in self.state.get_websockets() {
-            // W9 (makbuz "okundu geç" — W1 ile aynı zombie-socket kökü): send_with_str
-            // Ok ama yarı-açık socket'te client makbuzu ALMAZ; yine de pushed_at set
-            // edilirse flush_forwards 10sn bu satırı atlar → makbuz sonraki 90sn alarma
-            // takılır. Yazma HER socket'e yapılır (hibernating-ama-canlı ihtimali) ama
-            // "pushed" YALNIZ gerçekten-canlı (last_seen taze) socket için işaretlenir →
-            // zombie'de pushed_at NULL kalır → sonraki flush / force-reconnect replay eder.
+            // W9 ("read receipt arrives late" — same zombie-socket root cause as W1):
+            // send_with_str returns Ok on a half-open socket, yet the client never RECEIVES
+            // the receipt; stamping pushed_at anyway makes flush_forwards skip this row for
+            // 10s, so the receipt stalls until the next 90s alarm. We still write to EVERY
+            // socket (it may be hibernating but alive), but mark "pushed" ONLY for a
+            // genuinely live socket (fresh last_seen) → on a zombie pushed_at stays NULL and
+            // the next flush / force-reconnect replays it.
             if ws.send_with_str(payload.as_str()).is_ok() && super::message::ws_is_fresh(&ws, now) {
                 any_pushed = true;
             }
         }
         if any_pushed {
-            // Push attı → 10sn boyunca flush_forwards replay'i bu satırı atlar.
+            // Pushed → flush_forwards replay skips this row for the next 10s.
             let _ = storage.sql().exec_raw(
                 "UPDATE forward_queue SET pushed_at = ? WHERE id = ?",
                 Some(vec![
@@ -126,27 +128,27 @@ impl UserInbox {
         }
     }
 
-    /// Sprint 8.5a: WS reconnect / alarm anında kuyrukta birikmiş forward'ları
-    /// replay et. `force=false` (alarm): forward_signal'in az önce push attığı
-    /// satırlar (pushed_at son 10sn) SKIP — yoksa "INSERT+push" ile "alarm flush"
-    /// yarışı CANLI socket'e çift teslim yapardı.
+    /// Sprint 8.5a: replay the forwards piled up in the queue, on WS reconnect or from the
+    /// alarm. `force=false` (alarm): SKIP rows forward_signal just pushed (pushed_at within
+    /// the last 10s) — otherwise the "INSERT+push" and "alarm flush" race would deliver
+    /// twice to a LIVE socket.
     ///
-    /// `force=true` (TAZE reconnect, `ws_upgrade`): `pushed_at`'i YOK SAY → kuyruktaki
-    /// TÜM forward'ları ver. Gerekçe (saha 2026-06-02 "okundu aşırı gecikti"):
-    /// forward_signal ÖLÜ/zombie socket'e `send_with_str` Ok dönünce pushed_at
-    /// SET ediyordu; client o eski socket'ten ALMADAN reconnect edince 10sn-skip
-    /// makbuzu YENİ socket'ten de saklıyor → sonraki alarm'a (90sn!) veya sonraki
-    /// receipt'e kadar takılıyordu ("delivered+read birlikte" gözlemi). Yeni socket
-    /// tanım gereği eski push'ları almadı → hepsini ver. `forward_id` client'ta
-    /// dedup'lanır (tekrar gelse idempotent) → güvenli.
+    /// `force=true` (FRESH reconnect, `ws_upgrade`): IGNORE `pushed_at` → hand over EVERY
+    /// forward in the queue. Rationale (field report 2026-06-02, "read receipt hugely
+    /// delayed"): forward_signal stamped pushed_at whenever `send_with_str` returned Ok on a
+    /// dead/zombie socket; once the client reconnected WITHOUT having received it, the 10s
+    /// skip also hid the receipt from the NEW socket, so it stalled until the next alarm
+    /// (90s!) or the next receipt (the "delivered+read arrive together" symptom). A new
+    /// socket by definition received none of the earlier pushes → give it everything. Safe
+    /// because the client dedups on `forward_id` (a repeat is idempotent).
     pub(crate) fn flush_forwards_to(&self, ws: &WebSocket, force: bool) {
         let storage = self.state.storage();
         let now = (now_secs() * 1000) as i64;
         let stale_cutoff = now - 10_000;
         let cursor = if force {
-            // M1: force-replay'i son 48 saatle DARALT (eski orphan satırlar
-            // koşulsuz replay → alıcıda Olm-WIPE tekrar-tetikleme). pushed_at
-            // YOK SAYILIR (force semantiği korunur) ama created_at penceresi var.
+            // M1: NARROW force-replay to the last 48 hours (unconditional replay of old
+            // orphan rows re-triggered an Olm WIPE on the receiver). pushed_at is still
+            // IGNORED (force semantics preserved), but a created_at window now applies.
             let replay_cutoff = now - FORCE_REPLAY_WINDOW_MS;
             storage.sql().exec_raw(
                 "SELECT id, kind, from_user, ids_json, recipient_device_id
@@ -156,14 +158,15 @@ impl UserInbox {
                 Some(vec![JsValue::from_f64(replay_cutoff as f64)]),
             )
         } else {
-            // M1/FIX-4 (CONCERN M1 — steady-replay Olm-WIPE penceresi): 48h force-yoluna
-            // eklenen created_at penceresi steady ~90sn alarm yolunda YOKTU → forward_ack'-
-            // lenmemiş eski orphan `delivery_failed` satırı her 90sn yeniden push → alıcıda
-            // KOŞULSUZ Olm-WIPE → 30 güne dek ~90sn'de bir re-WIPE. AYNI created_at penceresini
-            // (FORCE_REPLAY_WINDOW_MS) bu yola da uygula → eski orphan'lar re-push edilmez
-            // (M1 forward_queue retention DELETE'i ile birlikte temizlenir). pushed_at-skip
-            // (taze-INSERT/alarm yarışı koruması) KORUNUR. NOT: bu yalnız worker-yüzey
-            // daraltması; gerçek kök (alıcı WIPE'ını idempotent yapmak) CORE tarafı = scope-dışı.
+            // M1/FIX-4 (CONCERN M1 — the steady-replay Olm WIPE window): the created_at window
+            // added to the 48h force path was MISSING from the steady ~90s alarm path, so an
+            // old un-forward_acked orphan `delivery_failed` row was re-pushed every 90s →
+            // UNCONDITIONAL Olm WIPE on the receiver → a re-WIPE roughly every 90s for up to
+            // 30 days. Apply the SAME created_at window (FORCE_REPLAY_WINDOW_MS) here too, so
+            // old orphans are never re-pushed (the M1 forward_queue retention DELETE clears
+            // them out). The pushed_at skip (fresh-INSERT vs. alarm race guard) is PRESERVED.
+            // NOTE: this only narrows the worker-side surface; the real root cause (making the
+            // receiver's WIPE idempotent) lives in CORE and is out of scope here.
             let replay_cutoff = now - FORCE_REPLAY_WINDOW_MS;
             storage.sql().exec_raw(
                 "SELECT id, kind, from_user, ids_json, recipient_device_id
@@ -199,10 +202,11 @@ impl UserInbox {
                 "forward_id": row.id,
             })
             .to_string();
-            // W9-b (Codex MED): replay yolu da forward_signal ile aynı zombie-socket
-            // ayracına tabi. Yalnız gerçekten-canlı socket'e teslim "pushed" sayılır →
-            // zombie'de pushed_at NULL kalır → sonraki flush/force replay eder. force=true
-            // (taze reconnect) socket'i accept-anında damgalı → daima taze → regresyon yok.
+            // W9-b (Codex MED): the replay path obeys the same zombie-socket test as
+            // forward_signal. Only delivery to a genuinely live socket counts as "pushed" →
+            // on a zombie pushed_at stays NULL and the next flush/force replays it. With
+            // force=true (fresh reconnect) the socket was stamped at accept time, so it is
+            // always fresh → no regression.
             if ws.send_with_str(payload.as_str()).is_ok() && super::message::ws_is_fresh(ws, now) {
                 pushed_ids.push(row.id);
             }
@@ -222,14 +226,15 @@ impl UserInbox {
         }
     }
 
-    /// Sprint 8: sender `forward_ack` frame'i gönderince çağrılır;
-    /// kuyruktan ilgili forward_id'leri siler.
+    /// Sprint 8: called when the sender sends a `forward_ack` frame; deletes the
+    /// acknowledged forward_ids from the queue.
     pub(crate) fn forward_ack(&self, ids: &[i64]) {
         if ids.is_empty() {
             return;
         }
         let storage = self.state.storage();
-        // SQLite IN clause manuel bind yerine BATCH delete (max 500 OK).
+        // One BATCH delete with an IN clause instead of per-id binds (SQLite is fine
+        // with the ~500 placeholders a client batch can produce).
         let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "DELETE FROM forward_queue WHERE id IN ({})",
@@ -244,10 +249,10 @@ impl UserInbox {
         if websockets.is_empty() {
             return;
         }
-        // Hepsi aynı kullanıcının WS'leri (multi-device) — kuyrukta birikmiş
-        // forward'ları her birine push. Client tarafında forward_id dedup.
-        // force=false: canlı socket'lere periyodik flush → 10sn-skip ile
-        // forward_signal-push vs alarm-flush yarışında çift teslimi önler.
+        // These are all sockets of the same user (multi-device) — push the queued
+        // forwards to each one; the client dedups on forward_id. force=false: a
+        // periodic flush to live sockets, where the 10s skip prevents double delivery
+        // in the forward_signal-push vs. alarm-flush race.
         for ws in websockets {
             self.flush_forwards_to(&ws, false);
         }

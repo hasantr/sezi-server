@@ -1,8 +1,9 @@
 use super::*;
 
 impl UserInbox {
-    /// WS frame handler — `DurableObject::websocket_message` buraya delege eder.
-    /// Frame türleri: ack / typing / ping / forward_ack / send / read.
+    /// WS frame handler — `DurableObject::websocket_message` delegates here.
+    /// Frame kinds: ack / typing / ping / forward_ack / receipt_sync / self_read /
+    /// self_read_sync / send / read. Anything else is ignored.
     pub(crate) async fn handle_ws_message(
         &self,
         ws: WebSocket,
@@ -12,13 +13,13 @@ impl UserInbox {
             WebSocketIncomingMessage::String(s) => s,
             WebSocketIncomingMessage::Binary(_) => return Ok(()),
         };
-        // W1 (delivered_live yanlış-pozitif fix): HERHANGİ bir inbound frame =
-        // client→server yolunun GERÇEKTEN canlı olduğunun kanıtı. Socket
-        // attachment'ında `last_seen_ms`'i tazele → notify_inner bu damgayı
-        // zombie-socket ayracı olarak kullanır (client 5sn'de bir ping atar →
-        // canlı socket her zaman taze; MIUI-kill sonrası yarı-açık socket
-        // bayatlar → o socket'e teslim "canlı" sayılmaz → FCM-wake tetiklenir).
-        // Hata yut: attachment yoksa/parse-fail → atla (ör. S1-öncesi bağlantı).
+        // W1 (delivered_live false-positive fix): ANY inbound frame proves the
+        // client→server direction is GENUINELY alive. Refresh `last_seen_ms` in the socket
+        // attachment; notify_inner uses that stamp as its zombie-socket test (the client
+        // pings every 5s, so a live socket is always fresh, while a half-open socket left
+        // behind by a MIUI background kill goes stale → delivery to it does not count as
+        // "live" → an FCM wake is triggered instead). Errors are swallowed: no attachment
+        // or a parse failure (e.g. a pre-S1 connection) simply skips the refresh.
         if let Ok(Some(mut att)) = ws.deserialize_attachment::<Attachment>() {
             att.last_seen_ms = Some((now_secs() * 1000) as i64);
             let _ = ws.serialize_attachment(att);
@@ -38,10 +39,11 @@ impl UserInbox {
                 if ids.is_empty() {
                     return Ok(());
                 }
-                // A1-tamamla: `ids`'e PARALEL msg_uid'ler (görünür 1:1 mesajda dolu).
-                // delivered makbuzu artık (read gibi) uid taşır → gönderenin KARDEŞİ
-                // `oc-{msg_uid}` satırını Sent→Delivered ilerletir. id→uid eşlemesi:
-                // `/forward-delivered` payload'ı `ids` sırasında uid dizisi taşısın.
+                // A1 completion: msg_uids PARALLEL to `ids` (populated for a visible 1:1
+                // message). The delivered receipt now carries uids just like read does, so the
+                // sender's SIBLING can advance its `oc-{msg_uid}` row from Sent to Delivered.
+                // The id→uid mapping travels as a uid array in `ids` order on the
+                // `/forward-delivered` payload.
                 let ack_uids: Vec<String> = value
                     .get("uids")
                     .and_then(|v| v.as_array())
@@ -57,29 +59,30 @@ impl UserInbox {
                     .zip(ack_uids.iter().cloned())
                     .filter(|(_, u)| !u.is_empty())
                     .collect();
-                // `success` opsiyonel — default true (geriye uyumluluk).
-                // false ise: queue temizlenir ama sender'a `delivered` forward
-                // edilmez. Receiver decrypt fail (MAC mismatch vb) durumunda
-                // queue temizliği için gönderilir; yanlış 2-tik göstermek
-                // istemediğimiz durum. Bkz. project_olm_2tik_fix.
+                // `success` is optional and defaults to true (backwards compatibility).
+                // When false the queue is still drained but no `delivered` is forwarded to
+                // the sender (a `delivery_failed` goes out instead, see below). The client
+                // sends it to clear the queue after a decrypt failure (MAC mismatch and
+                // friends), which is exactly when we must not paint a second tick.
+                // See project_olm_2tik_fix.
                 let success = value
                     .get("success")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                // M2-S2.3 ack-izolasyonu: yalnız BU cihaza ait satırlar SELECT+DELETE.
-                // FIX-2(b) (HIGH — NULL-tolerans GERİ): somut device varsa
-                // `AND (device_id=? OR device_id IS NULL)`. GEREKÇE: NULL pending
-                // artık MEŞRU = cihaz-listesi yayınlamamış-tek-cihaz kullanıcı
-                // (grup-fallback FIX-1 LEFT JOIN). Böyle kullanıcı TEK mantıksal cihaz
-                // → onun bağlanan cihazı kendi NULL satırını ack'leyebilmeli (aksi
-                // halde teslim edilen mesaj kuyruktan silinmez → redeliver-loop).
-                // Güvenli: NULL yalnız yayınlamamış-tek-cihazda oluşur (1:1 yolunda
-                // device_id ZORUNLU [FIX-2(a)] → 1:1'den NULL gelmez), çok-cihaz
-                // belirsizliği yok. Red-team #18'in kaldırma gerekçesi FIX-1 ile
-                // geçersiz.
-                // S3-TODO: çok-cihaz kullanıcısı NULL satıra sahip olabilirse
-                // yeniden değerlendir (NULL artık "tek cihaz" garantisi vermez →
-                // yanlış-cihaz silme riski geri gelir).
+                // M2-S2.3 ack isolation: SELECT+DELETE only rows belonging to THIS device.
+                // FIX-2(b) (HIGH — NULL tolerance RESTORED): with a concrete device, filter
+                // on `AND (device_id = ? OR device_id IS NULL)`. RATIONALE: a NULL pending row
+                // is now LEGITIMATE — it means a user who never published a device list
+                // (group fallback FIX-1, the LEFT JOIN). Such a user is a SINGLE logical
+                // device, so the device that connects must be able to ack its own NULL rows;
+                // otherwise a delivered message is never removed from the queue and we get a
+                // redelivery loop. This is safe because NULL only arises for an
+                // unpublished-single-device user (the 1:1 path REQUIRES device_id [FIX-2(a)],
+                // so NULL never comes from 1:1) → no multi-device ambiguity. Red-team #18's
+                // argument for dropping the tolerance is void since FIX-1.
+                // S3-TODO: revisit if a multi-device user can ever own a NULL row (NULL would
+                // no longer imply "one device" → the risk of deleting another device's row
+                // comes back).
                 let ack_device: Option<String> = ws
                     .deserialize_attachment::<Attachment>()
                     .ok()
@@ -87,8 +90,8 @@ impl UserInbox {
                     .and_then(|a| a.device_id);
                 let placeholders: String =
                     (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-                // device filtresi: somut device varsa (device_id=? OR NULL), yoksa
-                // (S1-öncesi token) filtre yok = bugünkü device-blind davranış.
+                // Device filter: with a concrete device, (device_id = ? OR NULL); without one
+                // (pre-S1 token) no filter at all, i.e. the existing device-blind behaviour.
                 let (dev_clause, mut extra_arg): (&str, Option<JsValue>) = match &ack_device {
                     Some(d) => (
                         " AND (device_id = ? OR device_id IS NULL)",
@@ -121,7 +124,7 @@ impl UserInbox {
                 struct AckRow {
                     id: i64,
                     sender_id: String,
-                    /// M2-S2.2: bu satırın alıcı-cihazı (delivered forward'a taşınır).
+                    /// M2-S2.2: this row's recipient device (carried into the delivered forward).
                     #[serde(default)]
                     device_id: Option<String>,
                 }
@@ -133,7 +136,7 @@ impl UserInbox {
                         .as_str(),
                 );
 
-                // recipient userId attachment'tan
+                // Recipient userId comes from the socket attachment.
                 let recipient_id: Option<String> = ws
                     .deserialize_attachment::<Attachment>()
                     .ok()
@@ -141,19 +144,19 @@ impl UserInbox {
                     .map(|a| a.user_id);
                 if let Some(rid) = recipient_id {
                     use std::collections::HashMap;
-                    // M2-S2.2: makbuzu (sender, recipient_device) çiftine grupla.
-                    // delivery-failed self-heal cihaz-çiftini doğru hedeflesin
-                    // (D1-BLOCKER). N=1'de tek device → tek grup; satır device'ı
-                    // NULL ise (backfill penceresi) ack_device'a düş.
+                    // M2-S2.2: group the receipts by (sender, recipient_device) so a
+                    // delivery-failed self-heal targets the right device pair (D1 BLOCKER).
+                    // With N=1 there is a single device → a single group; when the row's
+                    // device is NULL (the backfill window) fall back to ack_device.
                     let mut by_key: HashMap<(String, Option<String>), Vec<i64>> = HashMap::new();
                     for r in rows {
                         let dev = r.device_id.or_else(|| ack_device.clone());
                         by_key.entry((r.sender_id, dev)).or_default().push(r.id);
                     }
                     let namespace = self.env.durable_object("USER_INBOX")?;
-                    // `success=true` → /forward-delivered (sender 2-tik).
-                    // `success=false` → /forward-delivery-failed (sender
-                    //  failedDelivery status → UI 1.5-tik + auto-retry).
+                    // `success=true` → /forward-delivered (second tick for the sender).
+                    // `success=false` → /forward-delivery-failed (sender moves to
+                    //  failedDelivery → the UI shows a 1.5 tick and auto-retries).
                     let forward_path = if success {
                         "https://do.sezgi/forward-delivered"
                     } else {
@@ -161,9 +164,10 @@ impl UserInbox {
                     };
                     for ((sender_id, recipient_device), acked) in by_key {
                         let stub = namespace.id_from_name(&sender_id)?.get_stub()?;
-                        // A1-tamamla: `acked` sırasına PARALEL uid dizisi (yoksa boş string).
-                        // `/forward-delivered` → apply_receipt("delivered", .., uids) →
-                        // receipt_state.msg_uid → kardeş cursor-senk'te oc-satırını ilerletir.
+                        // A1 completion: a uid array PARALLEL to `acked` (empty string when
+                        // unknown). `/forward-delivered` → apply_receipt("delivered", .., uids)
+                        // → receipt_state.msg_uid → the sibling advances its oc- row on the
+                        // next cursor sync.
                         let uids: Vec<String> = acked
                             .iter()
                             .map(|id| id_to_uid.get(id).cloned().unwrap_or_default())
@@ -213,13 +217,14 @@ impl UserInbox {
                 let _ = stub.fetch_with_request(do_req).await;
             }
             "ping" => {
-                // Application-level keepalive — client zombie detection için
-                // pong döndürmek şart. Yoksa client TCP hala açık görür ama
-                // server-side hibernation/migration sonrası recv akışı kopuk.
+                // Application-level keepalive: returning a pong is mandatory for the
+                // client's zombie detection. Without it the client still sees an open TCP
+                // connection while, after a server-side hibernation/migration, the receive
+                // path is actually broken.
                 let _ = ws.send_with_str(r#"{"type":"pong"}"#);
             }
-            // Sprint 8: client receipt forward'ları aldığını onaylar →
-            // kuyruktan sil. Frame: { type: "forward_ack", ids: [...] }
+            // Sprint 8: the client confirms it received the forwarded receipts → drop them
+            // from the queue. Frame: { type: "forward_ack", ids: [...] }
             "forward_ack" => {
                 if let Some(ids_val) = value.get("ids") {
                     if let Ok(ids) = serde_json::from_value::<Vec<i64>>(ids_val.clone()) {
@@ -227,15 +232,16 @@ impl UserInbox {
                     }
                 }
             }
-            // Layer-4: client cursor'dan sonraki durable receipt_state'i ister →
-            // `receipt_batch` (delivered/read state) döner. Client connect'te +
-            // `receipt_update` bildiriminde + periyodik tetikler. (bkz receipt.rs)
+            // Layer-4: the client asks for durable receipt_state past its cursor and gets a
+            // `receipt_batch` (delivered/read state) back. Clients trigger this on connect,
+            // on a `receipt_update` notification and periodically. (See receipt.rs.)
             "receipt_sync" => {
                 let since = value.get("since").and_then(|v| v.as_i64()).unwrap_or(0);
                 self.receipt_sync(&ws, since);
             }
-            // Kardeş-okundu durable cursor (2026-06-28): U'nun cihazı okuduğu msg_uid'leri SICAK
-            // WS'ten bildirir → self_read_state set-once + diğer U-cihazlarına self_read_update/delta.
+            // Sibling-read durable cursor (2026-06-28): a device of U reports the msg_uids it
+            // read over the HOT socket → self_read_state set-once + self_read_update/delta to
+            // U's other devices.
             "self_read" => {
                 if let Some(uids_val) = value.get("uids") {
                     if let Ok(uids) = serde_json::from_value::<Vec<String>>(uids_val.clone()) {
@@ -243,33 +249,37 @@ impl UserInbox {
                     }
                 }
             }
-            // Client cursor'dan sonraki self_read_state'i ister → `self_read_batch`. Connect'te +
-            // `self_read_update` bildiriminde + yeni-cihaz cursor=0 full-pull'da tetikler.
+            // The client asks for self_read_state past its cursor → `self_read_batch`.
+            // Triggered on connect, on a `self_read_update` notification, and by a new
+            // device's cursor=0 full pull.
             "self_read_sync" => {
                 let since = value.get("since").and_then(|v| v.as_i64()).unwrap_or(0);
                 self.self_read_sync(&ws, since);
             }
-            // WS-send (saha 2026-06-02 + M2-S2.3 WIRE-CUT batch): mesaji HTTP-POST
-            // yerine SICAK WS'ten gonder → per-mesaj TLS/ECH handshake YOK (~85-150ms;
-            // HTTP soguk ~470ms). Bu kol GONDERENIN DO'sunda calisir; aliciya cross-DO
-            // POST /notify (handlers::send ile AYNI mantik → notify_inner store+id+push).
+            // WS-send (field report 2026-06-02 + the M2-S2.3 WIRE-CUT batch): send the message
+            // over the HOT socket instead of an HTTP POST → no per-message TLS/ECH handshake
+            // (~85-150ms, versus ~470ms for a cold HTTP request). This arm runs in the SENDER's
+            // DO and does a cross-DO POST /notify to the recipient (SAME logic as
+            // handlers::send → notify_inner stores, assigns an id and pushes).
             //
-            // M2-S2.3: frame `envelopes[]` batch (HTTP ≡ WS-send, bit-ayni). 1:1'de
-            // cihaz-basina ayri zarf ({device_id, envelope_b64}); grupta tek-eleman
-            // device_id'siz. envelopes[] dongusu → per-device /notify → TEK
-            // `send_ack_batch{ref, acks:[{device_id,id}], ts}`. KISMI-FAIL: bir cihaz
-            // /notify 500 → ack listesinden DUSER, batch yine send_ack_batch. send_err
-            // YALNIZ hicbir cihaz basarisizsa. N=1'de tek-eleman → tek ack = bugunku
-            // tek-zarf akisi. ref HER ZAMAN yanitlanir.
+            // M2-S2.3: the frame carries an `envelopes[]` batch (HTTP and WS-send are
+            // bit-identical). For 1:1 there is one envelope per device
+            // ({device_id, envelope_b64}); for a group a single element without a device_id.
+            // The envelopes[] loop does a per-device /notify and answers with ONE
+            // `send_ack_batch{ref, acks:[{device_id,id}], ts}`. PARTIAL FAILURE: a device whose
+            // /notify 500s DROPS OUT of the ack list, and the batch is still a send_ack_batch;
+            // send_err is sent ONLY when no device succeeded. With N=1 the single element
+            // yields a single ack, i.e. today's single-envelope flow. `ref` is ALWAYS answered.
             "send" => {
                 let reff = value.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let recipient_id =
                     value.get("recipient_id").and_then(|v| v.as_str()).unwrap_or("");
                 let group_id = value.get("group_id").and_then(|v| v.as_str());
-                // GÜVENLİK (checkpoint 3 — Codex "biggest miss"): WS-send YALNIZ 1:1 taşır.
-                // Grup HTTP `/messages/send` fan-out'unda yapılır (orada `group_role` ÜYELİK
-                // kontrolü var). group_id'li WS-send üyelik-kontrolsüz grup-enjeksiyon yolu
-                // açıyordu → REDDET (grup HTTP'ye yönlendir). `ref` her zaman yanıtlanır.
+                // SECURITY (checkpoint 3 — Codex's "biggest miss"): WS-send carries 1:1 ONLY.
+                // Groups go through the HTTP `/messages/send` fan-out, which checks MEMBERSHIP
+                // via `group_role`. A WS-send with a group_id opened a group-injection path
+                // with no membership check → REJECT it and push groups to HTTP. `ref` is
+                // always answered.
                 if group_id.is_some() {
                     let _ = ws.send_with_str(
                         serde_json::json!({"type":"send_err","ref":reff,"code":"group_via_http"})
@@ -278,14 +288,14 @@ impl UserInbox {
                     );
                     return Ok(());
                 }
-                // Gonderen kimligi + cihazi WS attachment'tan (ws_upgrade JWT).
+                // Sender identity + device come from the WS attachment (the ws_upgrade JWT).
                 let attach = ws
                     .deserialize_attachment::<Attachment>()
                     .ok()
                     .flatten();
                 let sender_id = attach.as_ref().map(|a| a.user_id.clone());
                 let sender_device_id = attach.as_ref().and_then(|a| a.device_id.clone());
-                // M2-S2.3: envelopes[] parse. EnvItem{device_id?, envelope_b64}.
+                // M2-S2.3: parse envelopes[] as EnvItem{device_id?, envelope_b64}.
                 let env_items: Vec<(Option<String>, String)> = value
                     .get("envelopes")
                     .and_then(|v| v.as_array())
@@ -306,22 +316,24 @@ impl UserInbox {
                             .collect()
                     })
                     .unwrap_or_default();
-                // 1:1 yolu icin recipient gerekli; grup yolu group_id ile (recipient
-                // bos). WS-send su an 1:1'i tasir (grup HTTP fan-out'ta — handlers).
-                // Yine de group_id varsa recipient-len kontrolunu atla.
+                // The 1:1 path needs a recipient; the group path is keyed by group_id with an
+                // empty recipient. WS-send currently carries only 1:1 (groups fan out over
+                // HTTP in handlers), but the recipient-length check is still skipped when a
+                // group_id is present.
                 let is_group = group_id.is_some();
-                // Validasyon (handlers::send paritesi): auth + ref + batch boyut +
-                // her zarf boyut + (1:1) uuid len + self-degil-veya-farkli-cihaz.
+                // Validation (parity with handlers::send): auth + ref + batch size + per-
+                // envelope size + (1:1) uuid length + not-self-or-a-different-device.
                 let envelopes_ok = !env_items.is_empty()
                     && env_items.len() <= 100
                     && env_items
                         .iter()
                         .all(|(_, e)| e.len() >= 20 && e.len() <= 64 * 1024);
-                // FIX-2(a) (HIGH — orphan NULL, handlers::send paritesi): 1:1 yolunda
-                // (is_group=false) her EnvItem.device_id ZORUNLU SOMUT. Gönderen
-                // bundle'dan alıcı cihazlarını bilir → her zarf somut cihaz hedefler;
-                // device_id=None taşıyan 1:1 = buggy/eski client → orphan-NULL pending.
-                // (Self-send dalı zaten device_id-Some + farklı-cihaz şartını kapsıyor.)
+                // FIX-2(a) (HIGH — orphan NULLs, parity with handlers::send): on the 1:1 path
+                // (is_group=false) every EnvItem.device_id MUST be concrete. The sender knows
+                // the recipient's devices from the bundle, so each envelope targets a concrete
+                // device; a 1:1 body with device_id=None is a buggy/old client and would create
+                // orphan NULL pending rows. (The self-send branch already implies device_id is
+                // Some and must differ from the sender's device.)
                 let recipient_ok = is_group
                     || (recipient_id.len() == 36
                         && env_items.iter().all(|(d, _)| d.is_some())
@@ -344,40 +356,80 @@ impl UserInbox {
                 }
                 let sender_id = sender_id.unwrap();
                 let sender_device_id = sender_device_id.unwrap();
-                // R1 (güvenlik, device-lifecycle denetimi): WS-send revoke-asimetrisini kapat.
-                // HTTP `/messages/send` (handlers.rs:125) device_revoked çağırıyor ama WS-send
-                // çağırmıyordu → revoke edilmiş cihaz SICAK WS'ten 1:1 mesaj ENJEKTE edebiliyordu
-                // (outbound-injection asimetrisi). Fail-closed pariteyle kapat (`ref` yanıtlanır).
-                match crate::auth::middleware::device_revoked(&self.env, &sender_id, &sender_device_id).await {
-                    Ok(true) => {
+                // R1 (security, device-lifecycle audit): close the WS-send revoke asymmetry.
+                // HTTP `/messages/send` (`messages::handlers::send`) calls device_revoked but WS-send did
+                // not, so a revoked device could still INJECT 1:1 messages over the HOT socket
+                // (outbound-injection asymmetry). Closed with fail-closed parity (`ref` is
+                // still answered).
+                match crate::auth::middleware::account_device_active(&self.env, &sender_id, &sender_device_id).await {
+                    Ok(false) => {
                         let _ = ws.send_with_str(
-                            serde_json::json!({"type":"send_err","ref":reff,"code":"device_revoked"})
+                            serde_json::json!({"type":"send_err","ref":reff,"code":"inactive_session"})
                                 .to_string()
                                 .as_str(),
                         );
                         return Ok(());
                     }
-                    Ok(false) => {}
+                    Ok(true) => {}
                     Err(_) => {
                         let _ = ws.send_with_str(
-                            serde_json::json!({"type":"send_err","ref":reff,"code":"revoke_check_unavailable"})
+                            serde_json::json!({"type":"send_err","ref":reff,"code":"authorization_unavailable"})
                                 .to_string()
                                 .as_str(),
                         );
                         return Ok(());
                     }
                 }
-                // H2 (DoS — WS sıcak-yol rate-limit paritesi): HTTP `/messages/send`
-                // (handlers.rs:94) per-user `msg:send:{sender_id}` 300/60s KV sliding-window
-                // uyguluyor; SICAK WS-send bunu ATLIYORDU → WS'ten sınırsız mesaj enjekte
-                // edilip alıcı DO (SQLite) şişirilebiliyordu. AYNI KV-kovası/parametre →
-                // ortak limit (HTTP+WS toplamı 300/60s). revoke-check'ten SONRA, alıcı DO'ya
-                // /notify'dan ÖNCE. KV binding self.env'den (HTTP yoluyla aynı).
-                // ŞABLON-DİYETİ: self-host şablonunda RATE_LIMIT KV binding'i YOK
-                // (deploy-ekranı sadeliği + isim-çakışması) → binding-yok/KV-hata
-                // fail-open, limitsiz devam (kurulu-KV'li prod bit-aynı).
+                let authz_db = match self.env.d1("DB") {
+                    Ok(db) => db,
+                    Err(_) => {
+                        let _ = ws.send_with_str(
+                            serde_json::json!({"type":"send_err","ref":reff,"code":"authorization_unavailable"})
+                                .to_string().as_str(),
+                        );
+                        return Ok(());
+                    }
+                };
+                match crate::contacts::direct_decision(&authz_db, &sender_id, recipient_id).await {
+                    Ok(crate::contacts::DirectDecision::Allowed) => {}
+                    Ok(crate::contacts::DirectDecision::NotFound) => {
+                        let _ = ws.send_with_str(
+                            serde_json::json!({"type":"send_err","ref":reff,"code":"recipient_not_found"})
+                                .to_string().as_str(),
+                        );
+                        return Ok(());
+                    }
+                    Ok(crate::contacts::DirectDecision::Denied) => {
+                        let _ = ws.send_with_str(
+                            serde_json::json!({"type":"send_err","ref":reff,"code":"contact_not_authorized"})
+                                .to_string().as_str(),
+                        );
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        let _ = ws.send_with_str(
+                            serde_json::json!({"type":"send_err","ref":reff,"code":"authorization_unavailable"})
+                                .to_string().as_str(),
+                        );
+                        return Ok(());
+                    }
+                }
+                // H2 (DoS — rate-limit parity for the hot WS path): HTTP `/messages/send`
+                // (`messages::handlers::send`) enforces a per-user `msg:send:{sender_id}` 300/60s KV
+                // sliding window; hot WS-send BYPASSED it, so a client could inject unlimited
+                // messages over the socket and bloat the recipient DO's SQLite. Uses the SAME
+                // KV bucket and parameters → one shared limit (HTTP + WS together 300/60s).
+                // Placed AFTER the revoke check and BEFORE the /notify to the recipient DO.
+                // The KV binding comes from self.env (same as the HTTP path).
+                // TEMPLATE DIET: the self-host template ships NO RATE_LIMIT KV binding (deploy
+                // screen simplicity + name clashes), so a missing binding or a KV error is
+                // fail-open and traffic continues unlimited (bit-identical on a prod install
+                // that does have the KV).
                 if !crate::ratelimit::check_rate_limit_env(
-                    &self.env, &format!("msg:send:{sender_id}"), 300, 60,
+                    &self.env,
+                    &crate::messages::handlers::send_rate_limit_key(&sender_id),
+                    300,
+                    60,
                 )
                 .await
                 {
@@ -388,7 +440,7 @@ impl UserInbox {
                     );
                     return Ok(());
                 }
-                // Alicinin DO'suna per-device /notify (handlers::send paritesi).
+                // Per-device /notify to the recipient's DO (parity with handlers::send).
                 let namespace = self.env.durable_object("USER_INBOX")?;
                 let stub = namespace.id_from_name(recipient_id)?.get_stub()?;
                 #[derive(Deserialize)]
@@ -397,16 +449,42 @@ impl UserInbox {
                     #[serde(default)]
                     delivered_live: bool,
                 }
-                // FCM-wake için D1 handle (1:1 WS-send yolu — alıcı offline'da içeriksiz uyandırma).
+                // D1 handle for the FCM wake (1:1 WS-send path — a content-less wake when the
+                // recipient is offline).
                 let push_db = self.env.d1("DB").ok();
                 let mut acks: Vec<serde_json::Value> = Vec::with_capacity(env_items.len());
                 for (dev, env_b64) in &env_items {
+                    // D-M12: do not deliver to a revoked RECIPIENT device over the hot WS path
+                    // either. This loop does NOT go through handlers.rs (it is its own
+                    // per-device delivery path), so without the gate here the hot path would
+                    // stay open to revoked devices. Revoked → skip that device (no pending row,
+                    // no ack; active devices are delivered to normally); a D1 error is
+                    // fail-closed send_err (the `account_device_active` idiom used by the send arm
+                    // above). Matches
+                    // the behaviour of the group JOIN.
+                    if let Some(d) = dev.as_deref() {
+                        match crate::auth::middleware::device_revoked(&self.env, recipient_id, d)
+                            .await
+                        {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(_) => {
+                                let _ = ws.send_with_str(
+                                    serde_json::json!({"type":"send_err","ref":reff,"code":"authorization_unavailable"})
+                                        .to_string()
+                                        .as_str(),
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
                     let payload = serde_json::json!({
                         "sender_id": sender_id,
                         "sender_device_id": sender_device_id,
                         "recipient_device_id": dev,
-                        // W1-backstop: ALICI user_id → notify_inner persist → alarm
-                        // stuck-pending FCM-wake (DO offline'da user'ını bilemez).
+                        // W1 backstop: the RECIPIENT user_id, which notify_inner persists so the
+                        // alarm can FCM-wake stuck pending rows (an offline DO cannot otherwise
+                        // know its own user).
                         "recipient_id": recipient_id,
                         "envelope_b64": env_b64,
                         "group_id": group_id,
@@ -419,7 +497,8 @@ impl UserInbox {
                     headers.set("content-type", "application/json")?;
                     init.with_headers(headers);
                     let do_req = Request::new_with_init("https://do.sezgi/notify", &init)?;
-                    // (id, delivered_live). Hata/şüphe → live=true (boşuna wake yollama).
+                    // (id, delivered_live). On error or doubt assume live=true (don't send a
+                    // pointless wake).
                     let (resp_id, live) = match stub.fetch_with_request(do_req).await {
                         Ok(mut resp) if resp.status_code() == 200 => match resp.json::<Idr>().await {
                             Ok(r) => (Some(r.id), r.delivered_live),
@@ -427,10 +506,11 @@ impl UserInbox {
                         },
                         _ => (None, true),
                     };
-                    // KISMI-FAIL: basarili cihaz acks'e; basarisiz cihaz DUSER.
+                    // PARTIAL FAILURE: a successful device joins acks, a failed one DROPS OUT.
                     if let Some(id) = resp_id {
                         acks.push(serde_json::json!({ "device_id": dev, "id": id }));
-                        // Alıcı o cihazda OFFLINE (canlı WS yok) → içeriksiz FCM-wake.
+                        // Recipient is OFFLINE on that device (no live socket) → content-less
+                        // FCM wake.
                         if !live {
                             if let Some(db) = &push_db {
                                 crate::push::fcm::maybe_push_wake(
@@ -442,7 +522,7 @@ impl UserInbox {
                     }
                 }
                 if acks.is_empty() {
-                    // Hicbir cihaz basaramadi → send_err (eski do_notify_failed paritesi).
+                    // No device succeeded → send_err (parity with the old do_notify_failed).
                     let _ = ws.send_with_str(
                         serde_json::json!({
                             "type": "send_err", "ref": reff, "code": "do_notify_failed"
@@ -460,12 +540,14 @@ impl UserInbox {
                     );
                 }
             }
-            // WS-read (saha 2026-06-02): okundu (3-tik) receipt'ini SICAK WS'ten al →
-            // per-receipt TLS/ECH handshake YOK (HTTP /messages/read soguk ~470ms; WS-send
-            // mesajlari WS'e alinca HTTP bagi soguyor). Bu kol OKUYANIN DO'sunda calisir;
-            // gonderenin (peer_id) DO'suna cross-DO /forward-read (handlers::read 104-118
-            // paritesi → forward_signal("read") + persistent forward_queue). Fire-and-forget:
-            // ack YOK (okundu idempotent/kozmetik; client beklemez, kayipta viewport tetikler).
+            // WS-read (field report 2026-06-02): take the read (third tick) receipt over the HOT
+            // socket → no per-receipt TLS/ECH handshake (cold HTTP /messages/read is ~470ms, and
+            // once WS-send moved messages onto the socket the HTTP connection goes cold). This
+            // arm runs in the READER's DO and does a cross-DO /forward-read to the sender's
+            // (peer_id) DO (parity with handlers::read 104-118 → forward_signal("read") + the
+            // persistent forward_queue). Fire-and-forget, NO ack: read state is idempotent and
+            // cosmetic, the client does not wait for it, and a loss is retriggered by the
+            // viewport.
             "read" => {
                 let peer_id = value.get("peer_id").and_then(|v| v.as_str()).unwrap_or("");
                 let ids: Vec<i64> = value
@@ -473,8 +555,9 @@ impl UserInbox {
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
                     .unwrap_or_default();
-                // #11 Layer-4b: `ids`'e PARALEL msg_uid'ler (okuyan sağlar) — gönderen DO'ya
-                // taşı → kardeş cihaz oc-satırını eşlesin. Eksikse boş (geriye-uyum).
+                // #11 Layer-4b: msg_uids PARALLEL to `ids` (supplied by the reader) — carried to
+                // the sender's DO so a sibling device can match its oc- row. Missing → empty
+                // (backwards compatible).
                 let uids: Vec<String> = value
                     .get("uids")
                     .and_then(|v| v.as_array())
@@ -484,34 +567,64 @@ impl UserInbox {
                             .collect()
                     })
                     .unwrap_or_default();
-                let reader_id = ws
+                let reader_attachment = ws
                     .deserialize_attachment::<Attachment>()
                     .ok()
-                    .flatten()
-                    .map(|a| a.user_id);
-                // Validasyon (handlers::read paritesi): auth + ids (1..=500) + uuid + self-degil.
+                    .flatten();
+                let reader_id = reader_attachment.as_ref().map(|a| a.user_id.clone());
+                let reader_device_id = reader_attachment.as_ref().and_then(|a| a.device_id.clone());
+                // Validation (parity with handlers::read): auth + ids (1..=500) + uuid + not-self.
                 let valid = reader_id.is_some()
+                    && reader_device_id.is_some()
                     && !ids.is_empty()
                     && ids.len() <= 500
                     && peer_id.len() == 36
                     && Some(peer_id) != reader_id.as_deref();
                 if !valid {
-                    return Ok(()); // fire-and-forget: gecersiz → sessizce yut (ack yok)
+                    return Ok(()); // fire-and-forget: invalid → swallow silently (no ack)
                 }
                 let reader_id = reader_id.unwrap();
-                // H2 (DoS — WS sıcak-yol rate-limit paritesi): WS-read de revoke/limit-siz
-                // peer DO'ya forward enjekte edebiliyordu. send ile AYNI KV-kovası
-                // (`msg:send:{reader_id}`) 300/60s → ortak limit (HTTP+WS+send+read toplamı).
-                // Fire-and-forget: aşılırsa/KV-hata → sessizce yut (read kozmetik/idempotent;
-                // client viewport tetikler, ack beklemez). peer DO'ya forward'dan ÖNCE.
-                // ŞABLON-DİYETİ: KV binding OPSİYONEL — yoksa limitsiz devam (fail-open;
-                // eski davranış binding-yokta fail-closed'du ama binding artık şablonda yok).
+                let reader_device_id = reader_device_id.unwrap();
+                if !matches!(
+                    crate::auth::middleware::account_device_active(
+                        &self.env,
+                        &reader_id,
+                        &reader_device_id,
+                    )
+                    .await,
+                    Ok(true)
+                ) {
+                    return Ok(());
+                }
+                let authz_db = match self.env.d1("DB") {
+                    Ok(db) => db,
+                    Err(_) => return Ok(()),
+                };
+                if !matches!(
+                    crate::contacts::direct_decision(&authz_db, &reader_id, peer_id).await,
+                    Ok(crate::contacts::DirectDecision::Allowed)
+                ) {
+                    return Ok(());
+                }
+                // H2 (DoS — rate-limit parity for the hot WS path): WS-read could likewise
+                // inject forwards into the peer DO without any limit. Uses the SAME separate
+                // bucket as HTTP read (`msg:read:{reader_id}`, 300/60s) → HTTP + WS reads are
+                // bounded together, and legitimate read traffic does not eat the send quota.
+                // Fire-and-forget: over the limit → swallow silently (read is cosmetic and
+                // idempotent; the client retriggers from the viewport and expects no ack).
+                // Placed BEFORE the forward to the peer DO. TEMPLATE DIET: the KV binding is
+                // OPTIONAL — with no binding (or a KV error) the limiter is fail-open and
+                // traffic continues unlimited; the older behaviour was fail-closed when the
+                // binding was absent, but the template no longer ships it.
                 if !crate::ratelimit::check_rate_limit_env(
-                    &self.env, &format!("msg:send:{reader_id}"), 300, 60,
+                    &self.env,
+                    &crate::messages::handlers::read_rate_limit_key(&reader_id),
+                    300,
+                    60,
                 )
                 .await
                 {
-                    return Ok(()); // limit aşıldı → sessizce yut
+                    return Ok(()); // over the limit → swallow silently
                 }
                 let namespace = self.env.durable_object("USER_INBOX")?;
                 let stub = namespace.id_from_name(peer_id)?.get_stub()?;
