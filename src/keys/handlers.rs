@@ -359,30 +359,40 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     }
     let device_id = body.device_id.as_deref();
     let db = ctx.env.d1("DB")?;
-    // ROOT FIX (stale-OTK cleanup; the field symptom was "unknown one-time key"): delete this
-    // device's OLD unconsumed OTKs so the fresh batch is a CLEAN REPLACE. This is what clears
-    // the stale public keys left behind by the old enumerate bug — prekey_id restarted at
-    // 1..N, collided under INSERT OR IGNORE, and the new OTKs were silently dropped — whose
-    // matching private key the recipient had already discarded, hence "unknown". Rows with
-    // consumed=1 (already claimed) are NEVER touched. Scoped by device, with '' as the legacy
-    // sentinel; and the delete is not load-bearing on its own — if it fails, the fresh insert
-    // still runs.
-    // F10 (2026-06-28): run the DELETE and the INSERTs as ONE atomic `db.batch`
-    // (all-or-nothing). It used to be a best-effort DELETE — its own commit, errors swallowed
-    // — followed by separate INSERTs, so a committed DELETE plus a failing INSERT could leave
-    // the device's OTK pool EMPTY, pushing new first contacts onto the SPK-only fallback with
-    // no forward secrecy (an FS degradation window). All-or-nothing means the pool is never
-    // left half-empty.
-    // ≤1 DELETE + ≤5 INSERT chunks (100 OTKs at 20 per chunk) = ≤6 statements and ≤400 binds,
-    // inside the D1 batch limit.
+    // REPLENISH APPENDS. It used to DELETE this device's unconsumed OTKs first, so the upload was
+    // a CLEAN REPLACE — and that is what kept the pool below target, permanently.
+    //
+    // Measured on the live relay 2026-07-29 (task #59). One device: 100 unconsumed at 21:20, 28
+    // claimed by peers, then a replenish uploaded 50 → the DELETE removed the 72 survivors and the
+    // insert added 50. Row totals confirm it exactly: 648 → 626 (−72 +50), unconsumed 100 → 50.
+    // With a client that uploads `target − pool` (which is the only correct amount to GENERATE),
+    // replace semantics make the pool settle at the size of the last delta and oscillate there. It
+    // can never reach the target, and an empty pool means first contact falls back to the signed
+    // prekey with no forward secrecy — the failure this whole path exists to prevent.
+    //
+    // The DELETE was introduced for the old `enumerate()` bug: prekey_id restarted at 1..N, collided
+    // under INSERT OR IGNORE, and fresh OTKs were silently dropped while the recipient had already
+    // discarded the matching private key — the "unknown one-time key" field symptom. **That was
+    // fixed at the root** (task #16): `prekey_id` is now derived from the public key itself
+    // (`identity::otk_prekey_id`), so two different keys cannot collide and re-publishing the SAME
+    // key is a no-op under INSERT OR IGNORE. The cleanup outlived the bug it cleaned up after.
+    //
+    // What the DELETE also did, and this is the honest cost of removing it: after a local store
+    // rewind (an identity restore from backup) the device's OLD public keys stay on the server and
+    // can still be handed to a peer, whose PreKey message this device can no longer answer. That is
+    // now a first-contact retry — the session self-heal (OlmReinit / pair-ack) covers it — rather
+    // than a permanent wedge, and it costs one peer one round trip in a rare flow. The alternative
+    // costs every peer forward secrecy in the common one. If the restore case ever bites, the fix is
+    // an explicit `replace: true` flag the client sets when it KNOWS its store was rewound, not a
+    // blanket wipe on every top-up.
+    //
+    // F10 (2026-06-28) kept the DELETE and the INSERTs in ONE atomic `db.batch` so a committed
+    // DELETE plus a failing INSERT could not leave the pool empty. With no DELETE that hazard is
+    // gone by construction, and the batch stays for the atomicity of the inserts themselves.
+    // ≤5 INSERT chunks (100 OTKs at 20 per chunk) = ≤5 statements and ≤400 binds, inside the D1
+    // batch limit.
     let device_sentinel = device_id.unwrap_or("");
-    let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(6);
-    // DELETE first (fresh replace): drop this device's old unconsumed OTKs. consumed=1 rows
-    // are NEVER touched.
-    stmts.push(
-        db.prepare("DELETE FROM one_time_prekeys WHERE user_id = ? AND device_id = ? AND consumed = 0")
-            .bind(&[d1_text(&user_id), d1_text(device_sentinel)])?,
-    );
+    let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(5);
     for chunk in body.otks.chunks(20) {
         let mut sql = String::from(
             // INSERT OR IGNORE keeps this idempotent: if an attach-replenish or a retry
@@ -420,17 +430,17 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // MEASURE WHAT ACTUALLY HAPPENED, not what the client asked for.
     //
     // This used to answer `{"count": body.otks.len()}` — the size of the request, echoed back. So
-    // the one shape that can silently destroy a pool was invisible from both ends: the client
-    // uploads only the keys it just GENERATED (a delta), while the DELETE above replaces the whole
-    // unconsumed pool. A device holding 100 keys that consumes 25 generates 25 — and this endpoint
-    // then removes the 75 survivors and inserts 25, answering "count: 25" either way. The
-    // server-side pool can never be deeper than the last batch, and nothing anywhere said so
-    // (measured 2026-07-28, task #53).
+    // the one shape that could silently destroy a pool was invisible from both ends: the client
+    // uploads only the keys it just GENERATED (a delta), while the replace-on-publish above removed
+    // the whole unconsumed pool. A device holding 100 keys that consumed 25 generated 25 — and this
+    // endpoint then removed the 75 survivors and inserted 25, answering "count: 25" either way.
     //
-    // The count is a separate read AFTER the batch, deliberately: it is the pool as it now stands,
-    // which is the number worth having, and being one round trip late cannot make it wrong in a
-    // way that matters for a diagnostic. `pool_after` MUCH smaller than `inserted + consumed` is
-    // the fingerprint of the shrink; `pool_after == inserted` every time is the shrink confirmed.
+    // That number is what caught it. Added 2026-07-28 to make the shrink falsifiable; the very next
+    // day the D1 rows showed `pool_after == uploaded` on a pool that had held twice as much, which
+    // is the shrink confirmed rather than suspected (task #59). The DELETE is gone now, so this
+    // reads as the health check it should always have been: `pool_after` climbing toward the
+    // client's target across rounds is the pool working, and `pool_after == uploaded` returning
+    // would mean replace semantics had come back.
     let pool_after = db
         .prepare(OTK_UNCONSUMED_COUNT_SQL)
         .bind(&[d1_text(&user_id), d1_text(device_sentinel)])?
