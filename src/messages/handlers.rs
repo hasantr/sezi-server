@@ -509,6 +509,17 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                     delivered_count += 1;
                     // This member device is OFFLINE → content-less FCM wake (per-device group
                     // fan-out). Skipped for `silent` control traffic such as a group receipt.
+                    if !delivered_live && body.silent {
+                        // The instrument for the wake policy: without it the log shows only
+                        // what was SENT, so a control message that still wakes a phone looks
+                        // identical to one correctly silenced. That is how this very door
+                        // shipped unnoticed on 2026-07-28 — the 1:1 path was quiet and the
+                        // group path was not, and the push log could not tell them apart.
+                        console_log!(
+                            "[push] atlandi (silent) grup={group_id} user={} dev={:?}",
+                            p.user_id, p.device_id
+                        );
+                    }
                     if !delivered_live && !body.silent {
                         crate::push::fcm::maybe_push_wake(
                             &ctx.env, &db, &p.user_id, p.device_id.as_deref(),
@@ -691,6 +702,12 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 // `silent` control traffic (caps announcement, state digest, typing, receipt) is
                 // stored and delivered on the next connect WITHOUT a wake — this is the path the
                 // 2026-07-28 measurement found burning three cold starts per desktop launch.
+                if !delivered_live && body.silent {
+                    console_log!(
+                        "[push] atlandi (silent) 1:1 user={recipient_id} dev={:?}",
+                        e.device_id
+                    );
+                }
                 if !delivered_live && !body.silent {
                     crate::push::fcm::maybe_push_wake(
                         &ctx.env, &db, recipient_id, e.device_id.as_deref(),
