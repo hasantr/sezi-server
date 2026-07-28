@@ -102,6 +102,10 @@ struct NotifyBody {
     /// path; notify_inner already takes the parameter today, which is what separates S2.2 from S2.3.
     #[serde(default)]
     recipient_device_id: Option<String>,
+    /// The sender asked for no FCM wake (control traffic). `#[serde(default)]` → a body from a
+    /// worker version that does not send it reads as false, i.e. today's behaviour.
+    #[serde(default)]
+    silent: bool,
 }
 
 #[derive(Deserialize)]
@@ -301,6 +305,7 @@ impl DurableObject for UserInbox {
                         body.recipient_id.as_deref(),
                         &body.envelope_b64,
                         body.group_id.as_deref(),
+                        body.silent,
                     )
                     .await?;
                 // D-M10: a cheap `ensure_alarm` on the warm /notify path (a no-op get_alarm when
@@ -578,6 +583,13 @@ impl UserInbox {
             "ALTER TABLE pending ADD COLUMN push_wake_at INTEGER",
             sql_no_args(),
         );
+        // `silent` = the sender declined an FCM wake for this envelope (control traffic). Stored so
+        // the W1 backstop alarm below skips the row: a wake the immediate path declined must not
+        // reappear minutes later. NULL on rows written before this column existed → treated as
+        // "wake", the old behaviour. ALTER-and-ignore, the push_wake_at pattern.
+        let _ = storage
+            .sql()
+            .exec_raw("ALTER TABLE pending ADD COLUMN silent INTEGER", sql_no_args());
         // Sprint 8: forward_queue — receipt forwards (delivered / read / delivery_failed) live in a
         // persistent queue instead of being fire-and-forget WS pushes. Each one is pushed
         // immediately to however many connected sockets exist AND written to this table; when the
@@ -855,6 +867,13 @@ impl UserInbox {
     /// closes the false-positive window W1 narrowed but could not eliminate (a socket dying right
     /// after a ping). One push per distinct device_id (maybe_push_wake with None means all devices),
     /// then push_wake_at is stamped so the next alarm does not re-push. Idempotent and best-effort.
+    ///
+    /// `silent` rows are EXCLUDED from the device scan. A control message the sender declined a wake
+    /// for is still legitimately unacked while the recipient sleeps, so without this filter the
+    /// backstop would wake the device for it after the grace period — converting the removed wake
+    /// into a delayed one, which is harder to explain than the original bug. The rows are still
+    /// stamped below (the UPDATE is deliberately unfiltered) so a silent row cannot keep the scan
+    /// returning it forever.
     async fn backstop_push_stale_pending(&self) {
         let storage = self.state.storage();
         let uid: Option<String> = storage.get(RECIPIENT_UID_KEY).await.ok().flatten();
@@ -870,7 +889,8 @@ impl UserInbox {
         let cutoff = now - PUSH_BACKSTOP_GRACE_SECS; // pending.created_at is in SECONDS
                                                      // Distinct recipient devices of the stuck rows (None = device-blind → all devices).
         let cursor = match storage.sql().exec_raw(
-            "SELECT DISTINCT device_id FROM pending WHERE push_wake_at IS NULL AND created_at < ?",
+            "SELECT DISTINCT device_id FROM pending
+             WHERE push_wake_at IS NULL AND created_at < ? AND (silent IS NULL OR silent = 0)",
             Some(vec![JsValue::from_f64(cutoff as f64)]),
         ) {
             Ok(c) => c,

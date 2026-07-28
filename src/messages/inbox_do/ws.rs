@@ -488,6 +488,12 @@ impl UserInbox {
                         "recipient_id": recipient_id,
                         "envelope_b64": env_b64,
                         "group_id": group_id,
+                        // No `silent` here, deliberately: this is the hot WS fan-out for CONTENT.
+                        // Control traffic reaches the server over `send_one_via_http` (the core's
+                        // singleton path) and never through a WS send frame, so there is nothing to
+                        // carry. `NotifyBody.silent` defaults to false, which is the correct answer
+                        // for every message that does arrive here. If control sends are ever routed
+                        // over WS, the frame must start carrying the flag or those wakes come back.
                     })
                     .to_string();
                     let mut init = RequestInit::new();

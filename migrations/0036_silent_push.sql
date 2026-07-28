@@ -1,0 +1,16 @@
+-- `silent` = the sender asked for NO FCM wake for this envelope.
+--
+-- Set for control traffic that is meaningless to a sleeping device: a capabilities
+-- announcement, a reconnect state digest, a receipt, a typing indicator (the core decides
+-- it in `needs_device_wake`). Delivery is unchanged — the envelope is stored and handed
+-- over on the recipient's next connect; only the push is declined.
+--
+-- Measured 2026-07-28: launching the desktop client sent one contact four such messages,
+-- which became three FCM wakes and three full background drains that delivered nothing a
+-- person could see, plus two contentless notifications.
+--
+-- On `fanout_retry` specifically, so the cron drain does not resurrect a wake the immediate
+-- path declined: without the column a silent group receipt whose DO fetch failed would wake
+-- the device minutes later, which reads as random noise. DEFAULT 0 = wake, i.e. every row
+-- written before this migration keeps the old behaviour.
+ALTER TABLE fanout_retry ADD COLUMN silent INTEGER NOT NULL DEFAULT 0;

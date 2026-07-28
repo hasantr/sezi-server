@@ -83,6 +83,11 @@ pub(crate) fn pending_frame(r: &PendingRow) -> String {
 }
 
 impl UserInbox {
+    /// `silent` = the sender asked for no FCM wake (control traffic; see the core's
+    /// `needs_device_wake`). It is persisted on the pending row for ONE reason: the W1 backstop
+    /// ALARM would otherwise wake the device minutes later for the very message the immediate path
+    /// stayed quiet about, turning a removed wake into a randomly delayed one.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn notify_inner(
         &self,
         sender_id: &str,
@@ -91,6 +96,7 @@ impl UserInbox {
         recipient_id: Option<&str>,
         envelope_b64: &str,
         group_id: Option<&str>,
+        silent: bool,
     ) -> Result<(i64, bool)> {
         // Returns (pending_id, delivered_live). `delivered_live` answers "did the push reach at
         // least one matching, genuinely-live (W1) socket?" — false means the recipient is offline
@@ -165,8 +171,8 @@ impl UserInbox {
             id: i64,
         }
         let cursor = storage.sql().exec_raw(
-            "INSERT INTO pending (sender_id, envelope_b64, group_id, device_id, sender_device_id, created_at, env_hash)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO pending (sender_id, envelope_b64, group_id, device_id, sender_device_id, created_at, env_hash, silent)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(sender_id, env_hash) DO NOTHING
              RETURNING id",
             Some(vec![
@@ -177,6 +183,7 @@ impl UserInbox {
                 sender_device_val,
                 JsValue::from_f64(now as f64),
                 JsValue::from_str(&env_hash_hex),
+                JsValue::from_f64(if silent { 1.0 } else { 0.0 }),
             ]),
         )?;
         let inserted: Option<IdRow> = cursor

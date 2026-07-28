@@ -182,6 +182,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0035_avatar_objects",
         include_str!("../migrations/0035_avatar_objects.sql"),
     ),
+    (
+        "0036_silent_push",
+        include_str!("../migrations/0036_silent_push.sql"),
+    ),
 ];
 
 thread_local! {

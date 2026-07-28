@@ -89,6 +89,20 @@ struct SendBody {
     sender_device_id: String,
     /// M2-S2.3: one envelope per device. 1:1 has N >= 1; a group has one element with no device_id.
     envelopes: Vec<EnvItem>,
+    /// Do NOT send an FCM wake for an offline recipient of this message. The SENDER sets it for
+    /// control traffic that is meaningless to a sleeping device — a capabilities announcement, a
+    /// reconnect state digest, a receipt, a typing indicator (see the core's `needs_device_wake`).
+    ///
+    /// It changes NOTHING about storage or delivery: the envelope is written to the recipient's
+    /// pending queue exactly as before and arrives on their next connect. It only declines to spend
+    /// a push, a cold start and several seconds of the recipient's radio on it.
+    ///
+    /// Measured 2026-07-28: launching the desktop client sent one contact four such messages, which
+    /// became three FCM wakes and three full queue drains that delivered nothing a person could see.
+    ///
+    /// `#[serde(default)]` → an older client that does not send the field gets today's behaviour.
+    #[serde(default)]
+    silent: bool,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +122,7 @@ fn build_notify_payload(
     recipient_device_id: Option<&str>,
     envelope_b64: &str,
     group_id: Option<&str>,
+    silent: bool,
 ) -> String {
     serde_json::json!({
         "sender_id": sender_id,
@@ -118,6 +133,10 @@ fn build_notify_payload(
         "recipient_id": recipient_id,
         "envelope_b64": envelope_b64,
         "group_id": group_id,
+        // Persisted on the pending row so the W1 backstop ALARM does not wake the device later for
+        // a message the immediate path deliberately stayed quiet about. Without this the fix only
+        // delays the pointless wake instead of removing it.
+        "silent": silent,
     })
     .to_string()
 }
@@ -155,6 +174,7 @@ async fn notify_once(
 /// notify_inner). The returned `id` is that RECIPIENT's pending sequence id. An error surfaces as
 /// `Err`, which makes a per-device failure VISIBLE during fan-out — the old silent skip is gone
 /// (red-team #18).
+#[allow(clippy::too_many_arguments)]
 async fn notify_recipient(
     namespace: &ObjectNamespace,
     recipient_id: &str,
@@ -163,6 +183,7 @@ async fn notify_recipient(
     recipient_device_id: Option<&str>,
     envelope_b64: &str,
     group_id: Option<&str>,
+    silent: bool,
 ) -> Result<(i64, bool)> {
     let payload = build_notify_payload(
         recipient_id,
@@ -171,6 +192,7 @@ async fn notify_recipient(
         recipient_device_id,
         envelope_b64,
         group_id,
+        silent,
     );
     // W4 BOUNDED in-request retry (3 attempts, catching transient DO 5xx / overload / routing
     // errors). notify_inner's dedup (60s on a warm DO) absorbs the "it succeeded but the response
@@ -220,13 +242,17 @@ pub(crate) async fn drain_fanout_retry(env: &Env) {
         envelope_b64: String,
         group_id: String,
         attempts: i64,
+        /// Whether the sender asked for no FCM wake. `#[serde(default)]` → a row written before this
+        /// column existed reads as 0 (wake), i.e. the old behaviour.
+        #[serde(default)]
+        silent: i64,
     }
     // Atomic claim: push the due rows' next_at a LEASE ahead (the in-flight marker) and return them.
     let claimed: Vec<RetryRow> = match db
         .prepare(
             "UPDATE fanout_retry SET next_at = ?
              WHERE id IN (SELECT id FROM fanout_retry WHERE next_at <= ? ORDER BY next_at LIMIT ?)
-             RETURNING id, recipient_id, recipient_device, sender_id, sender_device, envelope_b64, group_id, attempts",
+             RETURNING id, recipient_id, recipient_device, sender_id, sender_device, envelope_b64, group_id, attempts, silent",
         )
         .bind(&[
             d1_int(now + W4B_LEASE_SECS),
@@ -252,6 +278,7 @@ pub(crate) async fn drain_fanout_retry(env: &Env) {
             r.recipient_device.as_deref(),
             &r.envelope_b64,
             Some(&r.group_id),
+            r.silent != 0,
         );
         match notify_once(&namespace, &r.recipient_id, &payload).await {
             Ok((_, delivered_live)) => {
@@ -262,8 +289,10 @@ pub(crate) async fn drain_fanout_retry(env: &Env) {
                     let _ = stmt.run().await;
                 }
                 // FCM-wake parity with the handlers' offline branch (Codex#6): stored OK but
-                // offline → wake.
-                if !delivered_live {
+                // offline → wake. A `silent` row skips it: the retry queue must not resurrect a wake
+                // the immediate path deliberately declined (a group receipt would otherwise wake the
+                // device minutes later, which is worse than the original bug because it looks random).
+                if !delivered_live && r.silent == 0 {
                     crate::push::fcm::maybe_push_wake(
                         env, &db, &r.recipient_id, r.recipient_device.as_deref(),
                     )
@@ -469,6 +498,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 p.device_id.as_deref(),
                 envelope_b64,
                 Some(group_id),
+                body.silent,
             )
             .await
             {
@@ -477,8 +507,9 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         first_id = Some(id);
                     }
                     delivered_count += 1;
-                    // This member device is OFFLINE → content-less FCM wake (per-device group fan-out).
-                    if !delivered_live {
+                    // This member device is OFFLINE → content-less FCM wake (per-device group
+                    // fan-out). Skipped for `silent` control traffic such as a group receipt.
+                    if !delivered_live && !body.silent {
                         crate::push::fcm::maybe_push_wake(
                             &ctx.env, &db, &p.user_id, p.device_id.as_deref(),
                         )
@@ -523,8 +554,8 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                     .prepare(
                         "INSERT OR IGNORE INTO fanout_retry
                          (retry_key, recipient_id, recipient_device, sender_id, sender_device,
-                          envelope_b64, group_id, attempts, next_at, created_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                          envelope_b64, group_id, attempts, next_at, created_at, silent)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                     )
                     .bind(&[
                         d1_text(&retry_key),
@@ -536,6 +567,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         d1_text(group_id),
                         d1_int(now + W4B_INITIAL_BACKOFF_SECS),
                         d1_int(now),
+                        d1_int(i64::from(body.silent)),
                     ])
                 {
                     let _ = stmt.run().await;
@@ -646,6 +678,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             e.device_id.as_deref(),
             &e.envelope_b64,
             None,
+            body.silent,
         )
         .await
         {
@@ -655,7 +688,10 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                     "id": id,
                 }));
                 // Recipient is OFFLINE on that device → content-less FCM wake (1:1 HTTP path).
-                if !delivered_live {
+                // `silent` control traffic (caps announcement, state digest, typing, receipt) is
+                // stored and delivered on the next connect WITHOUT a wake — this is the path the
+                // 2026-07-28 measurement found burning three cold starts per desktop launch.
+                if !delivered_live && !body.silent {
                     crate::push::fcm::maybe_push_wake(
                         &ctx.env, &db, recipient_id, e.device_id.as_deref(),
                     )
