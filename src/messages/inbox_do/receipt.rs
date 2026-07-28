@@ -66,6 +66,21 @@ impl UserInbox {
         ts_ms: i64,
     ) {
         if ids.is_empty() {
+            // uid-only receipt: an M4-restored message has no `remote_id`, so `receipt_state`'s
+            // PK(peer_id, remote_id) cannot represent it and the receipt is DROPPED here. The
+            // `receipt_uid_state` table exists for exactly this case and nothing reads or writes it
+            // yet (see the note where it is created).
+            //
+            // Logged rather than left silent so the debt is MEASURED instead of argued about. If this
+            // line never appears in a `wrangler tail`, the gap costs nothing in practice and the
+            // table can go; if it appears often, that is the signal to finish the path. Right now
+            // nobody knows which, which is why it is still open.
+            if !uids.is_empty() {
+                console_log!(
+                    "[deliv] uid-only {kind} DUSTU peer={from_peer} uid_sayisi={} (receipt_uid_state yolu bitmedi)",
+                    uids.len()
+                );
+            }
             return;
         }
         let is_read = kind == "read";
