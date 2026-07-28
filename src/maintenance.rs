@@ -130,7 +130,7 @@ async fn check_and_run(env: Env) {
         && claim(&db, KEY_DRAIN, now, now - DRAIN_LAZY_AFTER_SECS).await
     {
         console_log!(
-            "maintenance: lazy drain (damga {}sn eski — cron'suz kurulum ya da cron gecikti)",
+            "maintenance: lazy drain (stamp is {}s old — a cron-less install, or the cron ran late)",
             now - drain_at
         );
         crate::messages::handlers::drain_fanout_retry(&env).await;
@@ -148,7 +148,7 @@ async fn check_and_run(env: Env) {
         && claim(&db, KEY_MOVE, now, now - MOVE_LAZY_AFTER_SECS).await
     {
         console_log!(
-            "maintenance: lazy storage-move (damga {}sn eski)",
+            "maintenance: lazy storage move (stamp is {}s old)",
             now - move_at
         );
         if let Err(e) = crate::storage::drain::run_storage_move(&env).await {
@@ -161,7 +161,7 @@ async fn check_and_run(env: Env) {
         && claim(&db, KEY_DAILY, now, now - DAILY_LAZY_AFTER_SECS).await
     {
         console_log!(
-            "maintenance: lazy gunluk-GC (damga {}sn eski)",
+            "maintenance: lazy daily GC (stamp is {}s old)",
             now - daily_at
         );
         run_daily(&env).await;
@@ -623,7 +623,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_stamp_bozuk_ve_eksik_sifira_duser() {
+    fn parse_stamp_falls_back_to_zero_when_corrupt_or_missing() {
         assert_eq!(parse_stamp(None), 0);
         assert_eq!(parse_stamp(Some("")), 0);
         assert_eq!(parse_stamp(Some("abc")), 0);
@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn is_due_esik_sinirlari() {
+    fn is_due_threshold_boundaries() {
         // Stamp = 0 (no row / first boot) → always due.
         assert!(is_due(1_780_000_000, 0, DRAIN_LAZY_AFTER_SECS));
         // Exactly at the threshold → due (>=).
@@ -654,20 +654,20 @@ mod tests {
     }
 
     #[test]
-    fn is_due_gunluk_esik() {
+    fn is_due_daily_threshold() {
         let t0 = 1_780_000_000i64;
         assert!(
             !is_due(t0 + 86_400, t0, DAILY_LAZY_AFTER_SECS),
-            "24s = pay içinde, uyur"
+            "24h = inside the margin, stays asleep"
         );
-        assert!(is_due(t0 + 90_000, t0, DAILY_LAZY_AFTER_SECS), "25s → due");
+        assert!(is_due(t0 + 90_000, t0, DAILY_LAZY_AFTER_SECS), "25h → due");
     }
 
     #[test]
-    fn throttle_ilk_bakis_ve_pencere() {
+    fn throttle_first_look_and_window() {
         assert!(
             throttle_due(0, 5, CHECK_EVERY_SECS),
-            "izolat ilk istekte bakar"
+            "an isolate checks on its first request"
         );
         assert!(!throttle_due(
             100,

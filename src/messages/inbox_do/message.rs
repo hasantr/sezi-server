@@ -215,7 +215,7 @@ impl UserInbox {
                 // Unexpected (a conflict but no row — a race or a purge in between) → fail-safe:
                 // signal "not delivered" to the caller instead of attempting a fresh INSERT; the
                 // next retry picks it up.
-                return Err("pending durable-dedup: conflict ama mevcut satır bulunamadı".into());
+                return Err("pending durable-dedup: conflict, but the existing row was not found".into());
             }
         };
 
@@ -297,7 +297,7 @@ impl UserInbox {
         // without a counter the effect cannot be proven.
         if zombie_seen && !delivered_live {
             worker::console_log!(
-                "[deliv] W1 zombie-socket yakalandı (send-ok+stale) -> FCM-wake yolu (grp={})",
+                "[deliv] W1 zombie socket caught (send-ok + stale) -> FCM wake path (grp={})",
                 group_id.unwrap_or("1:1")
             );
         }
@@ -489,16 +489,16 @@ mod dedup_sql_tests {
     #[test]
     fn durable_dedup_second_insert_no_row_single_pending() {
         let c = setup();
-        let id1 = insert(&c, "alice", Some("hh")).expect("ilk INSERT id döndürür");
+        let id1 = insert(&c, "alice", Some("hh")).expect("the first INSERT returns an id");
         let id2 = insert(&c, "alice", Some("hh"));
         assert!(
             id2.is_none(),
-            "D-M9: aynı (sender,env_hash) ikinci INSERT satır DÖNDÜRMEZ (DO NOTHING)"
+            "D-M9: a second INSERT with the same (sender, env_hash) RETURNS NO row (DO NOTHING)"
         );
         let cnt: i64 = c
             .query_row("SELECT COUNT(*) FROM pending", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cnt, 1, "tek pending satırı (çift-INSERT engellendi)");
+        assert_eq!(cnt, 1, "a single pending row (the double INSERT was blocked)");
         // The durable-dedup hit path: the existing id is found with a SELECT.
         let found: i64 = c
             .query_row(
@@ -507,7 +507,7 @@ mod dedup_sql_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(found, id1, "durable-dedup hit mevcut id'yi döndürür");
+        assert_eq!(found, id1, "a durable-dedup hit returns the existing id");
     }
 
     #[test]
@@ -519,12 +519,12 @@ mod dedup_sql_tests {
         assert!(insert(&c, "alice", Some("hh-dev1")).is_some());
         assert!(
             insert(&c, "alice", Some("hh-dev2")).is_some(),
-            "farklı env_hash (recipient_device farkı) yutulmamalı"
+            "a different env_hash (a different recipient_device) must not be swallowed"
         );
         let cnt: i64 = c
             .query_row("SELECT COUNT(*) FROM pending", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cnt, 2, "kardeş-cihaz grup mesajı KAYBOLMAZ");
+        assert_eq!(cnt, 2, "a sibling-device group message is NOT lost");
     }
 
     #[test]
@@ -535,7 +535,7 @@ mod dedup_sql_tests {
         assert!(insert(&c, "alice", None).is_some());
         assert!(
             insert(&c, "alice", None).is_some(),
-            "NULL env_hash çoklu-satır (eski satırlar UNIQUE çakışması üretmez)"
+            "NULL env_hash allows multiple rows (old rows produce no UNIQUE collision)"
         );
     }
 }

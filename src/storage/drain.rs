@@ -1,4 +1,4 @@
-//! Drain/move engine (Faz 4, plan c.4 "TAŞIMA") — moves the blobs of a `draining`
+//! Drain/move engine (Phase 4, plan c.4 "MOVE") — moves the blobs of a `draining`
 //! backend onto the remaining active ones; when its inventory reaches 0 the backend is
 //! flipped to `disabled` automatically.
 //!
@@ -101,7 +101,7 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
         }
         if !moved.is_empty() {
             transfer_counters(&db, &moved).await;
-            console_log!("storage drain: {} blob taşındı", moved.len());
+            console_log!("storage drain: moved {} blobs", moved.len());
         }
     }
 
@@ -127,7 +127,7 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
         // finished" breadcrumb).
         write_health(env, id, true, Some("drain_complete")).await;
         invalidate_storage_cache();
-        console_log!("storage drain: '{}' boşaldı → disabled", id);
+        console_log!("storage drain: '{}' is empty → disabled", id);
     }
     Ok(())
 }
@@ -187,7 +187,7 @@ async fn move_one(db: &D1Database, router: &StorageRouter, row: &MoveRow) -> Mov
             // would wedge forever. Any quota / per-backend counter drift is repaired by the
             // daily reconcile (which recomputes from the meta tables).
             phantom_meta_delete(db, row).await;
-            console_warn!("storage drain: kaynakta yok, meta düşürüldü: {key}");
+            console_warn!("storage drain: missing at the source, meta dropped: {key}");
             return MoveOutcome::Skipped;
         }
         Err(_) => return MoveOutcome::Skipped,
@@ -516,7 +516,7 @@ mod tests {
     /// The candidate key/class mapping is bit-identical to the mod.rs key scheme
     /// (a move is a copy, the key never changes — the precondition for Faz 4).
     #[test]
-    fn aday_anahtar_ve_sinif_semasi() {
+    fn candidate_key_and_class_schema() {
         let (k, c) = key_and_class("media", "", "b1").unwrap();
         assert_eq!(k, "media/b1");
         assert!(matches!(c, StorageClass::Media));
@@ -532,7 +532,7 @@ mod tests {
     /// Candidate SQL: 3 tables × n placeholders (matching in_binds_x3), oldest first,
     /// per-run ceiling MOVE_BATCH.
     #[test]
-    fn aday_sql_placeholder_siralama_limit() {
+    fn candidate_sql_placeholder_order_and_limit() {
         let sql = candidates_sql(2);
         assert_eq!(sql.matches('?').count(), 6, "3 tablo × 2 id");
         assert!(sql.contains("ORDER BY created_at ASC"));
@@ -546,13 +546,13 @@ mod tests {
     /// (`AND store_id = ?`) and uses RETURNING (0-row race detection); the phantom DELETE
     /// is conditional too. Unknown channel → None (no unconditional mutation path exists).
     #[test]
-    fn kosullu_update_yaris_korumasi() {
+    fn the_conditional_update_protects_against_races() {
         for chan in ["media", "plugin_media", "plugin_code"] {
             let sql = meta_update_sql(chan).unwrap();
-            assert!(sql.contains("AND store_id = ?"), "{chan}: koşulsuz UPDATE yasak");
-            assert!(sql.contains("RETURNING blob_id"), "{chan}: yarış tespiti RETURNING ister");
+            assert!(sql.contains("AND store_id = ?"), "{chan}: an unconditional UPDATE is forbidden");
+            assert!(sql.contains("RETURNING blob_id"), "{chan}: race detection needs RETURNING");
             let del = meta_delete_sql(chan).unwrap();
-            assert!(del.contains("store_id = ?"), "{chan}: hayalet-DELETE de koşullu");
+            assert!(del.contains("store_id = ?"), "{chan}: the ghost DELETE is conditional too");
             assert!(meta_select_sql(chan).is_some());
         }
         assert!(meta_update_sql("bogus").is_none());
@@ -563,7 +563,7 @@ mod tests {
     /// Conditional-UPDATE result → action: 1 row = delete the source; 0 rows = the target
     /// copy is a suspected orphan (race_action makes the call).
     #[test]
-    fn kopya_sonrasi_eylem() {
+    fn action_after_the_copy() {
         assert_eq!(after_copy(true), AfterCopy::DeleteSource);
         assert_eq!(after_copy(false), AfterCopy::OrphanTargetCopy);
     }
@@ -572,7 +572,7 @@ mod tests {
     /// different backend → orphan; meta == TARGET → canonical, LEAVE IT; D1 unreadable →
     /// fail-safe LEAVE IT (a wrong orphan is the data-loss direction).
     #[test]
-    fn yaris_karari_fail_safe() {
+    fn the_race_decision_is_fail_safe() {
         assert_eq!(
             race_action(&MetaNow::Gone, "r2-primary"),
             RaceAction::OrphanTargetCopy
@@ -593,7 +593,7 @@ mod tests {
 
     /// Completion check: 0 remaining → the backend's drain is done (auto-disabled).
     #[test]
-    fn bitis_tespiti() {
+    fn completion_detection() {
         assert!(drain_complete(0));
         assert!(!drain_complete(1));
         assert!(!drain_complete(87));
@@ -602,7 +602,7 @@ mod tests {
     /// Counter transfer: minus on the source / plus on the target, summed per backend,
     /// ordered by store_id.
     #[test]
-    fn sayac_aktarimi_toplanir() {
+    fn counter_transfers_accumulate() {
         let moved = vec![
             ("s3-a".to_string(), "r2-primary".to_string(), 100),
             ("s3-a".to_string(), "r2-primary".to_string(), 50),
@@ -622,7 +622,7 @@ mod tests {
 
     /// Remaining-inventory SQL: placeholders for all 3 tables + grouping per backend.
     #[test]
-    fn kalan_sql_gruplu() {
+    fn remaining_sql_is_grouped() {
         let sql = remaining_sql(1);
         assert_eq!(sql.matches('?').count(), 3);
         assert!(sql.contains("GROUP BY store_id"));

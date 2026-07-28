@@ -102,16 +102,16 @@ mod tests {
                 .unwrap();
             r.flatten().is_some()
         };
-        assert!(!revoked("u", "d"), "aktif alıcı cihaz revoked DEĞİL → teslim edilir");
+        assert!(!revoked("u", "d"), "an active recipient device is NOT revoked → it gets delivery");
         c.execute("UPDATE devices SET revoked_at=123 WHERE device_id='d'", [])
             .unwrap();
         assert!(
             revoked("u", "d"),
-            "D-M12: revoked alıcı cihaz tespit edilir → 1:1 teslim atlanır"
+            "D-M12: a revoked recipient device is detected → the 1:1 delivery is skipped"
         );
         assert!(
             !revoked("u", "missing"),
-            "listede olmayan cihaz → revoked değil (allow; empty device_id kodda erken false)"
+            "a device absent from the list is not revoked (allow; an empty device_id returns false early)"
         );
     }
 

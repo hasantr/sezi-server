@@ -49,7 +49,7 @@ fn load_signing_key(env: &Env) -> Result<SigningKey> {
         }
     }
     let raw = crate::self_provision::cached_jwt_pem().ok_or_else(|| {
-        Error::RustError("jwt: signing key yok (env-secret boş/geçersiz + self-provision hazır değil)".into())
+        Error::RustError("jwt: no signing key (env secret empty/invalid and self-provision not ready)".into())
     })?;
     parse_signing_pem(&raw)
 }

@@ -157,7 +157,7 @@ async fn read_db_cfg(env: &Env) -> (Option<String>, Option<String>) {
             // The expected case is a pre-migration "no such column" — it should not
             // vanish silently, but it must not break the endpoint either
             // (fail-open, with a trace).
-            console_warn!("cf_analytics: D1 config okunamadı (fail-open): {e:?}");
+            console_warn!("cf_analytics: could not read the D1 config (fail-open): {e:?}");
             return (None, None);
         }
     };
@@ -239,7 +239,7 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
         .is_err()
         || headers.set("content-type", "application/json").is_err()
     {
-        console_warn!("cf_analytics[{tag}]: header kurulamadı");
+        console_warn!("cf_analytics[{tag}]: could not build the headers");
         return None;
     }
     init.with_headers(headers);
@@ -248,21 +248,21 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
     let req = match Request::new_with_init("https://api.cloudflare.com/client/v4/graphql", &init) {
         Ok(r) => r,
         Err(e) => {
-            console_warn!("cf_analytics[{tag}]: request kurulamadı: {e:?}");
+            console_warn!("cf_analytics[{tag}]: could not build the request: {e:?}");
             return None;
         }
     };
     let mut resp = match Fetch::Request(req).send().await {
         Ok(r) => r,
         Err(e) => {
-            console_warn!("cf_analytics[{tag}]: fetch hatası: {e:?}");
+            console_warn!("cf_analytics[{tag}]: fetch failed: {e:?}");
             return None;
         }
     };
     let text = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
-            console_warn!("cf_analytics[{tag}]: gövde okunamadı: {e:?}");
+            console_warn!("cf_analytics[{tag}]: could not read the body: {e:?}");
             return None;
         }
     };
@@ -308,7 +308,7 @@ async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_j
         .cloned();
     if account.is_none() {
         console_warn!(
-            "cf_analytics[{tag}]: data.viewer.accounts[0] yok — {}",
+            "cf_analytics[{tag}]: no data.viewer.accounts[0] — {}",
             truncate_for_log(&text)
         );
     }
@@ -381,7 +381,7 @@ pub async fn fetch(env: &Env) -> Option<CfUsage> {
     // authoritative; return None so stats reports `authoritative:false` and prints the
     // self-reported figures.
     if requests_today.is_none() && requests_month.is_none() && r2_storage_bytes.is_none() {
-        console_warn!("cf_analytics: hiç metrik çıkmadı (şema-tuning gerek? — üstteki loglara bak)");
+        console_warn!("cf_analytics: no metric came out at all (schema tuning needed? — see the logs above)");
         return None;
     }
     Some(CfUsage {

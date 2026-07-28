@@ -1,9 +1,9 @@
-//! Contact QR V2 doğrulama/kanonikleştirme katmanı — `verify_offer_json` /
-//! `verify_claim_json` giriş noktaları + Ed25519/SHA-256/HMAC + kanonik-transcript
-//! byte-for-byte doğrulama (`CanonicalWriter`). contact_qr.rs'ten SAF-TAŞIMA ile
-//! ayrıştırıldı; `pub(super)` yüzeyini handler'lar (create_offer/claim_offer/
-//! offer_status) çağırır. Paylaşılan tipler/const'lar + kripto import'ları
-//! (base64/ed25519/hmac/sha2) `use super::*` ile parent'tan gelir.
+//! Contact QR V2 verification / canonicalisation layer — the `verify_offer_json` and
+//! `verify_claim_json` entry points, Ed25519/SHA-256/HMAC, and byte-for-byte
+//! canonical-transcript verification (`CanonicalWriter`). Split out of contact_qr.rs
+//! as a PURE MOVE; the handlers (create_offer/claim_offer/offer_status) call its
+//! `pub(super)` surface. Shared types and consts plus the crypto imports
+//! (base64/ed25519/hmac/sha2) come from the parent through `use super::*`.
 use super::*;
 
 pub(super) fn verify_offer_json(
@@ -241,9 +241,10 @@ pub(super) fn verify_ed25519(public_b64: &str, message: &[u8], signature_b64: &s
         .as_slice()
         .try_into()
         .map_err(|_| verify_error(VerifyErrorKind::InvalidSignature, "bad signature"))?;
-    // verify_strict: core tarafı vodozemac `verify_strict` kullanıyor — worker'ın
-    // kabul kümesi core'dan GENİŞ olmasın (torsion/small-order bileşenli egzotik
-    // imzalar iki tarafta da reddedilsin; "worker core'dan zayıf doğrulamaz" ilkesi).
+    // verify_strict: the core uses vodozemac's `verify_strict`, so the worker's accept
+    // set must not be WIDER than the core's — exotic signatures carrying a torsion or
+    // small-order component are rejected on both sides ("the worker never verifies more
+    // weakly than the core").
     verifying
         .verify_strict(message, &Signature::from_bytes(&signature_array))
         .map_err(|_| verify_error(VerifyErrorKind::InvalidSignature, "signature invalid"))

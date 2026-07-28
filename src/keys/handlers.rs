@@ -198,7 +198,7 @@ async fn build_device_bundle(
         None => return Ok(None), // this device has not published an SPK yet → skip it
     };
 
-    // M2-S3.5 SAHA-KRİTİK: core REQUIRES `DeviceBundle.identity_pubkey_b64` (the peer's
+    // M2-S3.5 FIELD-CRITICAL: core REQUIRES `DeviceBundle.identity_pubkey_b64` (the peer's
     // x_pub/Curve25519 key used for first-contact Olm). The field was MISSING, so the moment a
     // peer published a device list (making devices[] non-empty) core's BundleRes decode blew
     // up entirely ("error decoding response body") and every send died. Per-device it comes
@@ -339,7 +339,7 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     if body.otks.is_empty() || body.otks.len() > 100 {
         return json_err(400, "bad_request");
     }
-    // Sağlamlaştırma #8: stop one device from wiping and poisoning ANOTHER device's OTK pool. A
+    // Hardening #8: stop one device from wiping and poisoning ANOTHER device's OTK pool. A
     // same-account or stolen-token device sending body.device_id=VICTIM would DELETE the
     // victim's OTKs and write its own into that slot — a decrypt DoS. Parity with the
     // send-path device binding: if body.device_id is present it MUST match the token, and a
@@ -359,7 +359,7 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     }
     let device_id = body.device_id.as_deref();
     let db = ctx.env.d1("DB")?;
-    // KÖK-FIX (stale-OTK cleanup; the field symptom was "unknown one-time key"): delete this
+    // ROOT FIX (stale-OTK cleanup; the field symptom was "unknown one-time key"): delete this
     // device's OLD unconsumed OTKs so the fresh batch is a CLEAN REPLACE. This is what clears
     // the stale public keys left behind by the old enumerate bug — prekey_id restarted at
     // 1..N, collided under INSERT OR IGNORE, and the new OTKs were silently dropped — whose
@@ -416,7 +416,95 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         stmts.push(db.prepare(&sql).bind(&binds)?);
     }
     db.batch(stmts).await?;
-    Response::from_json(&serde_json::json!({ "count": body.otks.len() }))
+
+    // MEASURE WHAT ACTUALLY HAPPENED, not what the client asked for.
+    //
+    // This used to answer `{"count": body.otks.len()}` — the size of the request, echoed back. So
+    // the one shape that can silently destroy a pool was invisible from both ends: the client
+    // uploads only the keys it just GENERATED (a delta), while the DELETE above replaces the whole
+    // unconsumed pool. A device holding 100 keys that consumes 25 generates 25 — and this endpoint
+    // then removes the 75 survivors and inserts 25, answering "count: 25" either way. The
+    // server-side pool can never be deeper than the last batch, and nothing anywhere said so
+    // (measured 2026-07-28, task #53).
+    //
+    // The count is a separate read AFTER the batch, deliberately: it is the pool as it now stands,
+    // which is the number worth having, and being one round trip late cannot make it wrong in a
+    // way that matters for a diagnostic. `pool_after` MUCH smaller than `inserted + consumed` is
+    // the fingerprint of the shrink; `pool_after == inserted` every time is the shrink confirmed.
+    let pool_after = db
+        .prepare(OTK_UNCONSUMED_COUNT_SQL)
+        .bind(&[d1_text(&user_id), d1_text(device_sentinel)])?
+        .first::<i64>(Some("n"))
+        .await
+        .unwrap_or(None)
+        .unwrap_or(-1);
+    console_log!(
+        "[otk] replenish user={user_id} device='{device_sentinel}' uploaded={} pool_after={pool_after}",
+        body.otks.len()
+    );
+    Response::from_json(&serde_json::json!({
+        // Kept for older clients, which read this field.
+        "count": body.otks.len(),
+        // The unconsumed pool this device now has ON THE SERVER, or -1 if the count failed.
+        "pool_after": pool_after,
+    }))
+}
+
+/// The unconsumed pool of ONE device, the only number that says what a peer can actually be
+/// handed. Shared by `replenish`'s `pool_after` and by `otk_count` so the two can never drift
+/// into measuring different things.
+pub(crate) const OTK_UNCONSUMED_COUNT_SQL: &str =
+    "SELECT COUNT(*) AS n FROM one_time_prekeys WHERE user_id = ? AND device_id = ? AND consumed = 0";
+
+/// Which device's OTK pool a caller's token addresses. `''` is the legacy sentinel used by
+/// device-less tokens (mig 0016 made the column NOT NULL DEFAULT ''), and it is what `replenish`
+/// writes when the client sends no `device_id` — so the read and the write agree by construction.
+/// Getting this wrong is not a small error: a modern device scoped to `''` would report an empty
+/// pool while holding a full one, which is the exact false alarm this endpoint exists to rule out.
+fn otk_pool_scope(token_device: Option<&str>) -> &str {
+    match token_device {
+        Some(d) if !d.is_empty() => d,
+        _ => "",
+    }
+}
+
+/// GET /keys/otks/count — how many UNCONSUMED one-time prekeys the SERVER still holds for the
+/// CALLER's own device. Authenticated, and scoped to the token's user and device: there is no
+/// path here that reads another user's pool.
+///
+/// Why it exists (task #53): the local count and the server count are not proxies for one
+/// another. `bundle` claims an OTK for EVERY active device on every fetch, whether the caller
+/// ends up using it or not, while the core only counts the PreKey messages it actually decrypts —
+/// so the two numbers drift apart by construction and, until now, invisibly. This is the read
+/// side of that comparison; the core logs both on one line at attach.
+///
+/// Diagnostic only: it mutates nothing, and a failed count answers 200 with `-1` rather than an
+/// error, so a caller can never be harmed by asking.
+pub async fn otk_count(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let user_id = match require_auth(&req, &ctx.env) {
+        Ok(uid) => uid,
+        Err(resp) => return Ok(resp),
+    };
+    // The device is taken from the TOKEN, never from the request — the same binding `replenish`
+    // enforces, and the reason this cannot be pointed at somebody else's pool.
+    let token_device = crate::auth::middleware::extract_bearer(&req)
+        .and_then(|t| crate::auth::jwt::device_id_from_token(&ctx.env, &t).ok().flatten());
+    let device = otk_pool_scope(token_device.as_deref());
+    let db = ctx.env.d1("DB")?;
+    let count = db
+        .prepare(OTK_UNCONSUMED_COUNT_SQL)
+        .bind(&[d1_text(&user_id), d1_text(device)])?
+        .first::<i64>(Some("n"))
+        .await
+        .unwrap_or(None)
+        .unwrap_or(-1);
+    Response::from_json(&serde_json::json!({
+        // Unconsumed rows for this (user, device), or -1 if the count itself failed.
+        "count": count,
+        // The pool that was actually counted. Echoed back because a caller comparing this with a
+        // local number has to be able to see that both sides mean the same device.
+        "device_id": device,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -447,7 +535,7 @@ pub async fn rotate_signed_prekey(mut req: Request, ctx: RouteContext<()>) -> Re
         Ok(b) => b,
         Err(_) => return json_err(400, "bad_request"),
     };
-    // Sağlamlaştırma #8 (the SPK twin): stop a device from overwriting another device's signed
+    // Hardening #8 (the SPK twin): stop a device from overwriting another device's signed
     // prekey — parity with the send-path device binding (if body.device_id is present it must
     // match the token, and a revoked device cannot rotate).
     {
@@ -492,4 +580,49 @@ pub async fn rotate_signed_prekey(mut req: Request, ctx: RouteContext<()>) -> Re
     .run()
     .await?;
     no_content()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{otk_pool_scope, OTK_UNCONSUMED_COUNT_SQL};
+    use rusqlite::{params, Connection};
+
+    fn pool(c: &Connection, user: &str, device: &str) -> i64 {
+        c.query_row(OTK_UNCONSUMED_COUNT_SQL, params![user, device], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// `GET /keys/otks/count` must answer with the pool a peer could still be served from: only
+    /// unconsumed rows, only this user, only this device. Counting consumed rows would make an
+    /// exhausted pool look healthy, which is the failure this endpoint exists to expose.
+    #[test]
+    fn the_count_sees_only_this_devices_unconsumed_keys() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE one_time_prekeys(user_id TEXT, device_id TEXT, consumed INTEGER);
+             INSERT INTO one_time_prekeys VALUES('u','dev-a',0),('u','dev-a',0),('u','dev-a',1),
+                                                ('u','dev-b',0),
+                                                ('other','dev-a',0);",
+        )
+        .unwrap();
+        assert_eq!(pool(&c, "u", "dev-a"), 2, "consumed rows are not available to any peer");
+        assert_eq!(pool(&c, "u", "dev-b"), 1, "a sibling device has its own pool");
+        assert_eq!(pool(&c, "u", "dev-missing"), 0, "an unknown device holds nothing");
+        assert_eq!(
+            pool(&c, "u", "dev-a") + pool(&c, "u", "dev-b"),
+            3,
+            "no query ever spans users: 'other' is invisible from either device of 'u'"
+        );
+    }
+
+    /// The read must land on the same pool `replenish` writes to, or a healthy device reads back
+    /// zero and the instrument reports a shrink that never happened.
+    #[test]
+    fn a_device_less_token_reads_the_same_legacy_pool_replenish_writes() {
+        assert_eq!(otk_pool_scope(Some("dev-a")), "dev-a");
+        assert_eq!(otk_pool_scope(None), "", "legacy sentinel, matching replenish's unwrap_or(\"\")");
+        assert_eq!(otk_pool_scope(Some("")), "", "an empty token device is legacy, not a device");
+    }
 }

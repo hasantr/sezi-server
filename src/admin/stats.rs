@@ -141,7 +141,7 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // Whether a TURN credential can be issued at all — the owner screen needs it to say
     // whether calls between DIFFERENT networks will connect. Write-only: the bool only.
     let turn_configured = crate::turn::is_configured(&ctx.env).await;
-    let fcm_configured = fcm_mode != crate::push::fcm::PushMode::Off;
+    let fcm_configured = fcm_mode.can_push();
 
     // requests_today — CF's billing-accurate number when available, otherwise the
     // self-report usage_counters 'requests' row. Counting every request in D1 is

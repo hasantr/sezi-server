@@ -625,15 +625,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn label_dogrulama() {
-        assert!(label_ok("B2 — kişisel"));
+    fn label_validation() {
+        assert!(label_ok("B2 — café"));
         assert!(!label_ok("   "));
         assert!(!label_ok("a\nb"));
         assert!(!label_ok(&"x".repeat(121)));
     }
 
     #[test]
-    fn state_dogrulama() {
+    fn state_validation() {
         assert!(state_ok("active"));
         assert!(state_ok("readonly"));
         assert!(state_ok("disabled"));
@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_config_alan_bazli() {
+    fn merge_config_is_field_by_field() {
         let existing = r#"{"endpoint":"https://old","region":"r1","bucket":"b1","access_key_id":"k1","secret_access_key":"s1","prefix":"p/","storage_class":"STANDARD"}"#;
         // Change only the endpoint; everything else is preserved.
         let patch = ConfigPatch {
@@ -658,7 +658,7 @@ mod tests {
         let m = merge_config(existing, &patch).unwrap();
         assert_eq!(m.endpoint, "https://new");
         assert_eq!(m.region, "r1");
-        assert_eq!(m.secret_access_key, "s1", "secret korunur (rotasyon opsiyonel)");
+        assert_eq!(m.secret_access_key, "s1", "the secret is preserved (rotation is optional)");
         assert_eq!(m.prefix, "p/");
         // storage_class '' → clear; prefix '' → clear.
         let patch = ConfigPatch {

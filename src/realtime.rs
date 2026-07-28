@@ -1,7 +1,7 @@
-//! UserInbox'a gönderilen otorite-içermeyen canlı dürtüler.
+//! Non-authoritative live nudges sent to a UserInbox.
 //!
-//! D1 her zaman gerçek kaynaktır. `contact_update` yalnız istemciyi revision
-//! pull'a uyandırır; kaybolması güvenlik veya kalıcılık kaybı yaratmaz.
+//! D1 is always the source of truth. `contact_update` only wakes the client into a
+//! revision pull; losing one costs neither security nor durability.
 
 use crate::d1util::d1_text;
 use serde::Deserialize;
@@ -50,13 +50,13 @@ pub(crate) async fn nudge_contact_update_at(env: &Env, user_id: &str, revision: 
     .await
 }
 
-/// Grup üyeliği/epoch otoritesini taşımayan, yalnız `RefreshGroups` uyandıran
-/// canlı dürtü. Offline cihazlar boot/resume sırasında aynı pull'u yapar.
+/// A live nudge that carries no group-membership or epoch authority — it only wakes
+/// `RefreshGroups`. Offline devices do the same pull on boot/resume.
 pub(crate) async fn nudge_group_update(env: &Env, user_id: &str) -> Result<()> {
     send_control(env, user_id, "/group-update", "{}".into()).await
 }
 
-/// İlgili hesabın en son revision'ını taşıyan best-effort WS dürtüsü.
+/// A best-effort WS nudge carrying that account's latest revision.
 pub(crate) async fn nudge_contact_update(env: &Env, user_id: &str) -> Result<()> {
     let db = env.d1("DB")?;
     let row: Option<RevisionRow> = db
@@ -71,21 +71,21 @@ pub(crate) async fn nudge_contact_update(env: &Env, user_id: &str) -> Result<()>
     nudge_contact_update_at(env, user_id, revision).await
 }
 
-/// Üye D1'den silindikten sonra inbox'ını kalıcı olarak kapatır.
+/// Permanently closes a member's inbox after their row is deleted from D1.
 pub(crate) async fn purge_account_inbox(env: &Env, user_id: &str) -> Result<()> {
     send_control(env, user_id, "/purge-account", "{}".into()).await
 }
 
-/// Canlı dürtüler otorite değildir; handler başarısını etkilemeden görünür logla.
+/// Live nudges are not authoritative: log them visibly without affecting handler success.
 pub(crate) async fn nudge_contact_update_best_effort(env: &Env, user_id: &str) {
     if let Err(error) = nudge_contact_update(env, user_id).await {
         console_warn!("contact_update nudge failed user={user_id}: {error:?}");
     }
 }
 
-/// Bir hesabın aktif contact-grant karşı taraflarını yeni profil/device-list
-/// materialini çekmeleri için uyandırır. Grant listesi D1'den türetilir;
-/// frame'in kendisi veri taşımaz.
+/// Wakes an account's active contact-grant counterparties so they pull the new profile
+/// and device-list material. The grant list is derived from D1; the frame itself
+/// carries no data.
 pub(crate) async fn nudge_grant_counterparts_best_effort(env: &Env, user_id: &str) {
     let Ok(db) = env.d1("DB") else { return };
     let peers: Vec<PeerRow> = match db

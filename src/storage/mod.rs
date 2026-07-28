@@ -103,8 +103,8 @@ impl BlobStore {
         let _ = self.delete(&key).await; // best-effort cleanup
         match got? {
             Some(o) if o.bytes == payload => Ok(()),
-            Some(_) => Err(worker::Error::RustError("probe: bit-uyuşmazlık".into())),
-            None => Err(worker::Error::RustError("probe: yazılan blob okunamadı".into())),
+            Some(_) => Err(worker::Error::RustError("probe: bit mismatch".into())),
+            None => Err(worker::Error::RustError("probe: could not read back the written blob".into())),
         }
     }
 }
@@ -171,7 +171,7 @@ mod tests {
     /// R2Store::key/code_key/plugin_media_key (behaviour invariance: a moved blob is read and
     /// written under the same key).
     #[test]
-    fn anahtar_semasi_mevcut_ile_bit_ayni() {
+    fn key_schema_is_bit_identical_to_the_existing_one() {
         assert_eq!(media_key("abc"), "media/abc");
         assert_eq!(code_key("room1", "blob1"), "plugin-code/room1/blob1");
         assert_eq!(plugin_media_key("room1", "blob1"), "plugin-media/room1/blob1");

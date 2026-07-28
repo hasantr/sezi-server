@@ -18,7 +18,7 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         Ok(uid) => uid,
         Err(resp) => return Ok(resp),
     };
-    // SAĞLAMLAŞTIRMA (2026-06-25, Codex HIGH + audit #10): the `device_id` claim in the token
+    // HARDENING (2026-06-25, Codex HIGH + audit #10): the `device_id` claim in the token
     // MUST match body.device_id, so a user cannot register a push token on behalf of ANOTHER
     // device using their own identity (device impersonation plus waking the wrong device).
     // With no claim at all (a legacy device-less token) we keep the old behaviour for

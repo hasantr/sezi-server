@@ -131,7 +131,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plugin_id_dogrulama() {
+    fn plugin_id_validation() {
         // Valid: slug, reverse-DNS, dash/underscore/dot, exactly 128 chars.
         assert!(plugin_id_ok("echo"));
         assert!(plugin_id_ok("com.sezi.arena"));

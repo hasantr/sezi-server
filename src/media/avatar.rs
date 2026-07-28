@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn tek_slot_upsert_ve_lookup_by_ref() {
+    fn single_slot_upsert_and_lookup_by_ref() {
         let db = db_with_schema();
         upsert(&db, "u1", "obj-a", "r2-primary", 1000, 10);
 
@@ -304,10 +304,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1, "user_id PK → kullanıcı başına tek satır");
+        assert_eq!(n, 1, "user_id is the PK → one row per user");
 
         // The old ref no longer resolves (single-slot: the 404 class); the new one does.
-        assert_eq!(lookup(&db, "obj-a"), None, "düşen eski ref satır bulmaz");
+        assert_eq!(lookup(&db, "obj-a"), None, "the dropped old ref finds no row");
         assert_eq!(
             lookup(&db, "obj-b"),
             Some(("u1".into(), "s3-xyz".into(), 2000))
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn object_id_benzersiz_kullanicilar_arasi() {
+    fn object_id_is_unique_across_users() {
         let db = db_with_schema();
         upsert(&db, "u1", "shared-obj", "r2-primary", 100, 10);
         // A different user cannot take the SAME object_id — the unique index on object_id
@@ -325,11 +325,11 @@ mod tests {
             UPSERT_AVATAR_SQL,
             params!["u2", "shared-obj", "r2-primary", 100, 10],
         );
-        assert!(err.is_err(), "object_id unique index çakışmayı reddetmeli");
+        assert!(err.is_err(), "the object_id unique index must reject the collision");
     }
 
     #[test]
-    fn replace_eski_objeyi_storage_orphans_a_duser() {
+    fn replace_drops_the_old_object_into_storage_orphans() {
         let db = db_with_schema();
         // Starting avatar.
         upsert(&db, "u1", "obj-old", "r2-primary", 1500, 10);

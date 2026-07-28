@@ -1,6 +1,7 @@
-//! contacts/grants (grant list/revoke) — SAF-TAŞIMA ile contacts/mod.rs'ten ayrıştırıldı. Paylaşılan
-//! yardımcılar (active/cursor/revision/policy/contact_change_stmt) + import'lar
-//! `use super::*` ile mod.rs'ten gelir. pub handler'lar mod.rs'te re-export edilir.
+//! contacts/grants (grant list/revoke) — split out of contacts/mod.rs as a PURE MOVE.
+//! The shared helpers (active/cursor/revision/policy/contact_change_stmt) and the
+//! imports come from mod.rs through `use super::*`; the pub handlers are re-exported
+//! from mod.rs.
 use super::*;
 
 #[derive(Deserialize)]

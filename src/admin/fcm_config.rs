@@ -114,7 +114,7 @@ pub async fn set_fcm_config(mut req: Request, ctx: RouteContext<()>) -> Result<R
     // own credentials, the shared relay (the default, which the owner did NOT set up), or nothing.
     let mode = crate::push::fcm::mode(&ctx.env).await;
     Response::from_json(&serde_json::json!({
-        "fcm_configured": mode != crate::push::fcm::PushMode::Off,
+        "fcm_configured": mode.can_push(),
         "fcm_mode": mode.as_str(),
     }))
 }
@@ -150,7 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proje_id_dogrulama() {
+    fn project_id_validation() {
         assert!(project_id_ok("sezi-481e9"));
         assert!(project_id_ok("a"));
         // Control character → reject (URL-injection guard).
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn service_account_dogrulama() {
+    fn service_account_validation() {
         // Valid: both fields fcm.rs uses are populated.
         assert!(service_account_ok(
             r#"{"type":"service_account","client_email":"a@b.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----\n"}"#

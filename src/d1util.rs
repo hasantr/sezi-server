@@ -19,7 +19,7 @@ pub fn d1_int(n: i64) -> JsValue {
     // because the read path is f64 too.
     debug_assert!(
         n.unsigned_abs() < (1u64 << 53),
-        "d1_int: |{n}| >= 2^53 → workerd f64-okuma sessiz-bozulma riski"
+        "d1_int: |{n}| >= 2^53 → risk of silent corruption from workerd's f64 read"
     );
     JsValue::from_f64(n as f64)
 }

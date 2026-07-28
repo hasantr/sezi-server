@@ -48,7 +48,7 @@ use crate::utils::now_secs;
 // ── Embedded migration list ─────────────────────────────────────────────────
 // ORDERED and HAND-MAINTAINED (a deliberately simple choice over a build script): when
 // you add a migrations/NNNN_*.sql you must add a line here too. The
-// `migrations_listesi_klasorle_senkron` unit test catches the omission right after
+// `the_migrations_list_matches_the_folder` unit test catches the omission right after
 // compiling — cargo test reads the directory and compares it against this list.
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../migrations/0001_init.sql")),
@@ -332,7 +332,7 @@ async fn resolve_from_db(
         // Corrupt record → regenerate and INSERT OR REPLACE. Deliberate: ON CONFLICT
         // DO NOTHING would PRESERVE the corrupt record, and here overwriting is mandatory.
         console_warn!(
-            "self_provision: {} D1 kaydi BOZUK (validate gecmedi) → yeniden uretiliyor (self-heal; 2026-07-06 sezi-server2 vakasi)",
+            "self_provision: {} the D1 record is CORRUPT (it did not validate) → regenerating (self-heal; 2026-07-06 sezi-server2 vakasi)",
             db_key
         );
         let candidate = generate()?;
@@ -354,7 +354,7 @@ async fn resolve_from_db(
         .run()
         .await?;
         console_log!(
-            "self_provision: {} yeniden uretildi + D1'e yazildi (bozuk kaydin ustune)",
+            "self_provision: {} regenerated and written to D1 (over the corrupt record)",
             db_key
         );
         // Race note: if two isolates self-heal at the same time, the last writer wins the
@@ -389,7 +389,7 @@ async fn resolve_from_db(
     .run()
     .await?;
     console_log!(
-        "self_provision: {} uretildi + D1'e persist edildi (taze kurulum)",
+        "self_provision: {} generated and persisted to D1 (fresh install)",
         db_key
     );
     match read_config(&db, db_key).await? {
@@ -399,7 +399,7 @@ async fn resolve_from_db(
         Some(winner) if validate(&winner) => Ok(winner),
         Some(_) => {
             console_warn!(
-                "self_provision: {} yarisi kazanan D1 degeri BOZUK — kendi taze degerimiz kullaniliyor (sonraki boot self-heal eder)",
+                "self_provision: {} the D1 value that won the race is CORRUPT — using our own fresh value instead (the next boot self-heals eder)",
                 db_key
             );
             Ok(candidate)
@@ -490,7 +490,7 @@ async fn ensure_migrations(env: &Env) {
     match run_migrations(&db).await {
         Ok(()) => MIGRATIONS_CHECKED.with(|c| c.set(true)),
         Err(e) => console_error!(
-            "self_provision: self-migration durdu (mevcut sema ile hizmete devam): {}",
+            "self_provision: self-migration stopped (serving on with the existing schema): {}",
             e
         ),
     }
@@ -570,7 +570,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
     match db.batch(stmts).await {
         Ok(_) => {
             console_log!(
-                "self_provision: {} migration tek-batch uygulandi",
+                "self_provision: {} migrations applied in a single batch",
                 pending.len()
             );
             Ok(())
@@ -586,7 +586,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
                 // path whose subrequest cost matches the old pattern (≤2 calls per file),
                 // which was deemed acceptable.
                 console_warn!(
-                    "self_provision: tek-batch sema-cakismasi ({}) → dosya-dosya tolerant fallback",
+                    "self_provision: single-batch schema conflict ({}) → falling back to a tolerant file-by-file pass",
                     msg
                 );
                 for &(name, sql) in &pending {
@@ -599,7 +599,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
                 // the file away via a table/column name — and if per-file diagnosis is
                 // needed, the fallback path already reports the file name.
                 Err(Error::RustError(format!(
-                    "tek-batch migration ({} bekleyen): {msg}",
+                    "single-batch migration ({} pending): {msg}",
                     pending.len()
                 )))
             }
@@ -643,7 +643,7 @@ async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
                 // without IF NOT EXISTS in 0014/0015/0016; both produce only these two
                 // messages.)
                 console_warn!(
-                    "self_provision: migration zaten-uygulanmis sayildi ({}): {}",
+                    "self_provision: migration treated as already applied ({}): {}",
                     name,
                     msg
                 );
@@ -703,8 +703,8 @@ fn normalize_migration_name(raw: &str) -> &str {
 }
 
 /// Split a SQL file into statements. NOT a naive `;` split: migration comments do contain
-/// `;` — a real example is 0014's inline column comment, which reads (in Turkish)
-/// "... consume = satır DELETE; 'consumed' persist EDİLMEZ" — and a naive split would cut
+/// `;` — a real example is 0014's inline column comment, which is written in Turkish and
+/// carries a `;` mid-sentence — and a naive split would cut that CREATE TABLE in half.
 /// that CREATE TABLE in half.
 /// This is a small state machine aware of string literals (including the `''` escape),
 /// `--` line comments and `/* */` block comments. Comments are STRIPPED so D1's prepare

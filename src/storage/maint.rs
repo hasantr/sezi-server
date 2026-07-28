@@ -154,7 +154,7 @@ mod tests {
     /// Key parsing for the plugin-code backfill: exactly the `storage::code_key` scheme
     /// ("plugin-code/{room}/{blob}"); unexpected shapes are skipped (None).
     #[test]
-    fn parse_code_key_semasi() {
+    fn parse_code_key_schema() {
         assert_eq!(
             parse_code_key("plugin-code/room1/blob1"),
             Some(("room1", "blob1"))

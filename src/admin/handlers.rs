@@ -737,7 +737,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn davet_ttl_cozumleme() {
+    fn invite_ttl_resolution() {
         // ttl_minutes=5 → 300 s (expires_at ≈ now+300, the in-person invite).
         assert_eq!(resolve_invite_ttl_secs(Some(5), None), Ok(300));
         // With both fields present, ttl_minutes WINS.

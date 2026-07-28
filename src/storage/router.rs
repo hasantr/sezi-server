@@ -367,7 +367,7 @@ fn build_stores(env: &Env, configs: Vec<StoreConfig>) -> Vec<(StoreMeta, BlobSto
                 // Lite (binding_missing) is silently normal; an s3 parse failure is an owner
                 // mistake → warn.
                 if cfg.kind != "r2_binding" {
-                    console_warn!("storage: '{}' kurulamadı ({}): {e}", cfg.store_id, cfg.kind);
+                    console_warn!("storage: could not build '{}' ({}): {e}", cfg.store_id, cfg.kind);
                 }
             }
         }
@@ -388,14 +388,14 @@ mod tests {
     }
 
     #[test]
-    fn tek_active_sinirsiz_ilk_depo() {
+    fn a_single_unlimited_active_store_is_picked_first() {
         // A lone r2-primary (max NULL) → always the first candidate (bit-identical behaviour).
         let p = classify_placement([slot("active", None, 0)].into_iter(), 100);
         assert_eq!(p, Placement::Candidates(vec![0]));
     }
 
     #[test]
-    fn overflow_dolu_depo_atlanir_sonrakine_duser() {
+    fn overflow_skips_the_full_store_and_falls_to_the_next() {
         // idx0 is full (0+100 > 10), idx1 has room → only idx1 qualifies (plan f#5 overflow).
         let p = classify_placement(
             [slot("active", Some(10), 0), slot("active", None, 0)].into_iter(),
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn iki_sigan_depo_ikisi_de_aday_priority_sirasinda() {
+    fn two_fitting_stores_are_both_candidates_in_priority_order() {
         // Both have room → both qualify (for PUT fallback); input (= priority) order is kept.
         let p = classify_placement(
             [slot("active", Some(1000), 0), slot("active", None, 0)].into_iter(),
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn tavan_tam_sinirda_sigar() {
+    fn exactly_at_the_ceiling_still_fits() {
         // used + size == cap → FITS (<=).
         let p = classify_placement([slot("active", Some(100), 0)].into_iter(), 100);
         assert_eq!(p, Placement::Candidates(vec![0]));
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_ve_disabled_yerlestirmede_dislanir() {
+    fn readonly_and_disabled_are_excluded_from_placement() {
         // readonly + disabled on their own → NoActive (plan f#6: readonly is not writable).
         let p = classify_placement(
             [slot("readonly", None, 0), slot("disabled", None, 0)].into_iter(),
@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn tum_active_dolu_allfull() {
+    fn every_active_store_full_yields_allfull() {
         // Two active backends, both full → AllFull (→ 429 quota, plan f#5).
         let p = classify_placement(
             [slot("active", Some(10), 5), slot("active", Some(20), 20)].into_iter(),
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn hic_depo_yok_noactive() {
+    fn no_store_at_all_yields_noactive() {
         let p = classify_placement(std::iter::empty(), 100);
         assert_eq!(p, Placement::NoActive);
     }

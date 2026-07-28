@@ -17,10 +17,10 @@ pub fn b64_encode(bytes: &[u8]) -> String {
 }
 
 pub fn b64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    // Mobile/Rust core/TS-leftover farklı varyantlar gönderebilir:
-    // standard (+/=), standard-no-pad, url-safe (-_=), url-safe-no-pad.
-    // Hepsini tolere etmek için normalize: URL-safe → standard alfabe,
-    // padding eksikse '='ile tamamla, sonra STANDARD decode.
+    // Mobile, the Rust core and TS leftovers can each send a different variant:
+    // standard (+/=), standard-no-pad, url-safe (-_=), url-safe-no-pad. To tolerate
+    // all of them we normalise: url-safe → the standard alphabet, pad with '=' when
+    // padding is missing, then do a STANDARD decode.
     let cleaned: String = s
         .chars()
         .map(|c| match c {
@@ -55,9 +55,9 @@ pub fn random_b64u(n: usize) -> String {
     b64u_encode(&random_bytes(n))
 }
 
-/// ŞABLON-DİYETİ (deploy-ekranı sadeliği): `[vars]` satırı wrangler.toml'dan
-/// silinebilsin diye env-var yoksa kod-default'u döner. Env-SET kurulumlar
-/// (prod) bit-aynı davranır — env her zaman kazanır.
+/// TEMPLATE DIET (a simpler deploy screen): returns the code default when the env var
+/// is absent, so the `[vars]` block can be deleted from wrangler.toml. Installations
+/// that DO set the env (prod) behave bit-identically — the env always wins.
 pub fn var_or(env: &Env, key: &str, default: &str) -> String {
     env.var(key)
         .map(|v| v.to_string())

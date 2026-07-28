@@ -214,6 +214,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/devices/link-status", devices::link::link_status)
         .get_async("/keys/:user_id/bundle", keys::handlers::bundle)
         .post_async("/keys/otks/replenish", keys::handlers::replenish)
+        // Diagnostic (task #53): the caller's OWN unconsumed pool depth. `bundle` claims an OTK
+        // per active device on every fetch while the core counts only the PreKeys it decrypts,
+        // so the local number is not a proxy for this one — the core logs both together.
+        .get_async("/keys/otks/count", keys::handlers::otk_count)
         .post_async("/keys/signed-prekey", keys::handlers::rotate_signed_prekey)
         .post_async("/messages/send", messages::handlers::send)
         .post_async("/messages/read", messages::handlers::read)

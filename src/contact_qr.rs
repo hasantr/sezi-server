@@ -192,9 +192,10 @@ pub async fn create_offer(mut req: Request, ctx: RouteContext<()>) -> Result<Res
     let Some(auth_device) = auth.device_id.as_deref() else {
         return json_err(403, "active_device_required");
     };
-    // KV binding OPSİYONEL (şablon-diyeti): yoksa limitsiz devam. Offer başına
-    // ≤32KB D1 satırı + günlük 500'lük temizlik → limitsiz create, insider
-    // D1-şişirme yüzeyi (denetim 2026-07-16). UI doğal temposu ~12/saat (5dk TTL).
+    // The KV binding is OPTIONAL (template diet): without it we continue unlimited.
+    // Each offer is a ≤32KB D1 row with a daily 500-row cleanup, so unlimited create
+    // is an insider D1-bloat surface (audit 2026-07-16). The UI's natural pace is
+    // ~12/hour (5 min TTL).
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,
         &format!("qr:offer:{}", auth.user_id),
@@ -278,7 +279,7 @@ pub async fn claim_offer(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     let Some(auth_device) = auth.device_id.as_deref() else {
         return json_err(403, "active_device_required");
     };
-    // Claim başına 2×Ed25519 + HMAC doğrulama → CPU yüzeyi de sınırlı olsun.
+    // Each claim costs 2×Ed25519 plus an HMAC verification — bound the CPU surface too.
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,
         &format!("qr:claim:{}", auth.user_id),
@@ -434,8 +435,8 @@ pub async fn offer_status(req: Request, ctx: RouteContext<()>) -> Result<Respons
     let Some(offer_id) = ctx.param("id") else {
         return json_err(400, "bad_request");
     };
-    // Mobil 2sn'de bir poll'lar (~30/dk/offer); 90/dk üç eşzamanlı offer'a yeter
-    // (link:status ile aynı tavan).
+    // Mobile polls every 2 s (~30/min per offer); 90/min covers three concurrent
+    // offers (the same ceiling as link:status).
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,
         &format!("qr:status:{}", auth.user_id),

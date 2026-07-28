@@ -1,6 +1,7 @@
-//! contacts/requests (contact request create/list/respond/revoke) — SAF-TAŞIMA ile contacts/mod.rs'ten ayrıştırıldı. Paylaşılan
-//! yardımcılar (active/cursor/revision/policy/contact_change_stmt) + import'lar
-//! `use super::*` ile mod.rs'ten gelir. pub handler'lar mod.rs'te re-export edilir.
+//! contacts/requests (contact request create/list/respond/revoke) — split out of
+//! contacts/mod.rs as a PURE MOVE. The shared helpers (active/cursor/revision/policy/
+//! contact_change_stmt) and the imports come from mod.rs through `use super::*`; the
+//! pub handlers are re-exported from mod.rs.
 use super::*;
 
 #[derive(Deserialize, Default)]
@@ -77,7 +78,7 @@ async fn verify_request_signature(
         .and_then(|v| <[u8; 64]>::try_from(v.as_slice()).ok())
         .map(|v| ed25519_dalek::Signature::from_bytes(&v))
         .ok_or_else(|| json_err(400, "bad_signature").unwrap())?;
-    // verify_strict: core vodozemac verify_strict ile hizalı (bkz. contact_qr.rs).
+    // verify_strict: aligned with the core's vodozemac verify_strict (see contact_qr.rs).
     verifying
         .verify_strict(
             request_transcript(&auth.user_id, body).as_bytes(),

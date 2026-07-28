@@ -222,7 +222,7 @@ mod tests {
     const KOD: &str = "GENESIS_ORNEK_KOD_24chr0";
 
     #[test]
-    fn taze_kurulum_sayfasi_yonerge_adres_ve_kurulus_kodu_icerir() {
+    fn fresh_install_page_shows_instructions_address_and_genesis_code() {
         let html = render_welcome(Some(false), ORIGIN, Some(KOD));
         assert!(html.contains("hazır ve çalışıyor"));
         assert!(html.contains("Kendi sunucunu kur"));
@@ -241,7 +241,7 @@ mod tests {
     /// FAIL-OPEN: if the code cannot be obtained the page STILL renders, with a
     /// refresh line in place of the code box.
     #[test]
-    fn taze_kurulum_kod_alinamazsa_yenile_satiri() {
+    fn fresh_install_shows_a_retry_line_when_the_code_is_unavailable() {
         let html = render_welcome(Some(false), ORIGIN, None);
         assert!(html.contains("hazır ve çalışıyor"), "sayfa yine tam döner");
         assert!(html.contains("alınamadı"));
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn aktif_sunucu_sayfasi_davet_yonergesi_icerir_kod_asla_sizmaz() {
+    fn active_server_page_shows_invite_guidance_and_never_leaks_the_code() {
         // Defensive lock: even if genesis is accidentally passed as Some, the
         // owner-exists branch NEVER embeds the code (render is the single authority).
         let html = render_welcome(Some(true), ORIGIN, Some(KOD));
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn d1_hatasi_notr_sayfa_doner_fail_open_kod_sizmaz() {
+    fn a_d1_error_returns_a_neutral_page_fail_open_without_leaking_the_code() {
         let html = render_welcome(None, ORIGIN, Some(KOD));
         assert!(html.contains("Sezi sunucusu"));
         assert!(html.contains("okunamadı"));
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_ve_kod_html_escape_leniyor() {
+    fn origin_and_code_are_html_escaped() {
         let html = render_welcome(Some(false), "https://a<script>b", Some("k<img>d"));
         assert!(!html.contains("a<script>b"));
         assert!(html.contains("a&lt;script&gt;b"));
@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn sayfa_iskeleti_tek_enjeksiyon_noktasi_dolduruluyor() {
+    fn the_page_skeleton_fills_its_single_injection_point() {
         for (owner, genesis) in
             [(Some(true), None), (Some(false), Some(KOD)), (Some(false), None), (None, None)]
         {

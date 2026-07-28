@@ -742,7 +742,7 @@ mod tests {
         let tombstones: i64 = db
             .query_row("SELECT COUNT(*) FROM contact_tombstones", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(revisions, 3, "replay revision çoğaltmamalı");
+        assert_eq!(revisions, 3, "a replay must not multiply the revision");
         assert_eq!(tombstones, 3);
         let wrong_peer: i64 = db
             .query_row(

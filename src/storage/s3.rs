@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn object_url_path_style_ve_prefix() {
+    fn object_url_path_style_and_prefix() {
         let s = S3Store::from_config(valid_cfg());
         assert_eq!(
             s.object_url("media/abc"),
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_https_ok_http_kilitli() {
+    fn validate_config_accepts_https_and_blocks_http() {
         assert!(validate_config(&valid_cfg(), false).is_ok());
         // http → rejected in prod, allowed in dev.
         let mut c = valid_cfg();
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_bos_alanlar_red() {
+    fn validate_config_rejects_empty_fields() {
         let mut c = valid_cfg();
         c.bucket = "  ".into();
         assert_eq!(validate_config(&c, false), Err("bucket_invalid"));
@@ -364,10 +364,10 @@ mod tests {
     }
 
     #[test]
-    fn storage_class_bos_none_a_duser() {
+    fn an_empty_storage_class_falls_to_none() {
         let mut c = valid_cfg();
         c.storage_class = Some("".into());
         let s = S3Store::from_config(c);
-        assert!(s.storage_class.is_none(), "boş storage_class → None (imzasız)");
+        assert!(s.storage_class.is_none(), "an empty storage_class → None (unsigned)");
     }
 }

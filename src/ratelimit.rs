@@ -61,7 +61,7 @@ async fn check_rate_limit_weighted(
     let raw = match kv.get(key).text().await {
         Ok(v) => v,
         Err(e) => {
-            console_log!("ratelimit: KV get FAIL → fail-open (izin ver) key={key}: {e:?}");
+            console_log!("ratelimit: KV get FAIL → fail-open (allow) key={key}: {e:?}");
             return Ok(true);
         }
     };

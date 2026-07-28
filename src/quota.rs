@@ -120,12 +120,12 @@ mod tests {
     use super::decide_upload;
 
     #[test]
-    fn cap_altinda_izin() {
+    fn under_the_cap_is_allowed() {
         assert_eq!(decide_upload(100, 50, 10, Some(200), Some(100)), None);
     }
 
     #[test]
-    fn server_asimi_reddedilir() {
+    fn a_server_overage_is_rejected() {
         assert_eq!(
             decide_upload(195, 0, 10, Some(200), None),
             Some("server_storage")
@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn user_asimi_reddedilir() {
+    fn a_user_overage_is_rejected() {
         assert_eq!(
             decide_upload(0, 95, 10, Some(1000), Some(100)),
             Some("user_storage")
@@ -141,12 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn null_cap_sinirsiz() {
+    fn a_null_cap_is_unlimited() {
         assert_eq!(decide_upload(1 << 52, 1 << 52, 1 << 40, None, None), None);
     }
 
     #[test]
-    fn sinir_tam_esit_sigar() {
+    fn exactly_at_the_limit_still_fits() {
         // used + size == cap → ALLOWED (the comparison is `>`, not `>=`).
         assert_eq!(decide_upload(190, 90, 10, Some(200), Some(100)), None);
     }

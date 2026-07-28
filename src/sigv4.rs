@@ -49,7 +49,7 @@ pub enum SigV4Error {
 impl std::fmt::Display for SigV4Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SigV4Error::BadUrl(u) => write!(f, "sigv4: geçersiz URL: {u}"),
+            SigV4Error::BadUrl(u) => write!(f, "sigv4: invalid URL: {u}"),
         }
     }
 }
@@ -65,7 +65,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// HMAC-SHA256(key, data) → 32 bytes.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC her anahtar uzunluğunu kabul eder");
+        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -334,7 +334,7 @@ mod tests {
     const VEC_DATETIME: &str = "20150830T123600Z";
 
     #[test]
-    fn bos_govde_sha256_bilinen_deger() {
+    fn empty_body_sha256_matches_the_known_value() {
         // SHA-256("") — the constant that shows up all over the RFC/AWS docs.
         assert_eq!(
             sha256_hex(b""),
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn get_vanilla_kanonik_request_stringi() {
+    fn get_vanilla_canonical_request_string() {
         let headers = vec![
             ("host".to_string(), "example.amazonaws.com".to_string()),
             ("x-amz-date".to_string(), VEC_DATETIME.to_string()),
@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn get_vanilla_string_to_sign_ve_imza() {
+    fn get_vanilla_string_to_sign_and_signature() {
         let headers = vec![
             ("host".to_string(), "example.amazonaws.com".to_string()),
             ("x-amz-date".to_string(), VEC_DATETIME.to_string()),
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn uri_encode_kenarlari() {
+    fn uri_encode_edge_cases() {
         assert_eq!(uri_encode("/", false), "/");
         assert_eq!(uri_encode("/", true), "%2F");
         assert_eq!(uri_encode(" ", true), "%20");
@@ -418,20 +418,20 @@ mod tests {
     }
 
     #[test]
-    fn canonical_query_sirali_ve_encode() {
+    fn canonical_query_is_sorted_and_encoded() {
         assert_eq!(canonical_query(""), "");
         assert_eq!(canonical_query("b=2&a=1"), "a=1&b=2");
         assert_eq!(canonical_query("prefix=a/b&marker="), "marker=&prefix=a%2Fb");
     }
 
     #[test]
-    fn amz_date_iso_donusum() {
+    fn amz_date_iso_conversion() {
         assert_eq!(amz_date_from_iso("2015-08-30T12:36:00.000Z"), "20150830T123600Z");
         assert_eq!(amz_date_from_iso("2015-08-30T12:36:00Z"), "20150830T123600Z");
     }
 
     #[test]
-    fn sign_request_s3_basliklari_uretir() {
+    fn sign_request_produces_the_s3_headers() {
         let payload_hash = sha256_hex(b"hello");
         let out = sign_request(
             "PUT",

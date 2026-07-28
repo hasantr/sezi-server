@@ -151,27 +151,19 @@ async fn resolve_service_account(env: &Env, db: &D1Database) -> Option<String> {
     read_db_config(db, "fcm_service_account").await
 }
 
-/// Is FCM configured — backs the `fcm_configured` field of `/admin/stats` and the
-/// `PATCH /admin/fcm-config` response. It counts as configured when either (a) the owner's
-/// OWN config is complete (project id AND service account, from env or D1) or (b) the
-/// shared relay is enabled (the default). This is the read face of a WRITE-ONLY contract:
-/// only a bool escapes, never the value. Cheap by design — it never calls out to Google or
-/// the relay, it only checks presence — and it fails open to false (no D1 binding means
-/// "not configured"; stats must NEVER 500).
-pub async fn is_configured(env: &Env) -> bool {
-    !matches!(mode(env).await, PushMode::Off)
-}
-
-/// WHICH of the two ways this server can push — the question `is_configured` cannot answer.
+/// WHICH of the three ways this server stands on push — the single read of the FCM config.
 ///
-/// `is_configured` answers "will a push go out at all", and that is the right question for a health
-/// indicator. It is the wrong question for the owner's setup screen, where a bare "configured ✓" on a
-/// server whose owner has installed nothing reads as "I set this up" — the relay URL falls back to a
-/// built-in default unless explicitly `off`, so a FRESH self-host server reports true. Measured on
-/// the Pi 2026-07-28: `server_config` holds zero FCM keys and the flag was still true.
+/// `PushMode::can_push()` on top of it answers "will a push go out at all", which is the right
+/// question for a health indicator and backs `fcm_configured` on `/admin/stats` and on the
+/// `PATCH /admin/fcm-config` response. It is the WRONG question for the owner's setup screen: a
+/// bare "configured ✓" on a server whose owner installed nothing reads as "I set this up", because
+/// the relay URL falls back to a built-in default unless explicitly `off`, so a FRESH self-host
+/// server reports true. Measured on the Pi 2026-07-28: `server_config` held zero FCM keys and the
+/// flag was still true. That screen asks for the mode itself instead.
 ///
-/// Both are exported so each surface asks its own question. This one still leaks no values, only
-/// which of three states the server is in.
+/// The read face of a WRITE-ONLY contract: only which of three states escapes, never a value.
+/// Cheap by design — it never calls out to Google or to the relay, it only checks presence — and it
+/// fails safe to `Off` (no D1 binding means "not configured"; stats must NEVER 500).
 pub async fn mode(env: &Env) -> PushMode {
     let db = match env.d1("DB") {
         Ok(d) => d,
@@ -207,6 +199,15 @@ impl PushMode {
             PushMode::Relay => "relay",
             PushMode::Off => "off",
         }
+    }
+
+    /// Will a push go out at all — the health question, in ONE place.
+    ///
+    /// It used to be spelled `mode != PushMode::Off` at each call site, with `is_configured`
+    /// saying the same thing a fourth time and going unused. The same predicate written in
+    /// several places is how two of them end up disagreeing.
+    pub fn can_push(self) -> bool {
+        !matches!(self, PushMode::Off)
     }
 }
 
@@ -474,7 +475,7 @@ pub async fn maybe_push_wake(
         Some(m) => m,
         None => {
             console_log!(
-                "[push] user={recipient_id} mode=off -> atlandı (FCM yapılandırılmamış ya da 'off')"
+                "[push] user={recipient_id} mode=off -> skipped (FCM not configured, or 'off')"
             );
             return;
         }
@@ -517,7 +518,7 @@ pub async fn maybe_push_wake(
         // its token was deleted as stale. Without the line it cannot be told apart from a push that
         // WAS sent and then lost somewhere downstream.
         console_log!(
-            "[push] user={recipient_id} mode={mode_name} token=0 -> gonderilmedi (kayitli cihaz yok)"
+            "[push] user={recipient_id} mode={mode_name} token=0 -> not sent (no registered device)"
         );
         return;
     }
@@ -547,7 +548,7 @@ pub async fn maybe_push_wake(
                 // push for that device. "Notifications just stopped" needs a trace to follow, and a
                 // bulk deletion after an FCM 400 has bitten this project before.
                 console_warn!(
-                    "[push] user={recipient_id} cihaz={} token BAYAT -> silindi (bu cihaz artik uyandirilamaz)",
+                    "[push] user={recipient_id} device={} token STALE -> deleted (this device can no longer be woken)",
                     row.device_id
                 );
                 if let Ok(stmt) = db
@@ -560,7 +561,7 @@ pub async fn maybe_push_wake(
             Err(e) => {
                 failed += 1;
                 console_warn!(
-                    "[push] user={recipient_id} cihaz={} gonderim HATA: {e:?}",
+                    "[push] user={recipient_id} device={} send FAILED: {e:?}",
                     row.device_id
                 );
             }

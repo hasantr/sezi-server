@@ -94,7 +94,7 @@ pub async fn bootstrap(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         // registration, so in practice that set is empty — an accepted trade-off,
         // recorded here.
         console_warn!(
-            "bootstrap: HAYALET-owner tespit edildi (id={}, devices=0, refresh=0, yas>=grace) → temizlenip genesis yeniden aciliyor (self-heal; 2026-07-06 sezi-server2 vakasi)",
+            "bootstrap: GHOST owner detected (id={}, devices=0, refresh=0, age>=grace) → clearing it and reopening genesis aciliyor (self-heal; 2026-07-06 sezi-server2 vakasi)",
             o.id
         );
         // The cleanup is ONE ATOMIC BATCH (a D1 batch is an implicit transaction), so a
@@ -148,7 +148,7 @@ pub async fn bootstrap(req: Request, ctx: RouteContext<()>) -> Result<Response> 
 
     Response::from_json(&serde_json::json!({
         "bootstrap_token": token,
-        "note": "Bu kodu kullanan ILK kisi sunucu sahibi (owner) olur; sonra bu kapi kapanir.",
+        "note": "The FIRST person to use this code becomes the server owner; after that this door closes.",
     }))
 }
 
@@ -264,7 +264,7 @@ mod tests {
     /// The field-incident profile (2026-07-06 sezi-server2): an owner with no device,
     /// no session and past the grace window → ghost, so recovery opens.
     #[test]
-    fn hayalet_profili_taniniyor() {
+    fn a_ghost_profile_is_recognised() {
         let now = (T0 + GHOST_GRACE_SEC) as u64; // exact boundary: age == grace → ghost
         assert!(is_ghost_owner(0, 0, T0, now));
         assert!(is_ghost_owner(0, 0, T0, now + 86_400)); // and days later
@@ -272,7 +272,7 @@ mod tests {
 
     /// Conservatism: a SINGLE liveness signal is enough to leave the owner alone.
     #[test]
-    fn cihazli_veya_oturumlu_owner_asla_hayalet_degil() {
+    fn an_owner_with_a_device_or_session_is_never_a_ghost() {
         let now = (T0 + 30 * 24 * 3600) as u64; // even 30 days later
         assert!(!is_ghost_owner(1, 0, T0, now)); // published a device
         assert!(!is_ghost_owner(0, 1, T0, now)); // has a refresh token
@@ -281,14 +281,14 @@ mod tests {
 
     /// Grace: a fresh account (registration may still be running) is not a ghost.
     #[test]
-    fn taze_hesap_grace_icinde_korunur() {
+    fn a_fresh_account_is_protected_inside_the_grace_window() {
         assert!(!is_ghost_owner(0, 0, T0, T0 as u64)); // same instant
         assert!(!is_ghost_owner(0, 0, T0, (T0 + GHOST_GRACE_SEC - 1) as u64)); // 1s under the bound
     }
 
     /// Clock-skew defence: a created_at in the future (negative age) counts as young.
     #[test]
-    fn gelecek_tarihli_hesap_hayalet_degil() {
+    fn a_future_dated_account_is_not_a_ghost() {
         assert!(!is_ghost_owner(0, 0, T0 + 3600, T0 as u64));
     }
 }

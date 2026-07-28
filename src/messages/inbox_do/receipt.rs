@@ -77,7 +77,7 @@ impl UserInbox {
             // nobody knows which, which is why it is still open.
             if !uids.is_empty() {
                 console_log!(
-                    "[deliv] uid-only {kind} DUSTU peer={from_peer} uid_sayisi={} (receipt_uid_state yolu bitmedi)",
+                    "[deliv] uid-only {kind} DROPPED peer={from_peer} uid_count={} (the receipt_uid_state path is unfinished)",
                     uids.len()
                 );
             }
