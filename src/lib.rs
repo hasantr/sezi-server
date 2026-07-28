@@ -170,6 +170,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // FCM push config — owner self-service (owner ONLY; WRITE-ONLY: the service
         // account can only be written here, no endpoint ever hands it back).
         .patch_async("/admin/fcm-config", admin::fcm_config::set_fcm_config)
+        .patch_async("/admin/turn-config", admin::turn_config::set_turn_config)
         // Quota epic phase 0: self-reported usage statistics (admin/owner-gated;
         // SHADOW MODE — reporting only, no limit is enforced).
         .get_async("/admin/stats", admin::stats::stats)

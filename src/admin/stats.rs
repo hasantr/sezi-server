@@ -138,6 +138,9 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // returned nowhere, this endpoint included — only this bool. `is_configured`
     // is cheap (no call to Google, presence check only; fails open to false).
     let fcm_mode = crate::push::fcm::mode(&ctx.env).await;
+    // Whether a TURN credential can be issued at all — the owner screen needs it to say
+    // whether calls between DIFFERENT networks will connect. Write-only: the bool only.
+    let turn_configured = crate::turn::is_configured(&ctx.env).await;
     let fcm_configured = fcm_mode != crate::push::fcm::PushMode::Off;
 
     // requests_today — CF's billing-accurate number when available, otherwise the
@@ -283,6 +286,7 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // something they set up. Measured on a fresh self-host server 2026-07-28: zero FCM keys
         // in `server_config` and `fcm_configured` was still true, because the relay default is on.
         "fcm_mode": fcm_mode.as_str(),
+        "turn_configured": turn_configured,
         // v8 (additive, pluggable storage Faz 3): the compact store badge. Detail
         // lives at GET /admin/storage. draining = is any store being emptied
         // (Faz 4 drain).

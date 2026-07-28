@@ -9,7 +9,13 @@
 //! **Budget guard:** CF has no hard spending cap, so to avoid a surprise bill the worker
 //! keeps a monthly counter of issued credentials (`turn_usage`). Once `TURN_MONTHLY_CAP` is
 //! exceeded it issues nothing (`capped`), the client falls back to direct/STUN, and the CF
-//! bill stops there. If the secrets are unset, TURN is simply `disabled`.
+//! bill stops there. If the credentials are unset, TURN is simply `disabled`.
+//!
+//! **Where the credentials come from (the fcm.rs chain, verbatim):** per key, env FIRST and D1
+//! `server_config` second, so an env-set value keeps the production path bit-identical while an
+//! owner with no shell can paste the pair into the Sezi app instead (`PATCH /admin/turn-config`).
+//! Requiring `wrangler secret put` for this was the actual blocker: it puts a beta-blocking feature
+//! behind SSH access to a Raspberry Pi, which no ordinary self-hoster has.
 
 use crate::auth::middleware::require_active_auth;
 use crate::respond::json_err;
@@ -39,6 +45,63 @@ struct UsageRow {
     issued: i64,
 }
 
+/// Trim, and treat an all-whitespace value as absent — a pasted field that looks empty must not
+/// count as configured.
+fn normalize(v: String) -> Option<String> {
+    let t = v.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// One `server_config` row, or None. Mirrors `push/fcm.rs`'s reader; kept local rather than shared
+/// so neither module's read chain can be changed from under the other.
+async fn read_db_config(db: &D1Database, key: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Row {
+        value: String,
+    }
+    let row: Option<Row> = db
+        .prepare("SELECT value FROM server_config WHERE key = ? LIMIT 1")
+        .bind(&[crate::d1util::d1_text(key)])
+        .ok()?
+        .first(None)
+        .await
+        .ok()?;
+    normalize(row?.value)
+}
+
+/// The CF TURN key id: env secret FIRST (the existing production path), then the D1 row the owner
+/// entered from the app.
+async fn resolve_key_id(env: &Env, db: &D1Database) -> Option<String> {
+    if let Some(v) = env.secret("TURN_KEY_ID").ok().and_then(|v| normalize(v.to_string())) {
+        return Some(v);
+    }
+    read_db_config(db, "turn_key_id").await
+}
+
+/// The CF TURN API token: env secret FIRST, then D1. This is the strong half of the pair — it can
+/// mint credentials — which is why writing it is owner-only and no endpoint ever returns it.
+async fn resolve_api_token(env: &Env, db: &D1Database) -> Option<String> {
+    if let Some(v) = env
+        .secret("TURN_API_TOKEN")
+        .ok()
+        .and_then(|v| normalize(v.to_string()))
+    {
+        return Some(v);
+    }
+    read_db_config(db, "turn_api_token").await
+}
+
+/// Is TURN usable — backs `turn_configured` on `/admin/stats` and the `PATCH /admin/turn-config`
+/// response. Both halves must be present; either source counts. Write-only contract: only this bool
+/// ever leaves the server, never a value. Fails open to false (no D1 binding → "not configured"),
+/// because stats must not 500.
+pub async fn is_configured(env: &Env) -> bool {
+    let Ok(db) = env.d1("DB") else {
+        return false;
+    };
+    resolve_key_id(env, &db).await.is_some() && resolve_api_token(env, &db).await.is_some()
+}
+
 /// `POST /turn/credentials` — issue a short-lived CF TURN credential to an authenticated
 /// user, which the client adds to its ICE config. Auth is mandatory: registered users only.
 /// Response: `{iceServers:[...], ttl}` · disabled: `{iceServers:[], disabled:true}` · over
@@ -52,11 +115,14 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
         return Ok(resp);
     }
 
-    // 2. Are the secrets set? If not, TURN is disabled gracefully and the client uses STUN.
-    let key_id = env.secret("TURN_KEY_ID").map(|v| v.to_string()).ok();
-    let api_token = env.secret("TURN_API_TOKEN").map(|v| v.to_string()).ok();
+    // 2. Are the credentials set (env secret, or the D1 row the owner entered from the app)? If
+    //    not, TURN is disabled gracefully and the client uses STUN — a call on the same network
+    //    still works, which is why an unconfigured server is not a broken one.
+    let db = env.d1("DB")?;
+    let key_id = resolve_key_id(env, &db).await;
+    let api_token = resolve_api_token(env, &db).await;
     let (key_id, api_token) = match (key_id, api_token) {
-        (Some(k), Some(t)) if !k.is_empty() && !t.is_empty() => (k, t),
+        (Some(k), Some(t)) => (k, t),
         _ => {
             return Response::from_json(&serde_json::json!({
                 "iceServers": [],
@@ -68,7 +134,6 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
     // 3. Budget guard — the monthly ceiling. Once exceeded, issue NOTHING: the CF bill stops.
     let cap = monthly_cap(env);
     let month = current_month_utc();
-    let db = env.d1("DB")?;
     // Reading the counter fails open: a missing table (migration not applied) or any D1 error
     // counts as 0 and does NOT block issuing — this guard is a cost backstop, not a security
     // control. If the cap is genuinely reached, the counter will say so.
