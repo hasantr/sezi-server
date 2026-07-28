@@ -109,8 +109,14 @@ pub async fn set_fcm_config(mut req: Request, ctx: RouteContext<()>) -> Result<R
     // reports true if env is set) OR when a push relay URL resolves. The relay
     // falls back to a built-in default unless it is explicitly `off`, so this flag
     // does NOT mean "the owner's own FCM credentials are installed".
-    let fcm_configured = crate::push::fcm::is_configured(&ctx.env).await;
-    Response::from_json(&serde_json::json!({ "fcm_configured": fcm_configured }))
+    // `fcm_configured` stays as it was — "will a push go out at all" — because that is what a health
+    // indicator needs. `fcm_mode` answers the different question this screen is actually asking:
+    // own credentials, the shared relay (the default, which the owner did NOT set up), or nothing.
+    let mode = crate::push::fcm::mode(&ctx.env).await;
+    Response::from_json(&serde_json::json!({
+        "fcm_configured": mode != crate::push::fcm::PushMode::Off,
+        "fcm_mode": mode.as_str(),
+    }))
 }
 
 /// Apply a single key. Because `server_config` is key-value, cf_config's

@@ -521,6 +521,13 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         );
                     }
                     if !delivered_live && !body.silent {
+                        // Name the door on the WAKING push as well, not only on the skip. Logging one
+                        // side is how the group path stayed invisible for a round: "a wake happened"
+                        // and "which surface asked for it" are different questions.
+                        console_log!(
+                            "[push] uyandiriyor grup={group_id} user={}",
+                            p.user_id
+                        );
                         crate::push::fcm::maybe_push_wake(
                             &ctx.env, &db, &p.user_id, p.device_id.as_deref(),
                         )
@@ -709,6 +716,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                     );
                 }
                 if !delivered_live && !body.silent {
+                    console_log!("[push] uyandiriyor 1:1 user={recipient_id} dev={:?}", e.device_id);
                     crate::push::fcm::maybe_push_wake(
                         &ctx.env, &db, recipient_id, e.device_id.as_deref(),
                     )

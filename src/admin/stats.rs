@@ -137,7 +137,8 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // credentials. WRITE-ONLY CONTRACT (as with cf_configured): the values are
     // returned nowhere, this endpoint included — only this bool. `is_configured`
     // is cheap (no call to Google, presence check only; fails open to false).
-    let fcm_configured = crate::push::fcm::is_configured(&ctx.env).await;
+    let fcm_mode = crate::push::fcm::mode(&ctx.env).await;
+    let fcm_configured = fcm_mode != crate::push::fcm::PushMode::Off;
 
     // requests_today — CF's billing-accurate number when available, otherwise the
     // self-report usage_counters 'requests' row. Counting every request in D1 is
@@ -278,6 +279,10 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // v7 (additive): "can push be delivered" bool — NEVER the values
         // (write-only).
         "fcm_configured": fcm_configured,
+        // Which of the two ways, so the owner screen can stop implying the shared relay was
+        // something they set up. Measured on a fresh self-host server 2026-07-28: zero FCM keys
+        // in `server_config` and `fcm_configured` was still true, because the relay default is on.
+        "fcm_mode": fcm_mode.as_str(),
         // v8 (additive, pluggable storage Faz 3): the compact store badge. Detail
         // lives at GET /admin/storage. draining = is any store being emptied
         // (Faz 4 drain).

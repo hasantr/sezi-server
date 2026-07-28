@@ -159,13 +159,55 @@ async fn resolve_service_account(env: &Env, db: &D1Database) -> Option<String> {
 /// the relay, it only checks presence — and it fails open to false (no D1 binding means
 /// "not configured"; stats must NEVER 500).
 pub async fn is_configured(env: &Env) -> bool {
+    !matches!(mode(env).await, PushMode::Off)
+}
+
+/// WHICH of the two ways this server can push — the question `is_configured` cannot answer.
+///
+/// `is_configured` answers "will a push go out at all", and that is the right question for a health
+/// indicator. It is the wrong question for the owner's setup screen, where a bare "configured ✓" on a
+/// server whose owner has installed nothing reads as "I set this up" — the relay URL falls back to a
+/// built-in default unless explicitly `off`, so a FRESH self-host server reports true. Measured on
+/// the Pi 2026-07-28: `server_config` holds zero FCM keys and the flag was still true.
+///
+/// Both are exported so each surface asks its own question. This one still leaks no values, only
+/// which of three states the server is in.
+pub async fn mode(env: &Env) -> PushMode {
     let db = match env.d1("DB") {
         Ok(d) => d,
-        Err(_) => return false,
+        Err(_) => return PushMode::Off,
     };
     let own = resolve_project_id(env, &db).await.is_some()
         && resolve_service_account(env, &db).await.is_some();
-    own || resolve_relay_url(env, &db).await.is_some()
+    if own {
+        return PushMode::Own;
+    }
+    if resolve_relay_url(env, &db).await.is_some() {
+        return PushMode::Relay;
+    }
+    PushMode::Off
+}
+
+/// How a server sends push wakes. `Own` = the owner's own FCM project and service account;
+/// `Relay` = the shared push relay (the default, and NOT something the owner configured);
+/// `Off` = neither, so an offline recipient gets no wake at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushMode {
+    Own,
+    Relay,
+    Off,
+}
+
+impl PushMode {
+    /// The wire value for `fcm_mode`. Kept as a lowercase word rather than a number so a log or a
+    /// curl reads without a lookup table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PushMode::Own => "own",
+            PushMode::Relay => "relay",
+            PushMode::Off => "off",
+        }
+    }
 }
 
 /// Service-account JWT → OAuth2 access_token, cached and refreshed with a 60s margin.
