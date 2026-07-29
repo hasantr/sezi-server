@@ -340,7 +340,7 @@ async fn resolve_from_db(
         // the validator ever diverge we do not persist a corrupt value into D1.
         if !validate(&candidate) {
             return Err(Error::RustError(format!(
-                "self_provision: {db_key} uretilen deger validate'i gecemedi (uretici/dogrulayici uyumsuz?)"
+                "self_provision: {db_key} generated value failed validation (generator/validator mismatch?)"
             )));
         }
         db.prepare(
@@ -374,7 +374,7 @@ async fn resolve_from_db(
     // Paranoia (same rationale as above): never persist a corrupt value into D1.
     if !validate(&candidate) {
         return Err(Error::RustError(format!(
-            "self_provision: {db_key} uretilen deger validate'i gecemedi (uretici/dogrulayici uyumsuz?)"
+            "self_provision: {db_key} generated value failed validation (generator/validator mismatch?)"
         )));
     }
     db.prepare(

@@ -138,7 +138,7 @@ pub async fn bootstrap(req: Request, ctx: RouteContext<()>) -> Result<Response> 
                 .bind(&[d1_text(&o.id)])?,
         ])
         .await?;
-        console_log!("bootstrap: hayalet-owner {} temizlendi; genesis akisina donuluyor", o.id);
+        console_log!("bootstrap: ghost owner {} cleared; falling back to the genesis flow", o.id);
         // Fall through to the normal genesis-mint flow below. The old, already
         // redeemed genesis has used=1 so it is not selected, and a fresh token is
         // minted.

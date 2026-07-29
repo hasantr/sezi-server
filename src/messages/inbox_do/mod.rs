@@ -701,16 +701,23 @@ impl UserInbox {
             "INSERT OR IGNORE INTO self_read_meta (k, v) VALUES ('seq', 0)",
             sql_no_args(),
         )?;
-        // ── Codex#5: M4 / msg_uid-only read receipts (sender <-> recipient, without a remote_id) ──
-        // When an M4-restored message (msg_id = NULL) is read, core sends `msg_uids` with an empty
-        // `ids`, which receipt_state's PK(peer_id, remote_id) cannot represent, so it would be
-        // dropped. Hence a SEPARATE uid-keyed table rather than a synthetic remote_id (which would
-        // create semantic debt and collision risk; Codex Q6). It is designed to share the same
-        // `receipt_meta` seq space — the same axis as the receipt flow, a tick for the sender — so a
-        // single cursor covers both.
-        // STATUS: the table and index are created here, but nothing in the worker reads or writes
-        // `receipt_uid_state` yet, and apply_receipt still returns early on an empty `ids`, so
-        // uid-only receipts are still dropped. Schema groundwork only.
+        // ── Codex#5: msg_uid-only read receipts (sender <-> recipient, without a remote_id) ──
+        // A message pulled by M4 link-time sync has msg_id = NULL, which receipt_state's
+        // PK(peer_id, remote_id) cannot represent. Hence a SEPARATE uid-keyed table rather than a
+        // synthetic remote_id (which would create semantic debt and collision risk; Codex Q6),
+        // sharing the `receipt_meta` seq space so a single cursor covers both.
+        //
+        // STATUS: unwritten, and DELIBERATELY so. The premise it was built on — "core sends uids
+        // with an empty ids" — was measured in 2026-07-29 and is FALSE: core skips the receipt
+        // entirely when it has no remote_id, so nothing ever reached the uid branch. #20 closed the
+        // user-visible half on the client instead (a sibling that holds a remote_id relays the
+        // receipt), which is cheaper than a uid-keyed path across worker, protocol and client.
+        //
+        // What this table would still buy: the case where NO device of the account holds a
+        // remote_id — every copy came from M4 and the device that originally received the message
+        // is gone. Then the sender's third tick never arrives for those messages. Narrow, bounded
+        // to messages unread at the moment of the device transition, and self-limiting. Kept as
+        // groundwork; finish it only if that case is ever reported.
         storage.sql().exec_raw(
             "CREATE TABLE IF NOT EXISTS receipt_uid_state (
                 peer_id TEXT NOT NULL,
@@ -857,7 +864,7 @@ impl UserInbox {
             }
         }
         console_log!(
-            "UserInbox: set_alarm 3x fail — alarm zinciri risk (sonraki ws_upgrade re-dener)"
+            "UserInbox: set_alarm failed 3x — the alarm chain is at risk (the next ws_upgrade retries it)"
         );
     }
 

@@ -214,7 +214,7 @@ async fn notify_recipient(
             Err(e) => last_err = e,
         }
     }
-    console_log!("[deliv] W4 notify {NOTIFY_ATTEMPTS} deneme FAIL (recipient={recipient_id})");
+    console_log!("[deliv] W4 notify FAILED after {NOTIFY_ATTEMPTS} attempts (recipient={recipient_id})");
     Err(last_err)
 }
 
@@ -516,7 +516,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         // shipped unnoticed on 2026-07-28 — the 1:1 path was quiet and the
                         // group path was not, and the push log could not tell them apart.
                         console_log!(
-                            "[push] atlandi (silent) grup={group_id} user={} dev={:?}",
+                            "[push] skipped (silent) group={group_id} user={} dev={:?}",
                             p.user_id, p.device_id
                         );
                     }
@@ -711,7 +711,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 // 2026-07-28 measurement found burning three cold starts per desktop launch.
                 if !delivered_live && body.silent {
                     console_log!(
-                        "[push] atlandi (silent) 1:1 user={recipient_id} dev={:?}",
+                        "[push] skipped (silent) 1:1 user={recipient_id} dev={:?}",
                         e.device_id
                     );
                 }

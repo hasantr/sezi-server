@@ -66,18 +66,23 @@ impl UserInbox {
         ts_ms: i64,
     ) {
         if ids.is_empty() {
-            // uid-only receipt: an M4-restored message has no `remote_id`, so `receipt_state`'s
-            // PK(peer_id, remote_id) cannot represent it and the receipt is DROPPED here. The
-            // `receipt_uid_state` table exists for exactly this case and nothing reads or writes it
-            // yet (see the note where it is created).
+            // A uid-only receipt cannot be keyed: `receipt_state`'s PK is (peer_id, remote_id).
             //
-            // Logged rather than left silent so the debt is MEASURED instead of argued about. If this
-            // line never appears in a `wrangler tail`, the gap costs nothing in practice and the
-            // table can go; if it appears often, that is the signal to finish the path. Right now
-            // nobody knows which, which is why it is still open.
+            // This branch is UNREACHABLE from every current caller, which was measured, not
+            // assumed: `handlers::read` 400s on an empty `ids`, the WS `read` arm requires
+            // `!ids.is_empty()` to be valid, the WS `ack` arm returns early on one, and the
+            // client skips the receipt when it has no remote_id. So the log below is NOT a
+            // debt meter — a zero in `wrangler tail` says nothing about the gap it was
+            // written to measure, and reading it that way is how it stayed open. It is now an
+            // ALARM: a hit means a caller lost its guard.
+            //
+            // The real gap lives on the client and is closed there (#20): a device whose row
+            // came from M4 link-time sync has `msg_id: None`, so the sibling that DOES hold a
+            // remote_id relays the receipt (`handle_read_self_sync`). What remains is only the
+            // case where NO device of the account holds one — see `receipt_uid_state`.
             if !uids.is_empty() {
                 console_log!(
-                    "[deliv] uid-only {kind} DROPPED peer={from_peer} uid_count={} (the receipt_uid_state path is unfinished)",
+                    "[deliv] INVARIANT: uid-only {kind} reached apply_receipt peer={from_peer} uid_count={} — a caller's empty-ids guard is missing",
                     uids.len()
                 );
             }
