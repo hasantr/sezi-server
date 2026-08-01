@@ -1,0 +1,32 @@
+# Line-ending policy — repository normalises everything to LF.
+#
+# Edited from both Linux and Windows against the same GitHub remote, but
+# deployed only to Linux. CRLF that survives into deploy/ is not cosmetic:
+# systemd refuses unit files with CRLF and a shell script with CRLF fails with
+# a bare-carriage-return error. Storing and checking out LF removes the class.
+* text=auto eol=lf
+
+# Deployment artefacts that must be LF on the target host.
+*.sh      text eol=lf
+*.service text eol=lf
+*.timer   text eol=lf
+*.sql     text eol=lf
+
+# Windows-only script hosts genuinely need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets — never touch, never diff as text.
+*.wasm binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.ttf  binary
+*.woff  binary
+*.woff2 binary
+*.pdf  binary
+*.zip  binary
+*.db   binary
+*.sqlite binary
+*.sqlite3 binary
