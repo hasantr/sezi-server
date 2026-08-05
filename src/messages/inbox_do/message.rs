@@ -65,7 +65,7 @@ pub(crate) fn ws_attachment_device(ws: &WebSocket) -> Option<String> {
     ws.deserialize_attachment::<Attachment>()
         .ok()
         .flatten()
-        .and_then(|a| a.device_id)
+        .map(|a| a.device_id)
 }
 
 /// M2-S2.2: build the recipient frame from a pending row (it carries sender_device_id).
@@ -241,7 +241,7 @@ impl UserInbox {
                             Some(vec![JsValue::from_f64(evict as f64)]),
                         );
                         worker::console_log!(
-                            "[deliv] W2 pending-cap: {evict} en-eski satir evict (recipient bloat guard, count={})",
+                            "[deliv] W2 pending-cap: evicted {evict} oldest rows (recipient bloat guard, count={})",
                             cnt.n
                         );
                     }
@@ -356,14 +356,6 @@ impl UserInbox {
                 created_at: now,
                 delivered_live,
             });
-        }
-    }
-
-    pub(crate) fn forward_typing_inner(&self, sender_id: &str) {
-        let payload =
-            serde_json::json!({ "type": "typing", "from": sender_id }).to_string();
-        for ws in self.state.get_websockets() {
-            let _ = ws.send_with_str(payload.as_str());
         }
     }
 

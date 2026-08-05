@@ -23,7 +23,7 @@
 
 use crate::auth::hashing::sha256_hex;
 use crate::auth::jwt::sign_access_token;
-use crate::auth::middleware::require_auth;
+use crate::auth::middleware::require_active_auth;
 use crate::d1util::{d1_blob, d1_int, d1_opt_text, d1_text};
 use crate::respond::json_err;
 use crate::utils::{b64_decode, b64u_encode, now_secs, random_bytes};
@@ -166,10 +166,39 @@ struct LinkRow {
 
 /// `POST /devices/link-approve` (PRIMARY-AUTH) — the primary approves the new list.
 pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let auth_user = match require_auth(&req, &ctx.env) {
-        Ok(u) => u,
+    // Like `PUT /devices/list`, this call WRITES THE DEVICE LIST — it goes through the very same
+    // `validate_and_store_signed_list`, so it decides which devices exist and which are revoked.
+    // It used to gate on the bare stateless JWT, which proves a signature and an expiry and
+    // nothing else. A device revoked a minute ago therefore kept this endpoint for the rest of
+    // its ~15-minute access-token TTL, and this is the worst one to keep: approving attaches a
+    // NEW device of the attacker's choosing to the account and mints that device a fresh 30-day
+    // refresh token, which outlives the revocation that was supposed to end the session.
+    //
+    // Unlike `put_list` this takes the STRICTER gate. `put_list` must settle for
+    // `require_existing_account_auth` + `device_revoked` because it is the statement that CREATES
+    // the first `devices` rows: a fresh registration publishes rev=1 before any row exists, so an
+    // active-device proof there would deadlock the bootstrap. No bootstrap runs through HERE. An
+    // approver is by definition an ALREADY-LINKED primary — the doc it submits must be the
+    // account's existing list at rev+1, signed by the primary key bound to the stored SPK — and
+    // publishing that list is precisely what created its own `devices` row. So
+    // `require_active_auth` failing CLOSED on a missing row is correct here rather than a
+    // lockout: a caller with no device row cannot legitimately be approving anything. Nor is it a
+    // new class of failure, since the same account already cannot hold the `/sync` WebSocket
+    // without an active row (`sync_ws` → `validate_active_token`).
+    //
+    // One call covers both halves: the account must still exist (a kicked user's live token
+    // cannot graft a device onto a deleted account) AND the calling device must be present and
+    // unrevoked. Both halves always run: since d5ad1843 the `device_id` claim is mandatory at the
+    // type level, so a token without one fails to deserialize and never reaches this gate. The
+    // device-less exemption this comment used to describe no longer has a population or a path.
+    //
+    // Failure codes new to this endpoint: 401 inactive_account · 401 inactive_device ·
+    // 503 auth_check_unavailable.
+    let auth = match require_active_auth(&req, &ctx.env).await {
+        Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
+    let auth_user = auth.user_id;
 
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,
@@ -248,7 +277,7 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
 
     // Mint the tokens in memory only: an access JWT, plus a refresh token delivered in
     // plaintext while only its hash is stored.
-    let access = sign_access_token(&ctx.env, &auth_user, Some(&link.new_device_id))?;
+    let access = sign_access_token(&ctx.env, &auth_user, &link.new_device_id)?;
     let refresh = b64u_encode(&random_bytes(32));
     let refresh_hash = sha256_hex(&refresh);
 
@@ -472,3 +501,7 @@ async fn primary_ed_pub_b64(db: &D1Database, user_id: &str) -> Result<Option<Str
         .find(|d| d.role == "primary")
         .map(|d| d.ed_pub_b64))
 }
+
+#[cfg(test)]
+#[path = "link_tests.rs"]
+mod tests;

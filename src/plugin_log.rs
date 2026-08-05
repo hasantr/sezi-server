@@ -11,8 +11,7 @@
 //! reading CLIENT verifies `sig`, so not even a malicious SERVER can (signing/decryption live in
 //! CORE, Faz-3). The DO is nothing but opaque storage plus a sequencer.
 
-use crate::auth::jwt::device_id_from_token;
-use crate::auth::middleware::{device_revoked, extract_bearer, require_auth};
+use crate::auth::middleware::{device_revoked, require_auth_device};
 use crate::groups::group_role;
 use crate::messages::inbox_do::sql_no_args;
 use crate::respond::json_err;
@@ -310,8 +309,8 @@ pub async fn bump_epoch_floor(db: &D1Database, room_id: &str) -> Result<()> {
 /// `POST /plugin-log/:room/:plugin/append` — validate JWT + active membership + author binding, then
 /// forward to the DO.
 pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(u) => u,
+    let (user_id, device_id) = match require_auth_device(&req, &ctx.env) {
+        Ok(pair) => pair,
         Err(resp) => return Ok(resp),
     };
     // Per-user append rate limit (the message-send pattern; guards against DoS/log inflation).
@@ -327,11 +326,6 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // unrelated subsystem that arrived later — and the label's original meaning is not recoverable from
     // the code, so it is gone rather than guessed at. An initialism that collides with a real module
     // name is worse than no initialism.)
-    let token_device =
-        extract_bearer(&req).and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
-    let Some(device_id) = token_device else {
-        return json_err(403, "device_required");
-    };
     if device_revoked(&ctx.env, &user_id, &device_id).await? {
         return json_err(401, "device_revoked");
     }
@@ -414,18 +408,13 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 /// `GET /plugin-log/:room/:plugin/sync?since=` — JWT + active membership → the entries after the
 /// cursor, from the DO.
 pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(u) => u,
+    let (user_id, device_id) = match require_auth_device(&req, &ctx.env) {
+        Ok(pair) => pair,
         Err(resp) => return Ok(resp),
     };
     // Device binding + revoked gate (B6 — Codex HIGH: append had it, sync did NOT, so a removed or
     // revoked device could still PULL server-log ciphertext for as long as its access token lived —
     // short, but not zero. Mirror the append pattern: extract the token device, revoked → 401).
-    let token_device =
-        extract_bearer(&req).and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
-    let Some(device_id) = token_device else {
-        return json_err(403, "device_required");
-    };
     if device_revoked(&ctx.env, &user_id, &device_id).await? {
         return json_err(401, "device_revoked");
     }

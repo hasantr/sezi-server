@@ -1,5 +1,4 @@
-use crate::auth::jwt::device_id_from_token;
-use crate::auth::middleware::{device_revoked, extract_bearer, require_auth};
+use crate::auth::middleware::{device_revoked, require_auth, require_auth_device};
 use crate::d1util::{d1_int, d1_text};
 use crate::respond::{json_err, no_content};
 use crate::utils::now_secs;
@@ -14,17 +13,10 @@ struct RegisterBody {
 }
 
 pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let (user_id, claim_dev) = match require_auth_device(&req, &ctx.env) {
+        Ok(pair) => pair,
         Err(resp) => return Ok(resp),
     };
-    // HARDENING (2026-06-25, Codex HIGH + audit #10): the `device_id` claim in the token
-    // MUST match body.device_id, so a user cannot register a push token on behalf of ANOTHER
-    // device using their own identity (device impersonation plus waking the wrong device).
-    // With no claim at all (a legacy device-less token) we keep the old behaviour for
-    // backwards compatibility.
-    let claim_dev = extract_bearer(&req)
-        .and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
     let body: RegisterBody = match req.json().await {
         Ok(b) => b,
         Err(_) => return json_err(400, "bad_request"),
@@ -37,10 +29,12 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     {
         return json_err(400, "bad_request");
     }
-    if let Some(cd) = &claim_dev {
-        if cd != &body.device_id {
-            return json_err(403, "device_mismatch");
-        }
+    // HARDENING (2026-06-25, Codex HIGH + audit #10): the `device_id` claim in the token
+    // MUST match body.device_id, so a user cannot register a push token on behalf of ANOTHER
+    // device using their own identity (device impersonation plus waking the wrong device).
+    // This used to be skipped for a token carrying no claim; there is no such token.
+    if claim_dev != body.device_id {
+        return json_err(403, "device_mismatch");
     }
     // A revoked device may not register a push token. FAIL-CLOSED (W7, flagged by Codex
     // 2026-07-02): this used to be `.unwrap_or(false)`, i.e. a D1 error was read as "not
@@ -49,8 +43,15 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     // (`lib.rs`'s `sync_ws` route,
     // Err→503): during a D1 error window a revoked device could register a push token and
     // keep receiving wakes. Now it is at fail-closed parity with both.
+    //
+    // 401, not 403. This answered 403 while every other site raising `device_revoked` answers
+    // 401 — `auth/refresh.rs`, `auth/relogin.rs`, `devices/handlers.rs`, `keys/handlers.rs`
+    // (replenish and rotate), `messages/handlers.rs`, `plugin_log.rs`, `plugin_blob.rs` and
+    // `groups.rs`. One condition must not have two statuses: a client keys its "this device is
+    // finished, stop retrying and re-auth" branch on the status, and the odd one out reads as
+    // "you are authenticated but not allowed to do THIS", which is the wrong instruction.
     match device_revoked(&ctx.env, &user_id, &body.device_id).await {
-        Ok(true) => return json_err(403, "device_revoked"),
+        Ok(true) => return json_err(401, "device_revoked"),
         Ok(false) => {}
         Err(_) => return json_err(503, "revoke_check_unavailable"),
     }

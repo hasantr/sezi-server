@@ -33,12 +33,14 @@ struct VerifyBody {
     signed_prekey: PrekeyBundle,
     otks: Vec<Otk>,
     display_name: Option<String>,
-    // M2-S1 (optional; an older body without these works EXACTLY as before):
-    // device_id = this installation's device identity (16 hex chars);
-    // identity_ed_pub_b64 = the user's Ed25519 signing public key (base64). When
-    // absent, the pre-M2-S1 behaviour applies.
-    #[serde(default)]
-    device_id: Option<String>,
+    /// This installation's device identity (16 hex chars). MANDATORY: it becomes the
+    /// `device_id` claim of every token this account will ever hold, and the scope of its
+    /// signed prekey and OTK pool. An account registered without one had no device to address
+    /// and fell back to a `''` sentinel slot that nothing scoped; that population is gone.
+    device_id: String,
+    /// The user's Ed25519 signing public key (base64). Still optional, and NOT part of the
+    /// device work: when absent `users.identity_ed_pub` is NULL and `auth::relogin` backfills
+    /// it from the key its challenge signature proves.
     #[serde(default)]
     identity_ed_pub_b64: Option<String>,
 }
@@ -85,6 +87,12 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 
     if body.code.len() != 6 || !body.code.chars().all(|c| c.is_ascii_digit()) {
         return json_err(400, "bad_request");
+    }
+    // `''` was the sentinel the device-less population wrote under, so an empty string here is
+    // that population arriving by another name and must be refused with the same answer as a
+    // missing field.
+    if body.device_id.is_empty() || body.device_id.len() > 128 {
+        return json_err(400, "device_required");
     }
     if body.otks.len() > 100 {
         return json_err(400, "bad_request");
@@ -191,7 +199,7 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Some(s) => Some(b64_decode(s).map_err(|_| Error::RustError("bad ed pub".into()))?),
         None => None,
     };
-    let device_id = body.device_id.as_deref();
+    let device_id = body.device_id.as_str();
 
     // SELF-HEAL ORDERING (2026-07-06 sezi-server2 incident): sign the token BEFORE any
     // DB write. The old flow signed AFTER the user INSERT (and after the invite/code
@@ -272,14 +280,12 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         d1_blob(&spk_pub),
         d1_blob(&spk_sig),
         d1_int(now as i64),
-        d1_text(device_id.unwrap_or("")), // device_id is NOT NULL DEFAULT '' (mig 0015) -> sentinel
+        d1_text(device_id),
     ])?
     .run()
     .await?;
 
     // Batch-insert the OTKs in groups of 20 to stay under D1's placeholder limit.
-    // M2-S1 added the device_id column; when the body omits it we bind the ''
-    // sentinel (see the NOT NULL note below), which marks legacy/primary.
     if !body.otks.is_empty() {
         for chunk in body.otks.chunks(20) {
             let mut sql = String::from(
@@ -303,10 +309,9 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
                 // (parity with replenish).
                 binds.push(d1_prekey_id(k.prekey_id));
                 binds.push(d1_blob(p));
-                // mig 0016: one_time_prekeys.device_id is NOT NULL DEFAULT '', so
-                // binding NULL would violate NOT NULL; legacy/primary uses the ''
-                // sentinel (the primary key is device-scoped).
-                binds.push(d1_text(device_id.unwrap_or("")));
+                // The pool is device-scoped: this is the pool `keys::bundle` serves peers from
+                // for this device, and the one `keys::replenish` tops up.
+                binds.push(d1_text(device_id));
             }
             db.prepare(&sql).bind(&binds)?.run().await?;
         }
@@ -405,7 +410,7 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         d1_text(&user_id),
         d1_int((now + REFRESH_TTL_SEC) as i64),
         d1_int(now as i64),
-        d1_opt_text(device_id),
+        d1_text(device_id),
     ])?
     .run()
     .await?;

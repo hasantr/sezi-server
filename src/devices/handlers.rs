@@ -28,7 +28,7 @@
 //! device_lists.rev` plus RETURNING): two concurrent writers (link-approve and put_list)
 //! cannot fall into a read-then-write race, and the loser gets a 409.
 
-use crate::auth::middleware::{require_active_auth, require_auth};
+use crate::auth::middleware::{device_revoked, require_active_auth, require_existing_account_auth};
 use crate::d1util::{d1_blob, d1_int, d1_opt_text, d1_text};
 use crate::respond::json_err;
 use crate::utils::{b64_decode, now_ms, now_secs};
@@ -106,10 +106,32 @@ fn list_read_requires_active_device(caller: &str, target: &str) -> bool {
 /// `PUT /devices/list` — upload the primary-signed device list.
 /// A thin wrapper: auth + rate-limit + body → `validate_and_store_signed_list`.
 pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let auth_user = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    // This is the endpoint that DECIDES which devices exist and which are revoked, and it used
+    // to gate on the bare stateless JWT alone — neither account existence nor device revocation.
+    // Its siblings (`messages::handlers::send`, `plugin_blob::gate`, `push::register`) all check
+    // both, and here the gap mattered most: a revoked device's access token stays valid for its
+    // 15-minute TTL, and this is the one call that could publish a list reinstating it.
+    //
+    // It deliberately does NOT use `require_active_auth`. A fresh registration must publish
+    // rev=1 BEFORE any `devices` row exists — registration writes `users`, `signed_prekeys` and
+    // the OTK pool, but the first `devices` rows are created by THIS handler — so demanding an
+    // active-device proof would deadlock the bootstrap in exactly the way described for the
+    // self-read in `get_list` below. The two halves are therefore taken separately:
+    //   * `require_existing_account_auth` — the account must still exist (so a kicked user's
+    //     15-minute token cannot rewrite a device list), which is the same narrow exception
+    //     `get_list` already relies on at bootstrap.
+    //   * `device_revoked` — fail-closed for a device explicitly carrying `revoked_at`, and
+    //     false for a device with no row yet (the bootstrap). That is precisely the shape the
+    //     bootstrap needs: a device that has never been listed cannot have been revoked from a
+    //     list.
+    let auth = match require_existing_account_auth(&req, &ctx.env).await {
+        Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
+    let auth_user = auth.user_id;
+    if device_revoked(&ctx.env, &auth_user, &auth.device_id).await? {
+        return json_err(401, "device_revoked");
+    }
 
     // Rate-limit: a rarely called endpoint, so this is cheap protection built on the existing
     // KV sliding window. The KV binding is OPTIONAL (template diet): with none we continue
@@ -239,18 +261,17 @@ pub(crate) async fn validate_and_store_signed_list(
     // row" selection would check the primary's list-signature binding against the LINKED
     // device's SPK → identity_mismatch → the primary could no longer publish lists or remove
     // devices, breaking S3.5 revoke. Prefer the row matching the primary entry's device_id.
+    // EXACTLY the primary's slot: the `device_id IS NULL OR device_id = ''` widening is gone with
+    // the device-less write that filled it, so the primary can no longer be verified against a
+    // key that landed in an unscoped slot.
     let primary_dev = primary.device_id.as_str();
     let spk: Option<SpkRow> = db
         .prepare(
             "SELECT prekey_pub, signature FROM signed_prekeys
-             WHERE user_id = ? AND (device_id = ? OR device_id IS NULL OR device_id = '')
-             ORDER BY CASE WHEN device_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1",
+             WHERE user_id = ? AND device_id = ?
+             ORDER BY created_at DESC LIMIT 1",
         )
-        .bind(&[
-            d1_text(auth_user),
-            d1_text(primary_dev),
-            d1_text(primary_dev),
-        ])?
+        .bind(&[d1_text(auth_user), d1_text(primary_dev)])?
         .first(None)
         .await?;
     let spk = match spk {
@@ -448,11 +469,12 @@ pub(crate) async fn validate_and_store_signed_list(
 
     // 4) M2-S3.5 B4 (device removal): DELETE the refresh tokens of every real device_id ABSENT
     //    from the new list, so a removed device cannot renew its token — its session dies once
-    //    the 15-minute access-token TTL expires — and relogin rejects it as revoked. Legacy
-    //    NULL/'' device_ids are PRESERVED.
+    //    the 15-minute access-token TTL expires — and relogin rejects it as revoked. The
+    //    `device_id IS NOT NULL AND device_id != ''` carve-out that preserved rows belonging to
+    //    no device is gone: every refresh row names a device now, so it exempted nothing.
     let del_sql = format!(
         "DELETE FROM refresh_tokens
-         WHERE user_id = ? AND device_id IS NOT NULL AND device_id != '' AND device_id NOT IN ({placeholders})
+         WHERE user_id = ? AND device_id NOT IN ({placeholders})
            AND (SELECT doc_json FROM device_lists WHERE user_id = ?) = ?"
     );
     let mut del_binds: Vec<wasm_bindgen::JsValue> = Vec::with_capacity(3 + decoded.len());
@@ -475,7 +497,7 @@ pub(crate) async fn validate_and_store_signed_list(
     let del_otk_sql = format!(
         "DELETE FROM one_time_prekeys
          WHERE user_id = ? AND consumed = 0
-           AND device_id IS NOT NULL AND device_id != '' AND device_id NOT IN ({placeholders})
+           AND device_id NOT IN ({placeholders})
            AND (SELECT doc_json FROM device_lists WHERE user_id = ?) = ?"
     );
     let mut del_otk_binds: Vec<wasm_bindgen::JsValue> = Vec::with_capacity(3 + decoded.len());

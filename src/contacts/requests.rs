@@ -39,7 +39,7 @@ async fn verify_request_signature(
     auth: &ActiveAuth,
     body: &CreateRequestBody,
 ) -> std::result::Result<(), Response> {
-    if auth.device_id.as_deref() != Some(body.device_id.as_str()) {
+    if auth.device_id != body.device_id {
         return Err(json_err(403, "active_device_required").unwrap());
     }
     let expected = match crate::server::handlers::server_instance_fingerprint(env) {

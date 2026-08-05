@@ -2,8 +2,8 @@
 //!
 //! FIELD RATIONALE: on a fresh install, clicking the workers.dev address in a browser
 //! used to show a 404 or bare JSON, which answers "is my server running?" with zero
-//! confidence. This page gives a human-readable answer in three states (the rendered
-//! copy is Turkish):
+//! confidence. This page gives a human-readable answer in three states, in English or Turkish
+//! (`Lang::from_accept_language`, defaulting to English):
 //!   - NO owner (fresh install): "your server is ready" + copy-the-address + paste-it
 //!     into-the-app instructions + the GENESIS CODE (Hasan's 2026-07-07 call: a visible
 //!     fallback for when the app's automatic genesis fetch fails). Security-equivalent:

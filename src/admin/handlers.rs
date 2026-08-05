@@ -619,7 +619,7 @@ pub async fn remove_member(mut req: Request, ctx: RouteContext<()>) -> Result<Re
         crate::membership::RemovalReason::Removed,
         crate::membership::RemovalAuthority::Administrator {
             caller_id: &caller,
-            caller_device_id: caller_auth.device_id.as_deref(),
+            caller_device_id: &caller_auth.device_id,
         },
     )
     .await

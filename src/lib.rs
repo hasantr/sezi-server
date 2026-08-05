@@ -112,7 +112,16 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         return sync_ws(req, env).await;
     }
 
-    Router::new()
+    // CORS preflight. A browser sends this before any request that carries `Authorization`, and
+    // it never reaches the router — there is no `OPTIONS` route and adding sixty of them would
+    // be the wrong shape. See `cors_headers` for why the policy is what it is.
+    if req.method() == Method::Options {
+        let mut resp = Response::empty()?.with_status(204);
+        apply_cors(resp.headers_mut())?;
+        return Ok(resp);
+    }
+
+    let mut resp = Router::new()
         // Root = welcome page (human-readable; a fresh install shows "your server is
         // ready" plus copy-the-address instructions instead of an alarming 404).
         // The API surface is untouched.
@@ -142,6 +151,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             admin::handlers::transfer_ownership,
         )
         .patch_async("/admin/server-settings", admin::handlers::update_settings)
+        // Owner-only DATA wipe, gated a second time by the `RESET_PASSWORD` secret — a server that
+        // never set one cannot be wiped over the network at all. See admin/reset.rs.
+        .post_async("/admin/reset", admin::reset::reset)
+        // The destruction kit itself: the owner sets it from the app, so a server deployed with the
+        // dashboard button is not left unable to reset itself for want of shell access.
+        .post_async("/admin/reset-key", admin::reset::set_reset_key)
         // Virtual server directory + account-level contacts (V2). Directory
         // pages never expose email, last-seen, devices or raw key material.
         .get_async("/directory", contacts::directory)
@@ -174,8 +189,11 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // Quota epic phase 0: self-reported usage statistics (admin/owner-gated;
         // SHADOW MODE — reporting only, no limit is enforced).
         .get_async("/admin/stats", admin::stats::stats)
-        // Server-wide plugin policy. GET = require_auth, i.e. any authenticated caller
-        // (their plugin picker filters on the result); POST = require_admin (admin|owner).
+        // Server-wide plugin policy. GET = require_active_auth, i.e. any caller whose account
+        // still exists and whose token-bound device is not revoked (their plugin picker filters
+        // on the result); POST = require_admin (admin|owner). Not `require_auth`: that one gates
+        // on the stateless JWT alone, and a revoked device's access token stays valid for ~15
+        // minutes — `admin/mod.rs` has a test that fails the build if an admin module uses it.
         // DISABLED-only storage: a row means the plugin is disabled.
         .get_async("/plugin-policy", admin::plugin_policy::get_plugin_policy)
         .post_async(
@@ -260,7 +278,52 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // budget-gated).
         .post_async("/turn/credentials", turn::credentials)
         .run(req, env)
-        .await
+        .await?;
+    apply_cors(resp.headers_mut())?;
+    Ok(resp)
+}
+
+/// Let a browser talk to this server.
+///
+/// Native clients never needed this: an app makes the request it means to make. A page cannot —
+/// the browser refuses to hand back a cross-origin response unless the server says it may, and
+/// with an `Authorization` header it will not even send the request until a preflight `OPTIONS`
+/// says the header is allowed. Without these five lines the web client fails on every call,
+/// before anything reaches D1, with an error the page is not told the reason for.
+///
+/// **`*`, and it is not a weakening.** CORS is not an authorization boundary — it never was. It
+/// governs what one ORIGIN may read from another in a browser, and this API is authorized by a
+/// bearer token that a page can only hold if the user put it there. Anything a hostile page could
+/// reach with `*` it could already reach with curl, minus the token, which is exactly what
+/// `Allow-Origin: *` also forbids: the wildcard makes credentialed requests illegal, so no cookie
+/// or client certificate can ride along even if one existed.
+///
+/// The alternative — echoing back an allow-list of origins — buys nothing here. A self-hosted
+/// Sezgi server has no idea which page its owner will run the web client from, and an allow-list
+/// nobody can populate is a list of one wildcard written the long way.
+///
+/// `/sync` is not covered and does not need to be: a WebSocket handshake is exempt from the
+/// same-origin policy, which is also why its token travels as a subprotocol.
+fn apply_cors(headers: &mut Headers) -> Result<()> {
+    headers.set("Access-Control-Allow-Origin", "*")?;
+    headers.set(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    )?;
+    // `x-sezi-scope-*` is the media upload's group gate (`media/handlers.rs`). A header the client
+    // sends but this list omits fails the preflight, and the browser reports it as a generic CORS
+    // failure — so the two have to be kept in step by hand.
+    headers.set(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type, x-sezi-scope-kind, x-sezi-scope-id",
+    )?;
+    // Without this a page can read only the six CORS-safelisted response headers, so
+    // `content-length` — which the media download path checks before allocating — comes back
+    // absent rather than wrong.
+    headers.set("Access-Control-Expose-Headers", "Content-Length, Content-Type")?;
+    // One preflight per day per (origin, method, header set) instead of one per request.
+    headers.set("Access-Control-Max-Age", "86400")?;
+    Ok(())
 }
 
 async fn jwks(_req: Request, ctx: RouteContext<()>) -> Result<Response> {

@@ -15,8 +15,7 @@
 //! wire). The server CANNOT read the code; integrity is double-checked on the client via
 //! `blob_hash` (BLAKE3) and the AEAD tag.
 
-use crate::auth::jwt::device_id_from_token;
-use crate::auth::middleware::{device_revoked, extract_bearer, require_auth};
+use crate::auth::middleware::{device_revoked, require_auth_device};
 use crate::d1util::{d1_int, d1_text};
 use crate::groups::{group_role, is_group_admin};
 use crate::respond::json_err;
@@ -37,19 +36,19 @@ const MAX_CODE_SIZE: u64 = 8 * 1024 * 1024 + 64 * 1024;
 /// (device-revoked + active membership); it has no admin check and simply ignores `role`. Defining
 /// the IDOR/revoke gate once keeps the two channels from diverging.
 pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::Result<(String, String, String, String), Response> {
-    let user_id = require_auth(req, &ctx.env)?;
     // Device binding + revoked (the B6 pattern): a removed or revoked device must not be able to
     // fetch or upload code for the remaining lifetime of its token.
-    let token_device =
-        extract_bearer(req).and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
-    let device_id = match token_device {
-        Some(d) => d,
-        None => return Err(json_err(403, "device_required").unwrap_or_else(|_| Response::empty().unwrap())),
-    };
+    let (user_id, device_id) = require_auth_device(req, &ctx.env)?;
+    // 503, NOT 500, for every transient dependency failure in this gate — and the same spelling
+    // the rest of the worker uses. A failed revoke check is "ask again shortly", which is what a
+    // client's retry classification keys on; 500 says "this request is broken, do not repeat it",
+    // so a D1 wobble turned a retryable blip into a hard plugin-code failure. `groups.rs` already
+    // answers `503 revoke_check_unavailable` for this exact check and `auth/middleware.rs` answers
+    // `503 auth_check_unavailable`; this gate was the outlier on both status and name.
     match device_revoked(&ctx.env, &user_id, &device_id).await {
         Ok(true) => return Err(json_err(401, "device_revoked").unwrap_or_else(|_| Response::empty().unwrap())),
         Ok(false) => {}
-        Err(_) => return Err(json_err(500, "revoked_check_failed").unwrap_or_else(|_| Response::empty().unwrap())),
+        Err(_) => return Err(json_err(503, "revoke_check_unavailable").unwrap_or_else(|_| Response::empty().unwrap())),
     }
     let room_id = match ctx.param("room") {
         Some(r) => r.clone(),
@@ -60,14 +59,17 @@ pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::
         None => return Err(json_err(400, "bad_request").unwrap_or_else(|_| Response::empty().unwrap())),
     };
     // Active-membership gate (anti-IDOR: a non-member can neither fetch nor upload code).
+    // Both of these are the same class as the revoke check above: the database is momentarily
+    // unreachable, not the request malformed. 503 so the client retries instead of surfacing a
+    // permanent failure. `not_member` stays 403 — that one IS a verdict about the caller.
     let db = match ctx.env.d1("DB") {
         Ok(d) => d,
-        Err(_) => return Err(json_err(500, "db_unavailable").unwrap_or_else(|_| Response::empty().unwrap())),
+        Err(_) => return Err(json_err(503, "db_unavailable").unwrap_or_else(|_| Response::empty().unwrap())),
     };
     let role = match group_role(&db, &room_id, &user_id).await {
         Ok(Some(r)) => r,
         Ok(None) => return Err(json_err(403, "not_member").unwrap_or_else(|_| Response::empty().unwrap())),
-        Err(_) => return Err(json_err(500, "role_check_failed").unwrap_or_else(|_| Response::empty().unwrap())),
+        Err(_) => return Err(json_err(503, "role_check_unavailable").unwrap_or_else(|_| Response::empty().unwrap())),
     };
     Ok((user_id, room_id, blob_id, role))
 }

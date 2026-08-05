@@ -1,29 +1,23 @@
-use crate::auth::middleware::{require_active_auth, require_auth};
+use crate::auth::middleware::{require_active_auth, require_auth_device};
 use crate::d1util::{d1_blob, d1_int, d1_prekey_id, d1_text};
 use crate::ratelimit::check_rate_limit_env;
 use crate::respond::{json_err, no_content};
 use crate::utils::{b64_decode, b64_encode, now_secs};
+use ed25519_dalek::{Verifier, VerifyingKey};
 use serde::Deserialize;
 use worker::*;
+
+// The per-device bundle slot lifted out under the 800-line ceiling, declared here rather than in
+// `keys/mod.rs` so the routed handlers stay the whole of `keys::handlers` from the outside — the
+// shape `groups.rs` uses for its own four lifted blocks.
+#[path = "bundle_slot.rs"]
+mod bundle_slot;
+
+use bundle_slot::build_device_bundle;
 
 #[derive(Deserialize)]
 struct UserRow {
     identity_pubkey: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct SpkRow {
-    prekey_id: i64,
-    prekey_pub: Vec<u8>,
-    signature: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct OtkRow {
-    #[allow(dead_code)] // part of the D1 row shape: returned by the query, never read in Rust
-    id: i64,
-    prekey_id: i64,
-    prekey_pub: Vec<u8>,
 }
 
 /// M2-S2.3 bundle v2: an active device row — the server-side projection of the verified
@@ -108,9 +102,13 @@ pub async fn bundle(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         None => serde_json::Value::Null,
     };
 
-    // Active devices (revoked_at IS NULL). If empty — pre-M1, or no device list published
-    // yet — fall back to legacy: a single "primary" slot with no device_id, preserving the
-    // old single-device behaviour where SPK and OTK are claimed without a device filter.
+    // Active devices (revoked_at IS NULL). Empty means the target registered but has not run
+    // its first `PUT /devices/list` yet — a live bootstrap window, NOT a legacy population:
+    // `auth::verify` writes `users`, the SPK and the OTK pool, and only this handler's sibling
+    // creates `devices` rows. Fall back to one device-blind slot so a peer can still reach them.
+    // Their SPK and OTKs are device-scoped and they own exactly one device, so the unfiltered
+    // queries below select that device's material; only the reported `device_id` is unknown, and
+    // core resolves it from the device list once published.
     let devices: Vec<DeviceRow> = db
         .prepare(
             "SELECT device_id FROM devices
@@ -155,145 +153,31 @@ pub async fn bundle(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     }))
 }
 
-/// M2-S2.3: build the bundle slot for one device (its own SPK plus an OTK claim). `device`
-/// None means the legacy device-unfiltered path (old single-device compatibility). A device
-/// with no SPK is skipped by returning None, so it does not appear in the bundle; if no
-/// device has an SPK, `devices` ends up empty.
-async fn build_device_bundle(
-    db: &D1Database,
-    target_id: &str,
-    device: Option<&str>,
-) -> Result<Option<serde_json::Value>> {
-    // Newest SPK, scoped by device (a NULL device_id must still match an old/legacy SPK).
-    let spk: Option<SpkRow> = match device {
-        Some(d) => {
-            // PREFER the row whose device_id matches, and fall back to the legacy SPK.
-            // mig 0015 rewrote old NULL device_ids to '', BUT on a prod first deploy the
-            // code can land BEFORE the migration (the atomic wire-cut window), so on a
-            // pre-0015 schema the legacy SPK is still NULL. Tolerating `IS NULL` (parity
-            // with `auth::relogin` and `devices::handlers`'s SPK selects) makes this independent of
-            // deploy order; without it a legacy peer gets 503 no_signed_prekey and Olm
-            // cannot be established server-wide.
-            db.prepare(
-                "SELECT prekey_id, prekey_pub, signature FROM signed_prekeys
-                 WHERE user_id = ? AND (device_id = ? OR device_id IS NULL OR device_id = '')
-                 ORDER BY CASE WHEN device_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1",
-            )
-            .bind(&[d1_text(target_id), d1_text(d), d1_text(d)])?
-            .first(None)
-            .await?
-        }
-        None => {
-            db.prepare(
-                "SELECT prekey_id, prekey_pub, signature FROM signed_prekeys
-                 WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
-            )
-            .bind(&[d1_text(target_id)])?
-            .first(None)
-            .await?
-        }
-    };
-    let spk = match spk {
-        Some(s) => s,
-        None => return Ok(None), // this device has not published an SPK yet → skip it
-    };
+/// THE BOUND on `one_time_prekeys`: the largest UNCONSUMED pool one device may hold on the
+/// server. Past it `replenish` refuses to add more (429 `otk_pool_full`).
+///
+/// Why a bound and not just a rate limit: `check_rate_limit_env` fails OPEN when the `RATE_LIMIT`
+/// KV binding is absent (ratelimit.rs), so a limit is a brake that shapes bursts and never a
+/// ceiling. Nothing else stopped this table growing — replenish APPENDS (deliberately, see the
+/// long note in the handler), and no GC anywhere sweeps prekeys. This count needs no KV.
+///
+/// 300 is three times the client's `otk_pool_target` of 100 (`core/src/kernel/config.rs`), so a
+/// correctly behaving device — which tops UP to its target and therefore uploads `target − pool` —
+/// never comes near it. It is also far under vodozemac's `MAX_ONE_TIME_KEYS` = 5000, where the
+/// device starts evicting the OLDEST private half while the server still hands out its oldest
+/// first; that is the "unknown one-time key" wedge config.rs documents, and this ceiling is a
+/// second guard against walking into it from the server side.
+const MAX_OTK_POOL: i64 = 300;
 
-    // M2-S3.5 FIELD-CRITICAL: core REQUIRES `DeviceBundle.identity_pubkey_b64` (the peer's
-    // x_pub/Curve25519 key used for first-contact Olm). The field was MISSING, so the moment a
-    // peer published a device list (making devices[] non-empty) core's BundleRes decode blew
-    // up entirely ("error decoding response body") and every send died. Per-device it comes
-    // from `devices.x_pub`; on the legacy (None) path from `users.identity_pubkey`, the root
-    // DH key. If the device or user row is absent, skip this slot.
-    let identity_pub: Vec<u8> = match device {
-        Some(d) => {
-            #[derive(Deserialize)]
-            struct XRow {
-                x_pub: Vec<u8>,
-            }
-            let row: Option<XRow> = db
-                .prepare("SELECT x_pub FROM devices WHERE user_id = ? AND device_id = ? LIMIT 1")
-                .bind(&[d1_text(target_id), d1_text(d)])?
-                .first(None)
-                .await?;
-            match row {
-                Some(r) => r.x_pub,
-                None => return Ok(None),
-            }
-        }
-        None => {
-            #[derive(Deserialize)]
-            struct URow {
-                identity_pubkey: Vec<u8>,
-            }
-            let row: Option<URow> = db
-                .prepare("SELECT identity_pubkey FROM users WHERE id = ? LIMIT 1")
-                .bind(&[d1_text(target_id)])?
-                .first(None)
-                .await?;
-            match row {
-                Some(r) => r.identity_pubkey,
-                None => return Ok(None),
-            }
-        }
-    };
-
-    // Atomic per-device OTK claim in a single `UPDATE ... RETURNING`: SQLite's implicit
-    // transaction guarantees that concurrent requests cannot hand the same OTK to two peers.
-    // M2-S2.3 scopes the claim with `AND device_id = ?` (device None → the legacy
-    // device-unfiltered pool). If the subquery yields NULL the update is a no-op and
-    // RETURNING is an empty set, so the OTK comes back null: a working but not forward-secret
-    // fallback prekey session, and a client retry will pick up a real OTK.
-    let otk: Option<OtkRow> = match device {
-        Some(d) => {
-            db.prepare(
-                "UPDATE one_time_prekeys SET consumed = 1
-                 WHERE id = (
-                   SELECT id FROM one_time_prekeys
-                   WHERE user_id = ? AND device_id = ? AND consumed = 0
-                   ORDER BY id ASC LIMIT 1
-                 )
-                 RETURNING id, prekey_id, prekey_pub",
-            )
-            .bind(&[d1_text(target_id), d1_text(d)])?
-            .first(None)
-            .await?
-        }
-        None => {
-            db.prepare(
-                "UPDATE one_time_prekeys SET consumed = 1
-                 WHERE id = (
-                   SELECT id FROM one_time_prekeys
-                   WHERE user_id = ? AND consumed = 0
-                   ORDER BY id ASC LIMIT 1
-                 )
-                 RETURNING id, prekey_id, prekey_pub",
-            )
-            .bind(&[d1_text(target_id)])?
-            .first(None)
-            .await?
-        }
-    };
-
-    let otk_json = if let Some(o) = otk {
-        serde_json::json!({
-            "prekey_id": o.prekey_id,
-            "prekey_pub_b64": b64_encode(&o.prekey_pub),
-        })
-    } else {
-        serde_json::Value::Null
-    };
-
-    Ok(Some(serde_json::json!({
-        "device_id": device,
-        "identity_pubkey_b64": b64_encode(&identity_pub),
-        "signed_prekey": {
-            "prekey_id": spk.prekey_id,
-            "prekey_pub_b64": b64_encode(&spk.prekey_pub),
-            "signature_b64": b64_encode(&spk.signature),
-        },
-        "one_time_key": otk_json,
-    })))
-}
+/// THE BOUND on `signed_prekeys`: how many SPK rows one device keeps. Only the NEWEST row is ever
+/// read — `bundle`'s `build_device_bundle` and `auth::relogin` both select
+/// `ORDER BY created_at DESC LIMIT 1` — so everything behind the newest is dead weight that
+/// `rotate_signed_prekey` appended and nothing ever removed.
+///
+/// 5 rather than 1: the rows are cheap, and keeping a little history means a rotation racing a
+/// concurrent read cannot leave a window with no SPK at all. Bounding at 5 caps the table at
+/// devices × 5.
+const MAX_SPK_ROWS_PER_DEVICE: i64 = 5;
 
 #[derive(Deserialize)]
 struct OtkInput {
@@ -309,17 +193,18 @@ struct OtkInput {
 #[derive(Deserialize)]
 struct ReplenishBody {
     otks: Vec<OtkInput>,
-    // M2-S1 (optional): this device's device_id. When omitted, rows are written with the
-    // legacy '' sentinel — mig 0016 made the column NOT NULL DEFAULT '' (see the bind below).
-    // Since M2-S2.3 the bundle claims OTKs per device (`AND device_id = ?`), so the pool
-    // written here is exactly the one that device is served from.
+    /// This device's device_id, as the caller believes it to be. Optional and NOT the pool
+    /// scope — that comes from the token, exactly as `otk_count` reads it. Present, it must
+    /// agree; absent, the token still decides. Core's `run_replenish_otks` sends `None` when it
+    /// cannot re-derive the device from a corrupt identity blob, and those keys used to land in
+    /// the `''` pool nothing serves; they now reach the pool the device is served from.
     #[serde(default)]
     device_id: Option<String>,
 }
 
 pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let (user_id, device_id) = match require_auth_device(&req, &ctx.env) {
+        Ok(pair) => pair,
         Err(resp) => return Ok(resp),
     };
     // SAHA-FIX (2026-06-27): `req.json()` goes through workerd's JS `JSON.parse`, so a
@@ -340,25 +225,49 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         return json_err(400, "bad_request");
     }
     // Hardening #8: stop one device from wiping and poisoning ANOTHER device's OTK pool. A
-    // same-account or stolen-token device sending body.device_id=VICTIM would DELETE the
-    // victim's OTKs and write its own into that slot — a decrypt DoS. Parity with the
-    // send-path device binding: if body.device_id is present it MUST match the token, and a
-    // revoked device may not publish at all. (Legacy: device_id None targets the old ''
-    // single pool, which leaves modern devices untouched.)
-    {
-        let token_device = crate::auth::middleware::extract_bearer(&req)
-            .and_then(|t| crate::auth::jwt::device_id_from_token(&ctx.env, &t).ok().flatten());
-        if body.device_id.is_some() && token_device.as_deref() != body.device_id.as_deref() {
+    // same-account or stolen-token device sending body.device_id=VICTIM would write its own keys
+    // into the victim's slot — a decrypt DoS. The pool is the TOKEN's device, so that is now
+    // impossible by construction rather than by comparison; the body claim is still checked,
+    // because a client naming a device other than its own is a bug worth surfacing.
+    if let Some(claim) = body.device_id.as_deref() {
+        if claim != device_id {
             return json_err(403, "device_mismatch");
         }
-        if let Some(dev) = body.device_id.as_deref() {
-            if crate::auth::middleware::device_revoked(&ctx.env, &user_id, dev).await? {
-                return json_err(401, "device_revoked");
-            }
-        }
     }
-    let device_id = body.device_id.as_deref();
+    // A revoked device may not publish at all. This used to run only when the body named a
+    // device, so a caller could skip it by omitting the field.
+    if crate::auth::middleware::device_revoked(&ctx.env, &user_id, &device_id).await? {
+        return json_err(401, "device_revoked");
+    }
+    // A BRAKE (see MAX_OTK_POOL for why it is not the bound). Nothing limited how OFTEN this could
+    // be called: 100 OTKs per request × unlimited requests, appended, never swept. 30 calls per 5
+    // minutes is far above the real cadence — a device replenishes at attach and after consuming
+    // keys, not in a loop — while stopping a script from walking to the pool ceiling instantly and
+    // then hammering the rejection path. Scoped per DEVICE, since the pool is per device and a
+    // multi-device account must not have its siblings share one budget.
+    if !check_rate_limit_env(&ctx.env, &format!("otk:replenish:{user_id}:{device_id}"), 30, 300).await
+    {
+        return json_err(429, "rate_limited");
+    }
     let db = ctx.env.d1("DB")?;
+    // THE BOUND. Measured BEFORE the insert, because after it the damage is already in the table.
+    // A device at or above the ceiling is told to stop rather than silently ignored, so a client
+    // that has misunderstood the top-up contract shows up as 429s instead of as D1 growth. This
+    // costs one extra COUNT per replenish; the `pool_after` count below stays a separate read
+    // because INSERT OR IGNORE means the number of rows actually added is not knowable from here.
+    let pool_before = db
+        .prepare(OTK_UNCONSUMED_COUNT_SQL)
+        .bind(&[d1_text(&user_id), d1_text(&device_id)])?
+        .first::<i64>(Some("n"))
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0);
+    if pool_before >= MAX_OTK_POOL {
+        console_log!(
+            "[otk] replenish REFUSED user={user_id} device={device_id} pool={pool_before} cap={MAX_OTK_POOL}"
+        );
+        return json_err(429, "otk_pool_full");
+    }
     // REPLENISH APPENDS. It used to DELETE this device's unconsumed OTKs first, so the upload was
     // a CLEAN REPLACE — and that is what kept the pool below target, permanently.
     //
@@ -391,7 +300,6 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // gone by construction, and the batch stays for the atomicity of the inserts themselves.
     // ≤5 INSERT chunks (100 OTKs at 20 per chunk) = ≤5 statements and ≤400 binds, inside the D1
     // batch limit.
-    let device_sentinel = device_id.unwrap_or("");
     let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(5);
     for chunk in body.otks.chunks(20) {
         let mut sql = String::from(
@@ -419,9 +327,7 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
             // of the bundle 500s.
             binds.push(d1_prekey_id(k.prekey_id));
             binds.push(d1_blob(p));
-            // mig 0016 made device_id NOT NULL DEFAULT '', so binding NULL would violate the
-            // constraint; '' is the legacy sentinel.
-            binds.push(d1_text(device_sentinel));
+            binds.push(d1_text(&device_id));
         }
         stmts.push(db.prepare(&sql).bind(&binds)?);
     }
@@ -443,13 +349,13 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // would mean replace semantics had come back.
     let pool_after = db
         .prepare(OTK_UNCONSUMED_COUNT_SQL)
-        .bind(&[d1_text(&user_id), d1_text(device_sentinel)])?
+        .bind(&[d1_text(&user_id), d1_text(&device_id)])?
         .first::<i64>(Some("n"))
         .await
         .unwrap_or(None)
         .unwrap_or(-1);
     console_log!(
-        "[otk] replenish user={user_id} device='{device_sentinel}' uploaded={} pool_after={pool_after}",
+        "[otk] replenish user={user_id} device={device_id} uploaded={} pool_after={pool_after}",
         body.otks.len()
     );
     Response::from_json(&serde_json::json!({
@@ -466,18 +372,6 @@ pub async fn replenish(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
 pub(crate) const OTK_UNCONSUMED_COUNT_SQL: &str =
     "SELECT COUNT(*) AS n FROM one_time_prekeys WHERE user_id = ? AND device_id = ? AND consumed = 0";
 
-/// Which device's OTK pool a caller's token addresses. `''` is the legacy sentinel used by
-/// device-less tokens (mig 0016 made the column NOT NULL DEFAULT ''), and it is what `replenish`
-/// writes when the client sends no `device_id` — so the read and the write agree by construction.
-/// Getting this wrong is not a small error: a modern device scoped to `''` would report an empty
-/// pool while holding a full one, which is the exact false alarm this endpoint exists to rule out.
-fn otk_pool_scope(token_device: Option<&str>) -> &str {
-    match token_device {
-        Some(d) if !d.is_empty() => d,
-        _ => "",
-    }
-}
-
 /// GET /keys/otks/count — how many UNCONSUMED one-time prekeys the SERVER still holds for the
 /// CALLER's own device. Authenticated, and scoped to the token's user and device: there is no
 /// path here that reads another user's pool.
@@ -491,19 +385,16 @@ fn otk_pool_scope(token_device: Option<&str>) -> &str {
 /// Diagnostic only: it mutates nothing, and a failed count answers 200 with `-1` rather than an
 /// error, so a caller can never be harmed by asking.
 pub async fn otk_count(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
-        Err(resp) => return Ok(resp),
-    };
     // The device is taken from the TOKEN, never from the request — the same binding `replenish`
     // enforces, and the reason this cannot be pointed at somebody else's pool.
-    let token_device = crate::auth::middleware::extract_bearer(&req)
-        .and_then(|t| crate::auth::jwt::device_id_from_token(&ctx.env, &t).ok().flatten());
-    let device = otk_pool_scope(token_device.as_deref());
+    let (user_id, device) = match require_auth_device(&req, &ctx.env) {
+        Ok(pair) => pair,
+        Err(resp) => return Ok(resp),
+    };
     let db = ctx.env.d1("DB")?;
     let count = db
         .prepare(OTK_UNCONSUMED_COUNT_SQL)
-        .bind(&[d1_text(&user_id), d1_text(device)])?
+        .bind(&[d1_text(&user_id), d1_text(&device)])?
         .first::<i64>(Some("n"))
         .await
         .unwrap_or(None)
@@ -524,15 +415,18 @@ struct SignedPrekeyBody {
     prekey_id: u64,
     prekey_pub_b64: String,
     signature_b64: String,
-    // M2-S1 (optional): this device's device_id. When omitted the row is written with the
-    // legacy '' sentinel (see the bind below).
+    /// This device's device_id, as the caller believes it to be. Optional and NOT the slot the
+    /// row lands in — that is the token's device. Present, it must agree.
     #[serde(default)]
     device_id: Option<String>,
 }
 
 pub async fn rotate_signed_prekey(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    // The slot is the TOKEN's device. There is no longer a device-less write, and therefore no
+    // longer a `''` slot for an identity claim to be planted in — see the deleted
+    // `device_less_spk_write_allowed` and `auth::relogin`'s SPK selection.
+    let (user_id, device_id) = match require_auth_device(&req, &ctx.env) {
+        Ok(pair) => pair,
         Err(resp) => return Ok(resp),
     };
     // SAHA-FIX (2026-06-27): req.json() loses precision through JS (see replenish), so read
@@ -546,29 +440,102 @@ pub async fn rotate_signed_prekey(mut req: Request, ctx: RouteContext<()>) -> Re
         Err(_) => return json_err(400, "bad_request"),
     };
     // Hardening #8 (the SPK twin): stop a device from overwriting another device's signed
-    // prekey — parity with the send-path device binding (if body.device_id is present it must
-    // match the token, and a revoked device cannot rotate).
-    {
-        let token_device = crate::auth::middleware::extract_bearer(&req)
-            .and_then(|t| crate::auth::jwt::device_id_from_token(&ctx.env, &t).ok().flatten());
-        if body.device_id.is_some() && token_device.as_deref() != body.device_id.as_deref() {
+    // prekey. The row's slot is the token's device, so that is structural now; the body claim is
+    // still compared, because a client naming a device other than its own is a bug worth
+    // surfacing rather than silently rewriting.
+    if let Some(claim) = body.device_id.as_deref() {
+        if claim != device_id {
             return json_err(403, "device_mismatch");
         }
-        if let Some(dev) = body.device_id.as_deref() {
-            if crate::auth::middleware::device_revoked(&ctx.env, &user_id, dev).await? {
-                return json_err(401, "device_revoked");
-            }
-        }
+    }
+    // A revoked device cannot rotate. This used to run only when the body named a device.
+    if crate::auth::middleware::device_revoked(&ctx.env, &user_id, &device_id).await? {
+        return json_err(401, "device_revoked");
+    }
+    // A BRAKE on rotation. The upsert key is (user_id, device_id, prekey_id), so re-publishing the
+    // SAME prekey_id updates one row — but a caller walking prekey_id APPENDS a row every time,
+    // and nothing swept them. The prune at the end of this handler is the bound; this limit keeps
+    // a caller from spending signature verifications and D1 writes to reach it. Ten per hour is
+    // orders of magnitude above real rotation, which happens at registration and at device-link
+    // finalize and is not on any timer in the client at all.
+    if !check_rate_limit_env(&ctx.env, &format!("spk:rotate:{user_id}:{device_id}"), 10, 3600).await
+    {
+        return json_err(429, "rate_limited");
     }
     let pub_bytes =
         b64_decode(&body.prekey_pub_b64).map_err(|_| Error::RustError("bad pub".into()))?;
     let sig_bytes =
         b64_decode(&body.signature_b64).map_err(|_| Error::RustError("bad sig".into()))?;
-    let now = now_secs();
     let db = ctx.env.d1("DB")?;
+
+    // ---- AUTHENTICITY: this row is an IDENTITY CLAIM, so it is verified before it is stored.
+    //
+    // It used to be written VERBATIM with no signature check, while `auth::relogin` treats "the
+    // presented Ed25519 key verifies the newest stored SPK row" as PROOF OF IDENTITY. So anyone
+    // holding any access token for this user — including a device revoked seconds earlier, whose
+    // access token stays valid for the rest of its 15-minute TTL — could store an SPK signed with
+    // their OWN key and relogin AS the user for a 30-day renewable session. Device-less, that
+    // session carried no device claim either, so `validate_active_token` never re-checked it: a
+    // token meant to die in minutes became permanent.
+    //
+    // The claim is checked against `devices.ed_pub` for the writing device — the device list is
+    // primary-signed and each device_id is `hex(blake3(ed_pub)[..8])`. It is also the RIGHT key:
+    // a device signs its own SPK with its own Olm account, whose `ed25519_key()` is what the
+    // list carries. A LINKED device is deliberately NOT checked against `users.identity_ed_pub`
+    // — its SPK is signed by its own account, not the primary's identity, so anchoring it there
+    // would reject every legitimate linked device (the trap M2-S3.2 documents for relogin's
+    // per-device SPK selection).
+    // The step is not new — relogin and `validate_and_store_signed_list` both do it. Doing it
+    // where the row is CREATED, rather than only where it is trusted, is.
+    #[derive(Deserialize)]
+    struct DeviceEdRow {
+        ed_pub: Vec<u8>,
+    }
+    let anchor: Option<Vec<u8>> = db
+        .prepare("SELECT ed_pub FROM devices WHERE user_id = ? AND device_id = ? LIMIT 1")
+        .bind(&[d1_text(&user_id), d1_text(&device_id)])?
+        .first(None)
+        .await?
+        .map(|r: DeviceEdRow| r.ed_pub);
+    // NO ANCHOR is the remaining edge. Ed25519 offers no public-key recovery and the wire carries
+    // no key to check against, so with nothing stored there is nothing to verify and the write is
+    // accepted. Exactly ONE case reaches it now, and it is contained: a device with no `devices`
+    // row yet — the registration bootstrap window, before the first `PUT /devices/list`. The
+    // token binding pins the write to the caller's own device_id, so it reaches only that
+    // device's own slot, which `auth::relogin` reads only when asked for that device and then
+    // applies its own revoked check to.
+    //
+    // The second case is GONE rather than mitigated: a device-less write on an account with no
+    // device list and a NULL `users.identity_ed_pub` had no anchor AND landed in the `''` slot
+    // that a device-less relogin would then read as proof of identity. Requiring a device on both
+    // sides removes the slot, so there is nothing to plant and nothing that would read it.
+    if let Some(anchor_ed) = anchor {
+        let ed_arr: [u8; 32] = match anchor_ed.as_slice().try_into() {
+            Ok(a) => a,
+            // A stored anchor of the wrong length is server-side corruption, not a client error.
+            // It must fail closed rather than degrade into "then accept anything".
+            Err(_) => return json_err(500, "bad_identity_key"),
+        };
+        let verifying = match VerifyingKey::from_bytes(&ed_arr) {
+            Ok(v) => v,
+            Err(_) => return json_err(500, "bad_identity_key"),
+        };
+        let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+            Ok(s) => s,
+            Err(_) => return json_err(400, "bad_signature"),
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        // The signature covers the RAW SPK public bytes — client-side
+        // `account.sign(pub_key.as_bytes())` — which is the same convention relogin documents
+        // and verifies on the way back out.
+        if verifying.verify(&pub_bytes, &sig).is_err() {
+            return json_err(403, "spk_sig_invalid");
+        }
+    }
+
+    let now = now_secs();
     // Idempotent upsert (M2-S3.2c fix): when a linked device publishes its finalize SPK and
-    // the same (user_id, device_id, prekey_id) arrives again on a retry, update rather than
-    // 500. A NULL device_id becomes the '' sentinel, since the PK column is NOT NULL.
+    // the same (user_id, device_id, prekey_id) arrives again on a retry, update rather than 500.
     db.prepare(
         "INSERT INTO signed_prekeys (user_id, prekey_id, prekey_pub, signature, created_at, device_id)
          VALUES (?, ?, ?, ?, ?, ?)
@@ -585,54 +552,48 @@ pub async fn rotate_signed_prekey(mut req: Request, ctx: RouteContext<()>) -> Re
         d1_blob(&pub_bytes),
         d1_blob(&sig_bytes),
         d1_int(now as i64),
-        d1_text(body.device_id.as_deref().unwrap_or("")),
+        d1_text(&device_id),
     ])?
     .run()
     .await?;
+
+    // THE BOUND: keep only this device's newest MAX_SPK_ROWS_PER_DEVICE rows.
+    //
+    // Safe because nothing reads past the newest one: `build_device_bundle` and `auth::relogin`
+    // both take `ORDER BY created_at DESC LIMIT 1` for this exact (user_id, device_id). The row
+    // just written carries `created_at = now`, so it is always inside the keep-set and can never
+    // prune itself. `signed_prekeys` is a plain rowid table (its PK is the composite
+    // (user_id, device_id, prekey_id), so no column aliases rowid), which makes `rowid` available
+    // as the tiebreaker — needed because two rotations inside the same second share `created_at`
+    // and would otherwise order non-deterministically.
+    //
+    // Best-effort: the rotation itself has already succeeded and MUST NOT be reported as failed
+    // because housekeeping did not run. A skipped prune is retried by the next rotation.
+    if let Ok(stmt) = db
+        .prepare(
+            "DELETE FROM signed_prekeys
+              WHERE user_id = ? AND device_id = ?
+                AND rowid NOT IN (
+                  SELECT rowid FROM signed_prekeys
+                   WHERE user_id = ? AND device_id = ?
+                   ORDER BY created_at DESC, rowid DESC
+                   LIMIT ?
+                )",
+        )
+        .bind(&[
+            d1_text(&user_id),
+            d1_text(&device_id),
+            d1_text(&user_id),
+            d1_text(&device_id),
+            d1_int(MAX_SPK_ROWS_PER_DEVICE),
+        ])
+    {
+        let _ = stmt.run().await;
+    }
     no_content()
 }
 
+
 #[cfg(test)]
-mod tests {
-    use super::{otk_pool_scope, OTK_UNCONSUMED_COUNT_SQL};
-    use rusqlite::{params, Connection};
-
-    fn pool(c: &Connection, user: &str, device: &str) -> i64 {
-        c.query_row(OTK_UNCONSUMED_COUNT_SQL, params![user, device], |r| {
-            r.get(0)
-        })
-        .unwrap()
-    }
-
-    /// `GET /keys/otks/count` must answer with the pool a peer could still be served from: only
-    /// unconsumed rows, only this user, only this device. Counting consumed rows would make an
-    /// exhausted pool look healthy, which is the failure this endpoint exists to expose.
-    #[test]
-    fn the_count_sees_only_this_devices_unconsumed_keys() {
-        let c = Connection::open_in_memory().unwrap();
-        c.execute_batch(
-            "CREATE TABLE one_time_prekeys(user_id TEXT, device_id TEXT, consumed INTEGER);
-             INSERT INTO one_time_prekeys VALUES('u','dev-a',0),('u','dev-a',0),('u','dev-a',1),
-                                                ('u','dev-b',0),
-                                                ('other','dev-a',0);",
-        )
-        .unwrap();
-        assert_eq!(pool(&c, "u", "dev-a"), 2, "consumed rows are not available to any peer");
-        assert_eq!(pool(&c, "u", "dev-b"), 1, "a sibling device has its own pool");
-        assert_eq!(pool(&c, "u", "dev-missing"), 0, "an unknown device holds nothing");
-        assert_eq!(
-            pool(&c, "u", "dev-a") + pool(&c, "u", "dev-b"),
-            3,
-            "no query ever spans users: 'other' is invisible from either device of 'u'"
-        );
-    }
-
-    /// The read must land on the same pool `replenish` writes to, or a healthy device reads back
-    /// zero and the instrument reports a shrink that never happened.
-    #[test]
-    fn a_device_less_token_reads_the_same_legacy_pool_replenish_writes() {
-        assert_eq!(otk_pool_scope(Some("dev-a")), "dev-a");
-        assert_eq!(otk_pool_scope(None), "", "legacy sentinel, matching replenish's unwrap_or(\"\")");
-        assert_eq!(otk_pool_scope(Some("")), "", "an empty token device is legacy, not a device");
-    }
-}
+#[path = "handlers_tests.rs"]
+mod tests;

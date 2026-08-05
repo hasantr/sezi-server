@@ -1,4 +1,3 @@
-use crate::auth::jwt::{device_id_from_token, verify_access_token};
 use crate::utils::now_secs;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
@@ -46,7 +45,8 @@ const DEDUP_MAX_ENTRIES: usize = 256;
 
 /// Per-user inbox + WebSocket gateway; a faithful port of the UserInbox from the TypeScript
 /// worker. Owns the pending message queue in SQL storage, WS hibernation, the periodic alarm
-/// flush + cleanup, and the ack/typing/delivered/read RPC bridge.
+/// flush + cleanup, and the ack/delivered/read RPC bridge. (No typing: it rides E2E-encrypted
+/// inside an ordinary `send`, so this DO never sees it as typing.)
 #[durable_object]
 pub struct UserInbox {
     pub(crate) state: State,
@@ -106,11 +106,6 @@ struct NotifyBody {
     /// worker version that does not send it reads as false, i.e. today's behaviour.
     #[serde(default)]
     silent: bool,
-}
-
-#[derive(Deserialize)]
-struct ForwardTypingBody {
-    sender_id: String,
 }
 
 #[derive(Deserialize)]
@@ -186,11 +181,12 @@ pub(crate) struct Attachment {
     #[serde(rename = "userId")]
     pub(crate) user_id: String,
     /// M2-S2.2: the DEVICE behind this WS connection (from the JWT's device_id claim).
-    /// A pre-S1 token (no claim) yields `None`, and per-device flush/ack then falls back to NULL
-    /// tolerance. `#[serde(default)]` lets attachments serialized earlier (pre-S2 WS hibernation)
-    /// parse without error.
-    #[serde(rename = "deviceId", default)]
-    pub(crate) device_id: Option<String>,
+    ///
+    /// Never absent: the claim is mandatory, so a socket either has a device or was never
+    /// attached. This is the SOCKET's own device — distinct from `pending.device_id`, which is
+    /// still nullable and must stay that way (see the ack arm in `ws.rs`).
+    #[serde(rename = "deviceId")]
+    pub(crate) device_id: String,
     /// W1 (delivered_live false-positive fix): when the last CLIENT→SERVER frame (ping/ack/read;
     /// the client text-pings every 5s, see ws_conn.rs) was received on this socket, in ms.
     /// `notify_inner` uses it as its LIVENESS TEST: only a socket that produced a frame within the
@@ -316,11 +312,6 @@ impl DurableObject for UserInbox {
                 Response::from_json(
                     &serde_json::json!({ "id": id, "delivered_live": delivered_live }),
                 )
-            }
-            (Method::Post, "/forward-typing") => {
-                let body: ForwardTypingBody = req.json().await?;
-                self.forward_typing_inner(&body.sender_id);
-                Response::empty().map(|r| r.with_status(204))
             }
             // Layer-4: delivered/read are now durable `receipt_state` plus a per-device cursor
             // sync, NOT the consume-once forward_queue. recipient_device_id is NO LONGER used for
@@ -770,15 +761,13 @@ impl UserInbox {
         // (bit-identical to today's behaviour).
         crate::self_provision::ensure_keys(&self.env).await;
 
-        let mut attach_user: Option<String> = None;
-        let mut attach_device: Option<String> = None;
-        if let Ok(t) = crate::extract_bearer_subprotocol(&req) {
-            if let Ok(uid) = verify_access_token(&self.env, &t) {
-                attach_user = Some(uid);
-                // The device_id claim is ABSENT from a pre-S1 token → None (NULL tolerance).
-                attach_device = device_id_from_token(&self.env, &t).ok().flatten();
-            }
-        }
+        // The user and the device come from ONE verification, and either both are known or the
+        // token was not ours: the `device_id` claim is mandatory, so there is no longer a socket
+        // that authenticates but cannot say which device it is.
+        let attached: Option<(String, String)> = crate::extract_bearer_subprotocol(&req)
+            .ok()
+            .and_then(|t| crate::auth::jwt::token_identity(&self.env, &t).ok());
+        let attach_device: Option<&str> = attached.as_ref().map(|(_, d)| d.as_str());
 
         // M2-S3.0 (B3): the stale close is now DEVICE-AWARE. Two devices of the same user (primary +
         // linked) hold sockets at the same time, and each one flushes/acks ONLY its own pending rows
@@ -800,16 +789,16 @@ impl UserInbox {
                 .deserialize_attachment::<Attachment>()
                 .ok()
                 .flatten()
-                .and_then(|a| a.device_id);
-            if old_dev == attach_device {
+                .map(|a| a.device_id);
+            if old_dev.as_deref() == attach_device {
                 let _ = old.close(Some(1000), Some("superseded"));
             }
         }
 
-        if let Some(uid) = attach_user {
+        if let Some((uid, dev)) = attached.clone() {
             let _ = server.serialize_attachment(Attachment {
                 user_id: uid,
-                device_id: attach_device.clone(),
+                device_id: dev,
                 // W1: a freshly accepted socket counts as "live" for one `WS_LIVENESS_WINDOW_MS`,
                 // so no spurious push happens before the client sends its first ping.
                 // handle_ws_message refreshes the stamp on the first inbound frame.
@@ -821,7 +810,7 @@ impl UserInbox {
         // pending rows with the device of this first device-aware socket. A one-shot flag in DO
         // storage means a reconnect does NOT RE-STAMP. The value comes from Attachment.device_id,
         // i.e. straight from the claim and NEVER derived.
-        if let Some(dev) = attach_device.as_deref() {
+        if let Some(dev) = attach_device {
             self.backfill_null_device_once(dev).await;
         }
 

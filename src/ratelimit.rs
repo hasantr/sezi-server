@@ -1,13 +1,23 @@
 use crate::utils::now_secs;
 use worker::{console_log, kv::KvStore, Env, Result};
 
-/// TEMPLATE DIET (keeping the deploy screen simple): the self-host template ships
-/// WITHOUT a `RATE_LIMIT` KV binding — Deploy-to-Cloudflare renders a field for every
-/// binding, and KV names can collide. With no binding the rate limit is SILENTLY
-/// skipped (fail-open, consistent with the KV-error culture below). Prod, which does
-/// have the KV, behaves bit-identically. All callers go through these env helpers, so
-/// no handler is left with a `?`-propagating `env.kv("RATE_LIMIT")?` that would turn a
-/// missing binding into a 500.
+/// A MISSING BINDING FAILS OPEN. `env.kv("RATE_LIMIT")` erroring is read as "allow",
+/// so a deployment without the namespace silently has no rate limiting anywhere. All
+/// callers go through these env helpers, so no handler is left with a `?`-propagating
+/// `env.kv("RATE_LIMIT")?` that would turn a missing binding into a 500.
+///
+/// This used to say the self-host template ships WITHOUT the binding, to keep the
+/// Deploy-to-Cloudflare screen short. **That is no longer true** — `sezi-server`'s
+/// `wrangler.toml` declares the `RATE_LIMIT` namespace with a placeholder id the
+/// deployer fills in, the same as prod. The stale note mattered: it was read as
+/// "every rate limit in this file is decorative on a self-host install", which made
+/// each new limit look pointless to add. They are real on both.
+///
+/// The fail-open behaviour stays anyway, because a hand-rolled deployment can still
+/// omit the namespace, and losing a rate limit is a better failure than losing the
+/// endpoint. It does mean a limit is never a BOUND — anything that must actually be
+/// bounded needs a D1 count beside it, the way `groups::create_group` pairs its brake
+/// with `MAX_OWNED_GROUPS`.
 pub async fn check_rate_limit_env(env: &Env, key: &str, max_hits: usize, window_sec: u64) -> bool {
     check_rate_limit_weighted_env(env, key, max_hits, window_sec, 1).await
 }
@@ -87,11 +97,11 @@ async fn check_rate_limit_weighted(
     match kv.put(key, payload) {
         Ok(builder) => {
             if let Err(e) = builder.expiration_ttl(window_sec + 60).execute().await {
-                console_log!("ratelimit: KV put FAIL → fail-open (izin) key={key}: {e:?}");
+                console_log!("ratelimit: KV put FAIL → fail-open (allow) key={key}: {e:?}");
             }
         }
         Err(e) => {
-            console_log!("ratelimit: KV put-builder FAIL → fail-open (izin) key={key}: {e:?}");
+            console_log!("ratelimit: KV put-builder FAIL → fail-open (allow) key={key}: {e:?}");
         }
     }
     Ok(true)

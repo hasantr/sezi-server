@@ -6,10 +6,16 @@
 //! service (`turn.cloudflare.com`). All the worker does here is **issue short-lived TURN
 //! credentials** by calling the CF TURN API; the main API token never reaches the client.
 //!
-//! **Budget guard:** CF has no hard spending cap, so to avoid a surprise bill the worker
-//! keeps a monthly counter of issued credentials (`turn_usage`). Once `TURN_MONTHLY_CAP` is
-//! exceeded it issues nothing (`capped`), the client falls back to direct/STUN, and the CF
+//! **Budget guard, two layers:** CF has no hard spending cap, so to avoid a surprise bill the
+//! worker keeps a monthly counter of issued credentials (`turn_usage`). Once `TURN_MONTHLY_CAP`
+//! is exceeded it issues nothing (`capped`), the client falls back to direct/STUN, and the CF
 //! bill stops there. If the credentials are unset, TURN is simply `disabled`.
+//!
+//! That counter is server-WIDE, which bounds the bill but says nothing about who spends it: one
+//! account could exhaust the month for everyone. So a second, per-user guard sits beside it
+//! (`TURN_USER_MONTHLY_CAP`, a KV sliding window). Read them as different jobs — the D1 counter
+//! protects the operator's wallet and is a real bound; the KV one protects members from each
+//! other and is a brake, because its KV binding is optional. See the note at the check itself.
 //!
 //! **Where the credentials come from (the fcm.rs chain, verbatim):** per key, env FIRST and D1
 //! `server_config` second, so an env-set value keeps the production path bit-identical while an
@@ -33,6 +39,26 @@ const TURN_TTL_SECS: u32 = 21_600;
 /// One credential is roughly one call, and relayed audio costs ~30 MB per hour, so 5000
 /// credentials is a very low-risk bound.
 const DEFAULT_MONTHLY_CAP: i64 = 5_000;
+
+/// Default PER-USER ceiling; env `TURN_USER_MONTHLY_CAP` overrides it, and it is additionally
+/// clamped to the server-wide cap so it can never be the looser of the two.
+///
+/// `DEFAULT_MONTHLY_CAP` is server-wide and nothing divided it up, so one account could spend the
+/// whole month's budget by itself and every other member's calls would answer `capped` for the
+/// rest of the month. A shared budget with no per-member share is a denial of service any single
+/// member can perform, deliberately or by leaving a client in a retry loop.
+///
+/// 500 is a tenth of the server default — roughly 16 credentials a day, where one credential is
+/// about one call and its TTL is 6 hours. Far above personal use, far below "one person drains
+/// everybody".
+const DEFAULT_USER_MONTHLY_CAP: i64 = 500;
+
+/// Window for the per-user counter: 30 days, as a SLIDING window rather than the calendar month
+/// the server-wide counter uses. They differ deliberately — the server-wide counter exists to stop
+/// a billing period running away and is therefore aligned to the bill, while the per-user one
+/// exists to stop a single member monopolising the budget, which a sliding window does better
+/// (a calendar window would let one account spend twice its share across a month boundary).
+const USER_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Deserialize)]
 struct CfIceResponse {
@@ -111,9 +137,10 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
     let env = &ctx.env;
 
     // 1. Auth — only a registered user may obtain a credential, and only for their own call.
-    if let Err(resp) = require_active_auth(&req, env).await {
-        return Ok(resp);
-    }
+    let caller = match require_active_auth(&req, env).await {
+        Ok(auth) => auth.user_id,
+        Err(resp) => return Ok(resp),
+    };
 
     // 2. Are the credentials set (env secret, or the D1 row the owner entered from the app)? If
     //    not, TURN is disabled gracefully and the client uses STUN — a call on the same network
@@ -157,7 +184,41 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
         }));
     }
 
-    // 4. Ask the CF TURN API to mint a short-lived credential.
+    // 4. This caller's SHARE of that budget. Answered with the same `capped` shape as the
+    //    server-wide guard, so a client needs no new branch: an empty `iceServers` means fall back
+    //    to direct/STUN, which is what it already does. `user_capped` is added alongside so an
+    //    operator reading logs, or a future UI, can tell "you are out" from "the server is out" —
+    //    the two need very different responses from a human.
+    //
+    //    ⚠ A BRAKE, NOT A BOUND, and this is the honest limit of the fix. `check_rate_limit_env`
+    //    fails OPEN when the `RATE_LIMIT` KV binding is absent (ratelimit.rs), so on a hand-rolled
+    //    deployment without that namespace one account can still drain the server-wide cap. Making
+    //    it a real bound needs a per-user D1 counter — the shape `groups::create_group` uses, and
+    //    the shape step 5 below already uses for the server-wide number — which means a new table
+    //    and therefore a migration. The server-wide cap in step 3 IS a real bound and still holds
+    //    the billing line; what degrades without KV is only the fair-share half.
+    //
+    //    Counted at ATTEMPT rather than on success, unlike the server-wide counter in step 6. That
+    //    is deliberate: a caller retrying against a broken TURN config should also be braked, and
+    //    over-counting a rare upstream failure errs toward the operator's bill.
+    let user_cap = user_monthly_cap(env);
+    if user_cap > 0
+        && !crate::ratelimit::check_rate_limit_env(
+            env,
+            &format!("turn:issue:{caller}"),
+            user_cap as usize,
+            USER_WINDOW_SECS,
+        )
+        .await
+    {
+        return Response::from_json(&serde_json::json!({
+            "iceServers": [],
+            "capped": true,
+            "user_capped": true,
+        }));
+    }
+
+    // 5. Ask the CF TURN API to mint a short-lived credential.
     let url = format!(
         "https://rtc.live.cloudflare.com/v1/turn/keys/{}/credentials/generate-ice-servers",
         key_id
@@ -180,7 +241,7 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
     }
     let parsed: CfIceResponse = cf_resp.json().await?;
 
-    // 5. Bump the counter now that issuing succeeded. Best-effort: with a missing table or on
+    // 6. Bump the counter now that issuing succeeded. Best-effort: with a missing table or on
     //    error the credential is still returned — the counter just undercounts, and the call
     //    is not broken. Upserted per month.
     if let Ok(stmt) = db
@@ -193,7 +254,7 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
         let _ = stmt.run().await;
     }
 
-    // 6. Return iceServers to the client, ready to drop into an RTCPeerConnection config.
+    // 7. Return iceServers to the client, ready to drop into an RTCPeerConnection config.
     Response::from_json(&serde_json::json!({
         "iceServers": parsed.ice_servers,
         "ttl": TURN_TTL_SECS,
@@ -209,6 +270,23 @@ pub(crate) fn monthly_cap(env: &Env) -> i64 {
         .ok()
         .and_then(|v| v.to_string().parse::<i64>().ok())
         .unwrap_or(DEFAULT_MONTHLY_CAP)
+}
+
+/// The PER-USER monthly ceiling: env `TURN_USER_MONTHLY_CAP`, falling back to
+/// `DEFAULT_USER_MONTHLY_CAP`, then clamped to the server-wide `monthly_cap` — a per-user share
+/// larger than the whole budget is not a share, and an operator who lowers the server cap should
+/// not have to remember to lower this one too. `0` (or a negative value) disables the per-user
+/// guard, which is the escape hatch for an operator who wants only the server-wide bound.
+fn user_monthly_cap(env: &Env) -> i64 {
+    let configured = env
+        .var("TURN_USER_MONTHLY_CAP")
+        .ok()
+        .and_then(|v| v.to_string().parse::<i64>().ok())
+        .unwrap_or(DEFAULT_USER_MONTHLY_CAP);
+    if configured <= 0 {
+        return 0;
+    }
+    configured.min(monthly_cap(env))
 }
 
 /// Epoch seconds → "YYYY-MM" in UTC, via Howard Hinnant's civil-from-days algorithm so we

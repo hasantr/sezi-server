@@ -1,4 +1,4 @@
-use crate::auth::jwt::{device_id_from_token, verify_access_token};
+use crate::auth::jwt::{token_identity, verify_access_token};
 use crate::d1util::d1_text;
 use crate::respond::json_err;
 use serde::Deserialize;
@@ -32,13 +32,11 @@ pub fn extract_bearer(req: &Request) -> Option<String> {
 /// publish, plugin log/blob and push registration — so a stolen device is rejected
 /// before its access token's 15 minute TTL runs out. refresh/relogin are already
 /// revocation-aware; this closes the live-token send/session surface. Event driven:
-/// one query per request, with NO polling loop. An empty `device_id` returns `false`
-/// (a legacy device-less token), which is the SAME exemption refresh/relogin grant —
-/// needed for migration compatibility.
+/// one query per request, with NO polling loop.
+///
+/// A device with no `devices` row is NOT revoked — that is the registration bootstrap window,
+/// before the first `PUT /devices/list` creates any row, and `put_list` depends on it.
 pub async fn device_revoked(env: &Env, user_id: &str, device_id: &str) -> Result<bool> {
-    if device_id.is_empty() {
-        return Ok(false);
-    }
     #[derive(Deserialize)]
     struct RevRow {
         revoked_at: Option<i64>,
@@ -166,23 +164,17 @@ mod tests {
 }
 
 /// Sensitive account routes need more than a valid stateless JWT: the account
-/// must still exist and a token-bound device must still be present and active.
-/// Legacy device-less JWTs remain accepted for upgrade compatibility; contact
-/// request creation applies the stricter active-device proof on top.
+/// must still exist and the token-bound device must still be present and active.
 #[derive(Clone, Debug)]
 pub struct ActiveAuth {
     pub user_id: String,
-    pub device_id: Option<String>,
+    /// Never optional: `jwt::verify_access_token` refuses a token that names no device.
+    pub device_id: String,
 }
 
-fn token_identity(
-    env: &Env,
-    token: &str,
-) -> std::result::Result<ActiveAuth, Response> {
-    let user_id = verify_access_token(env, token)
-        .map_err(|_| json_err(401, "invalid_token").unwrap())?;
-    let device_id = device_id_from_token(env, token)
-        .map_err(|_| json_err(401, "invalid_token").unwrap())?;
+fn auth_from_token(env: &Env, token: &str) -> std::result::Result<ActiveAuth, Response> {
+    let (user_id, device_id) =
+        token_identity(env, token).map_err(|_| json_err(401, "invalid_token").unwrap())?;
     Ok(ActiveAuth { user_id, device_id })
 }
 
@@ -214,21 +206,16 @@ pub async fn validate_active_token(
     env: &Env,
     token: &str,
 ) -> std::result::Result<ActiveAuth, Response> {
-    let auth = token_identity(env, token)?;
+    let auth = auth_from_token(env, token)?;
     if !account_exists(env, &auth.user_id).await? {
         return Err(json_err(401, "inactive_account").unwrap());
     }
 
-    if let Some(device) = auth.device_id.as_deref() {
-        if device.is_empty() {
-            return Err(json_err(401, "inactive_device").unwrap());
-        }
-        if !account_device_active(env, &auth.user_id, device)
-            .await
-            .map_err(|_| json_err(503, "auth_check_unavailable").unwrap())?
-        {
-            return Err(json_err(401, "inactive_device").unwrap());
-        }
+    if !account_device_active(env, &auth.user_id, &auth.device_id)
+        .await
+        .map_err(|_| json_err(503, "auth_check_unavailable").unwrap())?
+    {
+        return Err(json_err(401, "inactive_device").unwrap());
     }
 
     Ok(auth)
@@ -243,7 +230,7 @@ pub async fn require_existing_account_auth(
 ) -> std::result::Result<ActiveAuth, Response> {
     let token =
         extract_bearer(req).ok_or_else(|| json_err(401, "unauthorized").unwrap())?;
-    let auth = token_identity(env, &token)?;
+    let auth = auth_from_token(env, &token)?;
     if !account_exists(env, &auth.user_id).await? {
         return Err(json_err(401, "inactive_account").unwrap());
     }
@@ -270,6 +257,21 @@ pub fn require_auth(req: &Request, env: &Env) -> std::result::Result<String, Res
         Ok(uid) => Ok(uid),
         Err(_) => Err(json_err(401, "invalid_token").unwrap()),
     }
+}
+
+/// Authentication that also yields the device the token is bound to.
+///
+/// The device-addressing routes (key publish, OTK pool, message send, push, plugin log/blob)
+/// each used to call `require_auth` and then re-derive the device with a second
+/// `extract_bearer` + full token verification, and each carried its own branch for the claim
+/// being absent. One verification, one shape, and the absent case is gone: `verify_access_token`
+/// already refuses a token that names no device, so reaching here means there is one.
+pub fn require_auth_device(
+    req: &Request,
+    env: &Env,
+) -> std::result::Result<(String, String), Response> {
+    let token = extract_bearer(req).ok_or_else(|| json_err(401, "unauthorized").unwrap())?;
+    token_identity(env, &token).map_err(|_| json_err(401, "invalid_token").unwrap())
 }
 
 #[derive(Deserialize)]

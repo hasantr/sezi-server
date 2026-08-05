@@ -142,6 +142,10 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // whether calls between DIFFERENT networks will connect. Write-only: the bool only.
     let turn_configured = crate::turn::is_configured(&ctx.env).await;
     let fcm_configured = fcm_mode.can_push();
+    // Does the server carry the means to wipe itself? The owner checklist needs this: without a
+    // reset key the one irreversible action an owner may legitimately want is unavailable, and the
+    // only way to find out used to be to try. Presence only — the key is returned nowhere.
+    let reset_key_configured = crate::admin::reset::reset_key_configured(&ctx.env).await;
 
     // requests_today — CF's billing-accurate number when available, otherwise the
     // self-report usage_counters 'requests' row. Counting every request in D1 is
@@ -287,6 +291,12 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // in `server_config` and `fcm_configured` was still true, because the relay default is on.
         "fcm_mode": fcm_mode.as_str(),
         "turn_configured": turn_configured,
+        // Additive field, shipped under the SAME `version: 8` as the storage badge — a client
+        // cannot gate on the version number for it, only on the key's presence. Absent on an
+        // older server → the client reads
+        // it as false and shows the gap, which is the safe direction: claiming a server can be
+        // reset when it cannot is the reading that wastes the owner's time at the worst moment.
+        "reset_key_configured": reset_key_configured,
         // v8 (additive, pluggable storage Faz 3): the compact store badge. Detail
         // lives at GET /admin/storage. draining = is any store being emptied
         // (Faz 4 drain).

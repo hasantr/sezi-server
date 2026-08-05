@@ -5,7 +5,7 @@
 //! idempotently retries the same outbox row.
 
 use crate::auth::middleware::require_active_auth;
-use crate::d1util::{d1_int, d1_opt_text, d1_text};
+use crate::d1util::{d1_int, d1_text};
 use crate::respond::json_err;
 use crate::utils::now_secs;
 use serde::Deserialize;
@@ -33,10 +33,10 @@ const ADMIN_MEMBERSHIP_GUARD_SQL: &str = "INSERT INTO membership_delete_guard(sl
       WHERE target.id=?1 AND target.id!=caller.id
         AND ((caller.role='owner' AND target.role!='owner')
           OR (caller.role='admin' AND target.role='member'))
-        AND (?3 IS NULL OR EXISTS(
+        AND EXISTS(
           SELECT 1 FROM devices device
            WHERE device.user_id=caller.id AND device.device_id=?3
-             AND device.revoked_at IS NULL))
+             AND device.revoked_at IS NULL)
       LIMIT 1))
      ON CONFLICT(slot) DO UPDATE SET target_id=excluded.target_id";
 
@@ -51,7 +51,9 @@ pub(crate) enum RemovalAuthority<'a> {
     SelfLeave,
     Administrator {
         caller_id: &'a str,
-        caller_device_id: Option<&'a str>,
+        /// The admin's own device. Never optional: it comes from the caller's token, which
+        /// always names one.
+        caller_device_id: &'a str,
     },
 }
 
@@ -126,14 +128,95 @@ const UPSERT_COUNTERPART_TOMBSTONES_SQL: &str = "INSERT INTO contact_tombstones
        peer_id=excluded.peer_id,revision=excluded.revision,
        deleted_at=excluded.deleted_at";
 
+/// Group succession — the INVOLUNTARY twin of `groups_transfer.rs`'s `transfer_to`. Both statements
+/// mint an owner row for somebody who did not ask for one; everything else about them differs.
+///
+/// # Why the voluntary gates become an ORDER and not a filter
+///
+/// `transfer_to` refuses: the recipient must already be an `admin`, and the transfer must not put
+/// them over `MAX_OWNED_GROUPS`. Neither refusal is available here.
+///
+/// There is nobody to refuse. By the time this runs the departing account is inside the same
+/// transaction as its own `DELETE FROM users`, and the request that started it is an account
+/// deletion that must succeed. And a refusal would not leave the group where it is: two
+/// statements below, `DELETE FROM groups WHERE created_by=?1` destroys every group this statement
+/// failed to hand on. So "refuse the successor" spells "delete the room", which is strictly worse
+/// for its members than any owner this could pick, and avoiding it is the entire reason the
+/// succession block exists.
+///
+/// The gates therefore move into the ORDER BY, where they express a preference that always has an
+/// answer, and the WHERE is left EXACTLY as it was. That split is load-bearing: the WHERE decides
+/// which groups survive the DELETE below, the ORDER BY decides only who inherits them. Adding one
+/// more predicate up there — "and the successor must be an admin", "and they must be under the
+/// cap" — silently converts a group that would have changed hands into a group that is destroyed.
+///
+/// # The three tiers
+///
+/// 1. **A sitting owner** (`WHEN 'owner' THEN 0`). This is an alignment fix, separable from the cap
+///    work below. `TRANSFER_CREATED_GROUPS_SQL` already ranks owner→admin→else; this statement did
+///    not, so a group whose `created_by` still pointed at the departing user while somebody ELSE
+///    held the owner row got a SECOND owner promoted alongside the first — a state no handler on
+///    the group surface can resolve, because `group_members` carries no partial UNIQUE index on
+///    `role='owner'` (see `TRANSFER_PROMOTE_TARGET_SQL` in `groups_transfer.rs`, which says so and
+///    guards it with NOT EXISTS instead). Ranking the sitting owner first makes the UPDATE a no-op
+///    in that case. It costs the ordinary case nothing: there the departing user IS the owner, and
+///    `c.user_id!=?1` keeps them out of the candidate set entirely.
+/// 2. **An admin over a plain member.** Unchanged in effect from the original
+///    `CASE role WHEN 'admin' THEN 0 ELSE 1 END`, and deliberately still a preference. It is the
+///    same ordering `groups_transfer.rs` cites when it makes admin-first a HARD gate — "the server
+///    already answers who inherits a group with 'an admin'" — but a group whose remaining members
+///    are all plain members must still get an owner rather than be deleted.
+/// 3. **Fewest groups owned.** The cap's stand-in, and the new part.
+///
+/// # Why "fewest owned" and not `MAX_OWNED_GROUPS`
+///
+/// The threshold is not reachable from here — `MAX_OWNED_GROUPS` is private to `crate::groups` —
+/// but it is also the wrong instrument. A threshold answers "may this person take it?", which is a
+/// question `transfer_to` can afford to answer with no; when every candidate is over the cap this
+/// statement still has to name one. "Fewest first" is the same intent with a defined answer in
+/// every case: it declines to pile another group onto the most loaded candidate whenever a lighter
+/// one exists at the same role tier, and it can never empty the candidate set.
+///
+/// The counting predicate is character-for-character `groups_transfer.rs`'s `OWNED_GROUP_COUNT_SQL`
+/// (`user_id=? AND role='owner'`), so the two paths measure ownership the same way. Counting
+/// `groups.created_by` instead would measure a past act rather than a present holding — the reason
+/// that file gives for its own choice.
+///
+/// # What this does NOT do
+///
+/// It is not incremental. SQLite computes the sort keys from the table as the statement found it,
+/// so the count does not climb as this same UPDATE hands out group after group: one deletion can
+/// still push one person past the cap by however many groups it gives them at once. The voluntary
+/// path carries the same residue by a different route (its pre-check races a concurrent transfer),
+/// so this is a shared limit of counting outside the write, not a new one.
+///
+/// And it is not consent, in the sense `transfer_to` is careful to disclaim. Nothing here can be:
+/// the person who would be asked cannot be asked by an account that no longer exists, and the
+/// alternative to not asking is deleting their room.
+///
+/// # Cost, and why the batch's atomicity is untouched
+///
+/// The count is an index seek on `idx_group_members_user` (migration `0006_groups.sql`), evaluated
+/// per candidate per row the UPDATE visits — bounded by `MAX_GROUP_MEMBERS` candidates across the
+/// groups one account created. That bound is worth stating because this runs inside the single
+/// account-deletion transaction, where anything that fails or times out rolls the WHOLE deletion
+/// back. Nothing added here can fail on its own terms: an ORDER BY term violates no constraint, and
+/// the statement's row set is byte-for-byte the one it selected before.
 const PROMOTE_GROUP_SUCCESSORS_SQL: &str = "UPDATE group_members AS gm SET role='owner'
       WHERE gm.user_id=(
         SELECT c.user_id FROM group_members c
          WHERE c.group_id=gm.group_id AND c.user_id!=?1 AND c.status='active'
-         ORDER BY CASE c.role WHEN 'admin' THEN 0 ELSE 1 END,c.joined_at,c.user_id
+         ORDER BY CASE c.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+                  (SELECT COUNT(*) FROM group_members o
+                    WHERE o.user_id=c.user_id AND o.role='owner'),
+                  c.joined_at,c.user_id
          LIMIT 1)
         AND gm.group_id IN (SELECT id FROM groups WHERE created_by=?1)";
 
+/// Move `groups.created_by` onto the successor the statement above just promoted. It re-derives the
+/// choice rather than being handed it, and the two agree because its first tier is `'owner'`: after
+/// the promotion the successor is the only owner in the room, so this picks the same person. Its
+/// lower tiers are the fallback for a group the promotion left alone.
 const TRANSFER_CREATED_GROUPS_SQL: &str = "UPDATE groups SET created_by=(
        SELECT gm.user_id FROM group_members gm
         WHERE gm.group_id=groups.id AND gm.user_id!=?1 AND gm.status='active'
@@ -199,7 +282,7 @@ pub(crate) async fn delete_membership(
         } => db.prepare(ADMIN_MEMBERSHIP_GUARD_SQL).bind(&[
             d1_text(target_id),
             d1_text(caller_id),
-            d1_opt_text(caller_device_id),
+            d1_text(caller_device_id),
         ])?,
     };
     let stmts = vec![
@@ -425,16 +508,16 @@ pub(crate) async fn delete_membership(
                                 (caller_role.as_deref(), row.role.as_str()),
                                 (Some("admin"), "member")
                             );
-                            let device_still_active = match caller_device_id {
-                                Some(device_id) => crate::auth::middleware::account_device_active(
-                                    env, caller_id, device_id,
+                            let device_still_active =
+                                crate::auth::middleware::account_device_active(
+                                    env,
+                                    caller_id,
+                                    caller_device_id,
                                 )
                                 .await
                                 // If the diagnostic query fails, preserve the original D1
                                 // batch error.
-                                .unwrap_or(true),
-                                None => true,
-                            };
+                                .unwrap_or(true);
                             if !still_allowed || !device_still_active || caller_id == target_id {
                                 return Err(DeleteError::AuthorizationChanged);
                             }
@@ -605,194 +688,8 @@ pub(crate) async fn drain_purge_outbox(env: &Env) {
     }
 }
 
+/// The rusqlite exercises over the SQL constants above. Split out because `membership.rs` sat
+/// exactly ON the 800-line ceiling; `keys/handlers.rs` is the worked example of the move.
 #[cfg(test)]
-mod tests {
-    use super::{
-        ADMIN_MEMBERSHIP_GUARD_SQL, INSERT_COUNTERPART_REVISIONS_SQL, PROMOTE_GROUP_SUCCESSORS_SQL,
-        SELF_MEMBERSHIP_GUARD_SQL, TRANSFER_CREATED_GROUPS_SQL, UPSERT_COUNTERPART_TOMBSTONES_SQL,
-    };
-    use rusqlite::{params, Connection};
-
-    #[test]
-    fn transaction_guard_rejects_owner_or_missing_target() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE users(id TEXT PRIMARY KEY,role TEXT NOT NULL);
-             INSERT INTO users VALUES('owner','owner'),('member','member');",
-        )
-        .unwrap();
-        db.execute_batch(include_str!(
-            "../migrations/0034_membership_cleanup_outbox.sql"
-        ))
-        .unwrap();
-
-        for target in ["owner", "missing"] {
-            let error = db
-                .execute(SELF_MEMBERSHIP_GUARD_SQL, params![target])
-                .unwrap_err();
-            assert!(error.to_string().contains("NOT NULL"));
-        }
-        db.execute(SELF_MEMBERSHIP_GUARD_SQL, params!["member"])
-            .unwrap();
-        assert_eq!(
-            db.query_row(
-                "SELECT target_id FROM membership_delete_guard WHERE slot=1",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap(),
-            "member"
-        );
-    }
-
-    #[test]
-    fn admin_guard_rechecks_both_roles_inside_the_delete_transaction() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE users(id TEXT PRIMARY KEY,role TEXT NOT NULL);
-             CREATE TABLE devices(user_id TEXT,device_id TEXT,revoked_at INTEGER);
-             INSERT INTO users VALUES
-               ('owner','owner'),('admin','admin'),('other-admin','admin'),
-               ('member','member'),('demoted','member');
-             INSERT INTO devices VALUES
-               ('owner','owner-device',NULL),('admin','admin-device',NULL),
-               ('demoted','demoted-device',NULL);",
-        )
-        .unwrap();
-        db.execute_batch(include_str!(
-            "../migrations/0034_membership_cleanup_outbox.sql"
-        ))
-        .unwrap();
-
-        for (target, caller) in [
-            ("owner", "admin"),
-            ("other-admin", "admin"),
-            ("member", "demoted"),
-            ("admin", "admin"),
-        ] {
-            let error = db
-                .execute(
-                    ADMIN_MEMBERSHIP_GUARD_SQL,
-                    params![target, caller, format!("{caller}-device")],
-                )
-                .unwrap_err();
-            assert!(error.to_string().contains("NOT NULL"));
-        }
-
-        db.execute(
-            ADMIN_MEMBERSHIP_GUARD_SQL,
-            params!["member", "admin", "admin-device"],
-        )
-        .unwrap();
-        db.execute("DELETE FROM membership_delete_guard", [])
-            .unwrap();
-        db.execute(
-            ADMIN_MEMBERSHIP_GUARD_SQL,
-            params!["other-admin", "owner", "owner-device"],
-        )
-        .unwrap();
-
-        db.execute("DELETE FROM membership_delete_guard", [])
-            .unwrap();
-        db.execute("UPDATE devices SET revoked_at=1 WHERE user_id='admin'", [])
-            .unwrap();
-        let error = db
-            .execute(
-                ADMIN_MEMBERSHIP_GUARD_SQL,
-                params!["member", "admin", "admin-device"],
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("NOT NULL"));
-    }
-
-    #[test]
-    fn membership_contact_tombstones_are_set_based_and_replay_safe() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE users(id TEXT PRIMARY KEY);
-             INSERT INTO users VALUES('gone'),('grant-peer'),('request-peer'),('block-peer');
-             CREATE TABLE contact_grants(user_low TEXT,user_high TEXT);
-             CREATE TABLE contact_requests(source_user_id TEXT,target_user_id TEXT);
-             CREATE TABLE contact_blocks(blocker_user_id TEXT,blocked_user_id TEXT);
-             CREATE TABLE contact_revisions(
-               revision INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT UNIQUE NOT NULL,
-               account_id TEXT NOT NULL,peer_id TEXT,entity TEXT NOT NULL,
-               entity_id TEXT NOT NULL,action TEXT NOT NULL,created_at INTEGER NOT NULL);
-             CREATE TABLE contact_tombstones(
-               account_id TEXT NOT NULL,entity TEXT NOT NULL,entity_id TEXT NOT NULL,
-               peer_id TEXT,revision INTEGER NOT NULL,deleted_at INTEGER NOT NULL,
-               PRIMARY KEY(account_id,entity,entity_id));
-             INSERT INTO contact_grants VALUES('gone','grant-peer');
-             INSERT INTO contact_requests VALUES('request-peer','gone');
-             INSERT INTO contact_blocks VALUES('gone','block-peer');",
-        )
-        .unwrap();
-
-        for _ in 0..2 {
-            db.execute(INSERT_COUNTERPART_REVISIONS_SQL, params!["gone", 10])
-                .unwrap();
-            db.execute(UPSERT_COUNTERPART_TOMBSTONES_SQL, params!["gone", 10])
-                .unwrap();
-        }
-        let revisions: i64 = db
-            .query_row("SELECT COUNT(*) FROM contact_revisions", [], |r| r.get(0))
-            .unwrap();
-        let tombstones: i64 = db
-            .query_row("SELECT COUNT(*) FROM contact_tombstones", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(revisions, 3, "a replay must not multiply the revision");
-        assert_eq!(tombstones, 3);
-        let wrong_peer: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM contact_tombstones WHERE peer_id!='gone'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(wrong_peer, 0);
-    }
-
-    #[test]
-    fn group_owner_moves_to_active_admin_and_pending_only_group_closes() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE groups(id TEXT PRIMARY KEY,created_by TEXT NOT NULL);
-             CREATE TABLE group_members(
-               group_id TEXT,user_id TEXT,role TEXT,status TEXT,joined_at INTEGER,
-               PRIMARY KEY(group_id,user_id));
-             INSERT INTO groups VALUES('survives','gone'),('closes','gone');
-             INSERT INTO group_members VALUES
-               ('survives','gone','owner','active',1),
-               ('survives','member','member','active',2),
-               ('survives','admin','admin','active',3),
-               ('closes','gone','owner','active',1),
-               ('closes','pending','member','pending',2);",
-        )
-        .unwrap();
-        db.execute(PROMOTE_GROUP_SUCCESSORS_SQL, params!["gone"])
-            .unwrap();
-        db.execute(TRANSFER_CREATED_GROUPS_SQL, params!["gone"])
-            .unwrap();
-        db.execute("DELETE FROM groups WHERE created_by=?", params!["gone"])
-            .unwrap();
-
-        let owner: (String, String) = db
-            .query_row(
-                "SELECT g.created_by,gm.role FROM groups g JOIN group_members gm
-                   ON gm.group_id=g.id AND gm.user_id=g.created_by WHERE g.id='survives'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(owner, ("admin".into(), "owner".into()));
-        assert_eq!(
-            db.query_row("SELECT COUNT(*) FROM groups WHERE id='closes'", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap(),
-            0
-        );
-    }
-}
+#[path = "membership_tests.rs"]
+mod tests;

@@ -50,6 +50,21 @@ pub fn sha256_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Compare two SECRETS for equality without leaking their contents through timing.
+///
+/// For a secret that is stored in plaintext rather than hashed — a `wrangler secret` the worker
+/// reads back and compares, such as `RESET_PASSWORD` — `==` on `&str` short-circuits at the first
+/// differing byte, which turns "how long did the request take" into an oracle for the prefix. The
+/// comparison also has to reject an EMPTY expected value: an unset secret reads as `""`, and with a
+/// plain `==` an empty submitted password would then match and open the gate. Callers still check
+/// "is it configured" separately; this refuses as a second line.
+pub(crate) fn secret_eq(submitted: &str, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    constant_time_eq(submitted.as_bytes(), expected.as_bytes())
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

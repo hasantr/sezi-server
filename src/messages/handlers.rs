@@ -1,5 +1,4 @@
-use crate::auth::jwt::device_id_from_token;
-use crate::auth::middleware::{extract_bearer, require_active_auth};
+use crate::auth::middleware::require_active_auth;
 use crate::d1util::{d1_int, d1_opt_text, d1_text};
 use sha2::{Digest, Sha256};
 
@@ -205,7 +204,7 @@ async fn notify_recipient(
             Ok(r) => {
                 if attempt > 0 {
                     console_log!(
-                        "[deliv] W4 notify retry-recovered: {}. denemede OK (recipient={recipient_id})",
+                        "[deliv] W4 notify retry-recovered: OK on attempt {} (recipient={recipient_id})",
                         attempt + 1
                     );
                 }
@@ -338,8 +337,8 @@ pub(crate) async fn gc_fanout_retry(env: &Env) {
 }
 
 pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let sender_id = match require_active_auth(&req, &ctx.env).await {
-        Ok(auth) => auth.user_id,
+    let (sender_id, token_device) = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => (auth.user_id, auth.device_id),
         Err(resp) => return Ok(resp),
     };
     // S2 (Fable HIGH — quota/DoS): per-user message rate limit, so envelopes that differ by a byte
@@ -376,15 +375,10 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     }
     // M2-S3.1 B1 (token binding) — the TRUST FOUNDATION of every S3 self/echo exclusion: stop an
     // HTTP send on ANOTHER device's behalf via a forged `sender_device_id` (fake self-copy / group
-    // echo injection). body.sender_device_id MUST MATCH the JWT's `device_id` claim. require_auth is
-    // left UNCHANGED (6 callers, too wide a blast radius), so the bearer and device are extracted
-    // separately here. token_device == None (an old token without the claim) → 403: S3 devices get
-    // tokens carrying a device claim, and an old token is forced to re-login. The WS-send path
-    // (inbox_do/ws.rs) is ALREADY token-bound through its attachment device, so this gate only
-    // closes the HTTP send forgery surface.
-    let token_device =
-        extract_bearer(&req).and_then(|t| device_id_from_token(&ctx.env, &t).ok().flatten());
-    if token_device.as_deref() != Some(body.sender_device_id.as_str()) {
+    // echo injection). body.sender_device_id MUST MATCH the JWT's `device_id` claim. The WS-send
+    // path (inbox_do/ws.rs) is ALREADY token-bound through its attachment device, so this gate
+    // only closes the HTTP send forgery surface.
+    if token_device != body.sender_device_id {
         return json_err(403, "device_mismatch");
     }
     // REVOCATION CHECK (security audit — checkpoint 3): if the token-bound device has been REMOVED
@@ -525,7 +519,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         // side is how the group path stayed invisible for a round: "a wake happened"
                         // and "which surface asked for it" are different questions.
                         console_log!(
-                            "[push] uyandiriyor grup={group_id} user={}",
+                            "[push] waking group={group_id} user={}",
                             p.user_id
                         );
                         crate::push::fcm::maybe_push_wake(
@@ -592,7 +586,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 }
             }
             console_log!(
-                "[deliv] W4-b enqueue: {failed_n}/{} kismi-fail durable-retry'e (group={group_id})",
+                "[deliv] W4-b enqueue: {failed_n}/{} partial-fail to durable-retry (group={group_id})",
                 pairs.len()
             );
         }
@@ -716,7 +710,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                     );
                 }
                 if !delivered_live && !body.silent {
-                    console_log!("[push] uyandiriyor 1:1 user={recipient_id} dev={:?}", e.device_id);
+                    console_log!("[push] waking 1:1 user={recipient_id} dev={:?}", e.device_id);
                     crate::push::fcm::maybe_push_wake(
                         &ctx.env, &db, recipient_id, e.device_id.as_deref(),
                     )
@@ -744,14 +738,14 @@ struct ReadBody {
 }
 
 pub async fn read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let recipient_id = match require_active_auth(&req, &ctx.env).await {
-        Ok(auth) => auth.user_id,
+    let (recipient_id, reader_device) = match require_active_auth(&req, &ctx.env).await {
+        Ok(auth) => (auth.user_id, auth.device_id),
         Err(resp) => return Ok(resp),
     };
     // FIX-3 (CONCERN H2 — WS-read DoS bypass): WS read got a rate limit but HTTP
     // `/messages/read` had no guard, so the WS limit could be bypassed over HTTP and unlimited
-    // forward-reads pushed into the peer DO (DoS). The guard here mirrors send() (line ~94): a
-    // per-user `msg:read:{recipient_id}` bucket of 300/60s, answering 429 when exceeded (the HTTP
+    // forward-reads pushed into the peer DO (DoS). The guard here mirrors the one at the top of
+    // `send`: a per-user `msg:read:{recipient_id}` bucket of 300/60s, answering 429 when exceeded (the HTTP
     // path rejects instead of silently dropping like the WS path; the limiter itself stays fail-open
     // when the KV binding is missing). Using a separate bucket keeps legitimate read traffic from
     // eating the send quota, and each read still costs one hit.
@@ -793,15 +787,10 @@ pub async fn read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // Hardening #9: a revoked device must not be able to FORGE a read receipt (revoke parity with
     // the send path — present in `inbox_do::ws`'s send arm but missing from the read path). If the
     // token-bound device has been removed (revoked) from the device list, REJECT the read forward
-    // without waiting for the 15 min TTL. (A legacy token with no device claim is not checked.)
-    {
-        let token_device = crate::auth::middleware::extract_bearer(&req)
-            .and_then(|t| crate::auth::jwt::device_id_from_token(&ctx.env, &t).ok().flatten());
-        if let Some(dev) = token_device.as_deref() {
-            if crate::auth::middleware::device_revoked(&ctx.env, &recipient_id, dev).await? {
-                return json_err(401, "device_revoked");
-            }
-        }
+    // without waiting for the 15 min TTL. This used to be skipped for a token carrying no device
+    // claim; there is no such token, so the check now covers every read.
+    if crate::auth::middleware::device_revoked(&ctx.env, &recipient_id, &reader_device).await? {
+        return json_err(401, "device_revoked");
     }
 
     let namespace = ctx.env.durable_object("USER_INBOX")?;

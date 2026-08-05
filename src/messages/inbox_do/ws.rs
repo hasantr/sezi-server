@@ -2,8 +2,9 @@ use super::*;
 
 impl UserInbox {
     /// WS frame handler — `DurableObject::websocket_message` delegates here.
-    /// Frame kinds: ack / typing / ping / forward_ack / receipt_sync / self_read /
-    /// self_read_sync / send / read. Anything else is ignored.
+    /// Frame kinds: ack / ping / forward_ack / receipt_sync / self_read / self_read_sync /
+    /// send / read. Anything else is ignored. There is deliberately no `typing` kind — see the
+    /// note where its arm used to be.
     pub(crate) async fn handle_ws_message(
         &self,
         ws: WebSocket,
@@ -87,11 +88,16 @@ impl UserInbox {
                     .deserialize_attachment::<Attachment>()
                     .ok()
                     .flatten()
-                    .and_then(|a| a.device_id);
+                    .map(|a| a.device_id);
                 let placeholders: String =
                     (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-                // Device filter: with a concrete device, (device_id = ? OR NULL); without one
-                // (pre-S1 token) no filter at all, i.e. the existing device-blind behaviour.
+                // The socket's own device is always known now, so the device-blind fallback for a
+                // claim-less token is gone. `ack_device` stays an Option only because the
+                // attachment itself may be missing on a socket that was never attached.
+                //
+                // `OR device_id IS NULL` STAYS, and is not the same thing: it is about the PENDING
+                // ROW, not the token. See the FIX-2(b) note above — a NULL row belongs to a member
+                // who has not published a device list yet.
                 let (dev_clause, mut extra_arg): (&str, Option<JsValue>) = match &ack_device {
                     Some(d) => (
                         " AND (device_id = ? OR device_id IS NULL)",
@@ -190,32 +196,11 @@ impl UserInbox {
                     }
                 }
             }
-            "typing" => {
-                let to = value.get("to").and_then(|v| v.as_str()).unwrap_or("");
-                if to.is_empty() {
-                    return Ok(());
-                }
-                let sender_id: Option<String> = ws
-                    .deserialize_attachment::<Attachment>()
-                    .ok()
-                    .flatten()
-                    .map(|a| a.user_id);
-                let sid = match sender_id {
-                    Some(s) if s != to => s,
-                    _ => return Ok(()),
-                };
-                let namespace = self.env.durable_object("USER_INBOX")?;
-                let stub = namespace.id_from_name(to)?.get_stub()?;
-                let payload = serde_json::json!({ "sender_id": sid }).to_string();
-                let mut init = RequestInit::new();
-                init.with_method(Method::Post);
-                init.with_body(Some(payload.into()));
-                let headers = Headers::new();
-                headers.set("content-type", "application/json")?;
-                init.with_headers(headers);
-                let do_req = Request::new_with_init("https://do.sezgi/forward-typing", &init)?;
-                let _ = stub.fetch_with_request(do_req).await;
-            }
+            // NO `typing` ARM, deliberately — the frame-kind list on `handle_ws_message` above
+            // omits it for the same reason. The typing indicator does not travel as a WS frame: it is an E2E-encrypted
+            // `InnerMessage::Typing` inside an ordinary `send`, so the server never sees it as
+            // typing. A frame arm existed here until 2026-08-05, sent by nothing, and it was the
+            // one path in this file that authorized nothing.
             "ping" => {
                 // Application-level keepalive: returning a pong is mandatory for the
                 // client's zombie detection. Without it the client still sees an open TCP
@@ -294,7 +279,7 @@ impl UserInbox {
                     .ok()
                     .flatten();
                 let sender_id = attach.as_ref().map(|a| a.user_id.clone());
-                let sender_device_id = attach.as_ref().and_then(|a| a.device_id.clone());
+                let sender_device_id = attach.as_ref().map(|a| a.device_id.clone());
                 // M2-S2.3: parse envelopes[] as EnvItem{device_id?, envelope_b64}.
                 let env_items: Vec<(Option<String>, String)> = value
                     .get("envelopes")
@@ -550,8 +535,10 @@ impl UserInbox {
             // socket → no per-receipt TLS/ECH handshake (cold HTTP /messages/read is ~470ms, and
             // once WS-send moved messages onto the socket the HTTP connection goes cold). This
             // arm runs in the READER's DO and does a cross-DO /forward-read to the sender's
-            // (peer_id) DO (parity with handlers::read 104-118 → forward_signal("read") + the
-            // persistent forward_queue). Fire-and-forget, NO ack: read state is idempotent and
+            // (peer_id) DO. NOT via forward_signal + the consume-once forward_queue: /forward-read
+            // routes to `apply_receipt`, because delivered/read are durable `receipt_state` now
+            // and the DO actively drains those kinds OUT of forward_queue. `forward_signal` has
+            // one caller left, delivery_failed. Fire-and-forget, NO ack: read state is idempotent and
             // cosmetic, the client does not wait for it, and a loss is retriggered by the
             // viewport.
             "read" => {
@@ -578,7 +565,7 @@ impl UserInbox {
                     .ok()
                     .flatten();
                 let reader_id = reader_attachment.as_ref().map(|a| a.user_id.clone());
-                let reader_device_id = reader_attachment.as_ref().and_then(|a| a.device_id.clone());
+                let reader_device_id = reader_attachment.as_ref().map(|a| a.device_id.clone());
                 // Validation (parity with handlers::read): auth + ids (1..=500) + uuid + not-self.
                 let valid = reader_id.is_some()
                     && reader_device_id.is_some()

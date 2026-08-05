@@ -67,16 +67,18 @@ struct JwtClaims {
     sub: String,
     iat: u64,
     exp: u64,
-    // M2-S1: optional device-addressing claim. `skip_serializing_if` means the field
-    // is omitted entirely from tokens minted without a device_id (identical to the
-    // old wire format), and `default` means older claim-less tokens still parse
-    // (backwards compatibility). Since S2 the claim is also CONSUMED — see
-    // `device_id_from_token`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_id: Option<String>,
+    /// Which device this session belongs to. MANDATORY, in both directions.
+    ///
+    /// Every route that addresses a device — message send's `sender_device_id` binding, the OTK
+    /// pool scope, the signed-prekey anchor, `plugin_blob::gate` — reads it, and each of them
+    /// used to carry a branch for the claim being absent. There is no such token: the four mint
+    /// sites (`auth::verify`, `auth::refresh`, `auth::relogin`, `devices::link`) all name a
+    /// device. Deserialization is where that is enforced, so a claim-less token fails to parse
+    /// and every path built on `verify_access_token` refuses it identically.
+    device_id: String,
 }
 
-pub fn sign_access_token(env: &Env, user_id: &str, device_id: Option<&str>) -> Result<String> {
+pub fn sign_access_token(env: &Env, user_id: &str, device_id: &str) -> Result<String> {
     let signing = load_signing_key(env)?;
     let issuer = issuer(env);
     let now = now_secs();
@@ -90,7 +92,7 @@ pub fn sign_access_token(env: &Env, user_id: &str, device_id: Option<&str>) -> R
         sub: user_id.to_string(),
         iat: now,
         exp: now + ACCESS_TTL_SEC,
-        device_id: device_id.map(|s| s.to_string()),
+        device_id: device_id.to_string(),
     };
     let header_b64 = b64u_encode(serde_json::to_string(&header)?.as_bytes());
     let claims_b64 = b64u_encode(serde_json::to_string(&claims)?.as_bytes());
@@ -100,7 +102,13 @@ pub fn sign_access_token(env: &Env, user_id: &str, device_id: Option<&str>) -> R
     Ok(format!("{}.{}", signing_input, sig_b64))
 }
 
-pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
+/// Full verification — signature, issuer, expiry — yielding the claims.
+///
+/// The one place any of that happens. `verify_access_token` and `device_id_from_token` used to be
+/// line-for-line copies of each other differing only in the field they returned, so a handler
+/// that wanted both the user and the device paid for two key loads and two Ed25519
+/// verifications, and any fix to one copy could miss the other.
+fn verified_claims(env: &Env, token: &str) -> Result<JwtClaims> {
     let signing = load_signing_key(env)?;
     let verifying = signing.verifying_key();
     let issuer = issuer(env);
@@ -121,6 +129,7 @@ pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
         .map_err(|e| Error::RustError(format!("jwt: sig invalid: {}", e)))?;
     let claims_json = b64u_decode(parts[1])
         .map_err(|e| Error::RustError(format!("jwt: claims decode: {}", e)))?;
+    // A token with no `device_id` claim fails HERE, as a parse error — see `JwtClaims`.
     let claims: JwtClaims = serde_json::from_slice(&claims_json)?;
     if claims.iss != issuer {
         return Err(Error::RustError("jwt: bad iss".into()));
@@ -129,47 +138,23 @@ pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
     if claims.exp <= now {
         return Err(Error::RustError("jwt: expired".into()));
     }
-    Ok(claims.sub)
+    if claims.device_id.is_empty() {
+        return Err(Error::RustError("jwt: empty device_id".into()));
+    }
+    Ok(claims)
 }
 
-/// M2-S1: returns the optional `device_id` claim from a verified token.
+pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
+    Ok(verified_claims(env, token)?.sub)
+}
+
+/// The verified `(user_id, device_id)` pair a token asserts.
 ///
-/// It lives beside `verify_access_token` rather than changing that function's
-/// signature or return type, so the blast radius of S2 stayed small. It performs the
-/// full verification (signature + iss + exp) and returns `None` when the claim is
-/// absent or the token is an older, claim-less one. Written since S1; consumed since
-/// S2 — the WS upgrade path attaches it to the socket, and the send/keys/plugin/push
-/// routes use it for per-device checks.
-pub fn device_id_from_token(env: &Env, token: &str) -> Result<Option<String>> {
-    let signing = load_signing_key(env)?;
-    let verifying = signing.verifying_key();
-    let issuer = issuer(env);
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err(Error::RustError("jwt: bad format".into()));
-    }
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let sig_bytes = b64u_decode(parts[2])
-        .map_err(|e| Error::RustError(format!("jwt: sig decode: {}", e)))?;
-    if sig_bytes.len() != 64 {
-        return Err(Error::RustError("jwt: sig length".into()));
-    }
-    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
-    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-    verifying
-        .verify(signing_input.as_bytes(), &sig)
-        .map_err(|e| Error::RustError(format!("jwt: sig invalid: {}", e)))?;
-    let claims_json = b64u_decode(parts[1])
-        .map_err(|e| Error::RustError(format!("jwt: claims decode: {}", e)))?;
-    let claims: JwtClaims = serde_json::from_slice(&claims_json)?;
-    if claims.iss != issuer {
-        return Err(Error::RustError("jwt: bad iss".into()));
-    }
-    let now = now_secs();
-    if claims.exp <= now {
-        return Err(Error::RustError("jwt: expired".into()));
-    }
-    Ok(claims.device_id)
+/// Callers that need both take them from ONE verification. The device is always present: a
+/// token that names no device is not one this server minted, and `verified_claims` refuses it.
+pub fn token_identity(env: &Env, token: &str) -> Result<(String, String)> {
+    let claims = verified_claims(env, token)?;
+    Ok((claims.sub, claims.device_id))
 }
 
 #[derive(Serialize)]

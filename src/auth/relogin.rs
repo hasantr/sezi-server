@@ -21,7 +21,7 @@
 
 use crate::auth::hashing::sha256_hex;
 use crate::auth::jwt::sign_access_token;
-use crate::d1util::{d1_blob, d1_int, d1_opt_text, d1_text};
+use crate::d1util::{d1_blob, d1_int, d1_text};
 use crate::respond::json_err;
 use crate::utils::{b64_decode, b64u_encode, now_secs, random_bytes};
 use ed25519_dalek::{Verifier, VerifyingKey};
@@ -34,14 +34,18 @@ struct ReloginBody {
     ed25519_pub_b64: String,
     ts: u64,
     signature_b64: String,
-    // M2-S1 (optional): this device's device_id plus the Ed25519 signing public key.
-    // An older body without them works EXACTLY as before. identity_ed_pub_b64 is the
-    // same key as ed25519_pub_b64 (already verified above), so it is used to backfill
-    // users.identity_ed_pub.
-    #[serde(default)]
-    device_id: Option<String>,
-    #[serde(default)]
-    identity_ed_pub_b64: Option<String>,
+    /// The device recovering the session. MANDATORY: it selects which SPK the identity proof is
+    /// checked against, it is the subject of the revocation check, and it becomes the claim on
+    /// the minted token. Without it this endpoint used to read the `''` slot and skip the
+    /// revocation check entirely.
+    ///
+    /// `identity_ed_pub_b64` used to live here too and was written straight into
+    /// users.identity_ed_pub. It is deliberately gone: the field was never checked against
+    /// anything, so a caller could seat an arbitrary key as the server-side identity anchor
+    /// that `contact_qr` and `invite_attribution` later trust. The backfill now uses the key
+    /// the challenge signature actually proves. Clients keep sending the field — it is simply
+    /// ignored, which is what serde does with an unknown field here anyway.
+    device_id: String,
 }
 
 const REFRESH_TTL_SEC: u64 = 30 * 24 * 60 * 60;
@@ -54,6 +58,13 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         Ok(b) => b,
         Err(_) => return json_err(400, "bad_request"),
     };
+
+    // `''` was the sentinel that steered the SPK selection at the legacy slot while ALSO
+    // skipping the revoked check. Both of those are gone, and so is the sentinel.
+    if body.device_id.is_empty() || body.device_id.len() > 128 {
+        return json_err(400, "device_required");
+    }
+    let dev = body.device_id.as_str();
 
     let now = now_secs();
     let skew = now.abs_diff(body.ts);
@@ -84,16 +95,22 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
     // each device publishes the SPK of its OWN Account (append-only), so a device-blind
     // "newest wins" selection would, right after a linked device onboards, check the
     // primary's relogin proof against the LINKED device's SPK → identity_mismatch →
-    // the primary can no longer recover its session. PREFER the SPK matching this
-    // device's device_id, falling back to the legacy NULL/'' rows.
-    let dev = body.device_id.as_deref();
+    // the primary can no longer recover its session.
+    //
+    // EXACTLY this device's slot. The selection used to widen to `device_id IS NULL OR
+    // device_id = ''` and prefer the match only by ORDER BY, so the legacy slot was a fallback
+    // any device could land on — and that slot is the one an identity claim could be planted in,
+    // because it was also the one `keys::rotate_signed_prekey` would accept a device-less write
+    // into. Both halves are gone: there is no device-less write, so there is nothing to fall
+    // back to, and a device with no SPK of its own now gets `no_identity` instead of somebody
+    // else's key.
     let spk: Option<SpkRow> = db
         .prepare(
             "SELECT prekey_pub, signature FROM signed_prekeys
-             WHERE user_id = ? AND (device_id = ? OR device_id IS NULL OR device_id = '')
-             ORDER BY CASE WHEN device_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1",
+             WHERE user_id = ? AND device_id = ?
+             ORDER BY created_at DESC LIMIT 1",
         )
-        .bind(&[d1_text(&body.user_id), d1_opt_text(dev), d1_opt_text(dev)])?
+        .bind(&[d1_text(&body.user_id), d1_text(dev)])?
         .first(None)
         .await?;
     let spk = match spk {
@@ -125,12 +142,14 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         return json_err(401, "bad_challenge");
     }
 
-    // M2-S3.5 B4: a REMOVED device must not come back through relogin. If
-    // body.device_id has been revoked (the primary dropped it from the list, so put_list
-    // set revoked_at=now) we answer 401 and issue no token — even though the SPK
-    // verification above passed. A missing or unknown device_id keeps the old behaviour:
-    // an N=1 primary with a legacy device_id-less token is exempt from this check.
-    if let Some(dev) = body.device_id.as_deref() {
+    // M2-S3.5 B4: a REMOVED device must not come back through relogin. The device has been
+    // revoked (the primary dropped it from the list, so put_list set revoked_at=now) → 401 and
+    // no token, even though the SPK verification above passed.
+    //
+    // This used to be skipped whenever the body named no device — an exemption kept so a
+    // device-less primary could not be locked out of session recovery. With a device always
+    // named there is nobody left to exempt, and the check now covers every relogin.
+    {
         #[derive(Deserialize)]
         struct RevRow {
             revoked_at: Option<i64>,
@@ -145,25 +164,27 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         }
     }
 
-    // M2-S1: optional Ed25519 signing-key backfill. `verifying` has already proven
-    // CRYPTOGRAPHICALLY that this key is the user's identity, so it is safe to store.
+    // M2-S1: Ed25519 signing-key backfill, from `ed_bytes` — the key the challenge signature
+    // was verified against a few lines up, and the only key in this request that anything has
+    // proven. It used to take `body.identity_ed_pub_b64`, a separate field nothing compared to
+    // `verifying` and nothing length-checked, while the comment here claimed it had been proven
+    // cryptographically. `users.identity_ed_pub` is the server-side trust root that
+    // `contact_qr::principal_is_authoritative` reads as `root_ed` and that
+    // `invite_attribution` snapshots for the card-to-invite binding, so an unproven value
+    // landing there is an anchor nobody signed for.
+    //
     // Only fill it when empty — never overwrite an existing value (idempotent).
-    if let Some(ed_b64) = body.identity_ed_pub_b64.as_deref() {
-        if let Ok(ed_pub) = b64_decode(ed_b64) {
-            db.prepare(
-                "UPDATE users SET identity_ed_pub = ?
-                 WHERE id = ? AND identity_ed_pub IS NULL",
-            )
-            .bind(&[d1_blob(&ed_pub), d1_text(&body.user_id)])?
-            .run()
-            .await?;
-        }
-    }
+    db.prepare(
+        "UPDATE users SET identity_ed_pub = ?
+         WHERE id = ? AND identity_ed_pub IS NULL",
+    )
+    .bind(&[d1_blob(&ed_bytes), d1_text(&body.user_id)])?
+    .run()
+    .await?;
 
     // Proof accepted → fresh tokens for the EXISTING user_id. No new identity is
     // minted, so pairing survives.
-    let device_id = body.device_id.as_deref();
-    let access_token = sign_access_token(&ctx.env, &body.user_id, device_id)?;
+    let access_token = sign_access_token(&ctx.env, &body.user_id, dev)?;
     let new_refresh = b64u_encode(&random_bytes(32));
     let new_hash = sha256_hex(&new_refresh);
     db.prepare(
@@ -175,7 +196,7 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         d1_text(&body.user_id),
         d1_int((now + REFRESH_TTL_SEC) as i64),
         d1_int(now as i64),
-        d1_opt_text(device_id),
+        d1_text(dev),
     ])?
     .run()
     .await?;
@@ -187,4 +208,38 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         "token_type": "Bearer",
         "expires_in": ACCESS_TTL_SEC,
     }))
+}
+
+/// The trust-root backfill must use the key the challenge signature proved, never a field the
+/// caller supplied alongside it.
+///
+/// This is a source-level guard rather than a behavioural test because the handler needs D1, a
+/// Durable Object and a live worker environment — the same reason `admin/mod.rs` guards its auth
+/// middleware this way. It is worth a guard at all because the regression is invisible at
+/// runtime: writing an unproven key succeeds, returns 200, and only surfaces later as a contact
+/// QR or an invite attribution that verifies against an anchor nobody signed for.
+#[cfg(test)]
+mod trust_root_backfill_guard {
+    /// `include_str!` binds at compile time, so renaming this file breaks the build instead of
+    /// silently emptying the guard.
+    const SRC: &str = include_str!("relogin.rs");
+
+    #[test]
+    fn identity_ed_pub_is_backfilled_from_the_verified_key() {
+        let update = SRC
+            .find("UPDATE users SET identity_ed_pub")
+            .expect("the identity_ed_pub backfill disappeared — if it moved, move this guard too");
+        // The bind list follows the UPDATE within a few lines.
+        let window = &SRC[update..SRC.len().min(update + 400)];
+        assert!(
+            window.contains("d1_blob(&ed_bytes)"),
+            "the backfill must bind `ed_bytes`, the key `verifying` was built from and the \
+             signature was checked against"
+        );
+        assert!(
+            !window.contains("identity_ed_pub_b64"),
+            "the backfill must not take a caller-supplied key: users.identity_ed_pub is the \
+             trust root that contact_qr and invite_attribution read"
+        );
+    }
 }

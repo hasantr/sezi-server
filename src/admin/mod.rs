@@ -8,6 +8,7 @@ pub mod fcm_config;
 pub mod turn_config;
 pub mod handlers;
 pub mod plugin_policy;
+pub mod reset;
 pub mod stats;
 pub mod storage;
 

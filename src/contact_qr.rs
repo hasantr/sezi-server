@@ -189,9 +189,7 @@ pub async fn create_offer(mut req: Request, ctx: RouteContext<()>) -> Result<Res
         Ok(v) => v,
         Err(resp) => return Ok(resp),
     };
-    let Some(auth_device) = auth.device_id.as_deref() else {
-        return json_err(403, "active_device_required");
-    };
+    let auth_device = auth.device_id.as_str();
     // The KV binding is OPTIONAL (template diet): without it we continue unlimited.
     // Each offer is a ≤32KB D1 row with a daily 500-row cleanup, so unlimited create
     // is an insider D1-bloat surface (audit 2026-07-16). The UI's natural pace is
@@ -276,9 +274,7 @@ pub async fn claim_offer(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         Ok(v) => v,
         Err(resp) => return Ok(resp),
     };
-    let Some(auth_device) = auth.device_id.as_deref() else {
-        return json_err(403, "active_device_required");
-    };
+    let auth_device = auth.device_id.as_str();
     // Each claim costs 2×Ed25519 plus an HMAC verification — bound the CPU surface too.
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,

@@ -448,6 +448,92 @@ const RECONCILE_INVITE_CLAIMS_SQL: &str = "UPDATE invite_tokens SET used = 1
         SELECT 1 FROM invite_attributions ia
          WHERE ia.invite_token_hash = invite_tokens.token_hash
       )";
+/// THE RETENTION WINDOW for CONSUMED one-time prekeys, counted in `one_time_prekeys.id` — not in
+/// seconds. The table has no `created_at` column and never had one (migration `0001_init.sql`
+/// created it without, `0016_otk_device_unique.sql` rebuilt it and did not add one), so there is
+/// nothing to compare a timestamp against. `id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, which is
+/// the property that makes it usable as a clock here: AUTOINCREMENT keeps `sqlite_sequence`, so an
+/// id is never reused even after the rows carrying it are deleted, and a sweep therefore cannot
+/// walk the watermark backwards into re-deleting the keys published after it.
+///
+/// # A consumed row is not garbage — it is the ledger that keeps a one-time key one-time
+///
+/// This is the constraint that sets the size. `keys/handlers.rs::replenish` APPENDS under
+/// `INSERT OR IGNORE` against `UNIQUE (user_id, device_id, prekey_id)`, and `prekey_id` is derived
+/// from the public key itself, so re-publishing a key the server already holds is a silent no-op.
+/// That no-op is what stops a key being handed out twice; `devices/handlers.rs` says it in as many
+/// words where it deletes a removed device's UNCONSUMED keys — "consumed=1 rows STAY: they are the
+/// record that stops a key ever being issued twice."
+///
+/// Deleting a consumed row deletes that record. Republish the same `prekey_id` afterwards and the
+/// IGNORE has nothing to collide with: the row comes back with `consumed = 0`, and `keys/bundle`
+/// can hand a second peer a one-time key that was already spent. So the window is not "how long
+/// before this is stale" — it is "how far past a spent key a device can still be before a
+/// republish of it becomes implausible".
+///
+/// The only realistic republish is a device whose local store was rewound to before it marked
+/// those keys published — the identity-restore case `replenish` already documents as the honest
+/// cost of dropping its DELETE. Everything else (a retry, an attach-replenish, a reconnect)
+/// republishes keys that are still UNCONSUMED, and unconsumed rows are never touched here.
+///
+/// # 100,000, against what evidence
+///
+/// The live relay's whole `one_time_prekeys` table was measured at 648 rows on 2026-07-29 (the row
+/// totals in `replenish`'s task-#59 note: 648 → 626). The window is ~150× that entire table, so on
+/// a server of that size the sweep never fires at all — which is the intent. It only becomes
+/// reachable on a server that has published a hundred thousand one-time keys, and at that point the
+/// oldest tombstone is a hundred thousand keys behind the newest.
+///
+/// It is also 66× the largest unconsumed pool a single ACCOUNT can hold at once (`MAX_DEVICES` = 5
+/// devices × `MAX_OTK_POOL` = 300 keys each) and 1,000× the client's `otk_pool_target` of 100. In
+/// bytes it is the ceiling this table has never had: ~100 B of payload per row plus index, so on
+/// the order of 20 MB, where before it was unbounded.
+///
+/// ⚠ `MAX_OTK_POOL` is private to `keys/handlers.rs`, so the ratio above is a documented
+/// cross-reference and not a compile-time one. Making it `pub(crate)` would let this file assert
+/// the relationship the way the cron thresholds below assert theirs.
+const OTK_CONSUMED_RETAIN_IDS: i64 = 100_000;
+
+/// Per-run bound on the sweep. This is a cron path, so the work has to be a known quantity rather
+/// than "whatever the backlog happens to be".
+///
+/// Twenty times the media and contact-QR limits in this same function, because it is a different
+/// kind of work: those iterate rows to make a network call each (an R2 delete), this is one D1
+/// statement with no per-row I/O. Draining a full retention window still takes ten daily passes,
+/// which is the point of the assert below — a mis-set window cannot empty the ledger in one run.
+const OTK_SWEEP_LIMIT: i64 = 10_000;
+
+// Compile-time contract lock, the twin of the cron-threshold asserts above: one pass must never be
+// able to consume a whole retention window. If someone shrinks the window to tune D1 size, this
+// stops the ledger being wiped in a single night as a side effect.
+const _: () = assert!(OTK_CONSUMED_RETAIN_IDS >= 10 * OTK_SWEEP_LIMIT);
+
+/// Sweep consumed one-time prekeys that are more than `OTK_CONSUMED_RETAIN_IDS` behind the newest
+/// key in the table. Binds: retain window, per-run limit.
+///
+/// `consumed = 1` is the whole filter beyond the window: an UNCONSUMED row is live stock a peer can
+/// still be handed, and `devices/handlers.rs` is the only place that may remove one.
+///
+/// The watermark is `MAX(id)` read inline rather than a stored high-water mark, and the two ways
+/// that can be wrong are both safe. An EMPTY table gives `MAX(id) = NULL`, `NULL - ?` is NULL, and
+/// `id <= NULL` is NULL for every row — the statement deletes nothing instead of everything. A
+/// watermark that REGRESSES (an account deletion took the newest rows with it, `membership.rs`
+/// deletes by `user_id`) lowers the cutoff, so fewer rows qualify. This statement can never lower
+/// it itself: a row at `MAX(id)` cannot also be at or below `MAX(id) - 100000`.
+///
+/// `id` is the rowid, so `id <= cutoff` is a rowid range scan that stops at the cutoff and never
+/// walks the live tail. `LIMIT` inside the `IN (SELECT …)` rather than on the DELETE is the shape
+/// the contact-QR statements above already use; SQLite only accepts `DELETE … LIMIT` when built
+/// with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`, which is not a thing to depend on across D1 and the
+/// rusqlite tests both.
+pub(crate) const OTK_CONSUMED_CLEANUP_SQL: &str = "DELETE FROM one_time_prekeys
+      WHERE id IN (
+        SELECT id FROM one_time_prekeys
+         WHERE consumed = 1
+           AND id <= (SELECT MAX(id) FROM one_time_prekeys) - ?
+         ORDER BY id LIMIT ?
+      )";
+
 const CONTACT_QR_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 pub(crate) const CONTACT_QR_CLAIM_CLEANUP_SQL: &str = "DELETE FROM contact_qr_claims
       WHERE offer_id IN (
@@ -589,6 +675,36 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         .run()
         .await?;
 
+    // 7) Consumed one-time prekeys older than the retention window. Until now nothing anywhere
+    // deleted them: `keys/bundle` turns one unconsumed row into a consumed one on every fetch by
+    // any authorized contact, `replenish` puts the replacement in, and the spent row stayed
+    // forever. `MAX_OTK_POOL` bounds the UNCONSUMED pool per device and says so; the consumed side
+    // had no ceiling at all.
+    //
+    // A leg of the daily GC rather than a fourth maintenance stamp. The cadence wanted is exactly
+    // the daily one — a window measured in a hundred thousand keys does not need a 2-minute tick —
+    // and this function is already the place whose job is "keep D1 from growing", already claimed
+    // by the daily winner-claim and already idempotent leg by leg. A separate stamp would buy a
+    // cadence nothing needs and a second thing to keep fresh.
+    //
+    // Last on purpose, so that a failure here cannot skip a leg above it. `?` still propagates:
+    // `run_daily` logs and carries on to the rest of the daily set.
+    let swept = db
+        .prepare(OTK_CONSUMED_CLEANUP_SQL)
+        .bind(&[d1_int(OTK_CONSUMED_RETAIN_IDS), d1_int(OTK_SWEEP_LIMIT)])?
+        .run()
+        .await?;
+    // Silent when there is nothing to do, which on a server under the window is every run.
+    if let Ok(Some(meta)) = swept.meta() {
+        if meta.changes.unwrap_or(0) > 0 {
+            console_log!(
+                "cleanup: {} consumed one-time prekeys removed (>{} ids behind the newest)",
+                meta.changes.unwrap_or(0),
+                OTK_CONSUMED_RETAIN_IDS
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -618,65 +734,8 @@ fn throttle_due(last: u64, now: u64, every: u64) -> bool {
     last == 0 || now.saturating_sub(last) >= every
 }
 
+/// The pure-helper and SQL exercises for this module. Split out because `maintenance.rs` was
+/// about to cross the 800-line ceiling; `keys/handlers.rs` is the worked example of the move.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_stamp_falls_back_to_zero_when_corrupt_or_missing() {
-        assert_eq!(parse_stamp(None), 0);
-        assert_eq!(parse_stamp(Some("")), 0);
-        assert_eq!(parse_stamp(Some("abc")), 0);
-        assert_eq!(parse_stamp(Some("12.5")), 0);
-        assert_eq!(parse_stamp(Some("-99")), 0, "negatif damga 0'a clamp");
-        assert_eq!(parse_stamp(Some("1780000000")), 1_780_000_000);
-        assert_eq!(parse_stamp(Some(" 42 ")), 42, "trim'li parse");
-    }
-
-    #[test]
-    fn is_due_threshold_boundaries() {
-        // Stamp = 0 (no row / first boot) → always due.
-        assert!(is_due(1_780_000_000, 0, DRAIN_LAZY_AFTER_SECS));
-        // Exactly at the threshold → due (>=).
-        assert!(is_due(
-            1000 + DRAIN_LAZY_AFTER_SECS,
-            1000,
-            DRAIN_LAZY_AFTER_SECS
-        ));
-        // One second below the threshold → not due.
-        assert!(!is_due(
-            1000 + DRAIN_LAZY_AFTER_SECS - 1,
-            1000,
-            DRAIN_LAZY_AFTER_SECS
-        ));
-        // Stamp in the future (clock skew) → not due (saturating).
-        assert!(!is_due(1000, 2000, DRAIN_LAZY_AFTER_SECS));
-    }
-
-    #[test]
-    fn is_due_daily_threshold() {
-        let t0 = 1_780_000_000i64;
-        assert!(
-            !is_due(t0 + 86_400, t0, DAILY_LAZY_AFTER_SECS),
-            "24h = inside the margin, stays asleep"
-        );
-        assert!(is_due(t0 + 90_000, t0, DAILY_LAZY_AFTER_SECS), "25h → due");
-    }
-
-    #[test]
-    fn throttle_first_look_and_window() {
-        assert!(
-            throttle_due(0, 5, CHECK_EVERY_SECS),
-            "an isolate checks on its first request"
-        );
-        assert!(!throttle_due(
-            100,
-            100 + CHECK_EVERY_SECS - 1,
-            CHECK_EVERY_SECS
-        ));
-        assert!(throttle_due(100, 100 + CHECK_EVERY_SECS, CHECK_EVERY_SECS));
-        // Clock moved backwards → do not look (and do not underflow).
-        assert!(!throttle_due(200, 150, CHECK_EVERY_SECS));
-    }
-    // The parse_code_key test moved to storage/maint.rs along with the function itself.
-}
+#[path = "maintenance_tests.rs"]
+mod tests;
