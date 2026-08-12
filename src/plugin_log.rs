@@ -14,7 +14,7 @@
 use crate::auth::middleware::{device_revoked, require_auth_device};
 use crate::groups::group_role;
 use crate::messages::inbox_do::sql_no_args;
-use crate::respond::json_err;
+use crate::respond::{json_err, passthrough};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -402,7 +402,7 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     headers.set("content-type", "application/json")?;
     init.with_headers(headers);
     let do_req = Request::new_with_init("https://do.sezgi/append", &init)?;
-    stub.fetch_with_request(do_req).await
+    passthrough(stub.fetch_with_request(do_req).await?).await
 }
 
 /// `GET /plugin-log/:room/:plugin/sync?since=` — JWT + active membership → the entries after the
@@ -442,5 +442,5 @@ pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let stub = namespace.id_from_name(&room_id)?.get_stub()?;
     let do_url = format!("https://do.sezgi/sync?plugin={plugin_id}&since={since}");
     let do_req = Request::new(&do_url, Method::Get)?;
-    stub.fetch_with_request(do_req).await
+    passthrough(stub.fetch_with_request(do_req).await?).await
 }

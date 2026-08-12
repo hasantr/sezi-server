@@ -13,7 +13,7 @@ const W4B_LEASE_SECS: i64 = 600;
 const W4B_BACKOFF_BASE_SECS: i64 = 120; // failure-backoff base (SEPARATE from the lease): 120→240→…→3600 cap
 const W4B_MAX_BACKOFF_SECS: i64 = 3600; // backoff ceiling — a long outage retries hourly and is NEVER deleted (no loss)
 const W4B_DRAIN_BATCH: usize = 50; // rows drained per cron (bounded by D1 response size + sequential DO fetch time)
-use crate::respond::{json_err, no_content};
+use crate::respond::{json_err, no_content, passthrough};
 use crate::utils::now_secs;
 use serde::Deserialize;
 use worker::*;
@@ -837,7 +837,7 @@ pub async fn receipt_sync(req: Request, ctx: RouteContext<()>) -> Result<Respons
         &format!("https://do.sezgi/receipt-sync?since={since}"),
         Method::Get,
     )?;
-    stub.fetch_with_request(do_req).await
+    passthrough(stub.fetch_with_request(do_req).await?).await
 }
 
 /// `POST /messages/self-read` (the 2026-06-28 sibling-read epic): a device of U reports the
@@ -877,7 +877,7 @@ pub async fn self_read(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     headers.set("content-type", "application/json")?;
     init.with_headers(headers);
     let do_req = Request::new_with_init("https://do.sezgi/self-read", &init)?;
-    stub.fetch_with_request(do_req).await
+    passthrough(stub.fetch_with_request(do_req).await?).await
 }
 
 /// `GET /messages/self-read-sync?since=` — sibling-read cursor pull (the HTTP twin of the WS
@@ -901,7 +901,7 @@ pub async fn self_read_sync(req: Request, ctx: RouteContext<()>) -> Result<Respo
         &format!("https://do.sezgi/self-read-sync?since={since}"),
         Method::Get,
     )?;
-    stub.fetch_with_request(do_req).await
+    passthrough(stub.fetch_with_request(do_req).await?).await
 }
 
 #[cfg(test)]
