@@ -1,11 +1,11 @@
-# Sezi Server — Cloudflare Worker (self-host şablonu)
+# Sezi Server — Cloudflare Worker (self-host template)
 #
-# Bu dosya "Deploy to Cloudflare" butonu için parametriktir: kaynak ID'leri
-# (D1/KV) buton akışında OTOMATİK oluşturulup buraya yazılır. CLI ile kuruyorsan
-# README'deki 3 komutla kaynakları oluşturup ID'leri işle.
+# This file is parametric for the "Deploy to Cloudflare" button: the resource IDs (D1/KV) are
+# created during the button's flow and written back here automatically. Installing from the CLI
+# instead? Create the resources with the three commands in the README and paste the real IDs in.
 #
-# PREBUILT: `build/` klasörü derlenmiş WASM içerir → deploy için Rust GEREKMEZ
-# ([build] bölümü bilinçli yok; `wrangler deploy` yalnız upload eder).
+# PREBUILT: `build/` contains compiled WASM, so deploying needs NO Rust toolchain. The absence of
+# a [build] section is deliberate — `wrangler deploy` only uploads.
 
 name = "sezi-server"
 main = "build/worker/shim.mjs"
@@ -13,45 +13,47 @@ compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
-# D1 — sunucu veritabanı (üyeler/davetler/kuyruk-metadata; içerik E2E-şifreli,
-# sunucu OKUYAMAZ). Şema ilk istekte otomatik kurulur (self-migration).
+# D1 — the server database (members, invitations, queue metadata; message CONTENT is end-to-end
+# encrypted and the server cannot read it). The schema installs itself on the first request
+# (self-migration), so no migration command is needed.
 [[d1_databases]]
 binding = "DB"
 database_name = "sezi"
-# PLACEHOLDER: "Deploy to Cloudflare" butonu yeni D1 oluşturup bu ID'yi kendisi
-# günceller (butonun parser'ı alanın MEVCUT olmasını ister — CF dokümanı).
-# CLI ile kuruyorsan: `wrangler d1 create sezi` → çıktıdaki gerçek id'yi yaz.
+# PLACEHOLDER: the "Deploy to Cloudflare" button creates a new D1 and rewrites this ID itself.
+# The field has to EXIST for the button's parser to see it — that is Cloudflare's documented
+# requirement, not a quirk of ours. From the CLI: `wrangler d1 create sezi`, then paste the real
+# id from the output.
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "./migrations"
 
-# R2 (medya) — BİLİNÇLİ KAPALI ("Lite" kurulum): R2, Cloudflare hesabında
-# abonelik-etkinleştirme (kart doğrulaması) istiyor; ilk kurulum kartsız olsun
-# diye binding yok. Mesajlaşma/grup/arama TAM çalışır; fotoğraf/dosya paylaşımı
-# kapalı görünür. SONRADAN AÇMAK (kod/redeploy GEREKMEZ):
-#   1. CF dashboard → R2 → etkinleştir (10 GB'a kadar ücretsiz) → "sezi-media"
-#      adında bucket oluştur.
-#   2. Workers & Pages → sezi-server → Settings → Bindings → Add → R2 bucket →
-#      Variable name: MEDIA, bucket: sezi-media → Deploy.
-#   3. Bitti — uygulama özelliği kendiliğinden gösterir (/capabilities dinamik).
-# (İstersen aşağıyı açıp CLI ile de verebilirsin:)
+# R2 (media) — DELIBERATELY OFF ("Lite" install). Enabling R2 on a Cloudflare account requires
+# activating a subscription, which means card verification; leaving the binding out is what keeps
+# the first install card-free. Messaging, groups and calls work in FULL; photo and file sharing
+# simply shows as unavailable. TURNING IT ON LATER NEEDS NO CODE AND NO REDEPLOY:
+#   1. CF dashboard -> R2 -> enable it (free up to 10 GB) -> create a bucket named "sezi-media".
+#   2. Workers & Pages -> sezi-server -> Settings -> Bindings -> Add -> R2 bucket ->
+#      Variable name: MEDIA, bucket: sezi-media -> Deploy.
+#   3. Done — the app shows the feature by itself (/capabilities is dynamic).
+# (Prefer the CLI? Uncomment the block below and bind it that way instead:)
 # [[r2_buckets]]
 # binding = "MEDIA"
 # bucket_name = "sezi-media"
 
-# KV (hız-limiti / brute-force freni) — AÇIK. "Deploy to Cloudflare" butonu (D1
-# gibi) yeni KV namespace oluşturup bu ID'yi kendisi günceller (parser'ı alanın
-# MEVCUT olmasını ister — CF dokümanı). ratelimit.rs `env.kv("RATE_LIMIT")` arar →
-# binding adı RATE_LIMIT ZORUNLU. Kod FAIL-OPEN: KV günlük-yazma limiti (ücretsiz
-# katman 1000/gün) aşılırsa hız-limiti gevşer ama MESAJLAŞMA DURMAZ (saha-testli,
-# 2026-06-27 wedge dersi). Brute-force hedefleri (bootstrap/verify/invite, ~5-10/5dk)
-# seyrek → o koruma her zaman aktif; asıl fren buradan gelir. CLI ile kuruyorsan:
-# `wrangler kv namespace create RATE_LIMIT` → çıktıdaki gerçek id'yi yaz.
+# KV (rate limiting / brute-force brake) — ON. Like D1, the "Deploy to Cloudflare" button creates
+# a new namespace and rewrites this ID itself, and its parser likewise wants the field to be
+# present. `ratelimit.rs` looks up `env.kv("RATE_LIMIT")`, so the binding NAME is mandatory.
+#
+# The code FAILS OPEN: if KV's daily write limit (1000/day on the free tier) is exhausted the
+# rate limiting loosens, but MESSAGING DOES NOT STOP — a lesson from the field, the 2026-06-27
+# wedge. The brute-force targets (bootstrap/verify/invite, roughly 5-10 per 5 minutes) are rare
+# enough that THAT protection is always live; the ordinary traffic brake is what gives way.
+# From the CLI: `wrangler kv namespace create RATE_LIMIT`, then paste the real id.
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
 id = "00000000000000000000000000000000"
 
-# Durable Objects — kullanıcı-başına gelen-kutusu + oda-başına eklenti-log'u.
-# Deploy'da otomatik oluşur, ön-hazırlık gerekmez.
+# Durable Objects — a per-user inbox and a per-room plugin log. Created automatically on deploy;
+# nothing to prepare.
 [[durable_objects.bindings]]
 name = "USER_INBOX"
 class_name = "UserInbox"
@@ -68,25 +70,24 @@ new_sqlite_classes = ["UserInbox"]
 tag = "v2"
 new_sqlite_classes = ["PluginRoomLog"]
 
-# [triggers]/cron BİLİNÇLİ YOK: CF free-planı hesap-başına cron sayısını
-# sınırlar (aynı hesapta 2. sunucu cron-adımında hata alıyordu). Bakım
-# (temizlik + teslim-tekrar-drain'i) cron'suz da çalışır: sunucu bunları
-# istek-sırtında kendisi yürütür (lazy-maintenance, src/maintenance.rs).
-# İstersen cron da ekleyebilirsin (dashboard → Settings → Triggers) —
-# eklersen lazy-yol kendiliğinden uyur, çift-koşum olmaz.
+# [triggers]/cron DELIBERATELY ABSENT: the CF free plan caps crons per ACCOUNT, and a second
+# server in the same account failed at the cron step because of it. Maintenance (cleanup plus the
+# delivery-retry drain) works without cron: the server performs it on the back of ordinary
+# requests (lazy maintenance, src/maintenance.rs). Add a cron if you want one — dashboard ->
+# Settings -> Triggers — and the lazy path stands down by itself, so nothing runs twice.
 
-# [vars] BİLİNÇLİ YOK — hepsi kodda güvenli default'lu (deploy-ekranı "isim +
-# Onayla"ya insin diye): ENV=prod (fail-secure) · JWT_ISSUER="sezi-server" ·
-# TURN_MONTHLY_CAP=5000. İnce-ayar istersen dashboard → Settings → Variables:
-#   ENV, JWT_ISSUER, TURN_MONTHLY_CAP, FCM_PROJECT_ID (Android push için;
-#   yanında FCM_SERVICE_ACCOUNT secret'ı gerekir — push'u uygulama içinden de
-#   açabilirsin: Sunucu → Kullanım → Bildirimler).
+# [vars] DELIBERATELY ABSENT — every one of them has a safe default in code, so the deploy screen
+# is just "name it and confirm": ENV=prod (fail-secure), JWT_ISSUER="sezi-server",
+# TURN_MONTHLY_CAP=5000. To tune them: dashboard -> Settings -> Variables. Also available there:
+# FCM_PROJECT_ID (Android push; it needs the FCM_SERVICE_ACCOUNT secret alongside it — you can
+# also switch push on from inside the app, under Server -> Usage -> Notifications).
 
-# ── Secret'lar — HEPSİ OPSİYONEL ──────────────────────────────────────────────
-# JWT_SIGNING_KEY / ADMIN_INVITE_KEY: girilmezse sunucu İLK AÇILIŞTA kendisi
-#   üretir ve D1'de saklar (self-provisioning). Kendi anahtarını yönetmek istersen
-#   `wrangler secret put JWT_SIGNING_KEY` (PKCS8 PEM Ed25519) — env HER ZAMAN kazanır.
-# TURN_KEY_ID / TURN_API_TOKEN: CF Realtime TURN (opsiyonel; yoksa arama LAN/STUN).
-# FCM_SERVICE_ACCOUNT: Firebase service-account JSON (opsiyonel; Android push).
-# CF_API_TOKEN / CF_ACCOUNT_ID: kullanım paneli "faturayla birebir" modu —
-#   bunları uygulama içinden de girebilirsin (Sunucu → Kullanım → CF Analytics).
+# -- Secrets — ALL OPTIONAL -----------------------------------------------------------------
+# JWT_SIGNING_KEY / ADMIN_INVITE_KEY: if you do not set them the server GENERATES them on its
+#   first boot and stores them in D1 (self-provisioning). To manage your own key instead,
+#   `wrangler secret put JWT_SIGNING_KEY` (PKCS8 PEM, Ed25519) — an env value ALWAYS wins.
+# TURN_KEY_ID / TURN_API_TOKEN: Cloudflare Realtime TURN (optional; without it calls fall back to
+#   LAN/STUN).
+# FCM_SERVICE_ACCOUNT: Firebase service-account JSON (optional; Android push).
+# CF_API_TOKEN / CF_ACCOUNT_ID: the usage panel's "matches your bill exactly" mode — you can also
+#   enter these from inside the app, under Server -> Usage -> CF Analytics.
