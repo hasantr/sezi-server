@@ -135,6 +135,15 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
     .run()
     .await?;
 
+    // The heartbeat of a session that is actually being used — a device renews here about every
+    // quarter of an hour, which is exactly the resolution the devices screen wants. Best-effort:
+    // a failed note must not fail a refresh. See `middleware::touch_device_seen`.
+    if let Err(e) =
+        crate::auth::middleware::touch_device_seen(&ctx.env, &user_id, device_id).await
+    {
+        worker::console_log!("last_seen touch failed on refresh for {device_id}: {e}");
+    }
+
     Response::from_json(&serde_json::json!({
         "user_id": user_id,
         "access_token": access_token,

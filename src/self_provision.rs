@@ -186,6 +186,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0036_silent_push",
         include_str!("../migrations/0036_silent_push.sql"),
     ),
+    (
+        "0037_device_last_seen",
+        include_str!("../migrations/0037_device_last_seen.sql"),
+    ),
 ];
 
 thread_local! {

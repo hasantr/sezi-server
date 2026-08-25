@@ -226,6 +226,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // Multi-device (M1 — store and serve the signed device list; additive).
         .put_async("/devices/list", devices::handlers::put_list)
         .get_async("/devices/list/:user_id", devices::handlers::get_list)
+        // What the server OBSERVED about my own devices, beside the signed list rather than
+        // inside it — the primary signs that document and cannot know when another device last
+        // connected. Self only.
+        .get_async("/devices/activity", devices::handlers::get_activity)
         // Multi-device (M2-S3.2 — QR link flow; all POST, see devices/link.rs).
         .post_async("/devices/link-start", devices::link::link_start)
         .post_async("/devices/link-approve", devices::link::link_approve)
@@ -351,6 +355,14 @@ async fn sync_ws(req: Request, env: Env) -> Result<Response> {
         Ok(auth) => auth,
         Err(resp) => return Ok(resp),
     };
+    // "This device connected" — the truest form of the question the devices screen asks, and once
+    // per socket rather than once per request. Best-effort: failing to record it is not a reason
+    // to refuse the connection. See `touch_device_seen`.
+    if let Err(e) =
+        crate::auth::middleware::touch_device_seen(&env, &auth.user_id, &auth.device_id).await
+    {
+        console_log!("last_seen touch failed on sync for {}: {e}", auth.device_id);
+    }
     let user_id = auth.user_id;
     let upgrade = req.headers().get("upgrade").ok().flatten();
     if upgrade.as_deref().map(|s| s.to_lowercase()) != Some("websocket".into()) {

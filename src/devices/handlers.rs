@@ -548,6 +548,53 @@ pub(crate) async fn validate_and_store_signed_list(
 
 /// `GET /devices/list/:user_id` — a user's current signed list.
 /// 200 `{doc_json, sig_b64, rev}` | 404 not_found.
+/// `GET /devices/activity` — when the server last saw each of MY devices.
+///
+/// Deliberately a separate route from `GET /devices/list`, which returns a document the PRIMARY
+/// signed. This is the server's own observation and it cannot go inside that blob: the signature
+/// would break, and the primary does not know the answer in the first place. Two sources, two
+/// trust levels, two fields — the client shows this as server-asserted.
+///
+/// SELF ONLY. When a device last connected is presence, and presence about another person is not
+/// something this endpoint has any business answering — the device list is readable by a direct
+/// contact (they need the keys), the activity is not.
+///
+/// `last_seen_at` is null for a device that has not made an authenticated request since the column
+/// existed. That covers both a device linked before this shipped and a genuine ghost — one whose
+/// first history sync timed out, leaving a row in the signed list and nothing behind it — and the
+/// client must not tell those two apart, because the server cannot.
+pub async fn get_activity(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let auth = match require_active_auth(&req, &ctx.env).await {
+        Ok(a) => a,
+        Err(resp) => return Ok(resp),
+    };
+    #[derive(Deserialize)]
+    struct ActivityRow {
+        device_id: String,
+        last_seen_at: Option<i64>,
+    }
+    let rows: Vec<ActivityRow> = ctx
+        .env
+        .d1("DB")?
+        .prepare(
+            "SELECT device_id, last_seen_at FROM devices
+              WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(&[d1_text(&auth.user_id)])?
+        .all()
+        .await?
+        .results()?;
+    Response::from_json(&serde_json::json!({
+        "devices": rows
+            .iter()
+            .map(|r| serde_json::json!({
+                "device_id": r.device_id,
+                "last_seen_at": r.last_seen_at,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 pub async fn get_list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let target = match ctx.param("user_id") {
         Some(s) => s.clone(),

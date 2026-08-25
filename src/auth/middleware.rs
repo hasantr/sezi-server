@@ -221,6 +221,53 @@ pub async fn validate_active_token(
     Ok(auth)
 }
 
+/// How stale `devices.last_seen_at` may get before it is written again.
+///
+/// Fifteen minutes is the resolution the question deserves — "today, or three weeks ago?" — and it
+/// is also the rhythm of the two callers below, so in practice almost every call writes.
+const SEEN_THROTTLE_MS: i64 = 15 * 60 * 1000;
+
+/// Record that this device was here, at most once per [`SEEN_THROTTLE_MS`].
+///
+/// **Called from exactly two places, and NOT from `validate_active_token`.** It was there first,
+/// which put a D1 statement behind all sixty-eight endpoints that gate on an active session —
+/// message send among them — for a field that decorates a device row. The `WHERE` clause throttles
+/// the WRITE, but the statement still runs, so the cost was a round trip per request, always.
+///
+/// The two callers give the same answer for a fraction of that: the `/sync` upgrade, which is
+/// exactly "this device connected", and `/auth/refresh`, which an active session performs on its
+/// own every quarter of an hour. A device in use hits both; one that is not hits neither, which is
+/// the thing being measured.
+///
+/// The read is the throttle: `WHERE last_seen_at IS NULL OR last_seen_at < ?` makes the write
+/// its own condition, so there is no second round trip to decide whether to write. NULL is
+/// included on purpose — it is what every device that predates the column looks like.
+///
+/// MILLISECONDS, matching `devices.added_at` — which the row is read beside. The same table's
+/// `revoked_at` is in SECONDS; that is older and not something to copy.
+pub(crate) async fn touch_device_seen(
+    env: &Env,
+    user_id: &str,
+    device_id: &str,
+) -> Result<()> {
+    let now = crate::utils::now_ms() as i64;
+    env.d1("DB")?
+        .prepare(
+            "UPDATE devices SET last_seen_at = ?
+              WHERE user_id = ? AND device_id = ?
+                AND (last_seen_at IS NULL OR last_seen_at < ?)",
+        )
+        .bind(&[
+            crate::d1util::d1_int(now),
+            d1_text(user_id),
+            d1_text(device_id),
+            crate::d1util::d1_int(now - SEEN_THROTTLE_MS),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
 /// Fresh registration bootstrap needs to read the account's own, initially
 /// missing device list before an active device row exists. Membership is still
 /// checked so the same narrow exception cannot be reused after a kick/leave.

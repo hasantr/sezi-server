@@ -1,0 +1,24 @@
+-- When each device last presented a valid token — the answer to "which of these is still mine?"
+--
+-- The device list a client reads is a document the PRIMARY signs, so it cannot carry this: the
+-- primary does not know when another device last connected, and the server cannot add a field to
+-- a blob it did not sign. Activity is therefore server-asserted and travels beside the signed
+-- list, never inside it (`GET /devices/activity`), and the UI has to say so — the same
+-- distinction `trust_state: server_asserted` already draws elsewhere.
+--
+-- The reason it is worth a column. The 2026-08-17 journey audit's finding #20: a linked device
+-- whose first history sync times out rolls itself back locally, and the entry it left in the
+-- primary's signed list stays. Every retry mints a fresh identity, so up to three of them
+-- accumulate against a ceiling of five. They are inert — the keys are gone and Remove works —
+-- and the whole harm is that the owner cannot tell which row is a real phone. A last-seen answers
+-- exactly that, without a new protocol message and without depending on a path that is broken by
+-- definition in the case it would be sent.
+--
+-- NULL means "never seen since this column existed", which is honest for both a genuine ghost and
+-- every device that predates the migration; the client renders the two the same way and does not
+-- pretend to know more.
+--
+-- MILLISECONDS, like `added_at` in the same table and unlike `revoked_at`, which is in seconds.
+-- That mixture is already here and is not something to extend; the value is read next to
+-- `added_at`, so it matches that one.
+ALTER TABLE devices ADD COLUMN last_seen_at INTEGER;
