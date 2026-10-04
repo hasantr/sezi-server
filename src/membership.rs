@@ -359,6 +359,15 @@ pub(crate) async fn delete_membership(
         // A private group with no successor is closed down entirely, leaking no membership.
         db.prepare("DELETE FROM groups WHERE created_by=?")
             .bind(&[d1_text(target_id)])?,
+        // The group LIBRARY of every room that just closed: queued for store deletion, released
+        // from the server total and dropped, here and in this order, because all three read
+        // "rooms with no group" and only now does that set include the rooms closed above. The
+        // rooms this account merely uploaded into keep its parts — a library belongs to its
+        // group, not to whoever pressed record (`room_library_cleanup.rs`).
+        db.prepare(crate::room_library::cleanup::ORPHAN_ROOMLESS_SQL)
+            .bind(&[d1_int(now)])?,
+        db.prepare(crate::room_library::cleanup::RELEASE_ROOMLESS_SQL),
+        db.prepare(crate::room_library::cleanup::DELETE_ROOMLESS_SQL),
         db.prepare("UPDATE group_members SET added_by=NULL WHERE added_by=?")
             .bind(&[d1_text(target_id)])?,
         db.prepare("DELETE FROM group_members WHERE user_id=?")

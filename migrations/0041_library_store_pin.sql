@@ -1,0 +1,18 @@
+-- 0041: pin the group LIBRARY to chosen stores ("recordings → the campus MinIO", campus plan
+-- Waves D and F).
+--
+-- Placement has been class-agnostic: every blob goes to the first active store with room, in
+-- priority order. A university that runs its own MinIO wants its recordings THERE and nowhere
+-- else, while chat media may keep using R2. A store with `library_pin = 1` is such a place.
+--
+-- The rule (`storage/router.rs`): while ANY store is pinned, library parts are placed ONLY on
+-- pinned stores — in priority order, with the usual overflow and per-store `max_bytes` among
+-- them. If none of them can take a part, the upload is refused (429 when they are full, 503
+-- when they are down) rather than spilled onto an unpinned store: a pin that leaks under
+-- pressure is a pin nobody can rely on. With no store pinned, the library is placed like
+-- everything else. Only the library looks at this column; it never keeps other classes out of a
+-- pinned store.
+--
+-- The pin governs where NEW parts go. Parts already stored stay where they are until a drain
+-- moves them — and a drain moves library parts onto a pinned store.
+ALTER TABLE storage_backends ADD COLUMN library_pin INTEGER NOT NULL DEFAULT 0;

@@ -37,10 +37,15 @@ use crate::utils::now_secs;
 /// Max blobs moved per run — the free-plan subrequest budget.
 const MOVE_BATCH: usize = 4;
 
-/// A move candidate coming from the 3-way meta-table UNION (`candidates_sql`).
+/// The meta tables a store's inventory is spread over: media, plugin media, plugin code and the
+/// group library. `candidates_sql` and `remaining_sql` repeat the store-id IN-list once per
+/// table, and `in_binds_per_table` binds it that many times.
+const META_TABLES: usize = 4;
+
+/// A move candidate coming from the meta-table UNION (`candidates_sql`).
 #[derive(Deserialize)]
 struct MoveRow {
-    chan: String, // 'media' | 'plugin_media' | 'plugin_code'
+    chan: String, // 'media' | 'plugin_media' | 'plugin_code' | 'library'
     room_id: String,
     blob_id: String,
     size_bytes: i64,
@@ -67,10 +72,10 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
     }
     let ids: Vec<String> = draining.into_iter().map(|r| r.store_id).collect();
 
-    // Candidates: the OLDEST ≤MOVE_BATCH blobs on a draining backend, over all 3 tables.
+    // Candidates: the OLDEST ≤MOVE_BATCH blobs on a draining backend, over every meta table.
     let rows: Vec<MoveRow> = db
         .prepare(candidates_sql(ids.len()))
-        .bind(&in_binds_x3(&ids))?
+        .bind(&in_binds_per_table(&ids))?
         .all()
         .await?
         .results()?;
@@ -129,7 +134,7 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
     Ok(())
 }
 
-/// REMAINING inventory count per draining backend (counted over the 3-table UNION).
+/// REMAINING inventory count per draining backend (counted over the meta-table UNION).
 /// Shared by the completion check, `GET /admin/storage`'s `draining_remaining` and the
 /// drain endpoint's response → "remaining" is defined in exactly one place. Every
 /// requested id is present in the result (0 when it has no rows).
@@ -148,7 +153,7 @@ pub(crate) async fn remaining_counts(
     }
     let rows: Vec<Row> = db
         .prepare(remaining_sql(store_ids.len()))
-        .bind(&in_binds_x3(store_ids))?
+        .bind(&in_binds_per_table(store_ids))?
         .all()
         .await?
         .results()?;
@@ -311,8 +316,8 @@ async fn transfer_counters(db: &D1Database, moved: &[(String, String, i64)]) {
     }
 }
 
-/// Per-channel key binds: media=[blob,source]; plugin_*=[room,blob,source] — exactly the
-/// WHERE order of `meta_update_sql`/`meta_delete_sql`.
+/// Per-channel key binds: media=[blob,source]; plugin_* and library=[room,blob,source] —
+/// exactly the WHERE order of `meta_update_sql`/`meta_delete_sql`.
 fn key_binds(row: &MoveRow) -> Vec<JsValue> {
     if row.chan == "media" {
         vec![d1_text(&row.blob_id), d1_text(&row.store_id)]
@@ -326,9 +331,9 @@ fn key_binds(row: &MoveRow) -> Vec<JsValue> {
 }
 
 /// The IN-list binds repeated once per table (matches candidates_sql/remaining_sql).
-fn in_binds_x3(ids: &[String]) -> Vec<JsValue> {
-    let mut binds = Vec::with_capacity(ids.len() * 3);
-    for _ in 0..3 {
+fn in_binds_per_table(ids: &[String]) -> Vec<JsValue> {
+    let mut binds = Vec::with_capacity(ids.len() * META_TABLES);
+    for _ in 0..META_TABLES {
         for id in ids {
             binds.push(d1_text(id));
         }
@@ -349,6 +354,9 @@ fn key_and_class(chan: &str, room_id: &str, blob_id: &str) -> Option<(String, St
             StorageClass::PluginMedia,
         )),
         "plugin_code" => Some((super::code_key(room_id, blob_id), StorageClass::PluginCode)),
+        // The library's class carries its pin: a part leaving a draining store lands on a pinned
+        // store when one is set, exactly as a new upload would.
+        "library" => Some((super::library_key(room_id, blob_id), StorageClass::Library)),
         _ => None,
     }
 }
@@ -369,6 +377,11 @@ fn meta_update_sql(chan: &str) -> Option<&'static str> {
             "UPDATE plugin_code_objects SET store_id = ? \
              WHERE room_id = ? AND blob_id = ? AND store_id = ? RETURNING blob_id",
         ),
+        // `object_id AS blob_id`: the RETURNING row is read into the same one-field struct.
+        "library" => Some(
+            "UPDATE room_library_objects SET store_id = ? \
+             WHERE room_id = ? AND object_id = ? AND store_id = ? RETURNING object_id AS blob_id",
+        ),
         _ => None,
     }
 }
@@ -382,6 +395,9 @@ fn meta_delete_sql(chan: &str) -> Option<&'static str> {
         ),
         "plugin_code" => Some(
             "DELETE FROM plugin_code_objects WHERE room_id = ? AND blob_id = ? AND store_id = ?",
+        ),
+        "library" => Some(
+            "DELETE FROM room_library_objects WHERE room_id = ? AND object_id = ? AND store_id = ?",
         ),
         _ => None,
     }
@@ -397,6 +413,9 @@ fn meta_select_sql(chan: &str) -> Option<&'static str> {
         ),
         "plugin_code" => Some(
             "SELECT store_id FROM plugin_code_objects WHERE room_id = ? AND blob_id = ? LIMIT 1",
+        ),
+        "library" => Some(
+            "SELECT store_id FROM room_library_objects WHERE room_id = ? AND object_id = ? LIMIT 1",
         ),
         _ => None,
     }
@@ -455,8 +474,12 @@ fn drain_complete(remaining: i64) -> bool {
     remaining <= 0
 }
 
-/// Move-candidate SQL for n draining backends: UNION over the 3 meta tables, oldest first,
-/// ≤MOVE_BATCH. Binds = `in_binds_x3` (the id list three times).
+/// Move-candidate SQL for n draining backends: UNION over the `META_TABLES` meta tables, oldest
+/// first, ≤MOVE_BATCH. Binds = `in_binds_per_table` (the id list once per table).
+///
+/// A table left out of this UNION is the dangerous omission: its blobs are never moved,
+/// `remaining_sql` (if it also leaves the table out) reports the store empty, the store flips to
+/// `disabled`, and the owner may then delete it with those blobs still on it.
 fn candidates_sql(n_stores: usize) -> String {
     let marks = placeholders(n_stores);
     format!(
@@ -468,11 +491,14 @@ fn candidates_sql(n_stores: usize) -> String {
          UNION ALL \
          SELECT 'plugin_code' AS chan, room_id, blob_id, size_bytes, store_id, created_at \
            FROM plugin_code_objects WHERE store_id IN ({marks}) \
+         UNION ALL \
+         SELECT 'library' AS chan, room_id, object_id AS blob_id, size_bytes, store_id, created_at \
+           FROM room_library_objects WHERE store_id IN ({marks}) \
          ORDER BY created_at ASC LIMIT {MOVE_BATCH}"
     )
 }
 
-/// Remaining-inventory SQL for n backends (counted per store_id). Binds = `in_binds_x3`.
+/// Remaining-inventory SQL for n backends (counted per store_id). Binds = `in_binds_per_table`.
 fn remaining_sql(n_stores: usize) -> String {
     let marks = placeholders(n_stores);
     format!(
@@ -480,6 +506,7 @@ fn remaining_sql(n_stores: usize) -> String {
            SELECT store_id FROM media_objects WHERE store_id IN ({marks}) \
            UNION ALL SELECT store_id FROM plugin_media_objects WHERE store_id IN ({marks}) \
            UNION ALL SELECT store_id FROM plugin_code_objects WHERE store_id IN ({marks}) \
+           UNION ALL SELECT store_id FROM room_library_objects WHERE store_id IN ({marks}) \
          ) t GROUP BY store_id"
     )
 }
@@ -523,20 +550,27 @@ mod tests {
         let (k, c) = key_and_class("plugin_code", "r1", "b1").unwrap();
         assert_eq!(k, "plugin-code/r1/b1");
         assert!(matches!(c, StorageClass::PluginCode));
+        let (k, c) = key_and_class("library", "r1", "b1").unwrap();
+        assert_eq!(k, "room-library/r1/b1");
+        assert!(
+            matches!(c, StorageClass::Library),
+            "a moved library part must carry its class, or the pin is ignored on the way out"
+        );
         assert!(key_and_class("bogus", "r", "b").is_none());
     }
 
-    /// Candidate SQL: 3 tables × n placeholders (matching in_binds_x3), oldest first,
-    /// per-run ceiling MOVE_BATCH.
+    /// Candidate SQL: every meta table × n placeholders (matching in_binds_per_table), oldest
+    /// first, per-run ceiling MOVE_BATCH.
     #[test]
     fn candidate_sql_placeholder_order_and_limit() {
         let sql = candidates_sql(2);
-        assert_eq!(sql.matches('?').count(), 6, "3 tables × 2 ids");
+        assert_eq!(sql.matches('?').count(), META_TABLES * 2, "every table × 2 ids");
         assert!(sql.contains("ORDER BY created_at ASC"));
         assert!(sql.ends_with(&format!("LIMIT {MOVE_BATCH}")));
         assert!(sql.contains("FROM media_objects"));
         assert!(sql.contains("FROM plugin_media_objects"));
         assert!(sql.contains("FROM plugin_code_objects"));
+        assert!(sql.contains("FROM room_library_objects"));
     }
 
     /// Conditional-UPDATE semantics: every channel's SQL is source-conditional
@@ -544,10 +578,13 @@ mod tests {
     /// is conditional too. Unknown channel → None (no unconditional mutation path exists).
     #[test]
     fn the_conditional_update_protects_against_races() {
-        for chan in ["media", "plugin_media", "plugin_code"] {
+        for chan in ["media", "plugin_media", "plugin_code", "library"] {
             let sql = meta_update_sql(chan).unwrap();
             assert!(sql.contains("AND store_id = ?"), "{chan}: an unconditional UPDATE is forbidden");
-            assert!(sql.contains("RETURNING blob_id"), "{chan}: race detection needs RETURNING");
+            assert!(
+                sql.contains("RETURNING ") && sql.ends_with("blob_id"),
+                "{chan}: race detection needs RETURNING, read back as `blob_id`"
+            );
             let del = meta_delete_sql(chan).unwrap();
             assert!(del.contains("store_id = ?"), "{chan}: the ghost DELETE is conditional too");
             assert!(meta_select_sql(chan).is_some());
@@ -617,11 +654,67 @@ mod tests {
         assert!(counter_deltas(&[]).is_empty());
     }
 
-    /// Remaining-inventory SQL: placeholders for all 3 tables + grouping per backend.
+    /// The library leg of the move engine against the REAL schema: a candidate names a part by
+    /// room and id under `chan = 'library'`, the remaining count sees it, the conditional UPDATE
+    /// moves exactly that row and reads back as `blob_id`, a replay from the old source moves
+    /// nothing, and the phantom DELETE only ever drops a row still on the store it names.
+    #[test]
+    fn the_library_leg_runs_against_the_real_schema() {
+        use rusqlite::{params, params_from_iter, OptionalExtension};
+        let db = crate::test_schema::full_schema();
+        let part = "obj-000000000001";
+        db.execute_batch(
+            "INSERT INTO room_library_objects
+               (room_id, object_id, uploader_id, size_bytes, store_id, created_at) VALUES
+               ('r1', 'obj-000000000001', 'u1', 700, 's3-old0000', 5),
+               ('r1', 'obj-000000000002', 'u1', 300, 'r2-primary', 6);",
+        )
+        .unwrap();
+        let draining = ["s3-old0000".to_string()];
+        let binds = || params_from_iter(draining.iter().cycle().take(META_TABLES));
+
+        let candidates: Vec<(String, String, String, i64, String)> = db
+            .prepare(&candidates_sql(1))
+            .unwrap()
+            .query_map(binds(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            candidates,
+            [("library".into(), "r1".into(), part.into(), 700, "s3-old0000".into())]
+        );
+        let remaining: i64 = db
+            .query_row(&remaining_sql(1), binds(), |r| r.get(1))
+            .unwrap();
+        assert_eq!(remaining, 1, "a store holding a library part is not empty");
+
+        let update = meta_update_sql("library").unwrap();
+        let moved = |source: &str| -> Option<String> {
+            db.query_row(update, params!["r2-primary", "r1", part, source], |r| r.get("blob_id"))
+                .optional()
+                .unwrap()
+        };
+        assert_eq!(moved("s3-old0000").as_deref(), Some(part));
+        assert_eq!(moved("s3-old0000"), None, "a second mover finds the row already gone");
+        let now: String = db
+            .query_row(meta_select_sql("library").unwrap(), params!["r1", part], |r| r.get(0))
+            .unwrap();
+        assert_eq!(now, "r2-primary");
+
+        let ghost = meta_delete_sql("library").unwrap();
+        assert_eq!(db.execute(ghost, params!["r1", part, "s3-old0000"]).unwrap(), 0);
+        assert_eq!(db.execute(ghost, params!["r1", part, "r2-primary"]).unwrap(), 1);
+    }
+
+    /// Remaining-inventory SQL: placeholders for every meta table + grouping per backend. A
+    /// table missing here reports a store holding its blobs as empty, and an empty draining
+    /// store is flipped to `disabled` and becomes deletable.
     #[test]
     fn remaining_sql_is_grouped() {
         let sql = remaining_sql(1);
-        assert_eq!(sql.matches('?').count(), 3);
+        assert_eq!(sql.matches('?').count(), META_TABLES);
         assert!(sql.contains("GROUP BY store_id"));
+        assert!(sql.contains("FROM room_library_objects"));
     }
 }

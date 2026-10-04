@@ -281,6 +281,10 @@ fn the_teardown_orphans_before_it_deletes_inside_one_batch() {
     for (orphan, drop) in [
         ("ORPHAN_PLUGIN_MEDIA_SQL", "DELETE FROM plugin_media_objects"),
         ("ORPHAN_PLUGIN_CODE_SQL", "DELETE FROM plugin_code_objects"),
+        // The group library (room_library_cleanup.rs). The release reads the same rows the
+        // delete drops, so it is held to the same order.
+        ("ORPHAN_ROOM_SQL", "DELETE_ROOM_SQL"),
+        ("RELEASE_ROOM_SQL", "DELETE_ROOM_SQL"),
     ] {
         let queued = batch.find(orphan).unwrap_or_else(|| panic!("{orphan} left the batch"));
         let dropped = batch.find(drop).unwrap_or_else(|| panic!("`{drop}` left the batch"));

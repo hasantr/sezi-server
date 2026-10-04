@@ -1,7 +1,7 @@
 use crate::auth::hashing::sha256_hex;
 use crate::d1util::{d1_int, d1_text};
-use crate::ratelimit::check_rate_limit_env;
-use crate::respond::json_err;
+use crate::ratelimit::{admit_env, Admission};
+use crate::respond::{json_err, rate_limited};
 use crate::utils::{now_secs, random_b64u};
 use serde::Deserialize;
 use worker::*;
@@ -33,17 +33,12 @@ const GENESIS_TTL_SEC: u64 = 100 * 365 * 24 * 60 * 60;
 pub async fn bootstrap(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // While there is no owner this endpoint is public, so a per-IP sliding window slows bot-driven
     // genesis enumeration. The KV binding is OPTIONAL (a slim install has no RATE_LIMIT) and
-    // `check_rate_limit_env` FAILS OPEN without it, so the gate keeps working. Legitimate
-    // onboarding calls /bootstrap 1-3 times, so 10 per 5 min is generous.
-    let ip = req
-        .headers()
-        .get("cf-connecting-ip")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "local".into());
+    // `admit_env` FAILS OPEN without it, so the gate keeps working. Legitimate onboarding calls
+    // /bootstrap 1-3 times, so 10 per 5 min is generous. A refusal says when in `Retry-After`.
+    let ip = crate::ratelimit::client_ip(&req, &ctx.env);
     let key = format!("auth:bootstrap:{}", ip);
-    if !check_rate_limit_env(&ctx.env, &key, 10, 5 * 60).await {
-        return json_err(429, "rate_limited");
+    if let Admission::Refused { retry_after_s } = admit_env(&ctx.env, &key, 10, 5 * 60).await {
+        return rate_limited(retry_after_s);
     }
 
     // The claim secret, when the relay has one, before any read: a caller without it learns

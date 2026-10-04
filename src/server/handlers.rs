@@ -82,6 +82,7 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
     let retention_days = fetch_retention_days(&ctx.env).await;
     let message_retention_days = fetch_message_retention_days(&ctx.env).await;
     let delete_window_hours = fetch_delete_window_hours(&ctx.env).await;
+    let library_days = fetch_library_retention_days(&ctx.env).await;
     // R2 is OPTIONAL, so features that depend on the MEDIA binding are announced
     // DYNAMICALLY. If the owner adds the binding from the dashboard later — no redeploy
     // needed — the next /capabilities call returns true and the client card updates itself.
@@ -135,12 +136,21 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         // media is NOT deleted on delivery — it is kept until the `media_days` TTL. Hence
         // `media: "ttl"` rather than on_delivery: the announcement matches actual behaviour.
         // Genuine delete-after-delivery would need recipient/room bookkeeping.
+        // `library_days` is the group library's own retention (`room_library.rs`), frozen into
+        // each part at upload: null = kept until deleted, the default. It is deliberately NOT
+        // the relay model above — R1 made the library a durable class beside it.
         "retention": {
             "model": "relay",
             "messages": "on_delivery",
             "media": "ttl",
             "media_days": retention_days,
             "message_days": message_retention_days,
+            "library_days": library_days,
+        },
+        // The group library's one fixed limit: the largest part a PUT accepts. The client cuts
+        // recordings into 32 MiB parts and encrypts each; this is that plus framing headroom.
+        "library": {
+            "max_object_bytes": crate::room_library::MAX_OBJECT_BYTES,
         },
         // The "delete for everyone" window: how many HOURS after a message was SENT it may
         // still be deleted for everyone. Owner-configurable, DEFAULT 48. The recipient side
@@ -166,6 +176,9 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         //     the client's next call is GET /instrument-pack/meta, which returns 404 `no_pack` on
         //     a server with no pack for ANY reason — none uploaded, no R2 binding, backend gone —
         //     and the plugin falls back to its procedural synth. One question, one answer.
+        //   - library → the group library's parts are blobs in the same stores as media, so a
+        //     server with no store answers every `/room-library` PUT with 503; announcing it
+        //     there would be the lie this block exists to avoid. Hence media_ok.
         "features": {
             "messaging": true,
             "media": media_ok,
@@ -173,7 +186,8 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
             "calls": true,
             "backup": true,
             "apps": media_ok,
-            "instrument_pack": true
+            "instrument_pack": true,
+            "library": media_ok
         },
         // ⚠️ P2P HONESTY: `supported:true` means the capability EXISTS and client toggles can
         // be persisted, while `available:false` means the transport is NOT ACTIVE YET
@@ -209,6 +223,25 @@ pub async fn fetch_retention_days(env: &Env) -> i64 {
         .ok()
         .flatten();
     row.map(|r| r.retention_days).unwrap_or(30)
+}
+
+/// `server_settings.library_retention_days` — how many days a group-library part is kept; `None`
+/// = until deleted. `None` too when the row, the column or D1 cannot be read: "keep" is the
+/// column's own default, and the PUT that actually freezes an expiry reads the setting itself
+/// and refuses to upload when it cannot (`room_library.rs`), so a failed read here can misstate
+/// the announcement but never the stored expiry.
+pub async fn fetch_library_retention_days(env: &Env) -> Option<i64> {
+    let db = env.d1("DB").ok()?;
+    #[derive(Deserialize)]
+    struct R {
+        library_retention_days: Option<i64>,
+    }
+    db.prepare("SELECT library_retention_days FROM server_settings WHERE id = 1 LIMIT 1")
+        .first::<R>(None)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.library_retention_days)
 }
 
 /// `server_settings.message_retention_days` — how many days an undelivered message stays in

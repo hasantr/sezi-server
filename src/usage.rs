@@ -95,65 +95,112 @@ pub async fn media_removed(db: &D1Database, removed: &[(String, i64)]) {
     .await;
 }
 
+/// Record a group-LIBRARY upload: the server total moves (`server_stats`, what
+/// `max_storage_bytes` is measured against) and `user_storage` deliberately does NOT — library
+/// bytes are charged to the room (`room_library.rs`), never to whoever pressed record.
+/// BEST-EFFORT, like `media_added`; the room's own usage needs no counter, it is summed from
+/// `room_library_objects` when a cap asks for it.
+pub async fn library_added(db: &D1Database, size: i64) {
+    let now = now_secs() as i64;
+    run_best_effort(
+        db,
+        "server_stats library add",
+        "INSERT INTO server_stats (id, media_bytes, media_count, updated_at) VALUES (1, ?, 1, ?) \
+         ON CONFLICT(id) DO UPDATE SET media_bytes = media_bytes + excluded.media_bytes, \
+         media_count = media_count + 1, updated_at = excluded.updated_at",
+        &[d1_int(size), d1_int(now)],
+    )
+    .await;
+}
+
+/// The removal twin of `library_added`: `bytes` and `count` leave the server total, clamped at 0.
+/// BEST-EFFORT.
+pub async fn library_removed(db: &D1Database, bytes: i64, count: i64) {
+    if count <= 0 {
+        return;
+    }
+    run_best_effort(
+        db,
+        "server_stats library sub",
+        "UPDATE server_stats SET media_bytes = MAX(0, media_bytes - ?), \
+         media_count = MAX(0, media_count - ?), updated_at = ? WHERE id = 1",
+        &[d1_int(bytes), d1_int(count), d1_int(now_secs() as i64)],
+    )
+    .await;
+}
+
 /// The daily authoritative reconcile — repairs drift in the best-effort counters by
-/// recomputing them from storage truth. Truth is the UNION of `media_objects` (ephemeral user
-/// media) and `plugin_media_objects` (persistent member plugin media): both feed the counters
+/// recomputing them from storage truth. Per-user truth is the UNION of `media_objects`
+/// (ephemeral user media) and `plugin_media_objects` (persistent member plugin media): both feed the counters
 /// through `media_added`, so reconcile MUST sum both tables or the self-heal would ERASE the
 /// plugin-media contribution and the quota would drop below reality. `db.batch` is a single D1
 /// transaction, giving a consistent snapshot; `maintenance::run_daily` calls it and logs any
 /// error rather than failing.
 ///
 /// The SAME batch recomputes per-backend `storage_backends.used_bytes`/`object_count`, grouped
-/// by `store_id` across THREE meta tables (media ∪ plugin_media ∪ plugin_code). plugin_code is
-/// DELIBERATELY excluded from the user_storage/server_stats math — it counts toward per-backend
-/// inventory only, so quota semantics stay unchanged.
+/// by `store_id` across FOUR meta tables (media ∪ plugin_media ∪ plugin_code ∪ room_library).
+/// plugin_code is DELIBERATELY excluded from the user_storage/server_stats math — it counts
+/// toward per-backend inventory only, so quota semantics stay unchanged.
+///
+/// The group library (`room_library_objects`) sits in the SERVER total and the per-backend
+/// inventory but never in `user_storage`: its bytes are charged to the room. So `server_stats`
+/// now means "everything `max_storage_bytes` is measured against", and its `media_` prefix is
+/// historical.
 pub async fn reconcile_storage(env: &Env) -> Result<()> {
     let db = env.d1("DB")?;
     let now = now_secs() as i64;
     db.batch(vec![
         db.prepare("DELETE FROM user_storage"),
-        db.prepare(
-            "INSERT INTO user_storage (user_id, bytes) \
-             SELECT uploader_id, COALESCE(SUM(size_bytes), 0) FROM ( \
-               SELECT uploader_id, size_bytes FROM media_objects \
-               UNION ALL \
-               SELECT uploader_id, size_bytes FROM plugin_media_objects \
-             ) GROUP BY uploader_id",
-        ),
+        db.prepare(RECONCILE_USER_STORAGE_SQL),
         db.prepare("DELETE FROM server_stats WHERE id = 1"),
-        db.prepare(
-            "INSERT INTO server_stats (id, media_bytes, media_count, updated_at) \
-             SELECT 1, COALESCE(SUM(size_bytes), 0), COUNT(*), ? FROM ( \
-               SELECT size_bytes FROM media_objects \
-               UNION ALL \
-               SELECT size_bytes FROM plugin_media_objects \
-             )",
-        )
-        .bind(&[d1_int(now)])?,
-        // Per-backend inventory recompute (UNION of the 3 meta tables, grouped by
-        // store_id). One correlated subquery per backend row — cheap, since the number
-        // of backends is a handful.
-        db.prepare(
-            "UPDATE storage_backends SET \
-               used_bytes = COALESCE(( \
-                 SELECT SUM(size_bytes) FROM ( \
-                   SELECT store_id, size_bytes FROM media_objects \
-                   UNION ALL SELECT store_id, size_bytes FROM plugin_media_objects \
-                   UNION ALL SELECT store_id, size_bytes FROM plugin_code_objects \
-                 ) u WHERE u.store_id = storage_backends.store_id), 0), \
-               object_count = ( \
-                 SELECT COUNT(*) FROM ( \
-                   SELECT store_id FROM media_objects \
-                   UNION ALL SELECT store_id FROM plugin_media_objects \
-                   UNION ALL SELECT store_id FROM plugin_code_objects \
-                 ) c WHERE c.store_id = storage_backends.store_id), \
-               updated_at = ?",
-        )
-        .bind(&[d1_int(now)])?,
+        db.prepare(RECONCILE_SERVER_STATS_SQL).bind(&[d1_int(now)])?,
+        db.prepare(RECONCILE_BACKENDS_SQL).bind(&[d1_int(now)])?,
     ])
     .await?;
     Ok(())
 }
+
+/// Per-UPLOADER storage: chat media and plugin media. Not plugin code (outside the quota since
+/// 0028) and not the group library (charged to the room).
+pub(crate) const RECONCILE_USER_STORAGE_SQL: &str = "INSERT INTO user_storage (user_id, bytes) \
+     SELECT uploader_id, COALESCE(SUM(size_bytes), 0) FROM ( \
+       SELECT uploader_id, size_bytes FROM media_objects \
+       UNION ALL \
+       SELECT uploader_id, size_bytes FROM plugin_media_objects \
+     ) GROUP BY uploader_id";
+
+/// The server total: every quota-charged byte — chat media, plugin media and the group library.
+/// Binds: now.
+pub(crate) const RECONCILE_SERVER_STATS_SQL: &str =
+    "INSERT INTO server_stats (id, media_bytes, media_count, updated_at) \
+     SELECT 1, COALESCE(SUM(size_bytes), 0), COUNT(*), ? FROM ( \
+       SELECT size_bytes FROM media_objects \
+       UNION ALL \
+       SELECT size_bytes FROM plugin_media_objects \
+       UNION ALL \
+       SELECT size_bytes FROM room_library_objects \
+     )";
+
+/// Per-backend inventory: every table that names a `store_id`. One correlated subquery per
+/// backend row — cheap, since the number of backends is a handful. A table missing here makes a
+/// store that holds its blobs look EMPTY, and `DELETE /admin/storage/:id` deletes empty stores.
+/// Binds: now.
+pub(crate) const RECONCILE_BACKENDS_SQL: &str = "UPDATE storage_backends SET \
+       used_bytes = COALESCE(( \
+         SELECT SUM(size_bytes) FROM ( \
+           SELECT store_id, size_bytes FROM media_objects \
+           UNION ALL SELECT store_id, size_bytes FROM plugin_media_objects \
+           UNION ALL SELECT store_id, size_bytes FROM plugin_code_objects \
+           UNION ALL SELECT store_id, size_bytes FROM room_library_objects \
+         ) u WHERE u.store_id = storage_backends.store_id), 0), \
+       object_count = ( \
+         SELECT COUNT(*) FROM ( \
+           SELECT store_id FROM media_objects \
+           UNION ALL SELECT store_id FROM plugin_media_objects \
+           UNION ALL SELECT store_id FROM plugin_code_objects \
+           UNION ALL SELECT store_id FROM room_library_objects \
+         ) c WHERE c.store_id = storage_backends.store_id), \
+       updated_at = ?";
 
 /// Bump a day-keyed general counter — upsert `+by` into today's `(day, kind)` row of
 /// `usage_counters`. BEST-EFFORT, so an error NEVER breaks the caller's real operation.

@@ -33,6 +33,7 @@ struct MyGroupRow {
     settings_json: Option<String>,
     status: String,
     added_by: Option<String>,
+    join_requests: i64,
 }
 
 #[derive(Deserialize)]
@@ -63,7 +64,11 @@ pub(super) async fn my_groups_page(db: &D1Database, user_id: &str) -> Result<ser
                     (SELECT COUNT(*) FROM group_members x
                        WHERE x.group_id = g.id AND x.status = 'active') AS member_count,
                     g.created_at, g.visibility, g.auto_join, g.settings_json,
-                    gm.status, gm.added_by
+                    gm.status, gm.added_by,
+                    CASE WHEN gm.status = 'active' AND gm.role IN ('owner', 'admin')
+                         THEN (SELECT COUNT(*) FROM group_join_requests r
+                                WHERE r.group_id = g.id AND r.state = 'pending')
+                         ELSE 0 END AS join_requests
              FROM groups g
              JOIN group_members gm ON gm.group_id = g.id
              WHERE gm.user_id = ?
@@ -98,6 +103,9 @@ pub(super) async fn my_groups_page(db: &D1Database, user_id: &str) -> Result<ser
                 "settings_json": r.settings_json,
                 "status": r.status,
                 "added_by": r.added_by,
+                // Pending join requests (a class invite's landing group), counted for the
+                // group's admins only — the list itself is `GET /groups/:id/join-requests`.
+                "join_requests": r.join_requests,
             })
         })
         .collect();

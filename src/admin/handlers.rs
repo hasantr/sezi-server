@@ -1,179 +1,9 @@
-use crate::auth::hashing::sha256_hex;
 use crate::auth::middleware::{fetch_role, require_active_auth, require_admin, require_owner};
-use crate::d1util::{d1_int, d1_opt_int, d1_opt_text, d1_text};
+use crate::d1util::{d1_int, d1_opt_int, d1_text};
 use crate::respond::json_err;
 use crate::utils::{now_secs, random_b64u};
 use serde::Deserialize;
 use worker::*;
-
-#[derive(Deserialize, Default)]
-struct CreateInviteBody {
-    email_hint: Option<String>,
-    ttl_hours: Option<u64>,
-    /// Minute-grained short TTL for in-person invites (5/15/60 min) — `ttl_hours`
-    /// bottoms out at an hour, far too long for handing a code to someone face to
-    /// face. When present this WINS over `ttl_hours`; when absent the `ttl_hours`
-    /// path still works, so older clients that send it keep working.
-    ttl_minutes: Option<u64>,
-}
-
-/// Resolve and validate the invite TTL in seconds. Precedence: `ttl_minutes` >
-/// `ttl_hours` (older clients) > a 24 hour default. Out of range → `Err(())`, which the
-/// caller turns into 400 bad_request:
-///   - ttl_minutes: 1..=43200 (30 days)
-///   - ttl_hours:   1..=24*30 (30 days)
-fn resolve_invite_ttl_secs(
-    ttl_minutes: Option<u64>,
-    ttl_hours: Option<u64>,
-) -> core::result::Result<u64, ()> {
-    if let Some(m) = ttl_minutes {
-        if !(1..=43200).contains(&m) {
-            return Err(());
-        }
-        return Ok(m * 60);
-    }
-    if let Some(h) = ttl_hours {
-        if !(1..=24 * 30).contains(&h) {
-            return Err(());
-        }
-        return Ok(h * 60 * 60);
-    }
-    Ok(24 * 60 * 60)
-}
-
-pub async fn create_invite(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_active_auth(&req, &ctx.env).await {
-        Ok(auth) => auth.user_id,
-        Err(resp) => return Ok(resp),
-    };
-    if let Err(resp) = require_admin(&user_id, &ctx.env).await {
-        return Ok(resp);
-    }
-    let body: CreateInviteBody = req.json().await.unwrap_or_default();
-    // `email_hint` is a free-text LABEL/NAME (optional; the admin notes who the invite
-    // was minted for). Redeem does NOT match it against the e-mail — binding it was
-    // useless against synthetic u...@sezgi.local addresses. Any label is allowed; only
-    // the length bound remains, as a DoS guard.
-    if let Some(h) = &body.email_hint {
-        if h.len() > 254 {
-            return json_err(400, "bad_request");
-        }
-    }
-    // TTL resolution: ttl_minutes > ttl_hours > 24h default.
-    let ttl = match resolve_invite_ttl_secs(body.ttl_minutes, body.ttl_hours) {
-        Ok(secs) => secs,
-        Err(()) => return json_err(400, "bad_request"),
-    };
-
-    let now = now_secs();
-    let token = random_b64u(18); // 24 char b64u
-    let token_hash = sha256_hex(&token);
-    let db = ctx.env.d1("DB")?;
-    db.prepare(
-        "INSERT INTO invite_tokens
-           (token, token_hash, email_hint, used, used_by, owner_user_id, expires_at, created_at)
-         VALUES (?, ?, ?, 0, NULL, ?, ?, ?)",
-    )
-    .bind(&[
-        d1_text(&token),
-        d1_text(&token_hash),
-        d1_opt_text(body.email_hint.as_deref()),
-        d1_text(&user_id),
-        d1_int((now + ttl) as i64),
-        d1_int(now as i64),
-    ])?
-    .run()
-    .await?;
-
-    Response::from_json(&serde_json::json!({
-        "token": token,
-        "email_hint": body.email_hint,
-        "expires_at": now + ttl,
-        "created_at": now,
-    }))
-}
-
-#[derive(Deserialize)]
-struct InviteRow {
-    token: String,
-    email_hint: Option<String>,
-    used: i32,
-    used_by: Option<String>,
-    owner_user_id: Option<String>,
-    used_by_email: Option<String>,
-    owner_email: Option<String>,
-    expires_at: i64,
-    created_at: i64,
-}
-
-pub async fn list_invites(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_active_auth(&req, &ctx.env).await {
-        Ok(auth) => auth.user_id,
-        Err(resp) => return Ok(resp),
-    };
-    if let Err(resp) = require_admin(&user_id, &ctx.env).await {
-        return Ok(resp);
-    }
-    let db = ctx.env.d1("DB")?;
-    // Who minted it (owner_email) and who used it (used_by_email) are resolved by JOIN.
-    // Used invites that TTL-GC already dropped from invite_tokens are still listed, from
-    // the durable invite_attributions ledger, under the SAME response schema. When a live
-    // row also has a ledger entry the ledger wins for used/used_by, so the narrow window
-    // between the claim and the `used` UPDATE never shows up as "unused" in the admin UI.
-    let rows: Vec<InviteRow> = db
-        .prepare(
-            "WITH invite_history AS (
-               SELECT it.token AS token,
-                      COALESCE(it.email_hint, ia.email_hint) AS email_hint,
-                      CASE WHEN ia.invite_token_hash IS NULL THEN it.used ELSE 1 END AS used,
-                      COALESCE(ia.used_by, it.used_by) AS used_by,
-                      COALESCE(ia.inviter_user_id, it.owner_user_id) AS owner_user_id,
-                      it.expires_at AS expires_at,
-                      it.created_at AS created_at
-                 FROM invite_tokens it
-                 LEFT JOIN invite_attributions ia ON ia.invite_token_hash = it.token_hash
-               UNION ALL
-               SELECT 'used:' || substr(ia.invite_token_hash, 1, 12) AS token,
-                      ia.email_hint, 1 AS used,
-                      ia.used_by, ia.inviter_user_id AS owner_user_id,
-                      ia.expires_at, ia.created_at
-                 FROM invite_attributions ia
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM invite_tokens it
-                   WHERE it.token_hash = ia.invite_token_hash
-                )
-             )
-             SELECT ih.token, ih.email_hint, ih.used, ih.used_by, ih.owner_user_id,
-                    ub.email AS used_by_email, ob.email AS owner_email,
-                    ih.expires_at, ih.created_at
-               FROM invite_history ih
-               LEFT JOIN users ub ON ih.used_by = ub.id
-               LEFT JOIN users ob ON ih.owner_user_id = ob.id
-              ORDER BY ih.created_at DESC LIMIT 100",
-        )
-        .all()
-        .await?
-        .results()?;
-    let now = now_secs();
-    let invites: Vec<_> = rows
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "token": r.token,
-                "email_hint": r.email_hint,
-                "used": r.used == 1,
-                "used_by": r.used_by,
-                "used_by_email": r.used_by_email,
-                "owner_user_id": r.owner_user_id,
-                "owner_email": r.owner_email,
-                "expires_at": r.expires_at,
-                "created_at": r.created_at,
-                "expired": (r.expires_at as u64) <= now,
-            })
-        })
-        .collect();
-    Response::from_json(&serde_json::json!({ "invites": invites }))
-}
 
 #[derive(Deserialize, Default)]
 struct UpdateSettingsBody {
@@ -195,12 +25,43 @@ struct UpdateSettingsBody {
     /// receiving side is what will ENFORCE it; the server only carries the value.
     /// None → keep the current value (twin of the retention pattern).
     delete_window_hours: Option<i64>,
+    /// Group-library retention in days, frozen into each object at upload. 0 CLEARS it (NULL =
+    /// keep until deleted, the default), 1..=3650 sets it, None keeps the current value — the
+    /// caps' 0-clears convention, because "keep" is a real setting here and not an error.
+    library_retention_days: Option<i64>,
+    /// Per-group library cap in bytes — same 0-clears convention as the storage caps.
+    max_room_library_bytes: Option<i64>,
 }
+
+/// The `server_settings` upsert behind `PATCH /admin/server-settings`, lifted out of the handler
+/// so the column list can be checked against the real migrations (`room_library_tests.rs`).
+/// Binds, in order: name, join_mode, directory_mode, dm_policy, retention_days,
+/// message_retention_days, max_storage_bytes, max_user_storage_bytes, delete_window_hours,
+/// library_retention_days, max_room_library_bytes, updated_at.
+pub(crate) const UPSERT_SERVER_SETTINGS_SQL: &str = "INSERT INTO server_settings \
+        (id, name, join_mode, directory_mode, dm_policy, retention_days, message_retention_days, \
+         max_storage_bytes, max_user_storage_bytes, delete_window_hours, \
+         library_retention_days, max_room_library_bytes, updated_at)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        join_mode = excluded.join_mode,
+        directory_mode = excluded.directory_mode,
+        dm_policy = excluded.dm_policy,
+        retention_days = excluded.retention_days,
+        message_retention_days = excluded.message_retention_days,
+        max_storage_bytes = excluded.max_storage_bytes,
+        max_user_storage_bytes = excluded.max_user_storage_bytes,
+        delete_window_hours = excluded.delete_window_hours,
+        library_retention_days = excluded.library_retention_days,
+        max_room_library_bytes = excluded.max_room_library_bytes,
+        updated_at = excluded.updated_at";
 
 /// `PATCH /admin/settings` — OWNER-only, not admin. Every field here is server-wide POLICY
 /// rather than day-to-day moderation: `directory_mode`/`dm_policy` decide who is discoverable
 /// and contactable (`join_mode` is still accepted, but only as `invite_only`), the retention pair
-/// decides how long undelivered content lives on the server, and `delete_window_hours` bounds
+/// decides how long undelivered content lives on the server, the library pair decides how long a
+/// group's library is kept and how large it may grow, and `delete_window_hours` bounds
 /// the "delete for everyone" promise made to every user. Changing what the server IS sits with
 /// `set_role` and `transfer_ownership`; admins keep invites, the member list and removals,
 /// which are separate handlers. `admin/storage.rs` draws the same line — owner mutates, admin
@@ -224,6 +85,8 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         && body.max_storage_bytes.is_none()
         && body.max_user_storage_bytes.is_none()
         && body.delete_window_hours.is_none()
+        && body.library_retention_days.is_none()
+        && body.max_room_library_bytes.is_none()
     {
         return json_err(400, "bad_request");
     }
@@ -273,6 +136,14 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
     {
         return json_err(400, "bad_request");
     }
+    // The two library settings share one rule (`room_library::library_setting`); validated here,
+    // before any read, and applied against the current row below.
+    use crate::room_library::{library_setting, LIBRARY_CAP_RANGE, LIBRARY_RETENTION_RANGE};
+    if library_setting(body.library_retention_days, None, LIBRARY_RETENTION_RANGE).is_err()
+        || library_setting(body.max_room_library_bytes, None, LIBRARY_CAP_RANGE).is_err()
+    {
+        return json_err(400, "bad_request");
+    }
 
     let now = now_secs();
     let db = ctx.env.d1("DB")?;
@@ -289,11 +160,15 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         max_storage_bytes: Option<i64>,
         max_user_storage_bytes: Option<i64>,
         delete_window_hours: i64,
+        // NULLABLE too: NULL = keep until deleted / unlimited.
+        library_retention_days: Option<i64>,
+        max_room_library_bytes: Option<i64>,
     }
     let cur: Option<CurRow> = db
         .prepare(
             "SELECT name, directory_mode, dm_policy, retention_days, message_retention_days, \
-             max_storage_bytes, max_user_storage_bytes, delete_window_hours \
+             max_storage_bytes, max_user_storage_bytes, delete_window_hours, \
+             library_retention_days, max_room_library_bytes \
              FROM server_settings WHERE id = 1 LIMIT 1",
         )
         .first(None)
@@ -337,25 +212,24 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         .map(|v| if v == 0 { None } else { Some(v) })
         .unwrap_or(cur_max_user_storage);
     let new_delete_window = body.delete_window_hours.unwrap_or(cur_delete_window);
-
-    let settings_stmt = db.prepare(
-        "INSERT INTO server_settings \
-            (id, name, join_mode, directory_mode, dm_policy, retention_days, message_retention_days, \
-             max_storage_bytes, max_user_storage_bytes, delete_window_hours, updated_at)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-            name = excluded.name,
-            join_mode = excluded.join_mode,
-            directory_mode = excluded.directory_mode,
-            dm_policy = excluded.dm_policy,
-            retention_days = excluded.retention_days,
-            message_retention_days = excluded.message_retention_days,
-            max_storage_bytes = excluded.max_storage_bytes,
-            max_user_storage_bytes = excluded.max_user_storage_bytes,
-            delete_window_hours = excluded.delete_window_hours,
-            updated_at = excluded.updated_at",
+    // Validated above, so the Err arm is unreachable; falling back to the current value keeps
+    // even that impossible case from writing something the owner did not ask for.
+    let cur_library_retention = cur.as_ref().and_then(|c| c.library_retention_days);
+    let cur_room_library_cap = cur.as_ref().and_then(|c| c.max_room_library_bytes);
+    let new_library_retention = library_setting(
+        body.library_retention_days,
+        cur_library_retention,
+        LIBRARY_RETENTION_RANGE,
     )
-    .bind(&[
+    .unwrap_or(cur_library_retention);
+    let new_room_library_cap = library_setting(
+        body.max_room_library_bytes,
+        cur_room_library_cap,
+        LIBRARY_CAP_RANGE,
+    )
+    .unwrap_or(cur_room_library_cap);
+
+    let settings_stmt = db.prepare(UPSERT_SERVER_SETTINGS_SQL).bind(&[
         d1_text(&new_name),
         d1_text(new_mode),
         d1_text(&new_directory_mode),
@@ -365,6 +239,8 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         d1_opt_int(new_max_storage),
         d1_opt_int(new_max_user_storage),
         d1_int(new_delete_window),
+        d1_opt_int(new_library_retention),
+        d1_opt_int(new_room_library_cap),
         d1_int(now as i64),
     ])?;
     let mut stmts = vec![settings_stmt];
@@ -390,43 +266,9 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         "max_storage_bytes": new_max_storage,
         "max_user_storage_bytes": new_max_user_storage,
         "delete_window_hours": new_delete_window,
+        "library_retention_days": new_library_retention,
+        "max_room_library_bytes": new_room_library_cap,
     }))
-}
-
-#[derive(Deserialize, Default)]
-struct RevokeInviteBody {
-    token: String,
-}
-
-/// Revoke an unused invite (admin). A used invite is never deleted.
-pub async fn revoke_invite(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_active_auth(&req, &ctx.env).await {
-        Ok(auth) => auth.user_id,
-        Err(resp) => return Ok(resp),
-    };
-    if let Err(resp) = require_admin(&user_id, &ctx.env).await {
-        return Ok(resp);
-    }
-    let body: RevokeInviteBody = req.json().await.unwrap_or_default();
-    if body.token.is_empty() || body.token.len() > 128 {
-        return json_err(400, "bad_request");
-    }
-    let db = ctx.env.d1("DB")?;
-    // If a ledger claim exists the invite has been used even when the legacy `used`
-    // flag is still 0, and revoke must not delete it: the claim INSERT is redeem's
-    // linearization point.
-    db.prepare(
-        "DELETE FROM invite_tokens
-          WHERE token = ? AND used = 0
-            AND NOT EXISTS (
-              SELECT 1 FROM invite_attributions ia
-               WHERE ia.invite_token_hash = invite_tokens.token_hash
-            )",
-    )
-    .bind(&[d1_text(&body.token)])?
-    .run()
-    .await?;
-    Response::from_json(&serde_json::json!({ "ok": true }))
 }
 
 #[derive(Deserialize)]
@@ -439,8 +281,28 @@ struct UserRow {
     last_seen_at: Option<i64>,
 }
 
-/// List the server's members (admin). The owner works from this list when
-/// assigning roles.
+/// One page of members, oldest first, ties by id. Binds: `?1` cursor created_at (NULL on the first
+/// page), `?2` cursor id, `?3` limit.
+pub(crate) const USERS_PAGE_SQL: &str = "SELECT id, email, display_name, role, created_at, last_seen_at
+       FROM users
+      WHERE ?1 IS NULL OR created_at > ?1 OR (created_at = ?1 AND id > ?2)
+      ORDER BY created_at ASC, id ASC
+      LIMIT ?3";
+
+/// The keyset position after a page of members.
+#[derive(serde::Serialize, Deserialize)]
+struct UsersCursor {
+    c: i64,
+    i: String,
+}
+
+/// List the server's members (admin), a page at a time: `?limit=` (default 200 — what the list
+/// returned in one go before, so a client that never pages sees what it always saw — max 500) and
+/// `?cursor=` from the previous page's `next`. `total` is the whole count, for the "Members 1,840"
+/// line. The owner works from this list when assigning roles.
+///
+/// `200 {"members": [{id, email, display_name, role, created_at, last_seen_at}], "next", "total"}`;
+/// a cursor this server did not issue is `400 bad_cursor`.
 pub async fn list_users(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => auth.user_id,
@@ -449,15 +311,45 @@ pub async fn list_users(req: Request, ctx: RouteContext<()>) -> Result<Response>
     if let Err(resp) = require_admin(&user_id, &ctx.env).await {
         return Ok(resp);
     }
+    let cursor: Option<UsersCursor> = match crate::page_cursor::from_request(&req) {
+        Ok(c) => c,
+        Err(()) => return json_err(400, "bad_cursor"),
+    };
+    let limit =
+        crate::page_cursor::limit(crate::page_cursor::query(&req, "limit").as_deref(), 200, 500);
+    let (after_c, after_i) = match &cursor {
+        Some(k) => (d1_int(k.c), d1_text(&k.i)),
+        None => (crate::d1util::d1_null(), d1_text("")),
+    };
     let db = ctx.env.d1("DB")?;
-    let rows: Vec<UserRow> = db
-        .prepare(
-            "SELECT id, email, display_name, role, created_at, last_seen_at
-             FROM users ORDER BY created_at ASC LIMIT 200",
-        )
+    let mut rows: Vec<UserRow> = db
+        .prepare(USERS_PAGE_SQL)
+        .bind(&[after_c, after_i, d1_int(limit + 1)])?
         .all()
         .await?
         .results()?;
+    let more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next = if more {
+        rows.last().map(|r| {
+            crate::page_cursor::encode(&UsersCursor {
+                c: r.created_at,
+                i: r.id.clone(),
+            })
+        })
+    } else {
+        None
+    };
+    #[derive(Deserialize)]
+    struct CountRow {
+        n: i64,
+    }
+    let total = db
+        .prepare("SELECT COUNT(*) AS n FROM users")
+        .first::<CountRow>(None)
+        .await?
+        .map(|r| r.n)
+        .unwrap_or(0);
     let members: Vec<_> = rows
         .into_iter()
         .map(|r| {
@@ -471,7 +363,7 @@ pub async fn list_users(req: Request, ctx: RouteContext<()>) -> Result<Response>
             })
         })
         .collect();
-    Response::from_json(&serde_json::json!({ "members": members }))
+    Response::from_json(&serde_json::json!({ "members": members, "next": next, "total": total }))
 }
 
 #[derive(Deserialize, Default)]
@@ -717,28 +609,47 @@ pub async fn transfer_ownership(mut req: Request, ctx: RouteContext<()>) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::USERS_PAGE_SQL;
+    use rusqlite::params;
 
+    /// The keyset walks every member exactly once across a tie in `created_at` — the 200-row cap
+    /// this replaced hid everyone past the two hundredth student.
     #[test]
-    fn invite_ttl_resolution() {
-        // ttl_minutes=5 → 300 s (expires_at ≈ now+300, the in-person invite).
-        assert_eq!(resolve_invite_ttl_secs(Some(5), None), Ok(300));
-        // With both fields present, ttl_minutes WINS.
-        assert_eq!(resolve_invite_ttl_secs(Some(5), Some(2)), Ok(300));
-        // ttl_minutes bounds: 0 → 400, 43201 (30 days + 1) → 400, 43200 → OK.
-        assert_eq!(resolve_invite_ttl_secs(Some(0), None), Err(()));
-        assert_eq!(resolve_invite_ttl_secs(Some(43201), None), Err(()));
-        assert_eq!(resolve_invite_ttl_secs(Some(43200), None), Ok(43200 * 60));
-        // Backwards compatibility: the ttl_hours-only path keeps the existing rule
-        // (1..=24*30, hours → seconds).
-        assert_eq!(resolve_invite_ttl_secs(None, Some(1)), Ok(3600));
-        assert_eq!(
-            resolve_invite_ttl_secs(None, Some(24 * 30)),
-            Ok(24 * 30 * 3600)
-        );
-        assert_eq!(resolve_invite_ttl_secs(None, Some(0)), Err(()));
-        assert_eq!(resolve_invite_ttl_secs(None, Some(24 * 30 + 1)), Err(()));
-        // Neither field → the 24 hour default.
-        assert_eq!(resolve_invite_ttl_secs(None, None), Ok(24 * 60 * 60));
+    fn the_member_list_pages_past_any_cap_without_gaps() {
+        let db = crate::test_schema::full_schema();
+        for (id, at) in [("a", 1), ("b", 2), ("c", 2), ("d", 2), ("e", 3)] {
+            db.execute(
+                "INSERT INTO users (id, email, identity_pubkey, created_at)
+                 VALUES (?1, ?1 || '@x', x'00', ?2)",
+                params![id, at],
+            )
+            .unwrap();
+        }
+        let page = |after: Option<(i64, &str)>| -> Vec<(String, i64)> {
+            let (c, i) = match after {
+                Some((c, i)) => (Some(c), i.to_string()),
+                None => (None, String::new()),
+            };
+            db.prepare(USERS_PAGE_SQL)
+                .unwrap()
+                .query_map(params![c, i, 2], |r| {
+                    Ok((r.get("id")?, r.get("created_at")?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let mut seen = Vec::new();
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let p = page(after.as_ref().map(|(c, i)| (*c, i.as_str())));
+            let Some(last) = p.last().cloned() else {
+                break;
+            };
+            seen.extend(p.into_iter().map(|(id, _)| id));
+            after = Some((last.1, last.0));
+        }
+        assert_eq!(seen, ["a", "b", "c", "d", "e"]);
     }
 }
+

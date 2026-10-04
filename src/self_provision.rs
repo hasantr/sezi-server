@@ -187,6 +187,26 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0039_genesis_claim",
         include_str!("../migrations/0039_genesis_claim.sql"),
     ),
+    (
+        "0040_room_library",
+        include_str!("../migrations/0040_room_library.sql"),
+    ),
+    (
+        "0041_library_store_pin",
+        include_str!("../migrations/0041_library_store_pin.sql"),
+    ),
+    (
+        "0042_class_invites",
+        include_str!("../migrations/0042_class_invites.sql"),
+    ),
+    (
+        "0043_invite_codes",
+        include_str!("../migrations/0043_invite_codes.sql"),
+    ),
+    (
+        "0044_group_join_requests",
+        include_str!("../migrations/0044_group_join_requests.sql"),
+    ),
 ];
 
 thread_local! {

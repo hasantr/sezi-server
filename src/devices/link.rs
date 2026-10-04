@@ -55,12 +55,7 @@ struct LinkStartBody {
 
 /// `POST /devices/link-start` (PRE-AUTH) — a new device starts a link request.
 pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let ip = req
-        .headers()
-        .get("cf-connecting-ip")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unknown".into());
+    let ip = crate::ratelimit::client_ip(&req, &ctx.env);
     // The KV binding is OPTIONAL: with none `check_rate_limit_env` fails open.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:start:{ip}"), 10, 60).await
     {
@@ -347,12 +342,7 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     // Rate-limit: this is a pre-auth poll endpoint, so anyone holding a link_code must not be
     // able to hammer the DB SELECT, the ed verification and the consume race without limit. At
     // ~1.5/s the cap stays above legitimate polling.
-    let ip = req
-        .headers()
-        .get("cf-connecting-ip")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unknown".into());
+    let ip = crate::ratelimit::client_ip(&req, &ctx.env);
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:status:{ip}"), 90, 60).await
     {
         return json_err(429, "rate_limited");

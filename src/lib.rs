@@ -18,6 +18,7 @@ mod maintenance;
 mod media;
 mod membership;
 mod messages;
+mod page_cursor;
 mod plugin_blob;
 mod plugin_log;
 mod plugin_media;
@@ -26,10 +27,13 @@ mod quota;
 mod ratelimit;
 mod realtime;
 mod respond;
+mod room_library;
 mod self_provision;
 mod server;
 mod sigv4;
 mod storage;
+#[cfg(test)]
+mod test_schema;
 mod turn;
 mod usage;
 mod utils;
@@ -129,9 +133,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .get_async("/auth/me", auth::me::me)
         .patch_async("/auth/profile", auth::profile::update)
         .post_async("/auth/leave", membership::leave)
-        .post_async("/admin/invites", admin::handlers::create_invite)
-        .get_async("/admin/invites", admin::handlers::list_invites)
-        .post_async("/admin/revoke-invite", admin::handlers::revoke_invite)
+        .post_async("/admin/invites", admin::invites::create_invite)
+        .get_async("/admin/invites", admin::invite_list::list_invites)
+        .post_async("/admin/revoke-invite", admin::invites::revoke_invite)
         .get_async("/admin/users", admin::handlers::list_users)
         .post_async("/admin/set-role", admin::handlers::set_role)
         .post_async("/admin/remove-member", admin::handlers::remove_member)
@@ -177,6 +181,16 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // Self-reported usage statistics, admin/owner-gated. SHADOW MODE: reporting only, no
         // limit is enforced.
         .get_async("/admin/stats", admin::stats::stats)
+        // Per-group library usage (admin/owner): sizes, counts and dates — never content, which
+        // the server does not have. Paged, largest first.
+        .get_async("/admin/library", admin::library::usage)
+        // Shorten the library retention: preview (admin), then apply on an explicit confirm
+        // (owner). Deletion itself happens at the nightly sweep. See admin/library_retention.rs.
+        .get_async(
+            "/admin/library/retention-preview",
+            admin::library_retention::preview,
+        )
+        .post_async("/admin/library/retention", admin::library_retention::apply)
         // Server-wide plugin policy. GET = require_active_auth, i.e. any caller whose account
         // still exists and whose token-bound device is not revoked (their plugin picker filters
         // on the result); POST = require_admin (admin|owner). Not `require_auth`: that one gates
@@ -208,6 +222,19 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/groups/:id/settings", groups::update_settings)
         .post_async("/groups/:id/accept", groups::accept_invite)
         .post_async("/groups/:id/decline", groups::decline_invite)
+        // Join requests a class invite left in its landing group (`groups_requests.rs`): the
+        // group's admins decide; the requester reads only their own.
+        .get_async("/groups/:id/join-requests", groups::list_join_requests)
+        .post_async(
+            "/groups/:id/join-requests/approve-all",
+            groups::approve_all_join_requests,
+        )
+        .post_async(
+            "/groups/:id/join-requests/:user/approve",
+            groups::approve_join_request,
+        )
+        .post_async("/groups/:id/join-requests/:user/deny", groups::deny_join_request)
+        .get_async("/join-requests/mine", groups::my_join_requests)
         .delete_async("/groups/:id", groups::delete_group)
         // Multi-device: store and serve the signed device list.
         .put_async("/devices/list", devices::handlers::put_list)
@@ -250,6 +277,13 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // active-member PUT/GET, room-scoped R2, quota/usage counters SHARED with regular media.
         .post_async("/plugin-media/:room/:id", plugin_media::put_media)
         .get_async("/plugin-media/:room/:id", plugin_media::get_media)
+        // The group LIBRARY (campus plan R1): durable encrypted parts charged to the room, with
+        // their own retention and per-group cap. Active-member PUT/GET/list; DELETE by the
+        // uploader or a group admin. GET streams. See room_library.rs for the full contract.
+        .put_async("/room-library/:room/:id", room_library::put_object)
+        .get_async("/room-library/:room/:id", room_library::get_object)
+        .delete_async("/room-library/:room/:id", room_library::delete_object)
+        .get_async("/room-library/:room", room_library::list_objects)
         // The operator-hosted instrument pack (music studio): one SoundFont per server. PUT and
         // DELETE are owner-only; both GETs take any active member token. This is the ONE object
         // the relay stores and serves in PLAINTEXT — see instrument_pack.rs for why. The static
@@ -301,17 +335,20 @@ fn apply_cors(headers: &mut Headers) -> Result<()> {
     // failure — so the two have to be kept in step by hand. `x-pack-name` is the instrument
     // pack's display name, and `If-None-Match` its conditional GET: neither is CORS-safelisted,
     // so a browser that sent one without this line would be refused before the request left.
+    // `x-sezi-library-kind` is the group library's part label (`room_library.rs`).
     headers.set(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, If-None-Match, Range, x-sezi-scope-kind, x-sezi-scope-id, x-pack-name",
+        "Authorization, Content-Type, If-None-Match, Range, x-sezi-scope-kind, x-sezi-scope-id, x-pack-name, x-sezi-library-kind",
     )?;
     // Without this a page can read only the six CORS-safelisted response headers, so
     // `content-length` — which the media download path checks before allocating — comes back
     // absent rather than wrong. `ETag`/`Content-Range`/`Accept-Ranges` are the instrument pack's
     // resume machinery: unexposed, a page cannot tell a resumed download from a fresh one.
+    // `Retry-After` is the auth door's wait (`respond::rate_limited`); unexposed, the browser's
+    // door could only say "a few minutes" where the app counts down.
     headers.set(
         "Access-Control-Expose-Headers",
-        "Content-Length, Content-Type, ETag, Content-Range, Accept-Ranges",
+        "Content-Length, Content-Type, ETag, Content-Range, Accept-Ranges, Retry-After",
     )?;
     // One preflight per day per (origin, method, header set) instead of one per request.
     headers.set("Access-Control-Max-Age", "86400")?;

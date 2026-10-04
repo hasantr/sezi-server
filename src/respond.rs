@@ -52,6 +52,16 @@ pub fn json_err(status: u16, code: &str) -> Result<Response> {
     Ok(resp.with_status(status))
 }
 
+/// `429 rate_limited` that says when to come back: `Retry-After` in whole seconds (RFC 9110
+/// §10.2.3), beside the same `{"error": "rate_limited"}` body every other refusal has. The app's
+/// door counts down to it; a client that ignores the header loses nothing.
+pub fn rate_limited(retry_after_s: u64) -> Result<Response> {
+    let mut resp = json_err(429, "rate_limited")?;
+    resp.headers_mut()
+        .set("Retry-After", &retry_after_s.to_string())?;
+    Ok(resp)
+}
+
 pub fn json_err_msg(status: u16, code: &str, message: &str) -> Result<Response> {
     let resp =
         Response::from_json(&serde_json::json!({"error": code, "message": message}))?;

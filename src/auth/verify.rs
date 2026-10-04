@@ -1,12 +1,16 @@
 use crate::auth::hashing::{sha256_hex, verify_code};
 use crate::auth::invite_attribution::{
     APPLY_INVITE_GRANT_SQL, INSERT_INVITER_GRANT_REVISION_SQL, INSERT_JOINER_GRANT_REVISION_SQL,
-    LOAD_INVITER_SQL, MARK_ATTRIBUTED_SQL, UPGRADE_LEGACY_CLAIM_SQL,
+    DOOR_INVITE_OF_CODE_SQL, LOAD_INVITER_SQL, LOAD_REDEMPTION_SQL, MARK_ATTRIBUTED_SQL,
+    UPGRADE_LEGACY_CLAIM_SQL,
 };
 use crate::auth::jwt::sign_access_token;
+use crate::auth::landing::RedemptionRow;
 use crate::d1util::{d1_blob, d1_int, d1_null, d1_opt_text, d1_prekey_id, d1_text};
-use crate::ratelimit::check_rate_limit_env;
-use crate::respond::json_err;
+use crate::ratelimit::{
+    admit_env, client_ip, per_invite_limit, Admission, DOOR_IP_CEILING, DOOR_WINDOW_SECS,
+};
+use crate::respond::{json_err, rate_limited};
 use crate::utils::{b64_decode, b64u_encode, now_secs, random_b64u, random_bytes};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -100,17 +104,16 @@ pub(crate) fn role_for_registration(redeemed_genesis: bool) -> &'static str {
 pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // Slim template: if the ENV var is missing, assume "prod" (FAIL-SECURE). The KV
     // binding is OPTIONAL — without it we continue unlimited, see
-    // ratelimit::check_rate_limit_env.
-    let env_name = crate::utils::var_or(&ctx.env, "ENV", "prod");
-    if env_name == "prod" {
-        let ip = req
-            .headers()
-            .get("cf-connecting-ip")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "local".into());
-        if !check_rate_limit_env(&ctx.env, &format!("auth:verify:{}", ip), 5, 5 * 60).await {
-            return json_err(429, "rate_limited");
+    // ratelimit::check_rate_limit_env. A refusal carries `Retry-After`, as redeem's does.
+    // The per-address window is only a CEILING; the limit a lecture hall meets is the invite's own,
+    // applied below once the e-mail names the redemption (`ratelimit`, "The door").
+    let limited = crate::utils::var_or(&ctx.env, "ENV", "prod") == "prod";
+    if limited {
+        let key = format!("auth:verify:ip:{}", client_ip(&req, &ctx.env));
+        if let Admission::Refused { retry_after_s } =
+            admit_env(&ctx.env, &key, DOOR_IP_CEILING, DOOR_WINDOW_SECS).await
+        {
+            return rate_limited(retry_after_s);
         }
     }
 
@@ -155,6 +158,29 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         code_hash: String,
         invite_token: Option<String>,
         invite_token_hash: Option<String>,
+    }
+    // The invite's own window, before an attempt is charged. A code with no redemption behind it
+    // has no invite to key by and is refused by the claim below anyway.
+    if limited {
+        #[derive(Deserialize)]
+        struct DoorRow {
+            invite_hash: String,
+            seats: i64,
+        }
+        let door: Option<DoorRow> = db
+            .prepare(DOOR_INVITE_OF_CODE_SQL)
+            .bind(&[d1_text(&body.email)])?
+            .first(None)
+            .await?;
+        if let Some(door) = door {
+            let prefix = &door.invite_hash[..32.min(door.invite_hash.len())];
+            let key = format!("auth:verify:inv:{prefix}");
+            if let Admission::Refused { retry_after_s } =
+                admit_env(&ctx.env, &key, per_invite_limit(door.seats), DOOR_WINDOW_SECS).await
+            {
+                return rate_limited(retry_after_s);
+            }
+        }
     }
     // One atomic claim: the ceiling test and the increment cannot be separated by a concurrent
     // request. See `CLAIM_CODE_ATTEMPT_SQL`.
@@ -302,6 +328,16 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         .first(None)
         .await?;
     let redeemed_genesis = inviter.as_ref().is_some_and(|row| row.genesis == 1);
+    // The redemption's other half of the snapshot: whether the invite introduces at all. A class
+    // invite does not, so verify reports no inviter — the client then skips its auto-intro exactly
+    // as it does for the genesis invite — and the grant statements below are no-ops.
+    let redemption: Option<RedemptionRow> = db
+        .prepare(LOAD_REDEMPTION_SQL)
+        .bind(&[d1_text(&body.email)])?
+        .first(None)
+        .await?;
+    let introduces = redemption.as_ref().is_none_or(|r| r.introduce == 1);
+    let inviter = inviter.filter(|_| introduces);
     let (inviter_user_id, inviter_ed_pub) = match inviter {
         // Both must be present: without ed_pub the binding cannot be made, so fail closed.
         Some(InviterRow {
@@ -459,6 +495,14 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     .run()
     .await?;
 
+    // The account exists now, so the invite's landing group can take it.
+    let landing = match &redemption {
+        Some(row) => {
+            crate::auth::landing::land_after_verify(&ctx.env, &db, &user_id, row, now as i64).await
+        }
+        None => None,
+    };
+
     // Once the writes are committed both sides get a wake-up nudge and nothing else: no contact
     // data travels in the frame, each side pulls authoritatively. The joiner publishes its device
     // list only after verify, so the inviter is nudged again when PUT /devices/list commits —
@@ -479,6 +523,10 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         // client then skips auto-intro fail-closed. Older clients ignore the fields (additive).
         "inviter_user_id": inviter_user_id,
         "inviter_ed_pub": inviter_ed_pub,
+        // Where the invite put the new member (`auth::landing`), or null. `added`: a pending group
+        // row the client accepts on its own; `requested`: a join request a group admin decides;
+        // `unavailable`: the invite named a group the joiner could not be put into.
+        "landing": landing,
     }))
 }
 

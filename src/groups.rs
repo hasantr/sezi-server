@@ -11,15 +11,22 @@
 //! E2E: the server never sees group CONTENT. This module manages only the membership table;
 //! message crypto is Megolm on the client and distribution is the fan-out in `messages`.
 
-// Four blocks declared here rather than in `lib.rs`, so the group surface stays one module from
-// the outside: the ownership-transfer write, the teardown batch, the live nudges, and the two
-// read projections.
+// Five blocks declared here rather than in `lib.rs`, so the group surface stays one module from
+// the outside: the ownership-transfer write, the teardown batch, the live nudges, the two
+// read projections, and the join requests a class invite leaves behind.
 #[path = "groups_delete.rs"]
 mod delete;
 #[path = "groups_notify.rs"]
 mod notify;
 #[path = "groups_read.rs"]
 mod read;
+#[path = "groups_requests.rs"]
+mod requests;
+pub(crate) use requests::nudge_landing;
+pub use requests::{
+    approve_all_join_requests, approve_join_request, deny_join_request, list_join_requests,
+    my_join_requests,
+};
 #[path = "groups_transfer.rs"]
 mod transfer;
 

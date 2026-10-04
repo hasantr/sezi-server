@@ -16,6 +16,10 @@
 //!   (put/get Err → last_health_ok=0). `readonly`/`disabled` are EXCLUDED from placement
 //!   (readonly still serves reads/deletes). `storage_orphans` cleanup and drain live in
 //!   maintenance.rs / drain.rs.
+//! - **One class-specific rule — the library pin (0041):** while any store has
+//!   `library_pin = 1`, `StorageClass::Library` is placed on pinned stores ONLY, and refused
+//!   (429/503) rather than spilled when none of them can take it. Every other class ignores the
+//!   pin. See `pinned_only`.
 
 use std::cell::RefCell;
 
@@ -75,6 +79,10 @@ struct StoreConfig {
     #[serde(default)]
     used_bytes: i64,
     config_json: String,
+    /// 1 = the group library is placed here (0041). Defaulted so a config cached from before the
+    /// migration still deserializes.
+    #[serde(default)]
+    library_pin: i64,
 }
 
 struct CachedConfig {
@@ -106,6 +114,8 @@ pub struct StoreMeta {
     pub max_bytes: Option<i64>,
     /// Usage estimate at placement time (best-effort, from the cache — soft cap).
     pub used_bytes: i64,
+    /// The group library is pinned here (`library_pin = 1`).
+    pub library_pin: bool,
 }
 
 /// Priority-ordered backend list. Handlers only ever call `put_new/get/delete/any_available`
@@ -114,6 +124,12 @@ pub struct StorageRouter {
     /// Kept for opportunistic health marking (put/get Err → last_health_ok=0; best-effort).
     env: Env,
     stores: Vec<(StoreMeta, BlobStore)>,
+    /// Is ANY configured store pinned for the library — counted from the config rows BEFORE the
+    /// live stores are built. A pinned S3 store whose config fails to build is absent from
+    /// `stores`, and deciding from `stores` would quietly spill the library onto R2 the moment
+    /// the campus store's credentials broke; counted here, the pin still holds and the upload
+    /// is refused instead.
+    library_pinned: bool,
 }
 
 impl StorageRouter {
@@ -146,10 +162,22 @@ impl StorageRouter {
             }
         };
         // 3. Build the live BlobStores (cheap: a binding lookup plus an S3Store struct).
+        let library_pinned = configs.iter().any(|c| c.library_pin != 0);
         let stores = build_stores(env, configs);
         Ok(StorageRouter {
             env: env.clone(),
             stores,
+            library_pinned,
+        })
+    }
+
+    /// The placement slots `classify_placement` sees, in priority order.
+    fn slots(&self) -> impl Iterator<Item = PlacementSlot<'_>> {
+        self.stores.iter().map(|(m, _)| PlacementSlot {
+            state: &m.state,
+            max_bytes: m.max_bytes,
+            used_bytes: m.used_bytes,
+            pinned: m.library_pin,
         })
     }
 
@@ -168,23 +196,16 @@ impl StorageRouter {
     /// through to the NEXT eligible backend (degraded write). All full → `AllFull` (→ 429
     /// quota); every attempt failed the PUT → `AllFailed` (→ 503); no active backend →
     /// `NoActive`. With a lone r2-primary (max_bytes NULL) this is just "write to the first
-    /// backend".
+    /// backend". The one class-specific rule is the library pin (`pinned_only`).
     pub async fn put_new(
         &self,
-        _class: StorageClass,
+        class: StorageClass,
         key: &str,
         bytes: Vec<u8>,
         content_type: &str,
     ) -> std::result::Result<String, PlacementError> {
         let size = bytes.len() as i64;
-        let plan = classify_placement(
-            self.stores.iter().map(|(m, _)| PlacementSlot {
-                state: &m.state,
-                max_bytes: m.max_bytes,
-                used_bytes: m.used_bytes,
-            }),
-            size,
-        );
+        let plan = classify_placement(self.slots(), size, pinned_only(&class, self.library_pinned));
         let candidates = match plan {
             Placement::Candidates(idxs) => idxs,
             Placement::AllFull => return Err(PlacementError::AllFull),
@@ -215,20 +236,13 @@ impl StorageRouter {
     /// the operator uploads by hand and can simply upload again.
     pub async fn put_once(
         &self,
-        _class: StorageClass,
+        class: StorageClass,
         key: &str,
         bytes: Vec<u8>,
         content_type: &str,
     ) -> std::result::Result<String, PlacementError> {
         let size = bytes.len() as i64;
-        let plan = classify_placement(
-            self.stores.iter().map(|(m, _)| PlacementSlot {
-                state: &m.state,
-                max_bytes: m.max_bytes,
-                used_bytes: m.used_bytes,
-            }),
-            size,
-        );
+        let plan = classify_placement(self.slots(), size, pinned_only(&class, self.library_pinned));
         let idx = match plan {
             Placement::Candidates(idxs) => idxs[0],
             Placement::AllFull => return Err(PlacementError::AllFull),
@@ -305,11 +319,20 @@ fn short(e: &Error) -> String {
 
 // ── Placement policy (PURE — unit-tested; independent of the worker types) ───────
 
-/// A backend as placement sees it (state + cap/usage).
+/// A backend as placement sees it (state + cap/usage + the library pin).
 struct PlacementSlot<'a> {
     state: &'a str,
     max_bytes: Option<i64>,
     used_bytes: i64,
+    pinned: bool,
+}
+
+/// Does this placement consider pinned stores ONLY? For the library, while any store is pinned
+/// (0041): a pin that spilled onto unpinned stores whenever the pinned ones were full or down
+/// would place recordings exactly where the operator said they must not go, silently, at the
+/// moment nobody is looking. Every other class ignores the pin.
+fn pinned_only(class: &StorageClass, any_pinned: bool) -> bool {
+    matches!(class, StorageClass::Library) && any_pinned
 }
 
 /// Placement classification (the pure core of put_new).
@@ -326,13 +349,21 @@ enum Placement {
 /// Pick the placement candidates out of the priority-ordered slots. Returns the indices of
 /// the backends that are `active` AND (`max_bytes` NULL || `used_bytes + size <= max_bytes`),
 /// in input order (= priority order). Overflow: first one full → falls to the second.
+///
+/// `pinned_only` narrows the field to pinned slots BEFORE anything else is decided, so "all
+/// full" and "none active" are answered about the pinned stores alone — the library is refused
+/// with the same two errors every class already maps, never placed elsewhere.
 fn classify_placement<'a>(
     slots: impl Iterator<Item = PlacementSlot<'a>>,
     size: i64,
+    pinned_only: bool,
 ) -> Placement {
     let mut candidates = Vec::new();
     let mut any_active = false;
     for (idx, s) in slots.enumerate() {
+        if pinned_only && !s.pinned {
+            continue; // the library is pinned elsewhere
+        }
         if s.state != "active" {
             continue; // readonly/draining/disabled → excluded from placement
         }
@@ -363,8 +394,8 @@ async fn load_configs(env: &Env) -> Vec<StoreConfig> {
     };
     let rows: Vec<StoreConfig> = match db
         .prepare(
-            "SELECT store_id, kind, state, priority, max_bytes, used_bytes, config_json \
-             FROM storage_backends ORDER BY priority ASC",
+            "SELECT store_id, kind, state, priority, max_bytes, used_bytes, config_json, \
+             library_pin FROM storage_backends ORDER BY priority ASC",
         )
         .all()
         .await
@@ -389,6 +420,7 @@ fn fallback_configs() -> Vec<StoreConfig> {
         max_bytes: None,
         used_bytes: 0,
         config_json: "{}".to_string(),
+        library_pin: 0,
     }]
 }
 
@@ -407,6 +439,7 @@ fn build_stores(env: &Env, configs: Vec<StoreConfig>) -> Vec<(StoreMeta, BlobSto
                     state: cfg.state,
                     max_bytes: cfg.max_bytes,
                     used_bytes: cfg.used_bytes,
+                    library_pin: cfg.library_pin != 0,
                 },
                 store,
             )),
@@ -431,20 +464,33 @@ mod tests {
             state,
             max_bytes: max,
             used_bytes: used,
+            pinned: false,
         }
+    }
+
+    fn pinned(state: &str, max: Option<i64>, used: i64) -> PlacementSlot<'_> {
+        PlacementSlot {
+            pinned: true,
+            ..slot(state, max, used)
+        }
+    }
+
+    /// The class-agnostic placement every class but a pinned library gets.
+    fn plain<'a>(slots: impl Iterator<Item = PlacementSlot<'a>>, size: i64) -> Placement {
+        classify_placement(slots, size, false)
     }
 
     #[test]
     fn a_single_unlimited_active_store_is_picked_first() {
         // A lone r2-primary (max NULL) → always the first candidate.
-        let p = classify_placement([slot("active", None, 0)].into_iter(), 100);
+        let p = plain([slot("active", None, 0)].into_iter(), 100);
         assert_eq!(p, Placement::Candidates(vec![0]));
     }
 
     #[test]
     fn overflow_skips_the_full_store_and_falls_to_the_next() {
         // idx0 is full (0+100 > 10), idx1 has room → only idx1 qualifies.
-        let p = classify_placement(
+        let p = plain(
             [slot("active", Some(10), 0), slot("active", None, 0)].into_iter(),
             100,
         );
@@ -454,7 +500,7 @@ mod tests {
     #[test]
     fn two_fitting_stores_are_both_candidates_in_priority_order() {
         // Both have room → both qualify (for PUT fallback); input (= priority) order is kept.
-        let p = classify_placement(
+        let p = plain(
             [slot("active", Some(1000), 0), slot("active", None, 0)].into_iter(),
             100,
         );
@@ -464,23 +510,23 @@ mod tests {
     #[test]
     fn exactly_at_the_ceiling_still_fits() {
         // used + size == cap → FITS (<=).
-        let p = classify_placement([slot("active", Some(100), 0)].into_iter(), 100);
+        let p = plain([slot("active", Some(100), 0)].into_iter(), 100);
         assert_eq!(p, Placement::Candidates(vec![0]));
         // used + size == cap+1 → DOES NOT FIT.
-        let p = classify_placement([slot("active", Some(99), 0)].into_iter(), 100);
+        let p = plain([slot("active", Some(99), 0)].into_iter(), 100);
         assert_eq!(p, Placement::AllFull);
     }
 
     #[test]
     fn readonly_and_disabled_are_excluded_from_placement() {
         // readonly + disabled on their own → NoActive (readonly is not writable).
-        let p = classify_placement(
+        let p = plain(
             [slot("readonly", None, 0), slot("disabled", None, 0)].into_iter(),
             100,
         );
         assert_eq!(p, Placement::NoActive);
         // readonly(0) skipped, active(1) has room → only idx1 (readonly still reads, never writes).
-        let p = classify_placement(
+        let p = plain(
             [slot("readonly", None, 0), slot("active", None, 0)].into_iter(),
             100,
         );
@@ -490,7 +536,7 @@ mod tests {
     #[test]
     fn every_active_store_full_yields_allfull() {
         // Two active backends, both full → AllFull (→ 429 quota).
-        let p = classify_placement(
+        let p = plain(
             [slot("active", Some(10), 5), slot("active", Some(20), 20)].into_iter(),
             100,
         );
@@ -499,7 +545,59 @@ mod tests {
 
     #[test]
     fn no_store_at_all_yields_noactive() {
-        let p = classify_placement(std::iter::empty(), 100);
+        let p = plain(std::iter::empty(), 100);
         assert_eq!(p, Placement::NoActive);
+    }
+
+    // ── The library pin (0041) ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn only_the_library_honours_the_pin_and_only_while_a_store_is_pinned() {
+        assert!(pinned_only(&StorageClass::Library, true));
+        assert!(!pinned_only(&StorageClass::Library, false), "nothing pinned → placed as usual");
+        for class in [
+            StorageClass::Media,
+            StorageClass::PluginMedia,
+            StorageClass::PluginCode,
+        ] {
+            assert!(!pinned_only(&class, true), "a pin never steers another class");
+        }
+    }
+
+    /// r2-primary first in priority, the campus store pinned: the library goes to the campus
+    /// store; everything else still goes to R2 first, campus store included as overflow.
+    #[test]
+    fn a_pinned_library_goes_only_to_pinned_stores() {
+        let stores = || [slot("active", None, 0), pinned("active", None, 0)].into_iter();
+        assert_eq!(classify_placement(stores(), 100, true), Placement::Candidates(vec![1]));
+        assert_eq!(plain(stores(), 100), Placement::Candidates(vec![0, 1]));
+    }
+
+    /// Two pinned stores overflow into each other in priority order, and never into R2.
+    #[test]
+    fn pinned_stores_overflow_among_themselves() {
+        let p = classify_placement(
+            [
+                slot("active", None, 0),
+                pinned("active", Some(50), 0),
+                pinned("active", None, 0),
+            ]
+            .into_iter(),
+            100,
+            true,
+        );
+        assert_eq!(p, Placement::Candidates(vec![2]));
+    }
+
+    /// The pin does not leak under pressure: full pinned stores are AllFull (429) and pinned
+    /// stores that cannot be written are NoActive (503), even with an empty R2 beside them.
+    #[test]
+    fn a_full_or_closed_pin_refuses_rather_than_spilling() {
+        let full = [slot("active", None, 0), pinned("active", Some(50), 0)];
+        assert_eq!(classify_placement(full.into_iter(), 100, true), Placement::AllFull);
+        let closed = [slot("active", None, 0), pinned("readonly", None, 0)];
+        assert_eq!(classify_placement(closed.into_iter(), 100, true), Placement::NoActive);
+        let draining = [slot("active", None, 0), pinned("draining", None, 0)];
+        assert_eq!(classify_placement(draining.into_iter(), 100, true), Placement::NoActive);
     }
 }

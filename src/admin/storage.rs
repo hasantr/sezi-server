@@ -46,6 +46,7 @@ struct ListRow {
     last_health_at: Option<i64>,
     last_health_ok: Option<i64>,
     last_health_err: Option<String>,
+    library_pin: i64,
 }
 
 pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -62,13 +63,13 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let rows: Vec<ListRow> = db
         .prepare(
             "SELECT store_id, kind, label, state, priority, max_bytes, used_bytes, \
-             object_count, last_health_at, last_health_ok, last_health_err \
+             object_count, last_health_at, last_health_ok, last_health_err, library_pin \
              FROM storage_backends ORDER BY priority ASC",
         )
         .all()
         .await?
         .results()?;
-    // Remaining-inventory count for draining stores — a UNION count over the 3 metadata
+    // Remaining-inventory count for draining stores — a UNION count over the metadata
     // tables, the SAME source the move engine uses to detect completion
     // (storage/drain.rs). With no draining store there is NO extra query. On error we
     // return an empty map: the list still renders, the field is not null, a draining
@@ -92,10 +93,15 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 "priority": r.priority,
                 "max_bytes": r.max_bytes,
                 "used_bytes": r.used_bytes,
+                // Room under the owner's cap, null without one — no backend reports real free
+                // space (`admin/library.rs` says why).
+                "free_bytes": crate::admin::library::free_bytes(r.max_bytes, r.used_bytes),
                 "object_count": r.object_count,
                 "last_health_at": r.last_health_at,
                 "last_health_ok": r.last_health_ok.map(|v| v != 0),
                 "last_health_err": r.last_health_err,
+                // The group library is placed only on pinned stores while any is pinned (0041).
+                "library_pin": r.library_pin != 0,
                 // A count only for a draining store, null otherwise.
                 "draining_remaining": (r.state == "draining")
                     .then(|| remaining.get(&r.store_id).copied().unwrap_or(0)),
@@ -178,7 +184,7 @@ pub async fn add(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Response::from_json(&json!({ "store_id": store_id }))
 }
 
-// ── PATCH /admin/storage/:id (require_owner) — label/state/priority/max_bytes/config ──
+// ── PATCH /admin/storage/:id (require_owner) — label/state/priority/max_bytes/config/pin ──
 
 #[derive(Deserialize, Default)]
 struct PatchBody {
@@ -188,6 +194,9 @@ struct PatchBody {
     /// None = keep, Some(0) = clear (NULL / unlimited), Some(n>0) = set.
     max_bytes: Option<i64>,
     config: Option<ConfigPatch>,
+    /// Pin the group library here (true) or release it (false); None = keep. While any store
+    /// is pinned the library goes ONLY to pinned stores (`storage/router.rs`).
+    library_pin: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -209,6 +218,7 @@ struct ExistingRow {
     priority: i64,
     max_bytes: Option<i64>,
     config_json: String,
+    library_pin: i64,
 }
 
 pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -228,7 +238,7 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     let db = ctx.env.d1("DB")?;
     let existing: Option<ExistingRow> = db
         .prepare(
-            "SELECT kind, label, state, priority, max_bytes, config_json \
+            "SELECT kind, label, state, priority, max_bytes, config_json, library_pin \
              FROM storage_backends WHERE store_id = ? LIMIT 1",
         )
         .bind(&[d1_text(&id)])?
@@ -261,6 +271,10 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Some(n) if n > 0 => Some(n),
         Some(_) => return field_err("max_bytes"),
     };
+    let library_pin = body
+        .library_pin
+        .map(i64::from)
+        .unwrap_or(existing.library_pin);
 
     // Config rotation (s3 only; an r2_binding store has no config). If it changed,
     // probe again.
@@ -290,7 +304,7 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // If the config was re-probed, stamp health as freshly green.
     if health_reprobed {
         db.prepare(
-            "UPDATE storage_backends SET label=?, state=?, priority=?, max_bytes=?, \
+            "UPDATE storage_backends SET label=?, state=?, priority=?, max_bytes=?, library_pin=?, \
              config_json=?, last_health_at=?, last_health_ok=1, last_health_err=NULL, updated_at=? \
              WHERE store_id=?",
         )
@@ -299,6 +313,7 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             d1_text(&state),
             d1_int(priority),
             d1_opt_int(max_bytes),
+            d1_int(library_pin),
             d1_text(&config_json),
             d1_int(now),
             d1_int(now),
@@ -308,14 +323,15 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         .await?;
     } else {
         db.prepare(
-            "UPDATE storage_backends SET label=?, state=?, priority=?, max_bytes=?, updated_at=? \
-             WHERE store_id=?",
+            "UPDATE storage_backends SET label=?, state=?, priority=?, max_bytes=?, library_pin=?, \
+             updated_at=? WHERE store_id=?",
         )
         .bind(&[
             d1_text(&label),
             d1_text(&state),
             d1_int(priority),
             d1_opt_int(max_bytes),
+            d1_int(library_pin),
             d1_int(now),
             d1_text(&id),
         ])?
@@ -484,6 +500,11 @@ pub async fn drain(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             .unwrap_or(0);
         if others == 0 {
             return json_err(409, "no_active_target");
+        }
+        // The same dead end for the pinned library: an active store remains, but none the
+        // library may use (`storage/pin.rs`).
+        if crate::storage::pin::drain_would_strand_library(&db, &id).await? {
+            return json_err(409, "no_library_target");
         }
         let now = now_secs() as i64;
         db.prepare(

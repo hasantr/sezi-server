@@ -19,6 +19,7 @@
 pub mod drain;
 mod health;
 pub mod maint;
+pub mod pin;
 mod r2;
 mod router;
 mod s3;
@@ -72,13 +73,16 @@ impl BlobStream {
     }
 }
 
-/// Placement class. The current policy is class-agnostic (every class follows the same
-/// priority order); the class is threaded through the API so pinning (e.g. keep plugin-code on
-/// r2) can be added without touching every call site.
+/// Placement class. Every class follows the same priority order with one exception: the group
+/// library can be PINNED to chosen stores (`storage_backends.library_pin`, 0041; the rule is
+/// `router.rs` `pinned_only`). The class is threaded through every PUT, so a further pin — e.g.
+/// keep plugin-code on r2 — is again a change to the router alone.
 pub enum StorageClass {
     Media,
     PluginMedia,
     PluginCode,
+    /// A group's library part (`room_library.rs`) — the durable, room-charged class.
+    Library,
 }
 
 /// A single backend handle. KEY-based (the key scheme lives in this module: `media_key` etc.).
@@ -163,6 +167,15 @@ pub fn plugin_media_key(room_id: &str, blob_id: &str) -> String {
     format!("plugin-media/{room_id}/{blob_id}")
 }
 
+/// Key for a group LIBRARY part — durable (kept until deleted unless the server sets a library
+/// retention) and room-scoped like plugin media, under a namespace of its own so a drain, a
+/// teardown or an operator browsing the bucket can tell the classes apart. SQL in
+/// `room_library.rs` and `room_library_cleanup.rs` spells this same shape
+/// (`'room-library/' || room_id || '/' || object_id`), so it may never change.
+pub fn library_key(room_id: &str, object_id: &str) -> String {
+    format!("room-library/{room_id}/{object_id}")
+}
+
 /// Key for profile/group avatar blobs — PERSISTENT (no TTL) and user-scoped. `avatar_objects`
 /// is single-slot meta (one object_id per user_id); on a new upload the old object is pushed
 /// into `storage_orphans` under this key and the daily `retry_orphans` removes it from the
@@ -216,6 +229,7 @@ mod tests {
         assert_eq!(media_key("abc"), "media/abc");
         assert_eq!(code_key("room1", "blob1"), "plugin-code/room1/blob1");
         assert_eq!(plugin_media_key("room1", "blob1"), "plugin-media/room1/blob1");
+        assert_eq!(library_key("room1", "obj1"), "room-library/room1/obj1");
         assert_eq!(avatar_key("user1", "obj1"), "avatar/user1/obj1");
         assert_eq!(instrument_pack_key("ab12"), "packs/ab12.sf2");
     }

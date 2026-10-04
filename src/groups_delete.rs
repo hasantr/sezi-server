@@ -53,7 +53,7 @@ pub(super) const ORPHAN_PLUGIN_CODE_SQL: &str =
 ///    already been erased — invisible to `list_my_groups`, and undeletable through this very
 ///    handler, which needs an owner row to authorise. `create_group` batches for exactly this
 ///    reason and says so.
-/// 3. **SUBREQUESTS.** Seven statements as one batch is one subrequest instead of seven, which is
+/// 3. **SUBREQUESTS.** Ten statements as one batch is one subrequest instead of ten, which is
 ///    what buys the room for the post-commit live nudges (`groups_notify.rs`).
 ///
 /// `plugin_epoch_floor` is DELETED, not bumped. The handler used to call
@@ -62,12 +62,21 @@ pub(super) const ORPHAN_PLUGIN_CODE_SQL: &str =
 /// the room id — a v4 UUID — can never be handed out again, so there is no future append to fence.
 /// `membership.rs:314` reaches the same conclusion from the other side, sweeping floors whose group
 /// no longer exists; doing it in the same transaction just means the sweep has nothing to find.
+///
+/// The group LIBRARY goes the same way, with one addition: its bytes are charged to the room and
+/// sit in the server total, so the batch hands them back there (`RELEASE_ROOM_SQL`) before the
+/// rows go — a course deleted to make room frees that room at once, not at the next reconcile.
 pub(super) async fn delete_group_rows(db: &D1Database, group_id: &str, now: i64) -> Result<()> {
+    use crate::room_library::cleanup::{DELETE_ROOM_SQL, ORPHAN_ROOM_SQL, RELEASE_ROOM_SQL};
     db.batch(vec![
         db.prepare(ORPHAN_PLUGIN_MEDIA_SQL)
             .bind(&[d1_int(now), d1_text(group_id)])?,
         db.prepare(ORPHAN_PLUGIN_CODE_SQL)
             .bind(&[d1_int(now), d1_text(group_id)])?,
+        db.prepare(ORPHAN_ROOM_SQL)
+            .bind(&[d1_int(now), d1_text(group_id)])?,
+        db.prepare(RELEASE_ROOM_SQL)
+            .bind(&[d1_text(group_id), d1_text(group_id)])?,
         // Only now that the outbox owns them may the authoritative inventory rows go. Dropping
         // `plugin_media_objects` is also what releases the uploader's quota: `usage.rs` derives
         // `user_storage` by summing this table, so the row IS the charge.
@@ -75,6 +84,7 @@ pub(super) async fn delete_group_rows(db: &D1Database, group_id: &str, now: i64)
             .bind(&[d1_text(group_id)])?,
         db.prepare("DELETE FROM plugin_code_objects WHERE room_id = ?")
             .bind(&[d1_text(group_id)])?,
+        db.prepare(DELETE_ROOM_SQL).bind(&[d1_text(group_id)])?,
         // `group_members` also cascades off the `groups` FK; the explicit delete is
         // belt-and-braces, and inside a batch it costs nothing.
         db.prepare("DELETE FROM group_members WHERE group_id = ?")

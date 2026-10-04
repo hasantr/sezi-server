@@ -37,6 +37,9 @@ struct MediaStatsRow {
 struct CapsRow {
     max_storage_bytes: Option<i64>,
     max_user_storage_bytes: Option<i64>,
+    // The group library's pair (0040). Both NULLABLE: NULL = unlimited / keep until deleted.
+    max_room_library_bytes: Option<i64>,
+    library_retention_days: Option<i64>,
 }
 
 /// Compact store badge for `/admin/stats`.
@@ -76,11 +79,13 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // Pending invites: unused, unexpired and not yet claimed in the attribution
     // ledger (same table list_invites reads). Used/expired rows are not actionable
     // anyway and cron eventually prunes them; the ledger check keeps an invite
-    // whose `used` flip lost a race from being counted as still pending.
+    // whose `used` flip lost a race from being counted as still pending. A class invite counts
+    // while it has a free seat and has not been revoked.
     let invites: i64 = db
         .prepare(
             "SELECT COUNT(*) AS n FROM invite_tokens it
               WHERE it.used = 0 AND it.expires_at > ?
+                AND it.revoked_at IS NULL AND it.uses < it.max_uses
                 AND NOT EXISTS (
                   SELECT 1 FROM invite_attributions ia
                    WHERE ia.invite_token_hash = it.token_hash
@@ -197,7 +202,8 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // missing row or a missing migration also yields null (fail-open, so stats never 500s).
     let caps = db
         .prepare(
-            "SELECT max_storage_bytes, max_user_storage_bytes \
+            "SELECT max_storage_bytes, max_user_storage_bytes, \
+             max_room_library_bytes, library_retention_days \
              FROM server_settings WHERE id = 1 LIMIT 1",
         )
         .first::<CapsRow>(None)
@@ -205,7 +211,11 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .ok()
         .flatten();
     let (max_storage, max_user_storage) = caps
+        .as_ref()
         .map(|c| (c.max_storage_bytes, c.max_user_storage_bytes))
+        .unwrap_or((None, None));
+    let (max_room_library, library_days) = caps
+        .map(|c| (c.max_room_library_bytes, c.library_retention_days))
         .unwrap_or((None, None));
 
     // The BADGE on the panel's main card: store count, unhealthy count (last_health_ok=0
@@ -232,11 +242,17 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         "admins": admins,
         "invites": invites,
         "media": { "bytes": media_bytes, "count": media_count },
-        "retention": { "media_days": media_days, "message_days": message_days },
+        // `library_days` null = the group library is kept until deleted (the default).
+        "retention": {
+            "media_days": media_days,
+            "message_days": message_days,
+            "library_days": library_days,
+        },
         "requests_today": requests_today,
         "caps": {
             "max_storage_bytes": max_storage,
             "max_user_storage_bytes": max_user_storage,
+            "max_room_library_bytes": max_room_library,
         },
         // Monthly video-call (TURN) usage + daily media volume.
         "turn": { "issued_month": turn_issued, "cap": turn_cap },

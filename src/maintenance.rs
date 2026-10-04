@@ -280,6 +280,14 @@ pub(crate) async fn run_daily(env: &Env) {
     crate::messages::handlers::gc_fanout_retry(env).await;
     // Every leg below logs and continues, so one failure does not skip the rest.
     //
+    // The group library's retention sweep (≤100 expired parts per run). Before the reconcile, so
+    // the counters it recomputes already reflect what the sweep removed.
+    if let Err(e) = crate::room_library::sweep_expired(env).await {
+        let msg = e.to_string();
+        let truncated: String = msg.chars().take(80).collect();
+        console_log!("library sweep error: {}", truncated);
+    }
+    //
     // Recompute drift in the best-effort storage counters (user_storage/server_stats)
     // from the media tables.
     if let Err(e) = crate::usage::reconcile_storage(env).await {
@@ -402,6 +410,12 @@ async fn backfill_legacy_invite_attributions(db: &D1Database) -> Result<usize> {
 /// `invite_attributions` ledger from 0031, so after the TTL this row can go safely.
 pub(crate) const INVITE_TOKEN_CLEANUP_SQL: &str = "DELETE FROM invite_tokens
       WHERE expires_at < ? AND (used = 0 OR token_hash IS NOT NULL)";
+/// How long an approved or denied join request stays readable by its requester
+/// (`GET /join-requests/mine`).
+const DECIDED_JOIN_REQUEST_KEEP_SECS: i64 = 30 * 24 * 60 * 60;
+/// Binds: the cutoff.
+pub(crate) const DECIDED_JOIN_REQUEST_CLEANUP_SQL: &str = "DELETE FROM group_join_requests
+      WHERE state != 'pending' AND decided_at < ?";
 const RECONCILE_INVITE_CLAIMS_SQL: &str = "UPDATE invite_tokens SET used = 1
       WHERE used = 0 AND token_hash IS NOT NULL AND EXISTS (
         SELECT 1 FROM invite_attributions ia
@@ -567,6 +581,13 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
     // 4) revoked / expired refresh tokens
     db.prepare("DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1")
         .bind(&[d1_int(now)])?
+        .run()
+        .await?;
+
+    // 4b) decided join requests, once the requester has had a month to read the answer. A pending
+    //     request never expires: it waits for a group admin however long that takes.
+    db.prepare(DECIDED_JOIN_REQUEST_CLEANUP_SQL)
+        .bind(&[d1_int(now - DECIDED_JOIN_REQUEST_KEEP_SECS)])?
         .run()
         .await?;
 

@@ -72,6 +72,32 @@ pub(crate) const LOAD_INVITER_SQL: &str =
         SELECT invite_token_hash FROM verification_codes WHERE email = ?
       )";
 
+/// The rest of the redemption's snapshot, beside [`LOAD_INVITER_SQL`] rather than inside it so the
+/// genesis read stays the statement its tests pin: whether the joiner and the minter are
+/// introduced, and where (if anywhere) the joiner lands. No row reads as a personal invite with
+/// no landing. Binds: email.
+pub(crate) const LOAD_REDEMPTION_SQL: &str = "SELECT ia.introduce AS introduce, ia.kind AS kind,
+            ia.landing_room_id AS landing_room_id,
+            ia.landing_needs_approval AS landing_needs_approval,
+            ia.source_hash AS source_hash, ia.email_hint AS label,
+            ia.inviter_user_id AS minter
+       FROM invite_attributions ia
+      WHERE ia.invite_token_hash = (
+        SELECT invite_token_hash FROM verification_codes WHERE email = ?
+      )";
+
+/// Which invite a pending verification belongs to, for verify's per-invite rate limit: a class
+/// redemption's invite is its `source_hash`, a personal one is its own key. Seats come from the
+/// live source row, 1 when it is gone. Binds: email.
+pub(crate) const DOOR_INVITE_OF_CODE_SQL: &str = "SELECT
+            COALESCE(ia.source_hash, ia.invite_token_hash) AS invite_hash,
+            COALESCE(it.max_uses, 1) AS seats
+       FROM verification_codes vc
+       JOIN invite_attributions ia ON ia.invite_token_hash = vc.invite_token_hash
+       LEFT JOIN invite_tokens it ON it.token_hash = COALESCE(ia.source_hash, ia.invite_token_hash)
+      WHERE vc.email = ?
+      LIMIT 1";
+
 /// Bind the durable ledger to the user once verify completes. On a retry or a race the
 /// COALESCE preserves the first successful attribution, so the same token is never
 /// re-attributed to a different user.
@@ -90,7 +116,9 @@ pub(crate) const MARK_ATTRIBUTED_SQL: &str = "UPDATE invite_attributions
 /// * an already-active grant keeps its stronger/original provenance;
 /// * a revoked grant is never resurrected by a verify retry;
 /// * either direction of an active block prevents creation;
-/// * open registration, deleted inviters and self-attribution are no-ops.
+/// * open registration, deleted inviters and self-attribution are no-ops;
+/// * a redemption whose snapshot says `introduce = 0` — every class-invite redemption — is a
+///   no-op, so one admin who admits a lecture hall does not become 120 students' contact.
 ///
 /// It is executed immediately after [`MARK_ATTRIBUTED_SQL`] in the same ordered
 /// D1 batch, so the SELECT observes the newly finalized `used_by` value. Bind
@@ -110,6 +138,7 @@ pub(crate) const APPLY_INVITE_GRANT_SQL: &str = concat!(
         AND ia.inviter_user_id IS NOT NULL
         AND ia.used_by IS NOT NULL
         AND ia.inviter_user_id != ia.used_by
+        AND ia.introduce = 1
         AND ",
     crate::contact_grant::contact_pair_block_guard_sql!("ia.inviter_user_id", "ia.used_by")
 );
@@ -144,12 +173,15 @@ mod tests {
     use crate::auth::hashing::sha256_hex;
     use rusqlite::{params, Connection, OptionalExtension};
 
-    /// 0031 creates the ledger and 0039 adds its `genesis` column; every statement in this file
-    /// reads the ledger as it stands after both, so the tests apply them as one step.
+    /// 0031 creates the ledger, 0039 adds its `genesis` column and 0042 the class-invite snapshot
+    /// (`introduce` among it); every statement in this file reads the ledger as it stands after
+    /// all three, so the tests apply them as one step.
     const MIGRATION: &str = concat!(
         include_str!("../../migrations/0031_invite_attributions.sql"),
         "\n;\n",
-        include_str!("../../migrations/0039_genesis_claim.sql")
+        include_str!("../../migrations/0039_genesis_claim.sql"),
+        "\n;\n",
+        include_str!("../../migrations/0042_class_invites.sql")
     );
     const CONTACTS_MIGRATION: &str =
         include_str!("../../migrations/0032_contacts_directory_v2.sql");

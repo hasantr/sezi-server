@@ -31,8 +31,19 @@ const MAX_CODE_SIZE: u64 = 8 * 1024 * 1024 + 64 * 1024;
 ///
 /// `pub(crate)` because `plugin_media` (the member-PUT sibling channel) reuses the SAME gate
 /// (device-revoked + active membership); it has no admin check and simply ignores `role`. Defining
-/// the IDOR/revoke gate once keeps the two channels from diverging.
+/// the IDOR/revoke gate once keeps the two channels from diverging. `room_library` reuses it too.
 pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::Result<(String, String, String, String), Response> {
+    let (user_id, room_id, role) = room_gate(req, ctx).await?;
+    let blob_id = match ctx.param("id") {
+        Some(p) => p.clone(),
+        None => return Err(json_err(400, "bad_request").unwrap_or_else(|_| Response::empty().unwrap())),
+    };
+    Ok((user_id, room_id, blob_id, role))
+}
+
+/// `gate` for a route that names a room and no object — the group library's listing. The same
+/// checks in the same order; only the `:id` parameter is not asked for. Ok → (user, room, role).
+pub(crate) async fn room_gate(req: &Request, ctx: &RouteContext<()>) -> std::result::Result<(String, String, String), Response> {
     // Device binding + revoked: a removed or revoked device must not be able to fetch or upload
     // code for the remaining lifetime of its token.
     let (user_id, device_id) = require_auth_device(req, &ctx.env)?;
@@ -51,10 +62,6 @@ pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::
         Some(r) => r.clone(),
         None => return Err(json_err(400, "bad_request").unwrap_or_else(|_| Response::empty().unwrap())),
     };
-    let blob_id = match ctx.param("id") {
-        Some(p) => p.clone(),
-        None => return Err(json_err(400, "bad_request").unwrap_or_else(|_| Response::empty().unwrap())),
-    };
     // Active-membership gate (anti-IDOR: a non-member can neither fetch nor upload code).
     // Both of these are the same class as the revoke check above: the database is momentarily
     // unreachable, not the request malformed. 503 so the client retries instead of surfacing a
@@ -68,7 +75,7 @@ pub(crate) async fn gate(req: &Request, ctx: &RouteContext<()>) -> std::result::
         Ok(None) => return Err(json_err(403, "not_member").unwrap_or_else(|_| Response::empty().unwrap())),
         Err(_) => return Err(json_err(503, "role_check_unavailable").unwrap_or_else(|_| Response::empty().unwrap())),
     };
-    Ok((user_id, room_id, blob_id, role))
+    Ok((user_id, room_id, role))
 }
 
 /// `POST /plugin-blob/:room/:id` — upload (encrypted) plugin code. PERSISTENT. Admins/owners only

@@ -146,7 +146,9 @@ const WIPE_TABLES: &[&str] = &[
     "avatar_objects",
     "plugin_media_objects",
     "plugin_code_objects",
-    // Group state.
+    "room_library_objects",
+    // Group state. Join requests first: they reference both `groups` and `users`.
+    "group_join_requests",
     "group_members",
     "plugin_epoch_floor",
     "membership_delete_guard",
@@ -272,6 +274,9 @@ pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
                FROM plugin_code_objects",
         )
         .bind(&[d1_int(now)])?,
+        // The group library's parts — every group's, since every group goes.
+        db.prepare(crate::room_library::cleanup::ORPHAN_ALL_SQL)
+            .bind(&[d1_int(now)])?,
     ];
     // ── 2) The wipe itself, children before parents ──────────────────────────────────────────
     for table in WIPE_TABLES {
@@ -333,6 +338,7 @@ mod tests {
             "directory_revisions",
             "directory_tombstones",
             "fanout_retry",
+            "group_join_requests",
             "group_members",
             "groups",
             "invite_attributions",
@@ -348,6 +354,7 @@ mod tests {
             "push_tokens",
             "push_wake_debounce",
             "refresh_tokens",
+            "room_library_objects",
             "server_config",
             "server_plugin_policy",
             "server_settings",
@@ -398,6 +405,7 @@ mod tests {
             "avatar_objects",
             "plugin_media_objects",
             "plugin_code_objects",
+            "room_library_objects",
         ] {
             assert!(
                 WIPE_TABLES.contains(&t),
