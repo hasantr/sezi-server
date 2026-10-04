@@ -56,6 +56,27 @@ impl R2Store {
         Ok(Some(BlobObject { bytes, content_type }))
     }
 
+    /// Read a blob as a STREAM (the big-object twin of `get`), starting at `offset` bytes;
+    /// `None` when the key is absent. `response_body()` hands the object's own stream to the
+    /// runtime, so a 30 MB instrument pack never enters worker memory and costs no CPU time.
+    ///
+    /// R2 answers an offset past the end of the object with a null body rather than an error, so
+    /// that case arrives here as `None` — the caller refuses an unsatisfiable range before ever
+    /// getting this far (it knows the size from D1).
+    pub async fn get_stream(&self, key: &str, offset: u64) -> Result<Option<super::BlobStream>> {
+        let mut builder = self.bucket.get(key);
+        if offset > 0 {
+            builder = builder.range(Range::OffsetToEnd { offset });
+        }
+        let Some(obj) = builder.execute().await? else {
+            return Ok(None);
+        };
+        let Some(body) = obj.body() else {
+            return Ok(None);
+        };
+        Ok(Some(super::BlobStream::Passthrough(body.response_body()?)))
+    }
+
     /// Delete a blob. R2's delete is idempotent (a missing key is NOT an error), which makes ack
     /// and cleanup retries safe. A GENUINE R2 error (outage) is propagated so the caller keeps its
     /// D1 meta row — otherwise we would create an orphan: an R2 object with no D1 record, which

@@ -8,12 +8,11 @@ use worker::{console_log, Env, Result};
 /// code itself stays visible, but access is limited to whoever holds the worker log
 /// (developer/admin).
 ///
-/// It is NOT withheld from HTTP clients in every configuration, so do not rely on that.
-/// `redeem` returns `dev_code` whenever ENV is not prod OR the server is `invite_only`
-/// (`auth/invite.rs`), and invite_only is the schema default. That is deliberate and argued
-/// there: in invite_only the invite itself is the registration authority, and the onboarding
-/// client registers a synthetic `@sezgi.local` address that no inbox will ever receive. Open
-/// mode in prod is the case where the code only travels by mail.
+/// It is NOT withheld from HTTP clients, so do not rely on that: `redeem` returns `dev_code`
+/// on every successful claim (`auth/invite.rs`). That is deliberate and argued there: the invite
+/// itself is the registration authority, and the onboarding client registers a synthetic
+/// `@sezgi.local` address that no inbox will ever receive. Open join mode, the one case where the
+/// code travelled only by mail, is refused since 2026-10-04 (`server/join_mode.rs`).
 ///
 /// TODO (#1-mailer-sprint): a real SES or SendGrid HTTPS POST. Logging it is an
 /// adequate stopgap for solo use for now.

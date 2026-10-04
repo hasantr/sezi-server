@@ -1,4 +1,4 @@
-//! M2-S3.2: the QR link flow — cryptographically binding a second device to the primary.
+//! The QR link flow — cryptographically binding a second device to the primary.
 //!
 //! Three endpoints, all POST (never a GET query, so tokens never land in URL logs):
 //!   `link-start`   (PRE-AUTH)      new device's ed/x pubs + device_id + PoP signature →
@@ -9,7 +9,7 @@
 //!                                  once approved it receives the token EXACTLY ONCE
 //!                                  (atomic consume).
 //!
-//! ## Security (red-team B7/H5)
+//! ## Security
 //! - **PoP (link-start):** the new device sends `ed_priv.sign(ed_pub||x_pub)` and the server
 //!   verifies it with ed_pub. This proves possession of ed_priv and binds the two keys
 //!   together, so a stolen ed_pub paired with someone else's x_pub is rejected.
@@ -34,7 +34,7 @@ use worker::*;
 use super::handlers::validate_and_store_signed_list;
 
 // Covers the whole start→approve→consume flow, which involves a human scanning, comparing a
-// fingerprint and passing biometrics. Deliberately short, to bound replay (H5).
+// fingerprint and passing biometrics. Deliberately short, to bound replay.
 const LINK_TTL_SEC: i64 = 120;
 const REFRESH_TTL_SEC: i64 = 30 * 24 * 60 * 60;
 const ACCESS_TTL_SEC: u64 = 15 * 60;
@@ -61,8 +61,7 @@ pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".into());
-    // The KV binding is OPTIONAL (template diet): with none we continue unlimited — see
-    // ratelimit::check_rate_limit_env.
+    // The KV binding is OPTIONAL: with none `check_rate_limit_env` fails open.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("link:start:{ip}"), 10, 60).await
     {
         return json_err(429, "rate_limited");
@@ -166,34 +165,23 @@ struct LinkRow {
 
 /// `POST /devices/link-approve` (PRIMARY-AUTH) — the primary approves the new list.
 pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // Like `PUT /devices/list`, this call WRITES THE DEVICE LIST — it goes through the very same
-    // `validate_and_store_signed_list`, so it decides which devices exist and which are revoked.
-    // It used to gate on the bare stateless JWT, which proves a signature and an expiry and
-    // nothing else. A device revoked a minute ago therefore kept this endpoint for the rest of
-    // its ~15-minute access-token TTL, and this is the worst one to keep: approving attaches a
-    // NEW device of the attacker's choosing to the account and mints that device a fresh 30-day
-    // refresh token, which outlives the revocation that was supposed to end the session.
+    // This call WRITES THE DEVICE LIST through `validate_and_store_signed_list`, so it decides
+    // which devices exist and which are revoked. Hence the STRICT gate, not the bare stateless
+    // JWT: a revoked device holding a live access token could otherwise approve a NEW device of
+    // the attacker's choosing and mint it a fresh 30-day refresh token, outliving the very
+    // revocation meant to end the session.
     //
-    // Unlike `put_list` this takes the STRICTER gate. `put_list` must settle for
-    // `require_existing_account_auth` + `device_revoked` because it is the statement that CREATES
-    // the first `devices` rows: a fresh registration publishes rev=1 before any row exists, so an
-    // active-device proof there would deadlock the bootstrap. No bootstrap runs through HERE. An
-    // approver is by definition an ALREADY-LINKED primary — the doc it submits must be the
-    // account's existing list at rev+1, signed by the primary key bound to the stored SPK — and
-    // publishing that list is precisely what created its own `devices` row. So
-    // `require_active_auth` failing CLOSED on a missing row is correct here rather than a
-    // lockout: a caller with no device row cannot legitimately be approving anything. Nor is it a
-    // new class of failure, since the same account already cannot hold the `/sync` WebSocket
-    // without an active row (`sync_ws` → `validate_active_token`).
+    // Unlike `put_list`, which must settle for `require_existing_account_auth` + `device_revoked`
+    // because it CREATES the first `devices` rows (a fresh registration publishes rev=1 before
+    // any row exists, and an active-device proof there would deadlock the bootstrap). No
+    // bootstrap runs through HERE: an approver is by definition an already-linked primary, and
+    // publishing its own list is what created its `devices` row. So `require_active_auth` failing
+    // CLOSED on a missing row is correct rather than a lockout.
     //
-    // One call covers both halves: the account must still exist (a kicked user's live token
+    // One call covers both halves — the account must still exist (a kicked user's live token
     // cannot graft a device onto a deleted account) AND the calling device must be present and
-    // unrevoked. Both halves always run: since d5ad1843 the `device_id` claim is mandatory at the
-    // type level, so a token without one fails to deserialize and never reaches this gate. The
-    // device-less exemption this comment used to describe no longer has a population or a path.
-    //
-    // Failure codes new to this endpoint: 401 inactive_account · 401 inactive_device ·
-    // 503 auth_check_unavailable.
+    // unrevoked. Failure codes specific to this gate: 401 inactive_account · 401 inactive_device
+    // · 503 auth_check_unavailable.
     let auth = match require_active_auth(&req, &ctx.env).await {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
@@ -237,8 +225,8 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
         return json_err(410, "link_expired");
     }
 
-    // Cross-check (B7): the signed doc must contain an entry carrying the EXACT keys recorded
-    // in link_requests (ed/x/device_id). That is what blocks key substitution.
+    // Cross-check: the signed doc must contain an entry carrying the EXACT keys recorded in
+    // link_requests (ed/x/device_id). That is what blocks key substitution.
     #[derive(Deserialize)]
     struct XDoc {
         devices: Vec<XEntry>,
@@ -266,8 +254,8 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
         return json_err(400, "link_key_mismatch");
     }
 
-    // Validate and store the list atomically (B6): the primary signature, the identity
-    // binding and the rev condition all live in there.
+    // Validate and store the list atomically: the primary signature, the identity binding
+    // and the rev condition all live in there.
     let rev = match validate_and_store_signed_list(&db, &auth_user, &body.doc_json, &body.sig_b64)
         .await?
     {
@@ -281,12 +269,11 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
     let refresh = b64u_encode(&random_bytes(32));
     let refresh_hash = sha256_hex(&refresh);
 
-    // ATOMIC CLAIM (review HIGH): first move link_requests from pending→approved and stash the
-    // tokens for delivery. An empty RETURNING means the claim was lost — someone else approved,
-    // consumed or expired it in between — and in that case we must NEVER create an
-    // account-valid refresh_token, so no orphaned credential can leak. The previous ordering
-    // INSERTed the refresh_token unconditionally and orphaned it whenever delivery failed.
-    // The token INSERT happens ONLY after the claim is won.
+    // ATOMIC CLAIM: first move link_requests from pending→approved and stash the tokens for
+    // delivery. An empty RETURNING means the claim was lost — someone else approved, consumed
+    // or expired it in between — and in that case an account-valid refresh_token must NEVER be
+    // created, or a credential nobody holds is left behind. The token INSERT happens ONLY
+    // after the claim is won.
     #[derive(Deserialize)]
     struct ClaimRow {
         #[allow(dead_code)]
@@ -357,9 +344,9 @@ struct ConsumedRow {
 
 /// `POST /devices/link-status` (PoP-AUTH) — the new device polls for approval.
 pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // Rate-limit (review HIGH): this is a pre-auth poll endpoint, so anyone holding a
-    // link_code must not be able to hammer the DB SELECT, the ed verification and the consume
-    // race without limit. At ~1.5/s the cap stays above legitimate polling.
+    // Rate-limit: this is a pre-auth poll endpoint, so anyone holding a link_code must not be
+    // able to hammer the DB SELECT, the ed verification and the consume race without limit. At
+    // ~1.5/s the cap stays above legitimate polling.
     let ip = req
         .headers()
         .get("cf-connecting-ip")
@@ -391,7 +378,7 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         None => return json_err(404, "link_not_found"),
     };
 
-    // Proof (H5): only the holder of ed_priv may read the status, so a leaked link_code cannot
+    // Proof: only the holder of ed_priv may read the status, so a leaked link_code cannot
     // be turned into a stolen token. proof = ed_priv.sign(link_code), verified against the
     // stored new_ed_pub.
     let ed_arr: [u8; 32] = match row.new_ed_pub.as_slice().try_into() {
@@ -448,7 +435,7 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
                 Some(c) => c,
                 None => return Response::from_json(&serde_json::json!({ "status": "consumed" })),
             };
-            // Trust-root fingerprint (H1): pull the primary's ed_pub out of the doc. The new
+            // Trust-root fingerprint: pull the primary's ed_pub out of the doc. The new
             // device shows it to the user and cross-checks it against the signed list.
             let primary_ed = match c.user_id.as_deref() {
                 Some(uid) => primary_ed_pub_b64(&db, uid).await?,

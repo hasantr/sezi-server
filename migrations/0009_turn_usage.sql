@@ -1,11 +1,11 @@
--- TURN bütçe bekçisi (calls Faz 1.5 — internet üstü arama relay'i).
+-- The TURN budget guard (the relay for calls that go over the internet).
 --
--- Aramalar P2P başarısız olunca medya CF Realtime TURN'den geçer ($0.05/GB,
--- ilk 1 TB/ay bedava). CF'de sert harcama-tavanı YOK → sürpriz faturayı
--- önlemek için worker kendi tavanını uygular: bu tabloda aylık kimlik-üretim
--- sayacı tutulur; `TURN_MONTHLY_CAP` aşılınca worker kimlik ÜRETMEZ (client
--- doğrudan/STUN'a düşer, CF faturası o noktada durur). Her kimlik ~bir arama.
+-- When P2P fails, call media goes through CF Realtime TURN ($0.05/GB, the first 1 TB per
+-- month free). CF has NO hard spend ceiling → to avoid a surprise bill the worker enforces
+-- one of its own: this table holds a monthly credential-issue counter, and once
+-- `TURN_MONTHLY_CAP` is exceeded the worker issues NO credential (the client falls back to
+-- direct/STUN and the CF bill stops there). One credential is roughly one call.
 CREATE TABLE IF NOT EXISTS turn_usage (
-    month  TEXT PRIMARY KEY,          -- "YYYY-MM" (UTC) bütçe penceresi
-    issued INTEGER NOT NULL DEFAULT 0 -- o ay üretilen TURN kimliği sayısı
+    month  TEXT PRIMARY KEY,          -- "YYYY-MM" (UTC), the budget window
+    issued INTEGER NOT NULL DEFAULT 0 -- TURN credentials issued during that month
 );

@@ -1,10 +1,11 @@
 use serde::Deserialize;
 use worker::*;
 
+/// `join_mode` is not read: there is one mode, and a stored `open` must not be advertised
+/// (`server::join_mode`).
 #[derive(Deserialize)]
 struct ServerSettingsRow {
     name: String,
-    join_mode: String,
     directory_mode: String,
     dm_policy: String,
 }
@@ -21,34 +22,25 @@ pub async fn info(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
     let row: Option<ServerSettingsRow> = db
         .prepare(
-            "SELECT name, join_mode, directory_mode, dm_policy
+            "SELECT name, directory_mode, dm_policy
                FROM server_settings WHERE id = 1 LIMIT 1",
         )
         .first(None)
         .await?;
-    let (name, join_mode, directory_mode, dm_policy) = row
-        .map(|r| (r.name, r.join_mode, r.directory_mode, r.dm_policy))
-        .unwrap_or_else(|| {
-            (
-                "Sezi".into(),
-                "invite_only".into(),
-                "off".into(),
-                "members".into(),
-            )
-        });
+    let (name, directory_mode, dm_policy) = row
+        .map(|r| (r.name, r.directory_mode, r.dm_policy))
+        .unwrap_or_else(|| ("Sezi".into(), "off".into(), "members".into()));
     // owner_exists answers onboarding's very first question — is this server owned or
-    // unowned — with ONE side-effect-free field. Without it the app has to probe
-    // /bootstrap for 200-vs-410, and that gate runs the ghost-owner audit SELECTs plus a
-    // possible self-heal batch. The definition of "owner" has a SINGLE authority in
-    // welcome.rs (bit-identical SELECT); there is no copy of it here. FAIL-SECURE: if the
-    // query fails (None) we answer `true`, i.e. "assume owned", so an unowned server is
-    // never mistakenly advertised as claimable — the app still confirms definitively via
-    // /bootstrap. The field is additive, so existing /server/info consumers parsing
-    // name/join_mode keep working.
+    // unowned — with ONE side-effect-free field. Without it the app has to probe /bootstrap
+    // for 200-vs-410, and that gate runs the ghost-owner audit SELECTs plus a possible
+    // self-heal batch. The definition of "owner" has a SINGLE authority in welcome.rs; there
+    // is no copy of it here. FAIL-SECURE: if the query fails (None) we answer `true`, i.e.
+    // "assume owned", so an unowned server is never mistakenly advertised as claimable — the
+    // app still confirms definitively via /bootstrap.
     let owner_exists = crate::welcome::owner_exists(&ctx.env).await.unwrap_or(true);
     Response::from_json(&serde_json::json!({
         "name": name,
-        "join_mode": join_mode,
+        "join_mode": crate::server::join_mode::JOIN_MODE,
         "directory_mode": directory_mode,
         "dm_policy": dm_policy,
         "server_fingerprint": server_instance_fingerprint(&ctx.env)?,
@@ -56,22 +48,21 @@ pub async fn info(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // `server_fingerprint`.
         "server_instance_fingerprint": server_instance_fingerprint(&ctx.env)?,
         "owner_exists": owner_exists,
+        // Beside owner_exists because the two answer one question together: an unowned server
+        // that requires the claim secret can be claimed only from the machine that installed it
+        // (`auth::claim`), and a device without the secret should say so rather than try.
+        "claim_secret_required": crate::auth::claim::claim_secret_required(&ctx.env),
     }))
 }
 
 /// The capabilities this server supports. The client calls `/capabilities` and enables or
 /// greys out its UI toggles according to the returned `p2p.kinds` list.
 ///
-/// Current state (P2P scaffolding mode):
-///   - `p2p.supported = true` — the client enables its UI toggles so the user's preference
-///     can be stored.
-///   - `p2p.kinds = ["message", "image", "attachment", "file"]` — every kind is permitted.
-///   - `transport = "iroh-pending"` — the server advertises the iroh signaling scaffold,
-///     but no real transport bridging is active yet.
-///   - **Behaviour**: the client still sends all traffic over CF, because the mobile
-///     `shouldUseP2P()` helper sees `transportAvailable=false` and falls back to CF. When
-///     the P3 integration lands the transport switches on by itself, with user preferences
-///     already saved.
+/// P2P is announced as scaffolding: `supported = true` so the client can store the user's
+/// preference, every kind permitted, `transport = "iroh-pending"` because no real transport
+/// bridging is active yet. All traffic still goes over CF — the mobile `shouldUseP2P()` helper
+/// sees `transportAvailable=false` — and switches over by itself once the transport lands,
+/// with preferences already saved.
 ///
 /// Versioning: the `version` field increases on a protocol change, and the client uses it
 /// to cope with incompatible versions.
@@ -80,7 +71,7 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
     let db = ctx.env.d1("DB")?;
     let row: Option<ServerSettingsRow> = db
         .prepare(
-            "SELECT name, join_mode, directory_mode, dm_policy
+            "SELECT name, directory_mode, dm_policy
                FROM server_settings WHERE id = 1 LIMIT 1",
         )
         .first(None)
@@ -91,30 +82,32 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
     let retention_days = fetch_retention_days(&ctx.env).await;
     let message_retention_days = fetch_message_retention_days(&ctx.env).await;
     let delete_window_hours = fetch_delete_window_hours(&ctx.env).await;
-    // Lite install (R2 is OPTIONAL): features that depend on the MEDIA binding are announced
+    // R2 is OPTIONAL, so features that depend on the MEDIA binding are announced
     // DYNAMICALLY. If the owner adds the binding from the dashboard later — no redeploy
     // needed — the next /capabilities call returns true and the client card updates itself.
-    // Faz 1: any_available is simply "is the MEDIA binding present", bit-identical to the old
-    // MediaStore::available. Faz 3: the router will also see external stores from D1, so a
-    // Lite+B2 install reports true.
+    // `any_available` also sees external stores from D1, so an install with no R2 binding but
+    // an active S3 reports true.
     let media_ok = crate::storage::StorageRouter::from_env(&ctx.env)
         .await
         .map(|r| r.any_available())
         .unwrap_or(false);
     Response::from_json(&serde_json::json!({
         "version": 1,
-        // Self-host update detection (2026-07-12): a BUILD-TIME stamp, a monotonic
-        // yyyyMMddHHmm integer. `sync-template.ps1` sets the `SEZI_BUILD` env var BEFORE the
-        // worker build and writes the same value into a `VERSION` file at the template root,
-        // so the stamp and the prebuilt WASM always come out of the SAME run (no drift). The
-        // client compares its current build against the upstream VERSION to decide whether an
-        // update exists. With no env var — monorepo prod, or a manual deploy — 0 means
-        // "unknown" and the client shows no badge. Keep this separate from `version`, which is
-        // the protocol version.
+        // Self-host update detection: a BUILD-TIME stamp, a monotonic yyyyMMddHHmm integer.
+        // `sync-template.ps1` sets the `SEZI_BUILD` env var BEFORE the worker build and
+        // writes the same value into a `VERSION` file at the template root, so the stamp and
+        // the prebuilt WASM always come out of the SAME run (no drift). The client compares
+        // its current build against the upstream VERSION to decide whether an update exists.
+        // With no env var — monorepo prod, or a manual deploy — 0 means "unknown" and the
+        // client shows no badge. Keep this separate from `version`, the protocol version.
         "build": option_env!("SEZI_BUILD").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
         "name": name,
         "server_fingerprint": server_instance_fingerprint(&ctx.env)?,
         "server_instance_fingerprint": server_instance_fingerprint(&ctx.env)?,
+        // Setup state, the same value `/server/info` carries: `/bootstrap` hands out the genesis
+        // invite only with the `x-sezi-claim` header (`auth::claim`). A configuration fact, so it
+        // stays true after the server is claimed.
+        "claim_secret_required": crate::auth::claim::claim_secret_required(&ctx.env),
         "policy": {
             "directory_mode": directory_mode,
             "dm_policy": dm_policy,
@@ -129,21 +122,19 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
             "contact_nudge_v1": true,
             "avatar_v1": true
         },
-        // M2-S2.3 (WIRE-CUT): the protocol capability announcement. device_addressing=1 means
-        // the server supports the batch wire format (envelopes[]) and per-device OTK/bundle v2;
-        // the old single envelope_b64 form now gets a 400. The client sends the batch form
-        // accordingly and the legacy single form is removed.
+        // The protocol capability announcement. device_addressing=1 means the server supports
+        // the batch wire format (envelopes[]) and per-device OTK/bundle v2; the single
+        // envelope_b64 form gets a 400.
         "protocol": {
             "device_addressing": 1
         },
         // Data retention announcement. The model is "relay": a message is deleted by the DO
         // fan-out on delivery (`on_delivery`), and an undelivered one is kept for at most
         // `message_days`.
-        // ⚠️ MEDIA HONESTY (2026-07-10 audit #3): the media ACK-delete chain is NOT wired up
-        // on the client, so media is NOT deleted on delivery — in every case it is kept until
-        // the `media_days` TTL. Hence `media: "ttl"` rather than on_delivery: the announcement
-        // matches actual behaviour exactly. Genuine delete-after-delivery would require
-        // recipient/room bookkeeping (the audit #2 + #3 epic).
+        // ⚠️ MEDIA HONESTY: the media ACK-delete chain is NOT wired up on the client, so
+        // media is NOT deleted on delivery — it is kept until the `media_days` TTL. Hence
+        // `media: "ttl"` rather than on_delivery: the announcement matches actual behaviour.
+        // Genuine delete-after-delivery would need recipient/room bookkeeping.
         "retention": {
             "model": "relay",
             "messages": "on_delivery",
@@ -151,16 +142,14 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
             "media_days": retention_days,
             "message_days": message_retention_days,
         },
-        // The "delete for everyone" window (2026-07-12): how many HOURS after a message was
-        // SENT it may still be deleted for everyone. Owner-configurable, DEFAULT 48. The
-        // recipient side will ENFORCE this in future (message age > window → reject); the
-        // server only announces the VALUE. Twin of the retention pattern, also from D1
-        // server_settings. Deliberately top-level rather than inside the retention block,
-        // because the client expects a flat `delete_window_hours` field.
+        // The "delete for everyone" window: how many HOURS after a message was SENT it may
+        // still be deleted for everyone. Owner-configurable, DEFAULT 48. The recipient side
+        // is what will ENFORCE it; the server only announces the VALUE. Deliberately
+        // top-level rather than inside the retention block — the client expects a flat
+        // `delete_window_hours` field.
         "delete_window_hours": delete_window_hours,
-        // Server feature announcement (C3). true = supported, false = not configured or not
-        // implemented yet.
-        // R2 dependency map (Lite install, verified against the code on 2026-07-06):
+        // Server feature announcement. true = supported, false = not configured or not
+        // implemented yet. The R2 dependency map:
         //   - media/files → media/handlers.rs upload/download are R2 blobs → media_ok.
         //   - apps → plugin code distribution goes through plugin_blob.rs put/get_code, i.e.
         //     R2: anything over 8KB, and ALL bundles unconditionally (see core
@@ -172,21 +161,25 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         //     stays true.
         //   - calls → signaling relay (DO/WS) plus TURN (CF Calls API), fully functional
         //     without R2, hence true.
+        //   - instrument_pack → the PROTOCOL, not a hosted file: this server answers the four
+        //     /instrument-pack routes. Deliberately NOT gated on media_ok, unlike its neighbours:
+        //     the client's next call is GET /instrument-pack/meta, which returns 404 `no_pack` on
+        //     a server with no pack for ANY reason — none uploaded, no R2 binding, backend gone —
+        //     and the plugin falls back to its procedural synth. One question, one answer.
         "features": {
             "messaging": true,
             "media": media_ok,
             "files": media_ok,
             "calls": true,
             "backup": true,
-            "apps": media_ok
+            "apps": media_ok,
+            "instrument_pack": true
         },
-        // ⚠️ P2P HONESTY (2026-07-10 audit #5): `supported:true` means the capability EXISTS
-        // and client toggles can be persisted, while `available:false` means the transport is
-        // NOT ACTIVE YET (iroh-pending). Both are stated so that anyone reading the raw JSON —
-        // an auditor, a third-party client — cannot conclude that P2P is working. The client
-        // already falls back to CF unless `transport=='iroh'` (p2p_router.shouldUseP2P).
-        // `available` and `status` are additive, so existing parsers of `supported`/`transport`
-        // keep working.
+        // ⚠️ P2P HONESTY: `supported:true` means the capability EXISTS and client toggles can
+        // be persisted, while `available:false` means the transport is NOT ACTIVE YET
+        // (iroh-pending). Both are stated so that anyone reading the raw JSON — an auditor, a
+        // third-party client — cannot conclude that P2P is working. The client already falls
+        // back to CF unless `transport=='iroh'` (p2p_router.shouldUseP2P).
         "p2p": {
             "supported": true,
             "available": false,

@@ -2,17 +2,16 @@ use crate::auth::middleware::require_active_auth;
 use crate::d1util::{d1_int, d1_opt_text, d1_text};
 use sha2::{Digest, Sha256};
 
-/// W4-b constants (durable retry for a partially failed group fan-out).
+/// Durable-retry constants for a partially failed group fan-out.
 const W4B_INITIAL_BACKOFF_SECS: i64 = 30; // delay from enqueue to the first drain attempt
-// MINOR-1 (Fable+Codex): keep the lease SEPARATE from the backoff base. The LEASE is the in-flight
-// claim window (10 min): after a drain crash or against a slow DO the row stays "busy" that long, so
-// an overlapping cron never re-claims the SAME row (lease >> the 2 min cron period + the maximum
-// drain duration → the double-notify window closes). On failure next_at is OVERWRITTEN with the
-// backoff (retry is not delayed); only a crashed drain has to wait out the 10 min to self-heal.
+// The LEASE is the in-flight claim window and is deliberately SEPARATE from the backoff base: it
+// must exceed the cron period plus the longest drain, so an overlapping cron cannot re-claim a row
+// another drain is still working and double-notify. On failure next_at is overwritten with the
+// backoff, so a retry is not delayed; only a CRASHED drain waits out the full lease to self-heal.
 const W4B_LEASE_SECS: i64 = 600;
-const W4B_BACKOFF_BASE_SECS: i64 = 120; // failure-backoff base (SEPARATE from the lease): 120→240→…→3600 cap
-const W4B_MAX_BACKOFF_SECS: i64 = 3600; // backoff ceiling — a long outage retries hourly and is NEVER deleted (no loss)
-const W4B_DRAIN_BATCH: usize = 50; // rows drained per cron (bounded by D1 response size + sequential DO fetch time)
+const W4B_BACKOFF_BASE_SECS: i64 = 120; // 120→240→…→cap
+const W4B_MAX_BACKOFF_SECS: i64 = 3600; // a long outage retries hourly and is NEVER deleted
+const W4B_DRAIN_BATCH: usize = 50; // per cron; bounded by D1 response size + sequential DO fetches
 use crate::respond::{json_err, no_content, passthrough};
 use crate::utils::now_secs;
 use serde::Deserialize;
@@ -59,10 +58,9 @@ fn classify_direct_http(
     }
 }
 
-/// M2-S2.3 (WIRE-CUT): one item of the envelope batch. For 1:1, `device_id` is the TARGET
-/// recipient device (the sender knows it from the bundle → a separate Olm envelope per
-/// device). For a GROUP there is NO `device_id` (a single Megolm envelope; the device
-/// fan-out is derived INSIDE the worker).
+/// One item of the envelope batch. For 1:1, `device_id` is the TARGET recipient device (the
+/// sender knows it from the bundle → a separate Olm envelope per device). For a GROUP there is
+/// NO `device_id`: a single Megolm envelope, whose device fan-out is derived inside the worker.
 #[derive(Deserialize)]
 struct EnvItem {
     #[serde(default)]
@@ -70,36 +68,28 @@ struct EnvItem {
     envelope_b64: String,
 }
 
-/// M2-S2.3: the single `envelope_b64` was REMOVED in favour of an `envelopes: Vec<EnvItem>`
-/// batch. HTTP and WS-send now take a bit-identical body. With N=1 a single-element
-/// `envelopes` reproduces today's single-envelope flow exactly.
+/// The `/messages/send` body, bit-identical between the HTTP and WS-send paths.
 #[derive(Deserialize)]
 struct SendBody {
     /// Recipient of a 1:1 direct message. `None` for a group message (`group_id` instead).
     #[serde(default)]
     recipient_id: Option<String>,
-    /// GROUP message (phase 2): fan out to this group's members. `None` for 1:1.
+    /// Fan out to this group's members. `None` for 1:1.
     #[serde(default)]
     group_id: Option<String>,
-    /// M2-S2.3: the SENDER's device (lets the recipient pick the right Olm device session;
-    /// still carried for a group's single Megolm envelope). Together with bundle v2 and the
-    /// device claim this gives end-to-end device addressing. The old single-envelope form did
-    /// not carry `sender_device_id`.
+    /// The SENDER's device, which lets the recipient pick the right Olm device session; still
+    /// carried for a group's single Megolm envelope.
     sender_device_id: String,
-    /// M2-S2.3: one envelope per device. 1:1 has N >= 1; a group has one element with no device_id.
+    /// One envelope per device. 1:1 has N >= 1; a group has one element with no device_id.
     envelopes: Vec<EnvItem>,
     /// Do NOT send an FCM wake for an offline recipient of this message. The SENDER sets it for
-    /// control traffic that is meaningless to a sleeping device — a capabilities announcement, a
-    /// reconnect state digest, a receipt, a typing indicator (see the core's `needs_device_wake`).
+    /// control traffic meaningless to a sleeping device — a capabilities announcement, a
+    /// reconnect state digest, a receipt, a typing indicator (the core's `needs_device_wake`).
     ///
-    /// It changes NOTHING about storage or delivery: the envelope is written to the recipient's
-    /// pending queue exactly as before and arrives on their next connect. It only declines to spend
-    /// a push, a cold start and several seconds of the recipient's radio on it.
-    ///
-    /// Measured 2026-07-28: launching the desktop client sent one contact four such messages, which
-    /// became three FCM wakes and three full queue drains that delivered nothing a person could see.
-    ///
-    /// `#[serde(default)]` → an older client that does not send the field gets today's behaviour.
+    /// It changes nothing about storage or delivery: the envelope is written to the recipient's
+    /// pending queue as before and arrives on their next connect. It only declines to spend a
+    /// push, a cold start and several seconds of the recipient's radio on it — measured at three
+    /// wakes and three full queue drains for one desktop launch, delivering nothing visible.
     #[serde(default)]
     silent: bool,
 }
@@ -111,9 +101,8 @@ struct NotifyResult {
     delivered_live: bool,
 }
 
-/// Builds the `/notify` payload (the recipient DO's request body for notify_inner).
-/// `notify_recipient` and the W4-b drain both build it here so the shape has a single source
-/// of truth.
+/// The recipient DO's `/notify` body. `notify_recipient` and the retry drain both build it here
+/// so the shape has one source of truth.
 fn build_notify_payload(
     recipient_id: &str,
     sender_id: &str,
@@ -127,14 +116,12 @@ fn build_notify_payload(
         "sender_id": sender_id,
         "sender_device_id": sender_device_id,
         "recipient_device_id": recipient_device_id,
-        // W1 backstop: the RECIPIENT user_id, which notify_inner persists (an offline DO does not
-        // know its own user).
+        // notify_inner persists this: an offline DO does not know its own user.
         "recipient_id": recipient_id,
         "envelope_b64": envelope_b64,
         "group_id": group_id,
-        // Persisted on the pending row so the W1 backstop ALARM does not wake the device later for
-        // a message the immediate path deliberately stayed quiet about. Without this the fix only
-        // delays the pointless wake instead of removing it.
+        // Persisted on the pending row, so the backstop alarm does not wake the device later for
+        // a message the immediate path deliberately stayed quiet about.
         "silent": silent,
     })
     .to_string()
@@ -142,8 +129,8 @@ fn build_notify_payload(
 
 /// A SINGLE DO `/notify` attempt (store + WS push). Ok → (pending_id, delivered_live); Err on
 /// id_from_name/stub failure, a failed fetch, a non-200 status or an unparseable body.
-/// `notify_recipient` loops this 3x for transient retries; the W4-b drain calls it ONCE per row
-/// because the row's own next_at backoff is the retry.
+/// `notify_recipient` calls this at most twice; the drain calls it once per row, because that
+/// row's own next_at backoff is the retry.
 async fn notify_once(
     namespace: &ObjectNamespace,
     recipient_id: &str,
@@ -167,12 +154,11 @@ async fn notify_once(
         .map_err(|_| Error::RustError("do_notify_bad_response".into()))
 }
 
-/// `/notify` one user's DO inbox (store + WS push). When `group_id` is Some the recipient's frame
-/// carries it, so the recipient takes the Megolm (group) decrypt path. When `recipient_device` is
-/// Some the pending row is scoped to that device (per-device queue + ack isolation; see S2.2
-/// notify_inner). The returned `id` is that RECIPIENT's pending sequence id. An error surfaces as
-/// `Err`, which makes a per-device failure VISIBLE during fan-out — the old silent skip is gone
-/// (red-team #18).
+/// `/notify` one user's DO inbox (store + WS push). A `group_id` rides along in the recipient's
+/// frame so they take the Megolm decrypt path; a `recipient_device` scopes the pending row to
+/// that device (per-device queue + ack isolation). The returned `id` is that RECIPIENT's pending
+/// sequence id. A per-device failure surfaces as `Err` rather than being silently skipped, which
+/// is what makes it visible during fan-out.
 #[allow(clippy::too_many_arguments)]
 async fn notify_recipient(
     namespace: &ObjectNamespace,
@@ -193,13 +179,25 @@ async fn notify_recipient(
         group_id,
         silent,
     );
-    // W4 BOUNDED in-request retry (3 attempts, catching transient DO 5xx / overload / routing
-    // errors). notify_inner's dedup (60s on a warm DO) absorbs the "it succeeded but the response
-    // was lost" case, so no duplicate pending row appears. All 3 failing returns Err → the caller
-    // counts it visibly → on a partial failure it is enqueued into the W4-b durable retry queue.
-    const NOTIFY_ATTEMPTS: usize = 3;
+    // A bounded in-request retry for a transient DO 5xx / overload / routing error. The DO's own
+    // 60s dedup absorbs "it succeeded but the response was lost", so no duplicate pending row
+    // appears. Exhausting the attempts returns Err, which the caller counts and enqueues.
+    //
+    // TWO ATTEMPTS, NOT THREE, AND NOT BACK TO BACK. Three immediate calls to an overloaded
+    // Durable Object are an amplifier, not a retry policy — the same question three times inside
+    // a few milliseconds, at the moment it is least able to answer — and three subrequests out of
+    // a ~50 ceiling (see `messages::budget`), so one struggling member's retries could starve the
+    // members behind it. The pause gives the DO time to be re-created, which is the only thing a
+    // same-request retry can usefully wait for; everything beyond that is `fanout_retry`'s job.
+    const NOTIFY_ATTEMPTS: usize = 2;
+    /// Long enough for a DO restart or a routing hiccup to settle, short enough that a group
+    /// fan-out of failures does not blow the request's wall clock.
+    const NOTIFY_RETRY_DELAY_MS: u64 = 50;
     let mut last_err = Error::RustError("do_notify_failed".into());
     for attempt in 0..NOTIFY_ATTEMPTS {
+        if attempt > 0 {
+            worker::Delay::from(std::time::Duration::from_millis(NOTIFY_RETRY_DELAY_MS)).await;
+        }
         match notify_once(namespace, recipient_id, &payload).await {
             Ok(r) => {
                 if attempt > 0 {
@@ -217,138 +215,23 @@ async fn notify_recipient(
     Err(last_err)
 }
 
-/// W4-b durable-retry drain (cron; runs on EVERY scheduled invocation). Atomically claims rows
-/// (`UPDATE ... next_at = LEASE-ahead ... RETURNING`, so an overlapping cron cannot re-notify the
-/// SAME row), then re-notifies each ONCE: on success DELETE the row and keep FCM-wake parity, on
-/// failure UPDATE with an exponential backoff (NEVER delete — Codex#4 loss prevention: a long
-/// outage keeps retrying and the TTL GC collects anything truly ancient). Bounded batch,
-/// best-effort: a D1/DO error leaves the row for the next round, and a missing table (migration not
-/// applied) is a silent no-op. Deliberately calls `notify_once` rather than notify_recipient's
-/// 3-retry body, because the row-level backoff IS the retry (Fable#2).
-pub(crate) async fn drain_fanout_retry(env: &Env) {
-    let Ok(db) = env.d1("DB") else { return };
-    let Ok(namespace) = env.durable_object("USER_INBOX") else { return };
-    let now = now_secs() as i64;
-    #[derive(serde::Deserialize)]
-    struct RetryRow {
-        id: i64,
-        recipient_id: String,
-        #[serde(default)]
-        recipient_device: Option<String>,
-        sender_id: String,
-        #[serde(default)]
-        sender_device: Option<String>,
-        envelope_b64: String,
-        group_id: String,
-        attempts: i64,
-        /// Whether the sender asked for no FCM wake. `#[serde(default)]` → a row written before this
-        /// column existed reads as 0 (wake), i.e. the old behaviour.
-        #[serde(default)]
-        silent: i64,
-    }
-    // Atomic claim: push the due rows' next_at a LEASE ahead (the in-flight marker) and return them.
-    let claimed: Vec<RetryRow> = match db
-        .prepare(
-            "UPDATE fanout_retry SET next_at = ?
-             WHERE id IN (SELECT id FROM fanout_retry WHERE next_at <= ? ORDER BY next_at LIMIT ?)
-             RETURNING id, recipient_id, recipient_device, sender_id, sender_device, envelope_b64, group_id, attempts, silent",
-        )
-        .bind(&[
-            d1_int(now + W4B_LEASE_SECS),
-            d1_int(now),
-            d1_int(W4B_DRAIN_BATCH as i64),
-        ]) {
-        Ok(stmt) => match stmt.all().await {
-            Ok(res) => res.results::<RetryRow>().unwrap_or_default(),
-            Err(_) => return,
-        },
-        Err(_) => return,
-    };
-    if claimed.is_empty() {
-        return;
-    }
-    let total = claimed.len();
-    let mut ok = 0usize;
-    for r in &claimed {
-        let payload = build_notify_payload(
-            &r.recipient_id,
-            &r.sender_id,
-            r.sender_device.as_deref().unwrap_or(""),
-            r.recipient_device.as_deref(),
-            &r.envelope_b64,
-            Some(&r.group_id),
-            r.silent != 0,
-        );
-        match notify_once(&namespace, &r.recipient_id, &payload).await {
-            Ok((_, delivered_live)) => {
-                if let Ok(stmt) = db
-                    .prepare("DELETE FROM fanout_retry WHERE id = ?")
-                    .bind(&[d1_int(r.id)])
-                {
-                    let _ = stmt.run().await;
-                }
-                // FCM-wake parity with the handlers' offline branch (Codex#6): stored OK but
-                // offline → wake. A `silent` row skips it: the retry queue must not resurrect a wake
-                // the immediate path deliberately declined (a group receipt would otherwise wake the
-                // device minutes later, which is worse than the original bug because it looks random).
-                if !delivered_live && r.silent == 0 {
-                    crate::push::fcm::maybe_push_wake(
-                        env, &db, &r.recipient_id, r.recipient_device.as_deref(),
-                    )
-                    .await;
-                }
-                ok += 1;
-            }
-            Err(_) => {
-                // Exponential backoff, NEVER delete (Codex#4): attempts++ and push next_at ahead.
-                // `attempts` counts only DO errors (offline is not an error — the notify succeeded),
-                // so a high attempts value means "the DO has been broken for days", which is rare.
-                let shift = r.attempts.clamp(0, 5) as u32;
-                let backoff = (W4B_BACKOFF_BASE_SECS << shift).min(W4B_MAX_BACKOFF_SECS);
-                if let Ok(stmt) = db
-                    .prepare("UPDATE fanout_retry SET attempts = attempts + 1, next_at = ? WHERE id = ?")
-                    .bind(&[d1_int(now + backoff), d1_int(r.id)])
-                {
-                    let _ = stmt.run().await;
-                }
-            }
-        }
-    }
-    console_log!("[deliv] W4-b drain: {ok}/{total} re-notify OK");
-}
-
-/// W4-b TTL GC (daily cron): collect very old fanout_retry rows. Since we never delete on max
-/// attempts, THIS is the only upper bound that keeps the table bounded. RETENTION PARITY
-/// (server-lean audit 2026-07-03): fanout_retry holds E2E ciphertext, making it a delivery buffer
-/// just like `pending` → it is kept for the owner-configured `message_retention_days` window, NOT a
-/// fixed TTL. Per the "the server forgets and does not grow" policy, fanout_retry lives exactly as
-/// long as the owner's retention says (an exact mirror of the pending cleanup at
-/// the alarm handler's pending cleanup in `inbox_do/mod.rs`).
-pub(crate) async fn gc_fanout_retry(env: &Env) {
-    let Ok(db) = env.d1("DB") else { return };
-    let days = crate::server::handlers::fetch_message_retention_days(env).await;
-    let cutoff = now_secs() as i64 - days * 24 * 3600;
-    if let Ok(stmt) = db
-        .prepare("DELETE FROM fanout_retry WHERE created_at < ?")
-        .bind(&[d1_int(cutoff)])
-    {
-        let _ = stmt.run().await;
-    }
-}
+// The durable retry queue (cron drain + TTL collector). Declared HERE rather than in
+// `messages/mod.rs` so `messages::handlers::drain_fanout_retry` stays the name the scheduler
+// already calls — the shape `keys/handlers.rs` uses for `bundle_slot`.
+#[path = "fanout_retry.rs"]
+mod fanout_retry;
+pub(crate) use fanout_retry::{drain_fanout_retry, gc_fanout_retry};
 
 pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let (sender_id, token_device) = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => (auth.user_id, auth.device_id),
         Err(resp) => return Ok(resp),
     };
-    // S2 (Fable HIGH — quota/DoS): per-user message rate limit, so envelopes that differ by a byte
-    // cannot slip past the 60s dedup and bloat the UserInbox DO's SQLite. 300 messages / 60s sits
-    // above the busiest legitimate conversation (a human manages well under 2/s) while still cutting
-    // automated spam. Implemented as a KV sliding window (the SAME infrastructure as auth
-    // redeem/verify and media upload). A group fan-out counts INSIDE this limit (one send = N DO
-    // writes but a single hit), so legitimate group traffic is unrestricted here.
-    // The KV binding is OPTIONAL (template diet): without it we continue unlimited — see
-    // ratelimit::check_rate_limit_env.
+    // Per-user rate limit, so envelopes differing by a byte cannot slip past the 60s dedup and
+    // bloat the UserInbox DO's SQLite. 300/60s sits above the busiest legitimate conversation
+    // while still cutting automated spam. A group fan-out is ONE hit here however wide it is; the
+    // weighted guard further down covers the amplification. The KV binding is optional, and
+    // without it check_rate_limit_env fails open.
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,
         &send_rate_limit_key(&sender_id),
@@ -363,28 +246,24 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Ok(b) => b,
         Err(_) => return json_err(400, "bad_request"),
     };
-    // M2-S2.3 (WIRE-CUT): the envelope batch. An empty batch is a 400. The per-envelope length
-    // check is ALL-OR-NOTHING: one out-of-range envelope rejects the whole request with 400 (no
-    // partial acceptance → from the client's view either everything was sent or nothing was, which
-    // keeps its state consistent).
+    // Batch validation is ALL-OR-NOTHING: one out-of-range envelope rejects the whole request, so
+    // from the client's view either everything was sent or nothing was and its state stays
+    // consistent.
     if body.envelopes.is_empty() || body.envelopes.len() > 100 {
         return json_err(400, "bad_request");
     }
     if body.sender_device_id.is_empty() {
         return json_err(400, "bad_request");
     }
-    // M2-S3.1 B1 (token binding) — the TRUST FOUNDATION of every S3 self/echo exclusion: stop an
-    // HTTP send on ANOTHER device's behalf via a forged `sender_device_id` (fake self-copy / group
-    // echo injection). body.sender_device_id MUST MATCH the JWT's `device_id` claim. The WS-send
-    // path (inbox_do/ws.rs) is ALREADY token-bound through its attachment device, so this gate
-    // only closes the HTTP send forgery surface.
+    // Token binding — the trust foundation of every self/echo exclusion: `sender_device_id` MUST
+    // match the JWT's `device_id` claim, or an HTTP send could be made on another device's behalf
+    // (fake self-copy / group echo injection). The WS-send path is already bound through its
+    // socket attachment, so this only closes the HTTP forgery surface.
     if token_device != body.sender_device_id {
         return json_err(403, "device_mismatch");
     }
-    // REVOCATION CHECK (security audit — checkpoint 3): if the token-bound device has been REMOVED
-    // (revoked) from the device list, REJECT the send without waiting for the 15 min access-token
-    // TTL to expire → a stolen device CANNOT send messages after revocation. Event-driven: one
-    // query per send, no polling.
+    // A revoked device cannot send, without waiting out the 15 min access-token TTL, so a stolen
+    // device is cut off at revocation. One query per send, no polling.
     if crate::auth::middleware::device_revoked(&ctx.env, &sender_id, &body.sender_device_id).await? {
         return json_err(401, "device_revoked");
     }
@@ -400,19 +279,18 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     };
     let namespace = ctx.env.durable_object("USER_INBOX")?;
 
-    // ---- GROUP path (phase 2 fan-out): group_id → /notify every member except the sender ----
+    // ---- GROUP path: /notify every member except the sender ----
     if let Some(group_id) = body.group_id.as_deref() {
-        // The sender must be a member of this group (E2E: the server never sees the content, it
-        // only distributes based on the membership table).
+        // The send gate is MEMBERSHIP ALONE, by design: the server never sees the content and
+        // distributes purely from the membership table (blocking is not a moderation layer here).
         if crate::groups::group_role(&db, group_id, &sender_id)
             .await?
             .is_none()
         {
             return json_err(403, "not_member");
         }
-        // M2-S2.3 (red-team BLOCKER #9): a group carries a single Megolm envelope, so there must
-        // be exactly one EnvItem and it must have no device_id (the fan-out is derived inside the
-        // worker). A group body with several envelopes, or one carrying a device_id, is invalid.
+        // A group carries a single Megolm envelope, so exactly one EnvItem with no device_id:
+        // the fan-out is derived inside the worker.
         if body.envelopes.len() != 1 || body.envelopes[0].device_id.is_some() {
             return json_err(400, "bad_request");
         }
@@ -420,26 +298,19 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
         #[derive(Deserialize)]
         struct MemberDevice {
             user_id: String,
-            // FIX-1 (BLOCKER): with a LEFT JOIN, `device_id` comes back NULL for an active member
-            // who never PUBLISHED a device list. Hence `Option<String>` — the old `String` with an
-            // INNER JOIN DROPPED device-less members and lost their group messages permanently.
+            // NULL for an active member who never published a device list — see the LEFT JOIN
+            // below.
             device_id: Option<String>,
         }
-        // M2-S2.3 group recipient_device derivation (red-team BLOCKER #9 + FIX-1): ACTIVE members
-        // (phase 6 #3 consent) crossed with each member's ACTIVE devices. `group_members LEFT JOIN
-        // devices` gives one (member, device) pair per INSERT of the SINGLE Megolm envelope, tagged
-        // with `recipient_device` — the DO's dedup keys on recipient_device, so a second device is
-        // not swallowed.
+        // Active members crossed with their active devices (`revoked_at IS NULL`), one (member,
+        // device) pair per insert of the single Megolm envelope; the DO's dedup keys on
+        // recipient_device, so a second device of the same member is not swallowed.
         //
-        // FIX-1 (BLOCKER — dropped group members): INNER JOIN became LEFT JOIN. An active member
-        // who never PUBLISHED a device list has no row in `devices`, so the INNER JOIN DROPPED them
-        // from the fan-out and lost their group message PERMANENTLY. The LEFT JOIN returns
-        // `device_id = NULL` for a device-less member → the loop below queues them with
-        // `recipient_device = None` (a device-blind pending row) → once that member publishes a
-        // device list and connects, the NULL-tolerant flush delivers it (FIX-2). With N=1 every
-        // member yields its single primary, i.e. rows bit-identical to the INNER JOIN.
-        // `revoked_at IS NULL` means an active device. The sender's own devices are excluded
-        // (user_id != sender).
+        // The join MUST stay LEFT. An active member who never published a device list has no row
+        // in `devices`, and an INNER JOIN dropped them from the fan-out, losing their group
+        // message permanently. LEFT gives `device_id = NULL`, the loop below queues a device-blind
+        // pending row, and the NULL-tolerant flush delivers it once that member publishes and
+        // connects.
         let pairs: Vec<MemberDevice> = db
             .prepare(
                 "SELECT gm.user_id AS user_id, d.device_id AS device_id
@@ -453,14 +324,10 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             .all()
             .await?
             .results()?;
-        // M12 (fan-out amplification — DoS): one group send produces `pairs.len()` DO writes
-        // (members x devices). The single-hit `msg:send` guard above counts that as ONE event, so a
-        // large group allowed 300 sends/60s = ~300xN DO writes. Hence a SECOND guard weighted by the
-        // fan-out WIDTH: a separate `msg:grp_fanout:{sender}` bucket charged `pairs.len()` units.
-        // 6000 units/60s permits ~23 sends/min into a full 256-member group and far more into small
-        // ones — legitimate use is unrestricted while amplification spam is cut off. The member
-        // ceiling (MAX_GROUP_MEMBERS=256) bounds the cost of a single send, so together the total
-        // stays bounded.
+        // A second guard, weighted by fan-out WIDTH: one group send is `pairs.len()` DO writes,
+        // which the single-hit `msg:send` bucket counts as one event, so a large group would allow
+        // ~300xN writes per minute. 6000 units/60s permits ~23 sends/min into a full 256-member
+        // group and far more into small ones, and MAX_GROUP_MEMBERS bounds a single send's cost.
         if !pairs.is_empty()
             && !crate::ratelimit::check_rate_limit_weighted_env(
                 &ctx.env,
@@ -473,17 +340,35 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
         {
             return json_err(429, "rate_limited");
         }
-        // Fan out to every (member, device) pair, sequentially — the worker's WASM runtime is
-        // single-threaded. If one device's DO fails, skip it and let the others through;
-        // idempotency lives in the DO's dedup. A group has NO single canonical id, so we report the
-        // first successful pair's id, or a timestamp if none succeeded (used only for the sender's
-        // local "Sent" tracking; group receipts are a separate axis). FIX-1: `device_id` Some means
-        // a concrete device target, None (a member who published no devices) means a
-        // `recipient_device = None` device-blind pending row, so the member is not dropped.
+        // Fan out sequentially — the worker's WASM runtime is single-threaded. One device's DO
+        // failure skips that device and lets the others through; idempotency lives in the DO's
+        // dedup. A group has no single canonical id, so the response reports the first successful
+        // pair's id, or a timestamp if none succeeded (the sender's local "Sent" tracking only;
+        // group receipts are a separate axis).
+        //
+        // THE SUBREQUEST BUDGET (full reasoning in `messages::budget`): every pair costs at least
+        // one DO call, plus a push worth several more for an offline recipient, against a Workers
+        // ceiling of ~50 per request. A room past roughly two dozen used to run out MID-LOOP, so
+        // every remaining pair failed for want of subrequests rather than for any delivery reason
+        // and fell into `fanout_retry`, whose drain hit the same wall. Pairs this request cannot
+        // pay for are now recognised BEFORE they are attempted and go straight to the queue.
+        let mut budget = crate::messages::budget::SubrequestBudget::new(
+            crate::messages::budget::resolve_budget(&ctx.env),
+            // +1 held back for the single `fanout_retry` batch that closes this handler.
+            crate::messages::budget::GROUP_SEND_PRELUDE + 1,
+        );
         let mut first_id: Option<i64> = None;
         let mut delivered_count: usize = 0;
+        let mut attempted: usize = 0;
         let mut failed_pairs = Vec::new();
+        let mut deferred_pairs = Vec::new();
         for p in &pairs {
+            if !budget.can_afford(crate::messages::budget::COST_PAIR_WORST_CASE) {
+                deferred_pairs.push(p);
+                continue;
+            }
+            attempted += 1;
+            budget.spend(crate::messages::budget::COST_NOTIFY);
             match notify_recipient(
                 &namespace,
                 &p.user_id,
@@ -501,56 +386,58 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         first_id = Some(id);
                     }
                     delivered_count += 1;
-                    // This member device is OFFLINE → content-less FCM wake (per-device group
-                    // fan-out). Skipped for `silent` control traffic such as a group receipt.
+                    // An offline member device gets a content-less FCM wake, unless the sender
+                    // marked the message silent. BOTH outcomes are logged: with only the sends
+                    // logged, a control message that still wakes a phone looks identical to one
+                    // correctly silenced, which is how a waking group path stayed invisible next
+                    // to an already-quiet 1:1 path.
                     if !delivered_live && body.silent {
-                        // The instrument for the wake policy: without it the log shows only
-                        // what was SENT, so a control message that still wakes a phone looks
-                        // identical to one correctly silenced. That is how this very door
-                        // shipped unnoticed on 2026-07-28 — the 1:1 path was quiet and the
-                        // group path was not, and the push log could not tell them apart.
                         console_log!(
                             "[push] skipped (silent) group={group_id} user={} dev={:?}",
                             p.user_id, p.device_id
                         );
                     }
                     if !delivered_live && !body.silent {
-                        // Name the door on the WAKING push as well, not only on the skip. Logging one
-                        // side is how the group path stayed invisible for a round: "a wake happened"
-                        // and "which surface asked for it" are different questions.
                         console_log!(
                             "[push] waking group={group_id} user={}",
                             p.user_id
                         );
+                        budget.spend(crate::messages::budget::COST_PUSH_WAKE);
                         crate::push::fcm::maybe_push_wake(
                             &ctx.env, &db, &p.user_id, p.device_id.as_deref(),
                         )
                         .await;
                     }
                 }
-                Err(_) => failed_pairs.push(p), // W4-b: all 3 attempts failed → durable retry
+                Err(_) => {
+                    // The in-request retry spent a second DO call before giving up.
+                    budget.spend(crate::messages::budget::COST_NOTIFY);
+                    failed_pairs.push(p); // every attempt failed → durable retry
+                }
             }
         }
-        // TOTAL failure (nothing delivered) → a retryable 502 and NO enqueue: the sender retries the
-        // whole thing, so there is no partial-duplicate risk. Hardening #4: previously even a total
-        // failure returned 200 with a synthetic id, so the sender believed it had succeeded and lost
-        // the message PERMANENTLY; a 502 lets the client retry safely (the DO's dedup makes that safe).
-        if !pairs.is_empty() && delivered_count == 0 {
+        // TOTAL failure → a retryable 502 and NO enqueue: the sender retries the whole thing, and
+        // the DO's dedup makes that safe. Returning 200 with a synthetic id here would have the
+        // sender believe it succeeded and lose the message permanently. `attempted` rather than
+        // `pairs.is_empty()` because a pair the budget DEFERRED was never tried and is no evidence
+        // that delivery is broken.
+        if attempted > 0 && delivered_count == 0 {
             return json_err(502, "fanout_failed");
         }
-        // W4-b: PARTIAL failure (delivered_count > 0 but some pairs Err) → write the failed
-        // (member, device) pairs into the DURABLE fanout_retry queue so the cron drain re-notifies
-        // them and that member does NOT miss the group message.
-        // retry_key = sha256(recipient|device|group|envelope)[..16] with INSERT OR IGNORE, which
-        // makes it idempotent: a sender retry or a double enqueue cannot write the SAME row twice,
-        // avoiding duplicate pending rows and wasted W2 cap.
-        // BEST-EFFORT: a failed INSERT (D1 down / migration missing) does NOT break the send and
-        // stays visible as `failed: n` in the response — no false guarantee, and STRICTLY BETTER
-        // than the silent loss it replaces. A total failure never reaches this point.
+        // PARTIAL failure → the failed (member, device) pairs go into the durable queue so the
+        // cron drain re-notifies them and that member does not miss the message. The
+        // sha256(recipient|device|group|envelope) retry_key with INSERT OR IGNORE makes the
+        // enqueue idempotent, so a sender retry cannot write the same row twice. Best-effort: a
+        // failed INSERT does not break the send and stays visible as `failed: n` in the response.
         let failed_n = failed_pairs.len();
-        if failed_n > 0 {
+        let deferred_n = deferred_pairs.len();
+        if failed_n + deferred_n > 0 {
             let now = now_secs() as i64;
-            for p in &failed_pairs {
+            // ONE BATCH, not one INSERT per pair: a separate statement is a separate subrequest,
+            // so the enqueue for a wide fan-out was paid for out of the same purse the fan-out had
+            // just exhausted. A D1 batch is one subrequest whatever its length.
+            let mut stmts = Vec::with_capacity(failed_n + deferred_n);
+            for p in failed_pairs.iter().chain(deferred_pairs.iter()) {
                 let device = p.device_id.as_deref().unwrap_or("");
                 let mut hasher = Sha256::new();
                 hasher.update(p.user_id.as_bytes());
@@ -582,29 +469,30 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                         d1_int(i64::from(body.silent)),
                     ])
                 {
-                    let _ = stmt.run().await;
+                    stmts.push(stmt);
                 }
             }
+            if !stmts.is_empty() {
+                let _ = db.batch(stmts).await;
+            }
             console_log!(
-                "[deliv] W4-b enqueue: {failed_n}/{} partial-fail to durable-retry (group={group_id})",
+                "[deliv] W4-b enqueue: {failed_n} failed + {deferred_n} over-budget of {} pairs to durable-retry (group={group_id})",
                 pairs.len()
             );
         }
         let id = first_id.unwrap_or_else(|| now_secs() as i64);
-        // SAHA-FIX (group send returned an "empty batch ack"): the client's `send_group_message`
-        // expects `SendBatchRes { ts, acks }` (the M2-S2.4 batch wire cut), but the old {id, ts}
-        // response carried no `acks`, so `res.acks.first()` was None and the group message was
-        // DROPPED after 8/8 retries. Now `acks` is included (a group has one canonical id → a single
-        // element with device_id = None) while `id` is kept for backwards compatibility with older
-        // clients. Not an M4 issue — groups were simply overlooked in the move to the 1:1 batch.
+        // The response MUST carry `acks`: the client's `send_group_message` reads
+        // `res.acks.first()`, and an {id, ts} body without it dropped the group message after all
+        // its retries. A group has one canonical id, hence a single element. `id` stays for
+        // backwards compatibility with older clients.
         return Response::from_json(&serde_json::json!({
             "id": id,
             "ts": now_secs(),
             "acks": [{ "id": id }],
-            // W4-b: how many (member, device) pairs fell back to durable retry (0 = fully
-            // delivered). The client ignores it today, but it is telemetry now and the hook for
-            // future "partial delivery" visibility or a nudge.
-            "failed": failed_n,
+            // Pairs that fell back to durable retry — failed plus budget-deferred, since from the
+            // sender's side both mean "queued, not yet delivered". 0 = fully delivered. Telemetry
+            // today; the hook for future partial-delivery visibility.
+            "failed": failed_n + deferred_n,
         }));
     }
 
@@ -616,10 +504,8 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     if recipient_id.len() != 36 {
         return json_err(400, "bad_request");
     }
-    // M2-S2.3 device-aware self-send: when recipient == sender, ONLY a different device is
-    // allowed (the wire shape for an OutboundCopy self-copy is ready; the behaviour lands in S3).
-    // A self-send to the same device is still a 400. Every EnvItem's device_id must differ from
-    // sender_device_id.
+    // A self-send is allowed only to a DIFFERENT device (the OutboundCopy self-copy shape), so
+    // every EnvItem's device_id must differ from sender_device_id.
     if recipient_id == sender_id {
         let any_same = body
             .envelopes
@@ -655,30 +541,44 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     if recipient.is_none() {
         return json_err(404, "recipient_not_found");
     }
-    // FIX-2(a) (HIGH — orphan NULLs): on the 1:1 path every EnvItem.device_id is MANDATORY. A 1:1
-    // sender knows the recipient's devices from bundle v2, so each envelope targets a CONCRETE
-    // device (a separate Olm session per device). A 1:1 body carrying device_id = None is a
-    // buggy/old client and would create orphan NULL pending rows (multi-device ambiguity), so it is
-    // rejected here with an early 400. (A NULL pending row is legitimate ONLY via the group fallback
-    // [a member who published no devices, FIX-1] or the device-blind S1-token path — NEVER from 1:1.)
+    // On the 1:1 path `device_id` is MANDATORY: the sender knows the recipient's devices from the
+    // bundle, so each envelope targets a concrete device. A device-less 1:1 envelope would create
+    // an orphan NULL pending row nobody resolves. NULL is legitimate only via the group fallback.
     if body.envelopes.iter().any(|e| e.device_id.is_none()) {
         return json_err(400, "bad_request");
     }
-    // M2-S2.3 batched 1:1 fan-out: each EnvItem gets its own /notify(recipient_device). Per-device
-    // success and failure are VISIBLE — the old `if let Ok(Some)` silent skip is gone (red-team
-    // #18): successful devices join `acks`, failed ones DROP OUT, so a missing device_id is visible
-    // to the client. With N=1 the single element yields a single ack, i.e. today's single-envelope
-    // flow.
+    // The recipient's published devices, resolved ONCE, in place of a per-envelope
+    // `device_revoked` call — which answers a different question: it is false for a device that
+    // DOES NOT EXIST, so an invented device id was indistinguishable from a live one and every
+    // envelope aimed at one became a `pending` row nobody would ever ack. See
+    // `messages::recipient_devices` for what that bought an attacker.
+    let recipient_devices =
+        crate::messages::recipient_devices::load_recipient_devices(&db, recipient_id).await?;
+    // All-or-nothing again: one fabricated target rejects the whole batch, so the sender re-fetches
+    // the bundle rather than half-succeeding against a device list it got wrong.
+    if body.envelopes.iter().any(|e| {
+        e.device_id.as_deref().map(|d| {
+            recipient_devices.verdict(d)
+                == crate::messages::recipient_devices::DeviceVerdict::Unknown
+        }) == Some(true)
+    }) {
+        return json_err(
+            400,
+            crate::messages::recipient_devices::UNKNOWN_DEVICE_CODE,
+        );
+    }
+    // Batched 1:1 fan-out: each EnvItem gets its own /notify(recipient_device). Per-device
+    // outcomes are visible to the client — successful devices join `acks`, failed ones drop out.
     let mut acks: Vec<serde_json::Value> = Vec::with_capacity(body.envelopes.len());
     for e in &body.envelopes {
-        // D-M12: do NOT deliver 1:1 to a revoked RECIPIENT device. The group fan-out already
-        // excludes revoked devices in its JOIN, so this establishes parity for 1:1. The sender's
-        // ~2 min stale device cache can no longer open a delivery window to a revoked recipient
-        // device — the worker is the authoritative gate. Fail-closed: a D1 error propagates via `?`
-        // (parity with the sender revoke check in `send`). device_id is MANDATORY for 1:1 (400
-        // above), so the None branch is unreachable in practice.
+        // A revoked recipient device is SKIPPED, giving 1:1 the parity the group fan-out gets from
+        // its JOIN: the worker is the authoritative gate, so the sender's ~2 min stale device
+        // cache cannot open a delivery window to a revoked device. An id that was never published
+        // at all already rejected the whole request above.
         if let Some(dev) = e.device_id.as_deref() {
-            if crate::auth::middleware::device_revoked(&ctx.env, recipient_id, dev).await? {
+            if recipient_devices.verdict(dev)
+                != crate::messages::recipient_devices::DeviceVerdict::Active
+            {
                 continue; // not added to acks → no pending row and no ack for that device
             }
         }
@@ -699,10 +599,8 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                     "device_id": e.device_id,
                     "id": id,
                 }));
-                // Recipient is OFFLINE on that device → content-less FCM wake (1:1 HTTP path).
-                // `silent` control traffic (caps announcement, state digest, typing, receipt) is
-                // stored and delivered on the next connect WITHOUT a wake — this is the path the
-                // 2026-07-28 measurement found burning three cold starts per desktop launch.
+                // Offline on that device → a content-less FCM wake, unless the message is silent
+                // control traffic, which is stored and delivered on the next connect instead.
                 if !delivered_live && body.silent {
                     console_log!(
                         "[push] skipped (silent) 1:1 user={recipient_id} dev={:?}",
@@ -720,7 +618,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             Err(_) => { /* per-device failure → drops out of the ack list (visibly) */ }
         }
     }
-    // No device succeeded → 502 (parity with the old single-envelope "do_notify_failed").
+    // No device succeeded → 502.
     if acks.is_empty() {
         return json_err(502, "do_notify_failed");
     }
@@ -731,8 +629,8 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
 struct ReadBody {
     peer_id: String,
     ids: Vec<i64>,
-    /// #11 Layer-4b (Codex Q7): msg_uids PARALLEL to `ids`, so sibling convergence keeps the uid
-    /// even when a WS read falls back to HTTP. An old client or the WS path sends an empty Vec.
+    /// msg_uids PARALLEL to `ids`, so sibling convergence keeps the uid even when a WS read falls
+    /// back to HTTP. An old client or the WS path sends an empty Vec.
     #[serde(default)]
     uids: Vec<String>,
 }
@@ -742,13 +640,9 @@ pub async fn read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Ok(auth) => (auth.user_id, auth.device_id),
         Err(resp) => return Ok(resp),
     };
-    // FIX-3 (CONCERN H2 — WS-read DoS bypass): WS read got a rate limit but HTTP
-    // `/messages/read` had no guard, so the WS limit could be bypassed over HTTP and unlimited
-    // forward-reads pushed into the peer DO (DoS). The guard here mirrors the one at the top of
-    // `send`: a per-user `msg:read:{recipient_id}` bucket of 300/60s, answering 429 when exceeded (the HTTP
-    // path rejects instead of silently dropping like the WS path; the limiter itself stays fail-open
-    // when the KV binding is missing). Using a separate bucket keeps legitimate read traffic from
-    // eating the send quota, and each read still costs one hit.
+    // Without this guard the WS read limit could simply be bypassed over HTTP, pushing unlimited
+    // forward-reads into the peer DO. Its own bucket, so legitimate read traffic does not eat the
+    // send quota; the HTTP path rejects with 429 where the WS path silently drops.
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,
         &read_rate_limit_key(&recipient_id),
@@ -784,11 +678,8 @@ pub async fn read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     ) {
         return json_err(err.status, err.code);
     }
-    // Hardening #9: a revoked device must not be able to FORGE a read receipt (revoke parity with
-    // the send path — present in `inbox_do::ws`'s send arm but missing from the read path). If the
-    // token-bound device has been removed (revoked) from the device list, REJECT the read forward
-    // without waiting for the 15 min TTL. This used to be skipped for a token carrying no device
-    // claim; there is no such token, so the check now covers every read.
+    // A revoked device must not be able to FORGE a read receipt — revoke parity with the send
+    // path, without waiting out the 15 min token TTL.
     if crate::auth::middleware::device_revoked(&ctx.env, &recipient_id, &reader_device).await? {
         return json_err(401, "device_revoked");
     }
@@ -812,18 +703,16 @@ pub async fn read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     no_content()
 }
 
-/// `GET /messages/receipt-sync?since=` — shared-root #1: cursor-pull the caller's OWN durable
-/// `receipt_state` from its UserInbox DO (the HTTP twin of the WS `receipt_sync` frame). A device
-/// that is NOT WS-connected (i.e. on the HTTP send fallback) converges the stuck tick of its own
-/// outgoing message through here. receipt_state lives in the caller's own inbox, hence
-/// `id_from_name(&user_id)`.
+/// `GET /messages/receipt-sync?since=<seq>` (auth required) → the DO's `{rows, more}`. Cursor-pull
+/// the caller's OWN durable `receipt_state`, the HTTP twin of the WS `receipt_sync` frame: a
+/// device on the HTTP send fallback converges its outgoing message's stuck tick through here.
+/// receipt_state lives in the caller's own inbox, hence `id_from_name(&user_id)`.
 pub async fn receipt_sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
-    // `since` comes from the client query (the plugin_log::sync pattern — a safely parsed i64 is
-    // the only thing interpolated into the DO URL).
+    // A safely parsed i64 is the only thing interpolated into the DO URL.
     let mut since: i64 = 0;
     let url = req.url()?;
     for (k, v) in url.query_pairs() {
@@ -840,31 +729,25 @@ pub async fn receipt_sync(req: Request, ctx: RouteContext<()>) -> Result<Respons
     passthrough(stub.fetch_with_request(do_req).await?).await
 }
 
-/// `POST /messages/self-read` (the 2026-06-28 sibling-read epic): a device of U reports the
-/// `msg_uid`s of the incoming messages it read to U's OWN inbox DO → `self_read_state` set-once +
-/// self_read_update/delta to U's other devices. It is the self-read twin of the `read` receipt, but
-/// it goes to my own DO instead of the PEER's (sibling convergence). The {uids:[...]} body is parsed
-/// in the DO; this handler forwards it opaquely.
+/// `POST /messages/self-read` (auth required), body `{uids:[…]}` forwarded opaquely → the DO's
+/// 204. A device of U reports the `msg_uid`s of the incoming messages it read to U's OWN inbox DO
+/// → `self_read_state` set-once + a delta to U's other devices. The self-read twin of the `read`
+/// receipt, but aimed at my own DO instead of the PEER's.
 pub async fn self_read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
-    // W3 (self-read DoS hardening, 2026-07-02): rate limit following the send/read pattern — a
-    // separate bucket, 300/60s, fail-open on a KV error. Together with the body cap below it bounds
-    // how fast `self_read_state` can grow. 300/60s sits FAR above the legitimate ceiling: the client
-    // BATCHES mark-read through its dwell controller (a request is not a message; the practical
-    // ceiling is ~30-60/min), so a real user NEVER reaches this limit and it only cuts runaway or
-    // abusive traffic. NOTE (Codex flag): the client's send_self_read_durable DROPS on error without
-    // retrying (pre-existing), so a 429 is theoretically a lost read — but since the limit is above
-    // legitimate use, only an abuser's OWN fabricated reads are dropped. A client-side retry is a
-    // separate robustness follow-up; this change is lossless for the legitimate path.
+    // Its own bucket, and with the body cap below it bounds how fast `self_read_state` can grow.
+    // 300/60s sits far above legitimate use — the client batches mark-read through its dwell
+    // controller, so ~30-60/min is the practical ceiling. ⚠ The client's send_self_read_durable
+    // drops on error without retrying, so a 429 is a lost read; above legitimate use that only
+    // costs an abuser their own fabricated reads, but a client-side retry is the honest fix.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("msg:selfread:{user_id}"), 300, 60).await {
         return json_err(429, "rate_limited");
     }
     let body = req.text().await.unwrap_or_default();
-    // W3: body size cap — 500 uids x ~40B is about 20KB, so 32KB is generous. Anything larger is an
-    // anomaly or abuse → 400.
+    // 500 uids x ~40B is about 20KB, so 32KB is generous; larger is an anomaly or abuse.
     if body.len() > 32 * 1024 {
         return json_err(400, "payload_too_large");
     }
@@ -880,9 +763,9 @@ pub async fn self_read(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     passthrough(stub.fetch_with_request(do_req).await?).await
 }
 
-/// `GET /messages/self-read-sync?since=` — sibling-read cursor pull (the HTTP twin of the WS
-/// `self_read_sync` frame). A new device pulls the entire read state from cursor=0 so its backlog
-/// converges. Mirrors receipt_sync.
+/// `GET /messages/self-read-sync?since=<seq>` (auth required) → the DO's `{rows, more}`. The
+/// sibling-read cursor pull, HTTP twin of the WS `self_read_sync` frame; a new device pulls from
+/// since=0 to converge its backlog. Mirrors receipt_sync.
 pub async fn self_read_sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => auth.user_id,
@@ -957,5 +840,23 @@ mod tests {
         assert_eq!(send_rate_limit_key(user), format!("msg:send:{user}"));
         assert_eq!(read_rate_limit_key(user), format!("msg:read:{user}"));
         assert_ne!(send_rate_limit_key(user), read_rate_limit_key(user));
+    }
+
+    /// The in-request notify retry, guarded at source because `notify_recipient` needs a live
+    /// Durable Object namespace and its policy is two numbers rather than a behaviour. Both
+    /// halves are pinned: the attempt count, and the fact that the second attempt WAITS. Needles
+    /// are split with `concat!` so they cannot match themselves in `include_str!`'s copy.
+    #[test]
+    fn the_in_request_notify_retry_is_bounded_and_paced() {
+        const SRC: &str = include_str!("handlers.rs");
+        assert!(
+            SRC.contains(concat!("NOTIFY_ATTEMPTS: usize", " = 2")),
+            "the in-request retry count changed — more than one retry against the same DO belongs \
+             in the durable fanout_retry queue, not in the request path"
+        );
+        assert!(
+            SRC.contains(concat!("worker::Delay::", "from(")),
+            "the retry lost its pause and is back to hammering the same DO with no delay"
+        );
     }
 }

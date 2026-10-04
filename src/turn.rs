@@ -1,4 +1,4 @@
-//! TURN credential issuing plus a budget guard (calls Faz 1.5 — calls over the internet).
+//! TURN credential issuing plus a budget guard — what makes calls work over the internet.
 //!
 //! Calls are P2P by default (direct over LAN/WiFi). Once the two ends are on different
 //! networks and NAT gets in the way, media is relayed through **CF Realtime TURN**. A CF
@@ -18,10 +18,10 @@
 //! other and is a brake, because its KV binding is optional. See the note at the check itself.
 //!
 //! **Where the credentials come from (the fcm.rs chain, verbatim):** per key, env FIRST and D1
-//! `server_config` second, so an env-set value keeps the production path bit-identical while an
-//! owner with no shell can paste the pair into the Sezi app instead (`PATCH /admin/turn-config`).
-//! Requiring `wrangler secret put` for this was the actual blocker: it puts a beta-blocking feature
-//! behind SSH access to a Raspberry Pi, which no ordinary self-hoster has.
+//! `server_config` second, so an env-set value keeps the production path unchanged while an owner
+//! with no shell can paste the pair into the Sezi app instead (`PATCH /admin/turn-config`).
+//! Requiring `wrangler secret put` would put calls behind SSH access to a box, which an ordinary
+//! self-hoster does not have.
 
 use crate::auth::middleware::require_active_auth;
 use crate::respond::json_err;
@@ -263,8 +263,8 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
 
 /// The monthly TURN credential ceiling: env `TURN_MONTHLY_CAP`, falling back to
 /// `DEFAULT_MONTHLY_CAP` when absent or unparseable. `pub(crate)` so that the budget guard
-/// (`credentials` above) and the /admin/stats report (Faz 1c) read the SAME ceiling —
-/// what is advertised matches what is enforced, as with retention.
+/// (`credentials` above) and the /admin/stats report read the SAME ceiling — what is
+/// advertised matches what is enforced, as with retention.
 pub(crate) fn monthly_cap(env: &Env) -> i64 {
     env.var("TURN_MONTHLY_CAP")
         .ok()
@@ -291,8 +291,8 @@ fn user_monthly_cap(env: &Env) -> i64 {
 
 /// Epoch seconds → "YYYY-MM" in UTC, via Howard Hinnant's civil-from-days algorithm so we
 /// need no chrono dependency. This is the budget window key, aligned to the calendar month.
-/// `pub(crate)` so /admin/stats (Faz 1c) reads this month's `turn_usage.issued` row with the
-/// SAME key — whoever writes the counter and whoever reports it agree on the window.
+/// `pub(crate)` so /admin/stats reads this month's `turn_usage.issued` row with the SAME
+/// key — whoever writes the counter and whoever reports it agree on the window.
 pub(crate) fn current_month_utc() -> String {
     let secs = now_secs() as i64;
     let days = secs.div_euclid(86_400);

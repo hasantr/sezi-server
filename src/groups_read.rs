@@ -1,23 +1,19 @@
 //! The two READ projections of the group surface — what `GET /groups` and
 //! `GET /groups/:id/members` hand back, and what they deliberately do not.
 //!
-//! Split out of `groups.rs` for size. They belong together because both are pure shaping of rows
-//! into JSON with no authority of their own — every gate stays in the handler — and because the
-//! two arguments worth keeping about this surface are both about the SHAPE of a response rather
-//! than about who may ask for it: how a page admits it is a page, and which columns never leave
-//! the server.
+//! Both are pure shaping of rows into JSON with no authority of their own — every gate stays in
+//! the handler. The two arguments worth keeping here are about the SHAPE of a response, not
+//! about who may ask for it: how a page admits it is a page, and which columns never leave the
+//! server.
 
 use crate::d1util::{d1_int, d1_text};
 use serde::Deserialize;
 use worker::*;
 
-/// Ceiling on one `GET /groups` page.
-///
-/// The number is unchanged; what changed is that the response now SAYS when it hit it. Previously
-/// this was a bare `LIMIT 200` with no cursor, no total and no flag, and joined groups and pending
-/// INVITES share the one query — so past 200 rows a user silently lost the tail, invites included,
-/// with no way to detect it. Since any member may create a group and add anyone to it, that was
-/// also reachable on purpose: fill a target's list and their real groups fall off the end.
+/// Ceiling on one `GET /groups` page. The response must SAY when it hits this: joined groups and
+/// pending INVITES share the one query, so a silent limit loses the tail — invites included —
+/// undetectably, and since any member may create a group and add anyone to it, that is reachable
+/// on purpose (fill a target's list and their real groups fall off the end).
 pub(super) const MAX_GROUPS_PAGE: i64 = 200;
 
 /// Ceiling on one member list. A group cannot exceed `MAX_GROUP_MEMBERS` (256) rows, so unlike the
@@ -48,28 +44,18 @@ struct CountRow {
 /// member count (a pending invitee is not counted until they accept). The client separates the two
 /// kinds by `status`.
 ///
-/// **ORDER: active memberships first, then invites, each by `updated_at DESC`.** The old ordering
-/// was `updated_at DESC` across both kinds, which handed anyone a way to evict a target's real
-/// groups from the page: a freshly created group carries `updated_at = now`, so a burst of unwanted
-/// invites sorts straight to the top and pushes older, joined groups past the limit. Ranking by
-/// kind first means an invite can now only ever displace another invite — a flood remains a
-/// nuisance, but it can no longer hide a group you are actually in. Within each kind the recency
-/// order the client already relies on is unchanged, and `g.id` breaks ties so the ordering is total
-/// (two groups can easily share an `updated_at` second).
+/// **ORDER: active memberships first, then invites, each by `updated_at DESC`.** Ordering by
+/// `updated_at` across both kinds hands anyone a way to evict a target's real groups from the
+/// page — a fresh group carries `updated_at = now`, so a burst of unwanted invites sorts to the
+/// top and pushes joined groups past the limit. Ranking by kind first means an invite can only
+/// displace another invite. `g.id` breaks ties so the ordering is total.
 ///
-/// **THE SIGNAL IS `total` + `truncated`, NOT A CURSOR**, and that is a judgement call worth
-/// stating. A cursor is the better answer in the abstract and it is the answer `contacts/` gives
-/// for the directory and the request feed. It is the wrong answer here today for two concrete
-/// reasons. First, nothing could consume it: the sole caller is `core`'s
-/// `ApiClient::list_groups`, which returns `Vec<GroupRow>` from a single request and has no paging
-/// concept, so a `next_cursor` would be server surface that is dead on arrival — and the file that
-/// would have to learn to follow it is not in this change. Second, the reusable half of the house
-/// cursor pattern (`encode_cursor`/`decode_cursor`/`query_param`) is private to `contacts/mod.rs`;
-/// reaching for it would mean either widening that module's visibility or writing a second cursor
-/// codec, and "one spelling per thing" is worth more than a page-two nobody requests. `total` and
-/// `truncated` cost one extra `COUNT(*)` and make the loss VISIBLE, which is the part that cannot
-/// be recovered afterwards. Wiring a real cursor is then a change to the client and this function
-/// together, with the flag already in place to prove it is needed.
+/// **THE SIGNAL IS `total` + `truncated`, NOT A CURSOR.** A cursor is the better answer in the
+/// abstract (`contacts/` gives one), but nothing here could consume it: `core`'s
+/// `ApiClient::list_groups` returns a `Vec` from a single request and has no paging concept, and
+/// the house cursor codec is private to `contacts/mod.rs`. `total`/`truncated` cost one extra
+/// `COUNT(*)` and make the loss VISIBLE, which is the part that cannot be recovered afterwards;
+/// a real cursor is then a change to the client and this function together.
 pub(super) async fn my_groups_page(db: &D1Database, user_id: &str) -> Result<serde_json::Value> {
     let rows: Vec<MyGroupRow> = db
         .prepare(
@@ -124,14 +110,11 @@ pub(super) async fn my_groups_page(db: &D1Database, user_id: &str) -> Result<ser
 
 /// One row of `GET /groups/:id/members`.
 ///
-/// **NO `email` COLUMN, and it is not an oversight to be helpfully restored.** This handler used to
-/// `SELECT u.email` and return it verbatim to every member of the room, which contradicts the
-/// directory design outright: the directory pages never expose an address and hard-code
-/// `avatar_ref: null` rather than leak anything extra, so the member list was the one place on the
-/// server where knowing a user id got you their e-mail. Nothing wanted it —
-/// `core/src/client/api/mod.rs` declares the field `#[serde(default)] Option<String>` and no Rust
-/// or Dart code reads it — so the leak bought nothing at all. `display_name` stays: it is the
-/// self-chosen label the member list exists to show.
+/// **NO `email` COLUMN, and it is not an oversight to be helpfully restored.** The directory
+/// pages never expose an address, so selecting `u.email` here would make the member list the one
+/// place on the server where knowing a user id gets you someone's e-mail — and no Rust or Dart
+/// code reads it. `display_name` stays: it is the self-chosen label the member list exists to
+/// show.
 #[derive(Deserialize)]
 struct MemberRow {
     user_id: String,

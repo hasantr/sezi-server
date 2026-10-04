@@ -1,17 +1,19 @@
--- M2-S3.5 SAHA-KRİTİK: one_time_prekeys UNIQUE (user_id, prekey_id) ->
---   UNIQUE (user_id, device_id, prekey_id). (signed_prekeys mig 0015 ile aynı sınıf.)
+-- FIELD-CRITICAL: one_time_prekeys UNIQUE (user_id, prekey_id) ->
+--   UNIQUE (user_id, device_id, prekey_id). (The same class as signed_prekeys in mig 0015.)
 --
--- Çıkış: çoklu-cihazda OTK replenish "UNIQUE constraint failed:
---   one_time_prekeys.user_id, one_time_prekeys.prekey_id" -> 500. Her cihaz kendi
---   prekey_id namespace'inden (ikisi de düşük id'den) OTK üretir; user_id ORTAK
---   (linked = primary'nin user_id'si) olduğundan aynı prekey_id farklı device'larda
---   ÇAKIŞIYORDU -> HİÇBİR cihaz OTK yayınlayamıyor -> peer first-contact için OTK yok
---   ("ilk mesaj için OTK gerekli") -> bağlı cihaz mesaj alamıyor + revoke-sonrası
---   yeni cihaz kurulamıyor. mig 0012 device_id kolonunu ekledi ama UNIQUE'e girmedi.
+-- The symptom: with multiple devices, an OTK replenish returned "UNIQUE constraint failed:
+--   one_time_prekeys.user_id, one_time_prekeys.prekey_id" -> 500. Every device generates its
+--   OTKs out of its own prekey_id namespace (both starting from a low id), and because
+--   user_id is SHARED (a linked device carries the primary's user_id) the same prekey_id
+--   COLLIDED across devices -> NO device could publish OTKs -> no OTK for a peer's first
+--   contact ("an OTK is required for the first message") -> a linked device received nothing
+--   and a new device could not be set up after a revoke. Mig 0012 added the device_id column
+--   but never put it into the UNIQUE.
 --
--- SQLite UNIQUE değiştirilemez -> tablo rebuild. device_id NULL (legacy/birincil) -> ''
--- sentinel (NOT NULL DEFAULT ''; signed_prekeys mig 0015 paritesi). `id` autoincrement
--- PK korunur. one_time_prekeys leaf tablo (yalnız users'a referans) -> DROP güvenli.
+-- A SQLite UNIQUE cannot be altered -> rebuild the table. device_id NULL (legacy/primary) ->
+-- the '' sentinel (NOT NULL DEFAULT ''; parity with signed_prekeys in mig 0015). The `id`
+-- autoincrement PK is preserved. one_time_prekeys is a leaf table (it only references users)
+-- -> the DROP is safe.
 CREATE TABLE one_time_prekeys_new (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id     TEXT NOT NULL REFERENCES users(id),

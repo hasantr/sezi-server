@@ -58,7 +58,7 @@ pub fn json_err_msg(status: u16, code: &str, message: &str) -> Result<Response> 
     Ok(resp.with_status(status))
 }
 
-#[allow(dead_code)] // util-belt: json_err/no_content kardeşi, ileride kullanılabilir
+#[allow(dead_code)] // util-belt: the sibling of json_err/no_content, may be used later
 pub fn json_status<T: Serialize>(status: u16, body: &T) -> Result<Response> {
     let resp = Response::from_json(body)?;
     Ok(resp.with_status(status))

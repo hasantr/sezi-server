@@ -1,20 +1,22 @@
--- 0018: M10 owner-race — tek-owner garantisi (eşzamanlı ilk-kayıt İKİ owner yaratmasın).
+-- 0018: the owner race — a single-owner guarantee (two concurrent first registrations must
+-- not produce TWO owners).
 --
--- Sorun: `auth/verify.rs` ilk kullanıcıyı owner yapar (`SELECT id FROM users LIMIT 1`
--- boşsa role='owner'). İki istek aynı anda bu SELECT'i boş görürse İKİ kullanıcı da
--- owner olarak INSERT edilebilir (TOCTOU). Owner = sunucu kurucusu/korumalı rol →
--- iki owner yetki modelini bozar.
+-- The problem: `auth/verify.rs` makes the first user the owner (role='owner' when
+-- `SELECT id FROM users LIMIT 1` comes back empty). If two requests see that SELECT empty at
+-- the same moment, BOTH users can be INSERTed as owner (TOCTOU). The owner is the server's
+-- founder and a protected role → two owners break the authority model.
 --
--- Fix: D1 (SQLite) partial UNIQUE index — yalnız role='owner' satırları üzerinde
--- tekillik zorlar. İkinci owner INSERT'i UNIQUE-violation ile başarısız olur (DB-atomik;
--- TOCTOU penceresi kapanır). member/admin satırları index'e GİRMEZ → onlarda kısıt yok.
--- IF NOT EXISTS → idempotent re-run güvenli.
+-- The fix: a D1 (SQLite) partial UNIQUE index that enforces uniqueness over the role='owner'
+-- rows alone. A second owner INSERT fails with a UNIQUE violation (atomic in the DB; the
+-- TOCTOU window closes). member/admin rows are NOT in the index → they stay unconstrained.
+-- IF NOT EXISTS → a re-run is idempotent and safe.
 
--- FIX-2 (DEPLOY-HAZARD): pre-dedup. Prod DB'de bu bug'ların (transfer-owner race /
--- bootstrap TOCTOU) ürettiği kirli durum (>=2 owner) zaten varsa, CREATE UNIQUE INDEX
--- PATLAR → D1 migration batch abort → DEPLOY BLOKLU. Idempotent temizlik: EN ESKİ
--- owner'ı (created_at MIN, tie-break rowid MIN) KORU, diğer tüm owner'ları admin'e indir.
--- 0 veya 1 owner varsa NO-OP (zararsız re-run). created_at = INTEGER (0001_init).
+-- DEPLOY HAZARD, so de-duplicate first. If a production DB already carries the dirty state
+-- these bugs produced (>=2 owners, from the transfer-owner race or the bootstrap TOCTOU), the
+-- CREATE UNIQUE INDEX below BLOWS UP → the D1 migration batch aborts → the DEPLOY IS BLOCKED.
+-- Idempotent cleanup: KEEP the OLDEST owner (created_at MIN, rowid MIN as the tie-break) and
+-- demote every other owner to admin. With 0 or 1 owner this is a NO-OP (a harmless re-run).
+-- created_at = INTEGER (0001_init).
 UPDATE users SET role = 'admin'
  WHERE role = 'owner'
    AND id NOT IN (
@@ -24,21 +26,21 @@ UPDATE users SET role = 'admin'
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_owner ON users(role) WHERE role = 'owner';
 
--- M10 bootstrap-race — eşzamanlı /bootstrap çağrıları çoklu genesis token
--- üretebiliyordu (her ikisi de "mevcut genesis yok" görüp INSERT). Genesis satırı
--- = `owner_user_id IS NULL AND used = 0` (sistem-üretimi, kullanılmamış). Partial
--- UNIQUE index → aynı anda EN FAZLA bir kullanılmamış genesis daveti olabilir;
--- ikinci eşzamanlı INSERT UNIQUE-violation ile düşer → bootstrap handler hatayı
--- yutup mevcut tek-satırı re-SELECT eder (idempotent, tek token döner). Gerçek
--- davetler (`create_invite`, owner_user_id dolu) bu index'e GİRMEZ → kısıt yok.
--- used=1 genesis de index-dışı (kullanıldıktan sonra yeniden tekil-kısıt gerekmez,
--- zaten owner oluşunca kapı 410). `used` indeksli kolon ama tüm partial-satırlarda
--- used=0 → sabit değer; tekillik owner_user_id-NULL+used=0 kümesinde tek-satır demek.
--- FIX-2 (DEPLOY-HAZARD): pre-dedup. Bootstrap-race >=2 kullanılmamış-genesis varsa
--- CREATE UNIQUE INDEX patlar. EN ESKİ kullanılmamış-genesis'i (created_at MIN, tie-break
--- rowid MIN) KORU, diğerlerini used=1 işaretle → index-dışına çıkar. invite_tokens
--- kolonları: token(PK)/used/expires_at/created_at(INTEGER, 0001_init)/owner_user_id
--- (0004). 0/1 genesis varsa NO-OP. token PK → NOT IN alt-sorgu token'a göre.
+-- The bootstrap race — concurrent /bootstrap calls could produce several genesis tokens (both
+-- saw "there is no genesis yet" and INSERTed). A genesis row = `owner_user_id IS NULL AND
+-- used = 0` (system-generated, unused). The partial UNIQUE index → AT MOST one unused genesis
+-- invite can exist at a time; a second concurrent INSERT fails with a UNIQUE violation → the
+-- bootstrap handler swallows the error and re-SELECTs the single existing row (idempotent,
+-- one token returned). Real invites (`create_invite`, owner_user_id set) are NOT in this index
+-- → unconstrained. A used=1 genesis is outside the index too: once it has been used there is
+-- no need for the uniqueness constraint again, and the door returns 410 as soon as an owner
+-- exists. `used` is the indexed column, but across every partial row used=0 → a constant
+-- value, so uniqueness here means one row in the owner_user_id-NULL + used=0 set.
+-- DEPLOY HAZARD, so de-duplicate first: if the bootstrap race left >=2 unused genesis rows,
+-- the CREATE UNIQUE INDEX blows up. KEEP the OLDEST unused genesis (created_at MIN, rowid MIN
+-- as the tie-break) and mark the rest used=1 → they leave the index. invite_tokens columns:
+-- token(PK)/used/expires_at/created_at(INTEGER, 0001_init)/owner_user_id (0004). With 0 or 1
+-- genesis this is a NO-OP. token is the PK → the NOT IN subquery keys on token.
 UPDATE invite_tokens SET used = 1
  WHERE owner_user_id IS NULL AND used = 0
    AND token NOT IN (

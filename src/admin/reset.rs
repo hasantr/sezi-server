@@ -1,55 +1,32 @@
 //! `POST /admin/reset` — wipe this server's DATA and leave its CONFIGURATION standing.
 //!
-//! Purpose: an owner who is finished with a server (a test run, a household that moved on) wants a
-//! clean one. Deleting the Cloudflare deployment and creating another is the expensive way round —
-//! the ADDRESS would change, and the address is what every client is paired to. Wiping the data
-//! instead gives back a factory-fresh server on the same address: `users` becomes empty, so
-//! `welcome::owner_exists` reads false, `ensure_genesis_token` mints a new genesis code, and the
-//! first account to register becomes the owner again. Measured, not assumed: the claim gate is
-//! `SELECT id FROM users WHERE role='owner'` and nothing anywhere records "this server was already
-//! set up once".
+//! An owner finished with a server wants a clean one at the SAME address, because the address is
+//! what every client is paired to. Wiping the data gives that back: `users` empties,
+//! `welcome::owner_exists` reads false, `ensure_genesis_token` mints a new code, and whoever
+//! redeems that genesis invite becomes the owner again (`invite_attribution::CLAIM_INVITE_SQL`
+//! decides the genesis fact; the claim gate is `SELECT id FROM users WHERE role='owner'`).
 //!
-//! ⚠️ **A wiped server is UNOWNED, and an unowned server is CLAIMABLE.** While no owner exists the
-//! genesis code is public by design — the welcome page prints it and `GET /bootstrap` hands it out.
-//! So an owner who wipes a server and walks away has left an address at which the first stranger to
-//! arrive becomes the owner. That is fine for "I am about to set it up again" and it is a hazard for
-//! "I am done with this server". The client has to say so, and it has to follow the wipe with the
-//! list of Cloudflare resources only the dashboard can remove.
+//! ⚠️ **A wiped server is UNOWNED, and an unowned server is CLAIMABLE.** With no owner the genesis
+//! code is public by design, so wiping and walking away leaves an address where the first stranger
+//! becomes the owner. The client has to say so.
 //!
-//! ## The rule for what goes
+//! **User data goes. Owner configuration stays** — one sentence, so a future table lands on the
+//! right side without a judgement call. The halves are [`WIPE_TABLES`] and [`KEEP_TABLES`], data
+//! rather than prose so the guard test can check every migrated table appears in exactly one. The
+//! name is deliberately KEPT: renaming is its own owner-only feature.
 //!
-//! **User data goes. Owner configuration stays.** One sentence, so a future table lands on the
-//! right side of it without a judgement call:
+//! Two traps: **blobs** — wiping `media_objects` and friends would leave every R2 blob
+//! unreferenced, invisible and still billed, so object rows are copied into `storage_orphans`
+//! first (the daily `retry_orphans` drains it) with key schemes byte-identical to
+//! `storage::media_key`/`avatar_key`/`plugin_media_key`. And **foreign keys** —
+//! `media_objects.uploader_id`, `avatar_objects.user_id` and `refresh_tokens.user_id` reference
+//! `users(id)`, and a D1 batch is one transaction, so `users` goes LAST and the orphan copies
+//! first.
 //!
-//! The two halves are [`WIPE_TABLES`] and [`KEEP_TABLES`] — data, not prose, so the guard test can
-//! check that every table the migrations create lands in exactly one of them. In outline: accounts,
-//! devices, keys, sessions, groups, invites, push tokens, queued envelopes, contact/directory state,
-//! stored-object bookkeeping and usage counters go; the owner's settings, the server's own signing
-//! identity, the plugin policy and the external-store credentials stay.
-//!
-//! The name is deliberately in the KEPT half: renaming is its own owner-only feature
-//! (`SetSharedServerName`), so a reset does not silently discard a decision made elsewhere.
-//!
-//! ## Two details that are easy to get wrong
-//!
-//! **Blobs.** Wiping `media_objects` and friends would leave every blob in R2 with nothing
-//! referencing it — invisible, unreachable, and still billed. So the object rows are first copied
-//! into `storage_orphans`, which the daily `retry_orphans` maintenance pass already drains. The key
-//! schemes here are byte-identical to `storage::media_key` / `avatar_key` / `plugin_media_key` and
-//! to the member-removal path in `membership.rs`, which is where this SQL comes from rather than
-//! being invented for the occasion.
-//!
-//! **Foreign keys.** `media_objects.uploader_id`, `avatar_objects.user_id` and
-//! `refresh_tokens.user_id` all REFERENCE `users(id)`, and a D1 batch is one transaction: deleting
-//! `users` before its children violates the constraint and rolls back the ENTIRE wipe. `users` is
-//! therefore last, and the orphan copies come first of all — they read the very rows about to go.
-//!
-//! Durable Objects are NOT touched, and do not need to be: a DO is addressed by
-//! `id_from_name(user_id)`, registration mints a fresh `Uuid` per account, so after the wipe every
-//! new account gets a NEW DO. The old ones are unreachable and the retention alarm collects them.
-//! This is also why the wipe includes the owner: preserving the owner's row would preserve their
-//! `user_id` and therefore their old inbox DO, with its queued envelopes and receipt high-water
-//! mark, while D1 insisted they had no devices — a half-wiped state, not a clean one.
+//! Durable Objects are not touched and need not be: a DO is addressed by `id_from_name(user_id)`
+//! and registration mints a fresh `Uuid`, so new accounts get new DOs and the retention alarm
+//! collects the old. It is also why the wipe includes the OWNER — keeping their row keeps their
+//! old inbox DO while D1 insists they have no devices.
 
 use crate::auth::hashing::{hash_code, secret_eq, verify_code};
 use crate::auth::middleware::{require_active_auth, require_owner};
@@ -62,11 +39,8 @@ use worker::*;
 /// `server_config` key holding the PBKDF2 hash of the owner's reset key.
 const RESET_KEY_ROW: &str = "reset_password_hash";
 
-/// Minimum length for a reset key set through the API.
-///
-/// A destruction gate is worth a real secret, and unlike the genesis code this one is chosen by a
-/// human, so the floor has to be stated somewhere. Modest on purpose: the gate is already behind
-/// `require_owner` and a 5-per-15-minutes brake, so this is protection against "1234", not against
+/// Minimum length for a reset key set through the API. Modest on purpose: the gate is already
+/// behind `require_owner` and a 5-per-15-minutes brake, so this guards against "1234", not against
 /// an offline attacker.
 const MIN_RESET_KEY_LEN: usize = 8;
 
@@ -112,16 +86,14 @@ async fn stored_reset_hash(db: &D1Database) -> Option<String> {
 
 /// `POST /admin/reset-key` — set or change this server's reset key (owner only).
 ///
-/// Why this exists: the wipe used to be reachable ONLY through a `wrangler secret put`, which means
-/// shell access to the relay. An owner who deployed with the dashboard button had no destruction kit
-/// at all and no way to get one — so the one irreversible thing they might legitimately want to do
-/// was the one thing the product could not offer them. A server should arrive carrying the means to
-/// undo itself.
+/// It exists so the key is not reachable only through `wrangler secret put`, i.e. shell access: an
+/// owner who deployed with the dashboard button would otherwise have no destruction kit at all. A
+/// server should arrive carrying the means to undo itself.
 ///
-/// Stored as a PBKDF2 hash, never in the clear, so reading D1 does not hand anyone the gate. It is
-/// also never returned by any endpoint (`/admin/stats` answers a bare bool), which is what keeps the
-/// wipe TWO factors: an owner token plus something only the owner knows. Handing the key back over
-/// an owner-authenticated read would quietly collapse it to one.
+/// Stored as a PBKDF2 hash, so reading D1 does not hand anyone the gate, and returned by no
+/// endpoint (`/admin/stats` answers a bare bool). That is what keeps the wipe TWO factors — an
+/// owner token plus something only the owner knows; handing the key back over an
+/// owner-authenticated read would collapse it to one.
 pub async fn set_reset_key(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => auth.user_id,
@@ -210,9 +182,8 @@ const WIPE_TABLES: &[&str] = &[
 
 /// Tables a reset must NOT touch — the owner's configuration and the server's own identity.
 ///
-/// Written as data rather than as a sentence in the module doc so the classification guard can
-/// check BOTH halves; a prose list is exactly the kind of claim that drifts away from the code
-/// without anything failing. Its only reader is that test, which is the point of it.
+/// Data rather than prose so the classification guard can check BOTH halves. Its only reader is
+/// that test, which is the point: a prose list drifts from the code with nothing failing.
 #[allow(dead_code)]
 const KEEP_TABLES: &[&str] = &[
     "server_settings",
@@ -241,14 +212,12 @@ pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
     }
     let db = ctx.env.d1("DB")?;
     let body: ResetBody = req.json().await.unwrap_or_default();
-    // Two sources, and the ENV SECRET WINS — the same precedence `self_provision` already uses for
-    // the JWT signing key, so a security-conscious owner can move the gate out of the database and
-    // that choice is respected everywhere. Otherwise the key the owner set through
-    // `/admin/reset-key` applies, compared against its PBKDF2 hash.
+    // Two sources, ENV SECRET WINS — the precedence `self_provision` uses for the JWT key, so an
+    // owner who moves the gate out of the database is respected. Otherwise the key set through
+    // `/admin/reset-key`, compared against its PBKDF2 hash.
     //
-    // FAIL-CLOSED when there is NEITHER: a server with no destruction kit cannot be wiped over the
-    // network at all. That is the right default for the one irreversible endpoint — an owner-token
-    // compromise alone must never be enough to erase a server.
+    // FAIL-CLOSED with NEITHER: a server holding no destruction kit cannot be wiped over the
+    // network at all. An owner-token compromise alone must never be enough to erase a server.
     let env_secret = ctx
         .env
         .secret("RESET_PASSWORD")
@@ -323,11 +292,10 @@ pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
     Response::from_json(&serde_json::json!({
         "ok": true,
         "accounts_removed": members,
-        // What the CLIENT cannot do anything about, reported at the one moment the user needs it:
-        // the wipe frees D1 rows and queues the blobs, but the Cloudflare RESOURCES themselves —
-        // the Worker, D1, R2, KV, the custom domain — outlive it and only the dashboard can remove
-        // them. Booleans rather than names because a Worker does not know its own script or
-        // database name at runtime; what it CAN answer truthfully is which bindings it has.
+        // The wipe frees D1 rows and queues the blobs, but the Cloudflare RESOURCES — Worker, D1,
+        // R2, KV, the custom domain — outlive it and only the dashboard can remove them, so this
+        // is reported at the one moment the user needs it. Booleans rather than names: a Worker
+        // does not know its own script or database name at runtime, only which bindings it has.
         "remaining": {
             "media_store": media_store,
             "rate_limit_kv": ctx.env.kv("RATE_LIMIT").is_ok(),
@@ -339,15 +307,13 @@ pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
 mod tests {
     use super::*;
 
-    /// The wipe list and the keep list must between them classify every table the migrations
-    /// create. A table in NEITHER list is the failure this guard exists for: it would silently
-    /// survive every reset, and nobody would notice until its stale rows produced a bug that
-    /// looked impossible on a "clean" server.
+    /// The wipe list and the keep list must together classify every table the migrations create. A
+    /// table in NEITHER survives every reset silently, and nobody notices until its stale rows
+    /// produce a bug that looks impossible on a "clean" server.
     ///
-    /// The migration SQL is the authority, so the expected set is written out here rather than
-    /// parsed — a test that derived it from the same source it checks would agree with itself.
-    /// Adding a migration means adding its table to one of the two lists AND to this list, which
-    /// is the point: three deliberate edits instead of one silent omission.
+    /// The expected set is written out rather than parsed: a test deriving it from the source it
+    /// checks would agree with itself. So a new migration means three deliberate edits — one list
+    /// here, one of the two above — instead of one silent omission.
     #[test]
     fn every_table_is_classified_as_wiped_or_kept() {
         // Every CREATE TABLE in worker-rs/migrations, minus the two `*_new` rebuild scratch tables

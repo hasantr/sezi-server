@@ -1,6 +1,6 @@
--- Sezgi push token kayıtları (Oturum 12.A).
--- Çoklu cihaz desteği: her (user_id, device_id) çifti benzersiz.
--- users.fcm_token kolonu legacy; bu tablo onun yerine geçer.
+-- Sezgi push-token records.
+-- Multi-device support: every (user_id, device_id) pair is unique.
+-- The users.fcm_token column is legacy; this table takes its place.
 
 CREATE TABLE IF NOT EXISTS push_tokens (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,

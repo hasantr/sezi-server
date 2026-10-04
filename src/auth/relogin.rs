@@ -1,10 +1,9 @@
-//! `POST /auth/relogin` — identity-signed session recovery (K5c).
+//! `POST /auth/relogin` — identity-signed session recovery.
 //!
-//! When the `refresh_token` dies (rotated, expired or revoked) the session used to be
-//! lost for good, because verify mints a NEW user_id and that breaks pairing. This
-//! endpoint makes the client prove possession of its **existing** Ed25519 identity key
-//! and then issues fresh tokens for the SAME `user_id`, preserving pairing and
-//! identity.
+//! When the `refresh_token` dies (rotated, expired or revoked), verify would mint a NEW
+//! user_id and break pairing. This endpoint instead makes the client prove possession of
+//! its **existing** Ed25519 identity key and then issues fresh tokens for the SAME
+//! `user_id`, preserving pairing and identity.
 //!
 //! The server does not store the user's Ed25519 signing key separately
 //! (`users.identity_pubkey` is the Curve25519/DH key). What it does have is the
@@ -36,15 +35,12 @@ struct ReloginBody {
     signature_b64: String,
     /// The device recovering the session. MANDATORY: it selects which SPK the identity proof is
     /// checked against, it is the subject of the revocation check, and it becomes the claim on
-    /// the minted token. Without it this endpoint used to read the `''` slot and skip the
-    /// revocation check entirely.
+    /// the minted token.
     ///
-    /// `identity_ed_pub_b64` used to live here too and was written straight into
-    /// users.identity_ed_pub. It is deliberately gone: the field was never checked against
-    /// anything, so a caller could seat an arbitrary key as the server-side identity anchor
-    /// that `contact_qr` and `invite_attribution` later trust. The backfill now uses the key
-    /// the challenge signature actually proves. Clients keep sending the field — it is simply
-    /// ignored, which is what serde does with an unknown field here anyway.
+    /// There is deliberately NO `identity_ed_pub_b64` field: a caller-supplied key nothing
+    /// checks would let anyone seat an arbitrary value as the server-side identity anchor that
+    /// `contact_qr` and `invite_attribution` trust. The backfill uses the key the challenge
+    /// signature actually proves. Clients still sending the field are simply ignored.
     device_id: String,
 }
 
@@ -59,8 +55,8 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         Err(_) => return json_err(400, "bad_request"),
     };
 
-    // `''` was the sentinel that steered the SPK selection at the legacy slot while ALSO
-    // skipping the revoked check. Both of those are gone, and so is the sentinel.
+    // An empty device_id is rejected, not treated as a slot: it must never steer the SPK
+    // selection or bypass the revoked check.
     if body.device_id.is_empty() || body.device_id.len() > 128 {
         return json_err(400, "device_required");
     }
@@ -91,19 +87,13 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         prekey_pub: Vec<u8>,
         signature: Vec<u8>,
     }
-    // M2-S3.2 (review HIGH): scope the SPK selection PER DEVICE. With multiple devices,
-    // each device publishes the SPK of its OWN Account (append-only), so a device-blind
-    // "newest wins" selection would, right after a linked device onboards, check the
-    // primary's relogin proof against the LINKED device's SPK → identity_mismatch →
-    // the primary can no longer recover its session.
-    //
-    // EXACTLY this device's slot. The selection used to widen to `device_id IS NULL OR
-    // device_id = ''` and prefer the match only by ORDER BY, so the legacy slot was a fallback
-    // any device could land on — and that slot is the one an identity claim could be planted in,
-    // because it was also the one `keys::rotate_signed_prekey` would accept a device-less write
-    // into. Both halves are gone: there is no device-less write, so there is nothing to fall
-    // back to, and a device with no SPK of its own now gets `no_identity` instead of somebody
-    // else's key.
+    // Scope the SPK selection PER DEVICE, to EXACTLY this device's slot. Each device publishes
+    // the SPK of its OWN Account (append-only), so a device-blind "newest wins" selection
+    // would, right after a linked device onboards, check the primary's relogin proof against
+    // the LINKED device's SPK → identity_mismatch → the primary can no longer recover its
+    // session. There is no device-less slot to fall back to either — a fallback slot is exactly
+    // where an identity claim could be planted — so a device with no SPK of its own gets
+    // `no_identity` rather than somebody else's key.
     let spk: Option<SpkRow> = db
         .prepare(
             "SELECT prekey_pub, signature FROM signed_prekeys
@@ -142,13 +132,10 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         return json_err(401, "bad_challenge");
     }
 
-    // M2-S3.5 B4: a REMOVED device must not come back through relogin. The device has been
-    // revoked (the primary dropped it from the list, so put_list set revoked_at=now) → 401 and
-    // no token, even though the SPK verification above passed.
-    //
-    // This used to be skipped whenever the body named no device — an exemption kept so a
-    // device-less primary could not be locked out of session recovery. With a device always
-    // named there is nobody left to exempt, and the check now covers every relogin.
+    // A REMOVED device must not come back through relogin. Revoked (the primary dropped it
+    // from the list, so put_list set revoked_at=now) → 401 and no token, even though the SPK
+    // verification above passed. Since a device is always named, this covers every relogin —
+    // there is no device-less caller left to exempt.
     {
         #[derive(Deserialize)]
         struct RevRow {
@@ -164,11 +151,9 @@ pub async fn relogin(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         }
     }
 
-    // M2-S1: Ed25519 signing-key backfill, from `ed_bytes` — the key the challenge signature
-    // was verified against a few lines up, and the only key in this request that anything has
-    // proven. It used to take `body.identity_ed_pub_b64`, a separate field nothing compared to
-    // `verifying` and nothing length-checked, while the comment here claimed it had been proven
-    // cryptographically. `users.identity_ed_pub` is the server-side trust root that
+    // Ed25519 signing-key backfill, from `ed_bytes` — the key the challenge signature was
+    // verified against a few lines up, and the only key in this request that anything has
+    // proven. `users.identity_ed_pub` is the server-side trust root that
     // `contact_qr::principal_is_authoritative` reads as `root_ed` and that
     // `invite_attribution` snapshots for the card-to-invite binding, so an unproven value
     // landing there is an anchor nobody signed for.

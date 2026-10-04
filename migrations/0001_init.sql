@@ -1,4 +1,4 @@
--- Sezgi D1 v1 şeması.
+-- Sezgi D1 schema, v1.
 
 CREATE TABLE IF NOT EXISTS users (
   id              TEXT PRIMARY KEY,

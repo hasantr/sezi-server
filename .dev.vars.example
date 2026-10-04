@@ -6,3 +6,8 @@ ADMIN_INVITE_KEY="dev-secret"
 # SET DEĞİLSE arama TURN'süz çalışır (yalnız LAN/WiFi/STUN).
 TURN_KEY_ID="buraya-cf-turn-key-id"
 TURN_API_TOKEN="buraya-cf-turn-api-token"
+
+# Claim secret (optional, src/auth/claim.rs). Set it and only a request sending the same value in
+# the `x-sezi-claim` header can fetch the genesis invite from /bootstrap; the welcome page stops
+# printing it. Leave it out and the first visitor to an unowned relay can claim it.
+# SEZI_CLAIM_SECRET="a-long-random-value"

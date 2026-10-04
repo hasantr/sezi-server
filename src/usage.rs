@@ -1,15 +1,12 @@
-//! Usage counters — quota epic **phase 0, SHADOW MODE** (counting only, NO enforcement).
+//! Usage counters — COUNTING ONLY: nothing here ever refuses a request.
 //!
-//! The turn.rs budget-guard pattern (turn_usage) generalized to storage:
 //! `user_storage` (a live per-user byte counter) + `server_stats` (server-wide media
 //! bytes/count in a single row, id=1) + `usage_counters` (day-keyed general counters).
 //!
 //! **BEST-EFFORT discipline:** NO error while writing a counter may break the real
 //! operation (upload/ack/cron cleanup) — it is logged (PII-free, truncated to 80 chars)
 //! and execution continues. Drift is accepted: the daily `reconcile_storage` cron
-//! recomputes the counters from the truth in the media tables (self-heal). There is no
-//! quota REJECTION here — enforcement is phase 1's job; in shadow mode no request is
-//! ever refused.
+//! recomputes the counters from the truth in the media tables (self-heal).
 
 use crate::d1util::{d1_int, d1_text};
 use crate::utils::now_secs;
@@ -99,22 +96,17 @@ pub async fn media_removed(db: &D1Database, removed: &[(String, i64)]) {
 }
 
 /// The daily authoritative reconcile — repairs drift in the best-effort counters by
-/// recomputing them from storage truth (self-heal). Truth is the UNION of TWO tables:
-/// `media_objects` (ephemeral user media) and `plugin_media_objects` (persistent member
-/// plugin media, 0026). Both feed the user_storage/server_stats counters through
-/// `media_added`, so a cap applies to the SUM of the two channels — which is exactly why
-/// reconcile MUST sum both tables. If it did not, the daily self-heal would ERASE the
-/// plugin-media contribution and the quota would drop below reality. `db.batch` is a
-/// single D1 transaction, giving a consistent snapshot. Called from
-/// `maintenance::run_daily` (cron and lazy path alike); the caller logs any error and
-/// keeps going.
+/// recomputing them from storage truth. Truth is the UNION of `media_objects` (ephemeral user
+/// media) and `plugin_media_objects` (persistent member plugin media): both feed the counters
+/// through `media_added`, so reconcile MUST sum both tables or the self-heal would ERASE the
+/// plugin-media contribution and the quota would drop below reality. `db.batch` is a single D1
+/// transaction, giving a consistent snapshot; `maintenance::run_daily` calls it and logs any
+/// error rather than failing.
 ///
-/// Pluggable storage phase 1 (ADDITIONAL, plan d): the SAME batch recomputes per-backend
-/// `storage_backends.used_bytes`/`object_count`, grouped by `store_id` across THREE meta
-/// tables (media ∪ plugin_media ∪ plugin_code). NOTE: the user_storage/server_stats math
-/// is UNCHANGED — plugin_code is DELIBERATELY excluded so quota semantics stay
-/// bit-identical; plugin_code only counts toward per-backend inventory truth. In
-/// single-backend phase 1 everything lands under 'r2-primary'.
+/// The SAME batch recomputes per-backend `storage_backends.used_bytes`/`object_count`, grouped
+/// by `store_id` across THREE meta tables (media ∪ plugin_media ∪ plugin_code). plugin_code is
+/// DELIBERATELY excluded from the user_storage/server_stats math — it counts toward per-backend
+/// inventory only, so quota semantics stay unchanged.
 pub async fn reconcile_storage(env: &Env) -> Result<()> {
     let db = env.d1("DB")?;
     let now = now_secs() as i64;
@@ -163,12 +155,10 @@ pub async fn reconcile_storage(env: &Env) -> Result<()> {
     Ok(())
 }
 
-/// Bump a day-keyed general counter (quota epic **phase 1c**, COUNTING ONLY) — upsert
-/// `+by` into today's `(day, kind)` row of `usage_counters`. A generalization of the
-/// `media_added` pattern: BEST-EFFORT, so an error NEVER breaks the caller's real
-/// operation (upload/download) — log and continue. Hooked into media upload
-/// (`upload_bytes`/`upload_count`) and download (`download_count`/`download_bytes`);
-/// /admin/stats reads it back with `read_today`.
+/// Bump a day-keyed general counter — upsert `+by` into today's `(day, kind)` row of
+/// `usage_counters`. BEST-EFFORT, so an error NEVER breaks the caller's real operation.
+/// Hooked into media upload (`upload_bytes`/`upload_count`) and download
+/// (`download_count`/`download_bytes`); /admin/stats reads it back with `read_today`.
 pub async fn count_bump(db: &D1Database, kind: &str, by: i64) {
     run_best_effort(
         db,
@@ -180,11 +170,9 @@ pub async fn count_bump(db: &D1Database, kind: &str, by: i64) {
     .await;
 }
 
-/// Read today's `kind` row from `usage_counters` — missing row or error yields 0
-/// (fail-open, following turn.rs's counter-read pattern: stats does not 500 even if the
-/// table was never migrated). Since phase 1c the `count_bump` hooks feed it with
-/// upload/download volume; the `requests` kind is still a stub, since request counting
-/// comes from phase 3 CF Analytics.
+/// Read today's `kind` row from `usage_counters` — missing row or error yields 0, so stats
+/// does not 500 even if the table was never migrated. The `requests` kind is a stub: request
+/// counting comes from CF Analytics.
 pub async fn read_today(db: &D1Database, kind: &str) -> i64 {
     #[derive(Deserialize)]
     struct Row {
@@ -205,12 +193,9 @@ pub async fn read_today(db: &D1Database, kind: &str) -> i64 {
     }
 }
 
-/// Read this month's total for `kind` from `usage_counters` (the monthly detail report)
-/// as the SUM over day rows. The month window is derived from turn.rs
-/// `current_month_utc` — day is "YYYY-MM-DD", so the prefix is "YYYY-MM%" — keeping the
-/// window aligned with the TURN budget. Fail-open: a bind/first error or a missing table
-/// yields 0 (same as read_today; stats does not 500). Feeds the "month" block of
-/// /admin/stats.
+/// Read this month's total for `kind` as the SUM over day rows. The window comes from turn.rs
+/// `current_month_utc` (day is "YYYY-MM-DD", so the prefix is "YYYY-MM%") so it stays aligned
+/// with the TURN budget. Fail-open like `read_today`. Feeds the "month" block of /admin/stats.
 pub async fn read_month(db: &D1Database, kind: &str) -> i64 {
     #[derive(Deserialize)]
     struct Row {

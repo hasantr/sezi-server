@@ -10,20 +10,18 @@ use worker::*;
 struct CreateInviteBody {
     email_hint: Option<String>,
     ttl_hours: Option<u64>,
-    /// Minute-grained short TTL for in-person invites (5/15/60 min). The
-    /// `ttl_hours` granularity (1 hour minimum) was far too long for handing a
-    /// code to someone face to face. When present this WINS over `ttl_hours`;
-    /// when absent the `ttl_hours` path works exactly as before, so older
-    /// clients that still send `ttl_hours` keep working.
+    /// Minute-grained short TTL for in-person invites (5/15/60 min) — `ttl_hours`
+    /// bottoms out at an hour, far too long for handing a code to someone face to
+    /// face. When present this WINS over `ttl_hours`; when absent the `ttl_hours`
+    /// path still works, so older clients that send it keep working.
     ttl_minutes: Option<u64>,
 }
 
-/// Resolve and validate the invite TTL in seconds. Precedence: `ttl_minutes`
-/// (minute-grained short TTL) > `ttl_hours` (backwards compatibility, older
-/// clients) > a 24 hour default. If both are present `ttl_minutes` WINS. Out of
-/// range → `Err(())`, which the caller turns into 400 bad_request:
-///   - ttl_minutes: 1..=43200 (30 days = 43200 min)
-///   - ttl_hours:   1..=24*30 (30 days — the pre-existing rule, unchanged)
+/// Resolve and validate the invite TTL in seconds. Precedence: `ttl_minutes` >
+/// `ttl_hours` (older clients) > a 24 hour default. Out of range → `Err(())`, which the
+/// caller turns into 400 bad_request:
+///   - ttl_minutes: 1..=43200 (30 days)
+///   - ttl_hours:   1..=24*30 (30 days)
 fn resolve_invite_ttl_secs(
     ttl_minutes: Option<u64>,
     ttl_hours: Option<u64>,
@@ -52,18 +50,16 @@ pub async fn create_invite(mut req: Request, ctx: RouteContext<()>) -> Result<Re
         return Ok(resp);
     }
     let body: CreateInviteBody = req.json().await.unwrap_or_default();
-    // `email_hint` is now a free-text LABEL/NAME (optional; the admin notes who the
-    // invite was minted for). Redeem does NOT match it against the e-mail — see
-    // invite.rs, where the old email binding was removed because it was useless
-    // against synthetic u...@sezgi.local addresses. The `@` requirement is GONE
-    // (any name/label is allowed); only the length bound remains, as a DoS guard.
+    // `email_hint` is a free-text LABEL/NAME (optional; the admin notes who the invite
+    // was minted for). Redeem does NOT match it against the e-mail — binding it was
+    // useless against synthetic u...@sezgi.local addresses. Any label is allowed; only
+    // the length bound remains, as a DoS guard.
     if let Some(h) = &body.email_hint {
         if h.len() > 254 {
             return json_err(400, "bad_request");
         }
     }
-    // TTL resolution: ttl_minutes > ttl_hours > 24h default (validated in the
-    // helper).
+    // TTL resolution: ttl_minutes > ttl_hours > 24h default.
     let ttl = match resolve_invite_ttl_secs(body.ttl_minutes, body.ttl_hours) {
         Ok(secs) => secs,
         Err(()) => return json_err(400, "bad_request"),
@@ -119,12 +115,11 @@ pub async fn list_invites(req: Request, ctx: RouteContext<()>) -> Result<Respons
         return Ok(resp);
     }
     let db = ctx.env.d1("DB")?;
-    // Who minted it (owner_email) and who used it (used_by_email) are resolved by
-    // JOIN. P0: used invites that TTL-GC already dropped from invite_tokens are
-    // still listed, from the durable invite_attributions ledger, under the SAME
-    // response schema. When a live row also has a ledger entry the ledger wins for
-    // used/used_by, so the very narrow window between the claim and the legacy
-    // `used` UPDATE never shows up as "unused" in the admin UI.
+    // Who minted it (owner_email) and who used it (used_by_email) are resolved by JOIN.
+    // Used invites that TTL-GC already dropped from invite_tokens are still listed, from
+    // the durable invite_attributions ledger, under the SAME response schema. When a live
+    // row also has a ledger entry the ledger wins for used/used_by, so the narrow window
+    // between the claim and the `used` UPDATE never shows up as "unused" in the admin UI.
     let rows: Vec<InviteRow> = db
         .prepare(
             "WITH invite_history AS (
@@ -190,10 +185,10 @@ struct UpdateSettingsBody {
     /// Message retention in days — how long an undelivered message may sit in the
     /// DO `pending` queue. None → keep the current value.
     message_retention_days: Option<i64>,
-    /// Quota Faz 1a: server-wide storage cap in bytes. Convention: 0 CLEARS the
-    /// cap (NULL = unlimited), > 0 sets it, None keeps the current value.
+    /// Server-wide storage cap in bytes. Convention: 0 CLEARS the cap (NULL =
+    /// unlimited), > 0 sets it, None keeps the current value.
     max_storage_bytes: Option<i64>,
-    /// Quota Faz 1a: per-user storage cap in bytes — same 0-clears convention.
+    /// Per-user storage cap in bytes — same 0-clears convention.
     max_user_storage_bytes: Option<i64>,
     /// "Delete for everyone" window in hours: how long after a message was SENT it
     /// may still be deleted for everyone (owner-configurable, DEFAULT 48). The
@@ -202,21 +197,14 @@ struct UpdateSettingsBody {
     delete_window_hours: Option<i64>,
 }
 
-/// OWNER-only, not admin. Every field on this endpoint is server-wide POLICY rather than day-to-day
-/// moderation: `join_mode` decides whether anyone can walk in, `directory_mode`/`dm_policy` decide who
-/// is discoverable and contactable, the retention pair decides how long undelivered content lives on
-/// the server, and `delete_window_hours` bounds the "delete for everyone" promise made to every user.
-///
-/// It used to be `require_admin`, which accepts admin OR owner, so any admin could change all of it.
-/// Three things said that was not the intent: the app's delete-window, storage-limit and retention
-/// editors all describe themselves as owner-only, `UpdateSettingsBody.delete_window_hours`'s own doc
-/// says "owner-configurable", and `admin/storage.rs` already gates configuration MUTATIONS on the owner
-/// while leaving reads to admins. This endpoint was the one configuration mutation sitting on the admin
-/// side of that line.
-///
-/// Admins keep what admins need — invites, the member list, removing a member — because those are
-/// separate handlers. Compare `set_role` and `transfer_ownership`, which have always been owner-only:
-/// this now sits with them, where changing what the server IS belongs.
+/// `PATCH /admin/settings` — OWNER-only, not admin. Every field here is server-wide POLICY
+/// rather than day-to-day moderation: `directory_mode`/`dm_policy` decide who is discoverable
+/// and contactable (`join_mode` is still accepted, but only as `invite_only`), the retention pair
+/// decides how long undelivered content lives on the server, and `delete_window_hours` bounds
+/// the "delete for everyone" promise made to every user. Changing what the server IS sits with
+/// `set_role` and `transfer_ownership`; admins keep invites, the member list and removals,
+/// which are separate handlers. `admin/storage.rs` draws the same line — owner mutates, admin
+/// reads.
 pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => auth.user_id,
@@ -244,9 +232,11 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
             return json_err(400, "bad_request");
         }
     }
+    // `open` is refused by name (`server::join_mode`); `invite_only` is accepted and changes
+    // nothing, since it is the only mode there is.
     if let Some(m) = &body.join_mode {
-        if m != "open" && m != "invite_only" {
-            return json_err(400, "bad_request");
+        if let Err(code) = crate::server::join_mode::check_requested(m) {
+            return json_err(400, code);
         }
     }
     if let Some(m) = &body.directory_mode {
@@ -291,7 +281,6 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
     #[derive(Deserialize)]
     struct CurRow {
         name: String,
-        join_mode: String,
         directory_mode: String,
         dm_policy: String,
         retention_days: i64,
@@ -303,7 +292,7 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
     }
     let cur: Option<CurRow> = db
         .prepare(
-            "SELECT name, join_mode, directory_mode, dm_policy, retention_days, message_retention_days, \
+            "SELECT name, directory_mode, dm_policy, retention_days, message_retention_days, \
              max_storage_bytes, max_user_storage_bytes, delete_window_hours \
              FROM server_settings WHERE id = 1 LIMIT 1",
         )
@@ -313,10 +302,6 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         .as_ref()
         .map(|c| c.name.clone())
         .unwrap_or_else(|| "Sezi".into());
-    let cur_mode = cur
-        .as_ref()
-        .map(|c| c.join_mode.clone())
-        .unwrap_or_else(|| "invite_only".into());
     let cur_directory_mode = cur
         .as_ref()
         .map(|c| c.directory_mode.clone())
@@ -331,7 +316,9 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
     let cur_max_user_storage = cur.as_ref().and_then(|c| c.max_user_storage_bytes);
     let cur_delete_window = cur.as_ref().map(|c| c.delete_window_hours).unwrap_or(48);
     let new_name = body.name.unwrap_or(cur_name);
-    let new_mode = body.join_mode.unwrap_or(cur_mode);
+    // Always the one mode, never the stored value: a server that stored `open` before it was
+    // refused is rewritten to `invite_only` by its owner's next save of anything.
+    let new_mode = crate::server::join_mode::JOIN_MODE;
     let new_directory_mode = body
         .directory_mode
         .unwrap_or_else(|| cur_directory_mode.clone());
@@ -370,7 +357,7 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
     )
     .bind(&[
         d1_text(&new_name),
-        d1_text(&new_mode),
+        d1_text(new_mode),
         d1_text(&new_directory_mode),
         d1_text(&new_dm_policy),
         d1_int(new_retention),
@@ -684,16 +671,12 @@ pub async fn transfer_ownership(mut req: Request, ctx: RouteContext<()>) -> Resu
     if target.is_none() {
         return json_err(404, "user_not_found");
     }
-    // Atomic swap: old owner (the caller) -> admin FIRST, then the target -> owner.
-    // FIX-1 (BLOCKER): a single-statement CASE UPDATE COLLIDES with `idx_one_owner`
-    // (the 0018 partial UNIQUE index WHERE role='owner'). SQLite scans `IN(...)` in
-    // order, so if new_owner_id sorts before the caller, the row-by-row UPDATE
-    // promotes new_owner to 'owner' while the caller is STILL owner → 2 owners →
-    // partial-UNIQUE violation → "UNIQUE constraint failed: users.role" → 500. That
-    // failure is non-deterministic (~50%, depending on UUID ordering). FIX: two
-    // ORDERED statements in a D1 batch, where the order IS guaranteed — demote the
-    // caller to 'admin' first (owner count drops to 0), then promote new_owner
-    // (owner count back to 1), so there are never 2 owners at once.
+    // Atomic swap: old owner (the caller) -> admin FIRST, then the target -> owner. Two
+    // ORDERED statements in a D1 batch, NOT one CASE UPDATE: SQLite scans `IN(...)` in row
+    // order, so a single statement can promote the new owner while the caller is STILL
+    // owner → 2 owners → the `idx_one_owner` partial UNIQUE index fires and the request
+    // 500s, non-deterministically, depending on how the UUIDs sort. The batch order is
+    // guaranteed, so the owner count goes 1 → 0 → 1 and is never 2.
     db.batch(vec![
         db.prepare(
             "UPDATE users SET role = 'admin', profile_revision = profile_revision + 1 WHERE id = ?",

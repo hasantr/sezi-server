@@ -1,9 +1,9 @@
 use crate::auth::hashing::{hash_code, sha256_hex};
 use crate::auth::invite_attribution::CLAIM_INVITE_SQL;
-use crate::d1util::{d1_int, d1_opt_text, d1_text};
+use crate::d1util::{d1_int, d1_text};
 use crate::email::mailer::send_verification_code;
 use crate::ratelimit::check_rate_limit_env;
-use crate::respond::{json_err, no_content};
+use crate::respond::json_err;
 use crate::utils::{now_secs, random_bytes};
 use serde::Deserialize;
 use worker::*;
@@ -51,101 +51,87 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 
     let now = now_secs();
     let db = ctx.env.d1("DB")?;
-    // Only a genuinely claimed invite_only token crosses the bridge into verify. In
-    // the old flow, a random token-shaped value in an open-mode request body could
-    // leak into verification_codes and forge an invite's inviter binding.
-    let mut claimed_token: Option<String> = None;
-    let mut claimed_token_hash: Option<String> = None;
 
-    // join_mode
+    // Every server is invite-only (`server::join_mode`): no invite, no code. The stored
+    // `join_mode` is deliberately not read — a server that once stored `open` must not
+    // start admitting walk-ins again.
+    let token = match &body.token {
+        Some(t) => t.clone(),
+        None => return json_err(403, "invite_required"),
+    };
+    let token_hash = sha256_hex(&token);
+    // Active tokens minted before 0031 have a NULL hash column. Before claiming,
+    // write the deterministic hash onto the source TTL row; newer invites already
+    // carry it. A hash mismatch means DB corruption, in which case the UPDATE and
+    // the claim are both no-ops — fail-closed.
+    db.prepare(
+        "UPDATE invite_tokens SET token_hash = COALESCE(token_hash, ?)
+          WHERE token = ? AND used = 0 AND expires_at > ?
+            AND (token_hash IS NULL OR token_hash = ?)",
+    )
+    .bind(&[
+        d1_text(&token_hash),
+        d1_text(&token),
+        d1_int(now as i64),
+        d1_text(&token_hash),
+    ])?
+    .run()
+    .await?;
     #[derive(Deserialize)]
-    struct ModeRow {
-        join_mode: String,
+    struct ClaimRow {
+        #[allow(dead_code)] // read only for its presence (the single-writer result)
+        invite_token_hash: String,
     }
-    let mode: Option<ModeRow> = db
-        .prepare("SELECT join_mode FROM server_settings WHERE id = 1 LIMIT 1")
-        .first(None)
-        .await?;
-    let join_mode = mode
-        .map(|r| r.join_mode)
-        .unwrap_or_else(|| "invite_only".into());
-
-    if join_mode == "invite_only" {
-        let token = match &body.token {
-            Some(t) => t.clone(),
-            None => return json_err(403, "invite_required"),
-        };
-        let token_hash = sha256_hex(&token);
-        // Active tokens minted before 0031 have a NULL hash column. Before claiming,
-        // write the deterministic hash onto the source TTL row; newer invites already
-        // carry it. A hash mismatch means DB corruption, in which case the UPDATE and
-        // the claim are both no-ops — fail-closed.
-        db.prepare(
-            "UPDATE invite_tokens SET token_hash = COALESCE(token_hash, ?)
-              WHERE token = ? AND used = 0 AND expires_at > ?
-                AND (token_hash IS NULL OR token_hash = ?)",
-        )
+    // P0: the ledger INSERT is the claim's LINEARIZATION POINT. Thanks to the
+    // token-hash primary key, only one of two parallel redeems gets a RETURNING
+    // row — the second loses even before the source invite is flipped to
+    // `used=1`. The same statement snapshots the inviter id, the Ed root, whether
+    // this is the genesis invite, and the metadata, so verify keeps the binding even
+    // if maintenance later deletes the token. The raw bearer token is never written
+    // to the ledger.
+    // With a claim secret configured, only the request that carries it may redeem the genesis
+    // invite (see CLAIM_INVITE_SQL); a refused genesis claim reads as any invalid invite.
+    let genesis_allowed = crate::auth::claim::claim_authorized(&req, &ctx.env);
+    let claim: Option<ClaimRow> = db
+        .prepare(CLAIM_INVITE_SQL)
         .bind(&[
             d1_text(&token_hash),
+            d1_int(now as i64),
             d1_text(&token),
             d1_int(now as i64),
             d1_text(&token_hash),
+            d1_int(genesis_allowed as i64),
         ])?
-        .run()
+        .first(None)
         .await?;
-        #[derive(Deserialize)]
-        struct ClaimRow {
-            #[allow(dead_code)] // read only for its presence (the single-writer result)
-            invite_token_hash: String,
-        }
-        // P0: the ledger INSERT is the claim's LINEARIZATION POINT. Thanks to the
-        // token-hash primary key, only one of two parallel redeems gets a RETURNING
-        // row — the second loses even before the source invite is flipped to
-        // `used=1`. The same statement snapshots the inviter id, the Ed root and the
-        // metadata, so verify keeps the binding even if maintenance later deletes the
-        // token. The raw bearer token is never written to the ledger.
-        let claim: Option<ClaimRow> = db
-            .prepare(CLAIM_INVITE_SQL)
-            .bind(&[
-                d1_text(&token_hash),
-                d1_int(now as i64),
-                d1_text(&token),
-                d1_int(now as i64),
-                d1_text(&token_hash),
-            ])?
-            .first(None)
-            .await?;
-        if claim.is_none() {
-            return json_err(403, "invalid_invite");
-        }
-        // NOTE: `email_hint` is now a cosmetic LABEL/NAME (free text from
-        // create_invite) and is NOT matched against the e-mail during redeem. The old
-        // email binding was REMOVED: it was useless against synthetic
-        // u...@sezgi.local addresses and turned name labels into 400/mismatch errors.
-        // The invite code is the single secret; if it is valid (used=0 and not
-        // expired) the redeem succeeds.
-        // Legacy/API compatibility: also flip the source token to used. Since the
-        // claim authority is now the ledger primary key, this UPDATE affecting 0 rows
-        // (an admin revoke or TTL-GC racing right after the claim) cannot undo a
-        // won redeem — the attribution is already snapshotted and verify proceeds
-        // safely.
-        db.prepare(
-            "UPDATE invite_tokens SET used = 1
-              WHERE token = ? AND token_hash = ? AND used = 0",
-        )
-            .bind(&[d1_text(&token), d1_text(&token_hash)])?
-            .run()
-            .await?;
-        claimed_token = Some(token);
-        claimed_token_hash = Some(token_hash);
+    if claim.is_none() {
+        return json_err(403, "invalid_invite");
     }
+    // NOTE: `email_hint` is now a cosmetic LABEL/NAME (free text from
+    // create_invite) and is NOT matched against the e-mail during redeem. The old
+    // email binding was REMOVED: it was useless against synthetic
+    // u...@sezgi.local addresses and turned name labels into 400/mismatch errors.
+    // The invite code is the single secret; if it is valid (used=0 and not
+    // expired) the redeem succeeds.
+    // Legacy/API compatibility: also flip the source token to used. Since the
+    // claim authority is now the ledger primary key, this UPDATE affecting 0 rows
+    // (an admin revoke or TTL-GC racing right after the claim) cannot undo a
+    // won redeem — the attribution is already snapshotted and verify proceeds
+    // safely.
+    db.prepare(
+        "UPDATE invite_tokens SET used = 1
+          WHERE token = ? AND token_hash = ? AND used = 0",
+    )
+    .bind(&[d1_text(&token), d1_text(&token_hash)])?
+    .run()
+    .await?;
 
     let code = generate_code();
     let code_hash = hash_code(&code);
 
     // The raw invite_token is only a short-lived legacy bridge; the durable binding
     // goes through invite_token_hash. When verify completes it deletes the VC row,
-    // and with it both values. In open mode both are always NULL.
+    // and with it both values.
     db.prepare(
         "INSERT INTO verification_codes
            (email, code_hash, attempts, invite_token, invite_token_hash, expires_at, created_at)
@@ -161,8 +147,8 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     .bind(&[
         d1_text(&body.email),
         d1_text(&code_hash),
-        d1_opt_text(claimed_token.as_deref()),
-        d1_opt_text(claimed_token_hash.as_deref()),
+        d1_text(&token),
+        d1_text(&token_hash),
         d1_int((now + CODE_TTL_SEC) as i64),
         d1_int(now as i64),
     ])?
@@ -171,20 +157,17 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 
     send_verification_code(&ctx.env, &body.email, &code).await?;
 
-    // In invite_only mode the invite IS the registration authority, and because the
-    // onboarding client uses a synthetic `@sezgi.local` address, mailing the code to
-    // a real inbox is pointless (the user would never see it). So once the invite is
-    // verified we return dev_code even in prod — safe, since registration without an
-    // invite is impossible. In open mode (no invite) prod e-mail verification stays
-    // intact: the code only goes to the real address.
-    if env_name != "prod" || join_mode == "invite_only" {
-        return Response::from_json(&serde_json::json!({
-            "ok": true,
-            "dev_code": code,
-            "join_mode": join_mode,
-        }));
-    }
-    no_content()
+    // The invite IS the registration authority, and because the onboarding client uses
+    // a synthetic `@sezgi.local` address, mailing the code to a real inbox is pointless
+    // (the user would never see it). So once the invite is claimed we return dev_code
+    // even in prod — safe, since registration without an invite is impossible. The
+    // e-mail-only path this used to keep for open mode went with open mode.
+    // `join_mode` stays in the body for clients that read it.
+    Response::from_json(&serde_json::json!({
+        "ok": true,
+        "dev_code": code,
+        "join_mode": crate::server::join_mode::JOIN_MODE,
+    }))
 }
 
 fn generate_code() -> String {

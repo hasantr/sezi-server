@@ -128,80 +128,26 @@ const UPSERT_COUNTERPART_TOMBSTONES_SQL: &str = "INSERT INTO contact_tombstones
        peer_id=excluded.peer_id,revision=excluded.revision,
        deleted_at=excluded.deleted_at";
 
-/// Group succession — the INVOLUNTARY twin of `groups_transfer.rs`'s `transfer_to`. Both statements
-/// mint an owner row for somebody who did not ask for one; everything else about them differs.
+/// Group succession — the INVOLUNTARY twin of `groups_transfer.rs`'s `transfer_to`: both mint an
+/// owner row for somebody who did not ask for one.
 ///
-/// # Why the voluntary gates become an ORDER and not a filter
+/// **The gates are an ORDER BY, never a filter.** This runs in the account-deletion transaction,
+/// and two statements below `DELETE FROM groups WHERE created_by=?1` destroys every group left
+/// unhanded. So the WHERE decides which groups SURVIVE and the ORDER BY only who INHERITS: one
+/// more predicate up there (must be admin, must be under the cap) silently turns a group that
+/// would have changed hands into a group that is destroyed.
 ///
-/// `transfer_to` refuses: the recipient must already be an `admin`, and the transfer must not put
-/// them over `MAX_OWNED_GROUPS`. Neither refusal is available here.
+/// The tiers: a sitting owner first — `group_members` has no partial UNIQUE index on
+/// `role='owner'`, so a group whose `created_by` still names the departing user while somebody
+/// else holds the owner row would gain a SECOND owner that no group handler can resolve; then an
+/// admin over a plain member (a preference, not a gate); then fewest groups owned, which stands
+/// in for `MAX_OWNED_GROUPS` because a threshold can empty the candidate set and this statement
+/// must always name someone. The counting predicate matches `groups_transfer.rs`'s
+/// `OWNED_GROUP_COUNT_SQL` exactly, so both paths measure a present holding, not a past act.
 ///
-/// There is nobody to refuse. By the time this runs the departing account is inside the same
-/// transaction as its own `DELETE FROM users`, and the request that started it is an account
-/// deletion that must succeed. And a refusal would not leave the group where it is: two
-/// statements below, `DELETE FROM groups WHERE created_by=?1` destroys every group this statement
-/// failed to hand on. So "refuse the successor" spells "delete the room", which is strictly worse
-/// for its members than any owner this could pick, and avoiding it is the entire reason the
-/// succession block exists.
-///
-/// The gates therefore move into the ORDER BY, where they express a preference that always has an
-/// answer, and the WHERE is left EXACTLY as it was. That split is load-bearing: the WHERE decides
-/// which groups survive the DELETE below, the ORDER BY decides only who inherits them. Adding one
-/// more predicate up there — "and the successor must be an admin", "and they must be under the
-/// cap" — silently converts a group that would have changed hands into a group that is destroyed.
-///
-/// # The three tiers
-///
-/// 1. **A sitting owner** (`WHEN 'owner' THEN 0`). This is an alignment fix, separable from the cap
-///    work below. `TRANSFER_CREATED_GROUPS_SQL` already ranks owner→admin→else; this statement did
-///    not, so a group whose `created_by` still pointed at the departing user while somebody ELSE
-///    held the owner row got a SECOND owner promoted alongside the first — a state no handler on
-///    the group surface can resolve, because `group_members` carries no partial UNIQUE index on
-///    `role='owner'` (see `TRANSFER_PROMOTE_TARGET_SQL` in `groups_transfer.rs`, which says so and
-///    guards it with NOT EXISTS instead). Ranking the sitting owner first makes the UPDATE a no-op
-///    in that case. It costs the ordinary case nothing: there the departing user IS the owner, and
-///    `c.user_id!=?1` keeps them out of the candidate set entirely.
-/// 2. **An admin over a plain member.** Unchanged in effect from the original
-///    `CASE role WHEN 'admin' THEN 0 ELSE 1 END`, and deliberately still a preference. It is the
-///    same ordering `groups_transfer.rs` cites when it makes admin-first a HARD gate — "the server
-///    already answers who inherits a group with 'an admin'" — but a group whose remaining members
-///    are all plain members must still get an owner rather than be deleted.
-/// 3. **Fewest groups owned.** The cap's stand-in, and the new part.
-///
-/// # Why "fewest owned" and not `MAX_OWNED_GROUPS`
-///
-/// The threshold is not reachable from here — `MAX_OWNED_GROUPS` is private to `crate::groups` —
-/// but it is also the wrong instrument. A threshold answers "may this person take it?", which is a
-/// question `transfer_to` can afford to answer with no; when every candidate is over the cap this
-/// statement still has to name one. "Fewest first" is the same intent with a defined answer in
-/// every case: it declines to pile another group onto the most loaded candidate whenever a lighter
-/// one exists at the same role tier, and it can never empty the candidate set.
-///
-/// The counting predicate is character-for-character `groups_transfer.rs`'s `OWNED_GROUP_COUNT_SQL`
-/// (`user_id=? AND role='owner'`), so the two paths measure ownership the same way. Counting
-/// `groups.created_by` instead would measure a past act rather than a present holding — the reason
-/// that file gives for its own choice.
-///
-/// # What this does NOT do
-///
-/// It is not incremental. SQLite computes the sort keys from the table as the statement found it,
-/// so the count does not climb as this same UPDATE hands out group after group: one deletion can
-/// still push one person past the cap by however many groups it gives them at once. The voluntary
-/// path carries the same residue by a different route (its pre-check races a concurrent transfer),
-/// so this is a shared limit of counting outside the write, not a new one.
-///
-/// And it is not consent, in the sense `transfer_to` is careful to disclaim. Nothing here can be:
-/// the person who would be asked cannot be asked by an account that no longer exists, and the
-/// alternative to not asking is deleting their room.
-///
-/// # Cost, and why the batch's atomicity is untouched
-///
-/// The count is an index seek on `idx_group_members_user` (migration `0006_groups.sql`), evaluated
-/// per candidate per row the UPDATE visits — bounded by `MAX_GROUP_MEMBERS` candidates across the
-/// groups one account created. That bound is worth stating because this runs inside the single
-/// account-deletion transaction, where anything that fails or times out rolls the WHOLE deletion
-/// back. Nothing added here can fail on its own terms: an ORDER BY term violates no constraint, and
-/// the statement's row set is byte-for-byte the one it selected before.
+/// Residue: sort keys are computed from the table as found, so one deletion can push a person
+/// past the cap by however many groups it hands over at once. And it is not consent — an account
+/// that no longer exists cannot ask.
 const PROMOTE_GROUP_SUCCESSORS_SQL: &str = "UPDATE group_members AS gm SET role='owner'
       WHERE gm.user_id=(
         SELECT c.user_id FROM group_members c
@@ -225,6 +171,31 @@ const TRANSFER_CREATED_GROUPS_SQL: &str = "UPDATE groups SET created_by=(
      WHERE created_by=?1 AND EXISTS(
        SELECT 1 FROM group_members gm
         WHERE gm.group_id=groups.id AND gm.user_id!=?1 AND gm.status='active')";
+
+/// A departing member's invites that nobody has used go with the membership.
+///
+/// They used to be orphaned like every other reference to the account — `owner_user_id` set to
+/// NULL — and an unused invite with no minter is exactly what the genesis invite looks like
+/// (`auth::bootstrap`). Two faults followed. A removed admin's invites stayed redeemable for the
+/// rest of their TTL, up to 30 days, so taking someone's role away left the doors they had handed
+/// out open. And `idx_one_genesis_invite` (0018) admits ONE unused minter-less row, so removing an
+/// admin who held two unused invites — or one, beside a leftover from an earlier removal — broke
+/// the unique index and rolled the whole removal back.
+///
+/// "Unused" is `used = 0`, wider than revoke's test, which also spares a row the ledger has
+/// claimed while its `used` flip has not landed. Detached, that row would be a minter-less
+/// `used = 0` row too, and deleting it costs nothing: verify and the admin list read the claim's
+/// snapshot in `invite_attributions`, never the source row. Runs BEFORE
+/// [`DETACH_SPENT_INVITES_SQL`].
+const DELETE_UNUSED_INVITES_SQL: &str =
+    "DELETE FROM invite_tokens WHERE owner_user_id=?1 AND used=0";
+
+/// What is left of the departing member's invites has been used. Its source row is detached,
+/// because the foreign key needs that before `users` goes, and is swept with its TTL; the ledger
+/// row in `invite_attributions` — who used it and when — stays. A `used = 1` row sits outside the
+/// genesis index, which is the whole reason [`DELETE_UNUSED_INVITES_SQL`] runs first.
+const DETACH_SPENT_INVITES_SQL: &str =
+    "UPDATE invite_tokens SET owner_user_id=NULL WHERE owner_user_id=?1";
 
 /// Closes out D1 membership authority in a single transaction. The first-statement guard
 /// rolls back any owner-role race that occurred between the handler's pre-check and the
@@ -400,7 +371,10 @@ pub(crate) async fn delete_membership(
             .bind(&[d1_text(target_id)])?,
         db.prepare("UPDATE invite_tokens SET used_by=NULL WHERE used_by=?")
             .bind(&[d1_text(target_id)])?,
-        db.prepare("UPDATE invite_tokens SET owner_user_id=NULL WHERE owner_user_id=?")
+        // Delete-then-detach, in this order: see the two constants.
+        db.prepare(DELETE_UNUSED_INVITES_SQL)
+            .bind(&[d1_text(target_id)])?,
+        db.prepare(DETACH_SPENT_INVITES_SQL)
             .bind(&[d1_text(target_id)])?,
         db.prepare(
             "DELETE FROM verification_codes

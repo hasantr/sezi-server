@@ -9,16 +9,13 @@
 //! from the pure-Rust `rsa` crate (deterministic PKCS1v15, so no RNG is needed).
 //! 404/UNREGISTERED means the token is stale and the caller deletes it from `push_tokens`.
 //!
-//! Config resolution (owner self-service): per key, **env FIRST, then D1 `server_config`**
-//! (the cf_analytics `resolve_cfg` pattern). With env set — our prod uses wrangler.toml
-//! `FCM_PROJECT_ID` plus the `FCM_SERVICE_ACCOUNT` secret — D1 is never touched and
-//! today's path stays BIT-IDENTICAL. Without env we use whatever the owner entered from
-//! the app via `PATCH /admin/fcm-config` and stored in D1; failing that we fall back to the
-//! **shared PUSH RELAY** (the default, so self-host installs that never bring their own
-//! service account still get zero-config push; see `DEFAULT_PUSH_RELAY_URL` and the
-//! `push-relay/` worker). With the relay set to `off` (env `PUSH_RELAY_URL` or D1
-//! `push_relay_url`) push becomes a silent no-op — FAIL-OPEN, because FCM is optional and
-//! the worker runs perfectly well without it. Details in `resolve_send_mode`.
+//! Config resolution (owner self-service), per key: **env FIRST, then D1 `server_config`**. With
+//! env set, D1 is never touched. Without it, whatever the owner entered via
+//! `PATCH /admin/fcm-config`; failing that, the **shared PUSH RELAY** — the default, so a
+//! self-host install that never brings its own service account still gets zero-config push (see
+//! `DEFAULT_PUSH_RELAY_URL` and the `push-relay/` worker). With the relay `off`, push is a silent
+//! no-op: FAIL-OPEN, because FCM is optional and the worker runs fine without it. See
+//! `resolve_send_mode`.
 
 use std::sync::Mutex;
 
@@ -44,36 +41,27 @@ struct CachedToken {
     exp: u64, // unix seconds; refresh before this
 }
 
-// Module-global OAuth token cache, living as long as the warm isolate. Per Codex: do NOT
-// tie it to DO memory. workerd is single-threaded so the Mutex is effectively a no-op, and
-// the cache is cleared when the isolate is recycled (the token is simply re-fetched).
+// Module-global OAuth token cache, living as long as the warm isolate — NOT tied to DO memory.
+// workerd is single-threaded, so the Mutex is effectively a no-op.
 //
-// NOTE (fcm-config self-service): if the owner enters a NEW service account from the app,
-// this cache can keep using the token obtained with the OLD one until it expires (~1h) —
-// a config change does not invalidate the cache. That is ACCEPTABLE: isolate lifetimes are
-// short (workerd recycles often), and as long as the old token is still valid at Google
-// push keeps working; within ~1h at the latest it is renewed with the fresh account.
+// A config change does not invalidate it: after the owner enters a NEW service account the
+// token from the old one may still be used until it expires (~1h). Acceptable — isolates recycle
+// often, and an old token Google still accepts keeps push working meanwhile.
 static TOKEN_CACHE: Mutex<Option<CachedToken>> = Mutex::new(None);
 
-// ── Config resolution — env-first / D1-fallback (cf_analytics `resolve_cfg` pattern) ──
+// ── Config resolution — env-first, D1-fallback ──
 //
-// DELIBERATELY NOT MEMOIZED: instead of the self_provision thread_local pattern we read
-// fresh on every send. Push is RARE — it fires only for a message whose recipient is
-// offline — and the same `maybe_push_wake` call ALREADY goes to D1 for push_tokens, so one
-// extra SELECT is negligible. A thread_local memo, by contrast, would hide config the
-// owner just entered from the app for the whole isolate lifetime: the "I saved it but no
-// push arrives" trap. The self_provision keys are fixed, whereas this config changes by
-// the owner's hand. Reading fresh means save → it takes effect on the FIRST push.
-// On an env-configured install (our prod) these functions never reach D1 at all.
+// DELIBERATELY NOT MEMOIZED, unlike self_provision's keys: those are fixed, this config changes
+// by the owner's hand, and a thread_local memo would hide a value they just saved for the whole
+// isolate lifetime — the "I saved it but no push arrives" trap. Reading fresh costs nothing worth
+// counting: push fires only for an offline recipient, and that same call already goes to D1 for
+// push_tokens. An env-configured install never reaches D1 here at all.
 //
-// SECURITY (the D1-storage trade-off, identical to admin/cf_config.rs):
-// FCM_SERVICE_ACCOUNT contains a Google service-account private key. D1 is encrypted at
-// rest by CF, but the worker must read it in plaintext to sign the Google OAuth assertion
-// — it cannot be encrypted with a key we do not hold. This is the owner's OWN Firebase
-// project on their OWN server, and it is not E2E content: push is a contentless wake, so
-// even a leaked key cannot open message content, only forge wakes. The value is never
-// returned from any endpoint (worker-internal reads only), and a security-conscious owner
-// can move it to an env secret, which ALWAYS wins.
+// SECURITY (the D1-storage trade-off, as in admin/cf_config.rs): FCM_SERVICE_ACCOUNT holds a
+// Google private key, and the worker must read it in plaintext to sign the OAuth assertion, so it
+// cannot be encrypted with a key we do not hold. It is the owner's own Firebase project and not
+// E2E content — push is a contentless wake, so a leaked key forges wakes, it does not open
+// messages. No endpoint returns the value, and an owner can move it to an env secret, which wins.
 
 /// Trim, then empty → None. env and D1 values are normalized with the SAME discipline
 /// (the cf_analytics `normalize` pattern).
@@ -86,9 +74,9 @@ fn normalize(raw: String) -> Option<String> {
     }
 }
 
-/// Read a single key from D1 `server_config` (the 0025 key-value table). FAIL-OPEN is
-/// ABSOLUTE here: missing table (pre-migration), missing row or any D1 error all yield
-/// None, and the caller silently no-ops. Push is optional; fcm never fails a request.
+/// Read a single key from D1 `server_config`. FAIL-OPEN is ABSOLUTE: a missing table, a missing
+/// row or any D1 error yields None and the caller silently no-ops. Push is optional and must
+/// never fail a request.
 async fn read_db_config(db: &D1Database, key: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Row {
@@ -104,11 +92,9 @@ async fn read_db_config(db: &D1Database, key: &str) -> Option<String> {
     normalize(row?.value)
 }
 
-/// The shared push relay (Hasan's CF worker) — the DEFAULT push path for self-host
-/// installs that do not bring their own service account. The URL is NOT a secret: the
-/// relay is token-gated and rate-limited, and the worst case is a contentless wake. If the
-/// owner supplies their own service account (via env or D1) the relay is never used at all
-/// (see `resolve_send_mode` below).
+/// The shared push relay — the DEFAULT push path for a self-host install that brings no service
+/// account of its own. The URL is NOT a secret: the relay is token-gated and rate-limited, and the
+/// worst case is a contentless wake. An owner with their own service account never reaches it.
 const DEFAULT_PUSH_RELAY_URL: &str = "https://sezi-push-relay.hsn-salihoglu.workers.dev";
 
 /// Relay URL resolution: env `PUSH_RELAY_URL` → D1 `push_relay_url` → the compiled-in
@@ -126,10 +112,8 @@ async fn resolve_relay_url(env: &Env, db: &D1Database) -> Option<String> {
     }
 }
 
-/// Firebase project id: the env var FIRST (today's path — our prod stays BIT-IDENTICAL
-/// without ever touching D1), then, if absent or empty, D1 `fcm_project_id` as entered by
-/// the owner from the app. None means FCM is not configured and the caller silently no-ops
-/// (today's behaviour).
+/// Firebase project id: the env var first, then D1 `fcm_project_id` as entered by the owner.
+/// None means FCM is not configured and the caller silently no-ops.
 async fn resolve_project_id(env: &Env, db: &D1Database) -> Option<String> {
     if let Some(v) = env.var("FCM_PROJECT_ID").ok().and_then(|v| normalize(v.to_string())) {
         return Some(v);
@@ -137,9 +121,8 @@ async fn resolve_project_id(env: &Env, db: &D1Database) -> Option<String> {
     read_db_config(db, "fcm_project_id").await
 }
 
-/// Service-account JSON: the env secret FIRST (today's path), then D1
-/// `fcm_service_account`. Content is validated at write time by `PATCH /admin/fcm-config`
-/// (valid JSON carrying client_email and private_key).
+/// Service-account JSON: the env secret first, then D1 `fcm_service_account`. Validated at WRITE
+/// time by `PATCH /admin/fcm-config` (valid JSON carrying client_email and private_key).
 async fn resolve_service_account(env: &Env, db: &D1Database) -> Option<String> {
     if let Some(v) = env
         .secret("FCM_SERVICE_ACCOUNT")
@@ -153,17 +136,15 @@ async fn resolve_service_account(env: &Env, db: &D1Database) -> Option<String> {
 
 /// WHICH of the three ways this server stands on push — the single read of the FCM config.
 ///
-/// `PushMode::can_push()` on top of it answers "will a push go out at all", which is the right
-/// question for a health indicator and backs `fcm_configured` on `/admin/stats` and on the
-/// `PATCH /admin/fcm-config` response. It is the WRONG question for the owner's setup screen: a
-/// bare "configured ✓" on a server whose owner installed nothing reads as "I set this up", because
-/// the relay URL falls back to a built-in default unless explicitly `off`, so a FRESH self-host
-/// server reports true. Measured on the Pi 2026-07-28: `server_config` held zero FCM keys and the
-/// flag was still true. That screen asks for the mode itself instead.
+/// `PushMode::can_push()` on top of it answers "will a push go out at all" — the right question
+/// for a health indicator (`fcm_configured` on `/admin/stats` and on the fcm-config response), and
+/// the WRONG one for the owner's setup screen: the relay URL falls back to a built-in default
+/// unless explicitly `off`, so a FRESH server with zero FCM keys reports true, and a bare
+/// "configured ✓" would read as "I set this up". That screen asks for the mode itself.
 ///
-/// The read face of a WRITE-ONLY contract: only which of three states escapes, never a value.
-/// Cheap by design — it never calls out to Google or to the relay, it only checks presence — and it
-/// fails safe to `Off` (no D1 binding means "not configured"; stats must NEVER 500).
+/// The read face of a WRITE-ONLY contract: which of three states, never a value. Cheap by design —
+/// presence checks only, no call to Google or the relay — and it fails safe to `Off`, because
+/// stats must NEVER 500.
 pub async fn mode(env: &Env) -> PushMode {
     let db = match env.d1("DB") {
         Ok(d) => d,
@@ -228,7 +209,7 @@ async fn get_access_token(env: &Env, db: &D1Database) -> Result<String> {
     // running normally.
     let sa_json = resolve_service_account(env, db)
         .await
-        .ok_or_else(|| Error::RustError("fcm: service_account yok (env+D1)".into()))?;
+        .ok_or_else(|| Error::RustError("fcm: no service_account (env+D1)".into()))?;
     let sa: ServiceAccount = serde_json::from_str(&sa_json)
         .map_err(|e| Error::RustError(format!("fcm: service_account parse: {e}")))?;
     // Inside the JSON string the private_key line breaks may be `\n`-escaped → restore real
@@ -334,13 +315,12 @@ async fn send_wake(env: &Env, db: &D1Database, fcm_token: &str, project_id: &str
     }
 }
 
-/// Classification of an FCM `messages:send` response (D-M8). A token is only ever DELETED
-/// on a POSITIVE stale signal: 404 + UNREGISTERED, or a 400 in which FCM blames the
-/// registration token itself (a `fieldViolations` entry for field `message.token`, or
-/// "registration token" appearing in `error.message`). EVERY other non-200 — a bare or
-/// ambiguous INVALID_ARGUMENT, a payload/config bug of ours, a 5xx, an empty or malformed
-/// body — is `Transient` and the token is KEPT. That is what stops a systematic 400 from
-/// wiping the whole token registry and killing push in a way that hides itself.
+/// Classification of an FCM `messages:send` response. A token is DELETED only on a POSITIVE stale
+/// signal: 404 + UNREGISTERED, or a 400 where FCM blames the registration token itself (a
+/// `fieldViolations` entry for `message.token`, or "registration token" in `error.message`). Every
+/// other non-200 — an ambiguous INVALID_ARGUMENT, a payload bug of ours, a 5xx, a malformed body —
+/// is `Transient` and KEEPS the token, so a systematic 400 cannot wipe the whole registry and kill
+/// push silently.
 #[derive(Debug, PartialEq, Eq)]
 enum FcmSendOutcome {
     Sent,
@@ -447,30 +427,22 @@ async fn resolve_send_mode(env: &Env, db: &D1Database) -> Option<SendMode> {
     resolve_relay_url(env, db).await.map(|url| SendMode::Relay { url })
 }
 
-/// Recipient is OFFLINE (delivered_live=false) → send a contentless wake to their
-/// registered push tokens. `recipient_device_id` Some → that device only; None → ALL of the
-/// user's devices (device-blind pending). Best-effort: own config → direct FCM, otherwise
-/// the shared relay (the default), and with the relay `off` a silent no-op (push is
-/// optional; the worker runs normally). A stale token (`Ok(false)`) is deleted from
-/// `push_tokens`.
+/// Recipient is OFFLINE → a contentless wake to their registered push tokens.
+/// `recipient_device_id` Some → that device only; None → ALL of the user's devices.
+/// Best-effort: own config → direct FCM, else the shared relay, and with the relay `off` a silent
+/// no-op. A stale token is deleted from `push_tokens`.
 pub async fn maybe_push_wake(
     env: &Env,
     db: &D1Database,
     recipient_id: &str,
     recipient_device_id: Option<&str>,
 ) {
-    // One verdict line per wake attempt.
-    //
-    // Every exit from this function used to be silent except a hard `Err`. "Push is switched off",
-    // "the device has no token", "the token was stale and has just been deleted" and "it went out
-    // fine" were indistinguishable from outside, which is why "notifications do not arrive when the
-    // app is closed" had no answer on 2026-07-27: the server correctly logged that it had chosen the
-    // FCM-wake path, and then nothing at all. The delivery decision was observable; its OUTCOME was
-    // not.
-    //
-    // `mode` also matters on its own. A self-hosted server with no FCM configuration silently falls
-    // back to the shared default relay, so the operator can be pushing through someone else's
-    // infrastructure without ever being told. Naming the mode here is what makes that visible.
+    // One verdict line per wake attempt, on EVERY exit. Silence here makes "push is switched off",
+    // "the device has no token", "the token was stale and was just deleted" and "it went out fine"
+    // indistinguishable from outside — which is why "notifications do not arrive when the app is
+    // closed" once had no answer: the decision to take the FCM path was logged, its outcome was
+    // not. The mode is named because a server with no FCM configuration falls back to the shared
+    // relay, and its operator should not push through someone else's infrastructure unknowingly.
     let mode = match resolve_send_mode(env, db).await {
         Some(m) => m,
         None => {
@@ -525,13 +497,11 @@ pub async fn maybe_push_wake(
     let total = rows.len();
     let (mut ok, mut stale, mut failed) = (0usize, 0usize, 0usize);
 
-    // NOTE (2026-06-26): wake debounce was REVERTED. A 20s per-recipient+device debounce was
-    // suppressing LEGITIMATE follow-up messages that arrived just after a drain finished: no
-    // wake → no delivery → single tick and no notification, a real field bug. `delivered_live`
-    // (message.rs) ALREADY prevents wakes during a drain over an active WS, which made the
-    // debounce both redundant and harmful. The real root of the storm was the WEDGE (a resend
-    // loop), fixed by Fix-2/3 (coalesce + 5xx retry + boot-401 expedite). So every undelivered
-    // message must get its wake — that is what correct delivery requires.
+    // NO wake debounce. A 20s per-recipient+device debounce suppressed legitimate follow-up
+    // messages arriving just after a drain finished — no wake, no delivery, a single tick and no
+    // notification. `delivered_live` (message.rs) already prevents wakes during a drain over an
+    // active WS, so a debounce is redundant as well as harmful; the storm it was aimed at came
+    // from a resend wedge. Every undelivered message gets its wake.
     for row in rows {
         let sent = match &mode {
             SendMode::Direct { project_id } => {
@@ -568,7 +538,7 @@ pub async fn maybe_push_wake(
         }
     }
     console_log!(
-        "[push] user={recipient_id} mode={mode_name} token={total} ok={ok} bayat={stale} hata={failed}"
+        "[push] user={recipient_id} mode={mode_name} token={total} ok={ok} stale={stale} failed={failed}"
     );
 }
 
@@ -610,7 +580,7 @@ mod tests {
     #[test]
     fn dm8_unparseable_body_not_stale() {
         assert_eq!(classify_fcm_send(400, ""), FcmSendOutcome::Transient);
-        assert_eq!(classify_fcm_send(400, "{bozuk json"), FcmSendOutcome::Transient);
+        assert_eq!(classify_fcm_send(400, "{corrupt json"), FcmSendOutcome::Transient);
         assert_eq!(classify_fcm_send(404, ""), FcmSendOutcome::Transient);
     }
 

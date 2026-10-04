@@ -1,32 +1,33 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-/// W1 (delivered_live false-positive fix): for a socket to count as "genuinely live",
-/// its last CLIENT→SERVER frame (`Attachment.last_seen_ms`) must fall inside this
-/// window. The client text-pings every 5s (ws_conn.rs) and declares the socket a zombie
-/// and reconnects if no frame arrives for 14s → a healthy connection is always <5s
-/// fresh. 20s is 4x the ping interval (room for one missed ping + hibernation wake
-/// latency + clock skew). For a socket OUTSIDE this window, delivery does not count as
-/// "live" even when `send_with_str` returns Ok → the caller sends an FCM wake.
+/// For a socket to count as "genuinely live" its last CLIENT→SERVER frame must fall inside this
+/// window. The client pings every 5s and reconnects after 14s of silence, so a healthy connection
+/// is always under 5s fresh; 20s is 4× the ping interval, leaving room for a missed ping,
+/// hibernation wake latency and clock skew. Outside it, delivery does not count as live even when
+/// `send_with_str` returns Ok, and the caller sends an FCM wake instead.
 const WS_LIVENESS_WINDOW_MS: i64 = 20_000;
 
-/// W2 (per-recipient pending DoS cap, 2026-07-02 Codex plan): keep one recipient's `pending`
-/// table (this DO) from growing without bound — a malicious or noisy sender could DoS the victim
-/// DO by bloating its SQLite. TTL retention (the alarm's `DELETE ... created_at < retention`)
-/// bounds it in TIME, but a flood INSIDE the retention window still bloats it, so a hard row-count
-/// cap is the SECOND line of defence. Once exceeded, the oldest (lowest id) surplus rows are
-/// evicted = bounded FIFO. The value is generous (a legitimate offline backlog rarely reaches it);
-/// exceeding it means a very long offline period or a DoS → the oldest undelivered rows are
-/// dropped (the client's M4 sync + redelivery compensate; recent rows are kept).
+/// A hard row-count cap on one recipient's `pending` table, the second line of defence behind TTL
+/// retention: retention bounds the queue in TIME, but a flood INSIDE that window still bloats the
+/// victim DO's SQLite. Past the cap the oldest surplus rows are evicted — bounded FIFO. The value
+/// is generous, so reaching it means a very long offline period or a DoS, and the client's history
+/// sync plus redelivery compensate for what is dropped.
+///
+/// KNOWN RESIDUE — eviction is GLOBAL-oldest, not per sender, so one noisy sender can push out
+/// another's older undelivered messages. The free half of that attack is closed elsewhere:
+/// envelopes for FABRICATED device ids no longer reach this table (`messages::recipient_devices`),
+/// so what remains costs a real sender its own rate limit. A proper fix is a per-sender share
+/// (evict from the largest slice first), which changes the eviction query's shape and cost — it
+/// was weighed, not missed.
 const PENDING_MAX_ROWS: i64 = 10_000;
 /// Enforce the cap roughly every N inserts rather than on EVERY one (amortizes the hot-path
 /// COUNT+DELETE; overshoot stays <= PENDING_MAX_ROWS + N). Gated on `row.id`, which is monotonic
 /// thanks to AUTOINCREMENT.
 const PENDING_CAP_ENFORCE_EVERY: i64 = 512;
 
-/// W1: `last_seen_ms` from the WS attachment, if present. `None` means the caller must NOT
-/// treat the socket as fresh (conservative: it may be a zombie, so let the wake fire; the
-/// field is filled in on the first ping).
+/// `last_seen_ms` from the WS attachment, if present. `None` must NOT be treated as fresh — the
+/// socket may be a zombie, so let the wake fire; the field is filled in on the first ping.
 pub(crate) fn ws_last_seen_ms(ws: &WebSocket) -> Option<i64> {
     ws.deserialize_attachment::<Attachment>()
         .ok()
@@ -113,14 +114,11 @@ impl UserInbox {
             }
         }
 
-        // Idempotency check: if the same (sender, sender_device, recipient_device, envelope) was
-        // handled within the last 60s, return the cached msg_id instead of INSERTing a duplicate.
-        // Keeps a client retry from bloating DO storage and from pushing the same frame twice to
-        // the recipient.
-        // M2-S2.2 (BLOCKER #11): sender_device and recipient_device are PART of the hash. When a
-        // group's single Megolm envelope fans out to TWO devices of the same user the envelope is
-        // byte-identical, but the differing recipient_device yields a DIFFERENT hash → the second
-        // device's row is not swallowed. Hash16 =
+        // Idempotency: the same 4-tuple within the last 60s returns the cached msg_id instead of a
+        // duplicate INSERT, so a client retry neither bloats DO storage nor pushes the frame twice.
+        // Both DEVICES are part of the hash on purpose: a group's single Megolm envelope fanning
+        // out to two devices of one user is byte-identical, and only the differing recipient_device
+        // keeps the second row from being swallowed. Hash16 =
         //   SHA256(sender||"|"||sender_dev||"|"||recipient_dev||"|"||envelope)[0..16].
         let mut envelope_hash = [0u8; 16];
         {
@@ -134,16 +132,13 @@ impl UserInbox {
             hasher.update(envelope_b64.as_bytes());
             envelope_hash.copy_from_slice(&hasher.finalize()[..16]);
         }
-        // D-M9: the hex of that same 4-tuple hash is the durable dedup key (pending.env_hash UNIQUE).
+        // The hex of that same hash is the DURABLE dedup key (pending.env_hash UNIQUE).
         let env_hash_hex: String = envelope_hash.iter().map(|b| format!("{b:02x}")).collect();
         if let Some((cached_id, cached_live)) = self.dedup_lookup(sender_id, &envelope_hash, now) {
-            // W4-a (Codex HIGH): on a dedup hit return the FIRST delivery's REAL delivered_live,
-            // NOT a hard-coded `true`. The old code assumed "the original attempt already made the
-            // wake decision", but in a W4 in-request retry the first attempt's cross-DO response
-            // may be lost, so the caller NEVER sees that decision; the retry then hits dedup, gets
-            // `true` and SILENTLY suppresses the FCM wake even for an offline recipient. Returning
-            // the real value means an offline first delivery (live=false) makes the retry false too
-            // → the caller sends the wake; online (live=true) → no pointless wake.
+            // A dedup hit returns the FIRST delivery's REAL delivered_live, never a hard-coded
+            // `true`: on an in-request retry the first attempt's cross-DO response may be lost, so
+            // the caller never saw that decision, and answering `true` would silently suppress the
+            // FCM wake for an offline recipient.
             return Ok((cached_id, cached_live));
         }
 
@@ -160,12 +155,11 @@ impl UserInbox {
             Some(d) => JsValue::from_str(d),
             None => JsValue::NULL,
         };
-        // D-M9: ON CONFLICT DO NOTHING RETURNING id. A new row returns its id (the normal path).
-        // A conflict (the same sender+env_hash is ALREADY pending, i.e. a retry after a DO restart
-        // or TTL expiry) returns no row from DO NOTHING → look the existing id up with a SELECT and
-        // report delivered_live=false (conservative: the first delivery's liveness is not stored in
-        // the DB, and one extra FCM wake is harmless). No second pending row is written, so the
-        // duplicate WS frame / notification / bubble is avoided.
+        // ON CONFLICT DO NOTHING RETURNING id: a new row returns its id, while a conflict (the same
+        // sender+env_hash already pending — a retry after a DO restart or TTL expiry) returns none,
+        // so the existing id is looked up with a SELECT and reported delivered_live=false. That is
+        // conservative: the first delivery's liveness is not stored, and one extra wake is
+        // harmless. Either way no second pending row exists, so no duplicate frame or bubble.
         #[derive(Deserialize)]
         struct IdRow {
             id: i64,
@@ -264,17 +258,14 @@ impl UserInbox {
         // Attachment.device_id of None (pre-S1 token) also counts as a target (NULL tolerance).
         // Matching rule: a concrete recipient device and a concrete attachment device that differ
         // mean the frame does NOT go to that socket.
-        // W1 (delivered_live false-positive fix): `send_with_str` returning Ok does NOT mean the
-        // client received it. After a MIUI background kill the TCP connection stays half-open, so
-        // the CF edge accepts the write as buffered (Ok) while the client receives NOTHING. The old
-        // code counted that as `delivered_live=true` and SUPPRESSED the FCM wake → the message sat
-        // silently in `pending` until the 90s alarm or a reconnect and no notification ever went out
-        // (the root cause of "messages don't arrive"). FIX: a socket counts as a "live delivery" only
-        // if (a) the send returned Ok AND (b) a client frame arrived within the last
-        // `WS_LIVENESS_WINDOW_MS` (fresh last_seen). We still write to a stale / last_seen-less
-        // socket (it may be hibernating but alive, and the pending row survives until it is acked)
-        // but we do NOT set delivered_live → the caller sends an FCM wake: correct for a zombie,
-        // a harmless duplicate for a genuinely live client (which also receives the message).
+        // `send_with_str` returning Ok does NOT mean the client received it: after a background
+        // kill the TCP connection stays half-open and the CF edge accepts the write as buffered
+        // while the client gets nothing. Counting that as delivered suppresses the FCM wake and the
+        // message sits silently in `pending` until the alarm or a reconnect — the root of
+        // "messages don't arrive". So a live delivery needs BOTH an Ok send and a client frame
+        // within `WS_LIVENESS_WINDOW_MS`. A stale socket is still written to (it may be hibernating
+        // but alive) without setting delivered_live: correct for a zombie, and a harmless duplicate
+        // for a client that is genuinely live.
         let now_ms = now * 1000;
         let mut delivered_live = false;
         let mut zombie_seen = false;
@@ -285,35 +276,29 @@ impl UserInbox {
                 if send_ok && fresh {
                     delivered_live = true;
                 } else if send_ok && !fresh {
-                    // Write Ok but last_seen stale = zombie / half-open. (Trusting send-ok here
-                    // is exactly what set delivered_live=true and suppressed FCM — the W1 root.)
+                    // Write Ok but last_seen stale = zombie / half-open.
                     zombie_seen = true;
                 }
             }
         }
-        // [deliv-telemetry] W1: a zombie was caught AND no other live socket took the delivery →
-        // delivered_live=false → the caller sends an FCM wake. How often this line appears in
-        // `wrangler tail` measures W1's real-world impact (catching MIUI-kill zombies); per Codex,
-        // without a counter the effect cannot be proven.
+        // A zombie was caught and no other live socket took the delivery, so the caller wakes by
+        // FCM. How often this line appears in `wrangler tail` is the only measure of how much the
+        // liveness window actually catches.
         if zombie_seen && !delivered_live {
             worker::console_log!(
                 "[deliv] W1 zombie socket caught (send-ok + stale) -> FCM wake path (grp={})",
                 group_id.unwrap_or("1:1")
             );
         }
-        // W1 backstop NOTE: we deliberately do NOT set `push_wake_at` here. For delivered_live=false
-        // (offline) rows the caller sends maybe_push_wake IMMEDIATELY; but stamping the row here
-        // would break the ws.rs WS-send path where the response is lost (no retry): the row would be
-        // marked "pushed" although no push actually happened → the backstop would skip it → no wake
-        // would EVER go out (a fragile-coupling gap). Instead `push_wake_at` is set ONLY by the
-        // backstop, after its own push → every row gets AT MOST one backstop wake. So an offline row
-        // gets the caller's immediate wake plus (if still unacked after the grace period) one
-        // backstop wake: bounded, content-less, deduplicated per device — a wake retry that helps on
-        // MIUI — and the ws.rs gap is closed too.
-        // W4-a: write the dedup entry with the REAL delivered_live AFTER the send loop. notify_inner
-        // has no await between the loop and this write, and the DO is single-threaded, so nothing can
-        // interleave (effectively atomic) → a retry finds the same envelope in dedup with the correct
-        // liveness value.
+        // `push_wake_at` is deliberately NOT stamped here. The caller wakes an offline row
+        // immediately, but marking the row "pushed" from here would break the WS-send path whose
+        // response is lost: no push happened, yet the backstop would skip it and NO wake would ever
+        // go out. Only the backstop stamps it, after its own push, so every row gets at most one
+        // backstop wake on top of the caller's immediate one.
+        //
+        // The dedup entry carries the REAL delivered_live and is written AFTER the send loop. There
+        // is no await between them and the DO is single-threaded, so a retry finds the envelope
+        // with the correct liveness.
         self.dedup_insert(sender_id.to_string(), envelope_hash, row.id, now, delivered_live);
         Ok((row.id, delivered_live))
     }

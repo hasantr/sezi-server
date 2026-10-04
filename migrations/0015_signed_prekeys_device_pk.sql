@@ -1,15 +1,15 @@
--- M2-S3.2c bug-fix: signed_prekeys PK (user_id, prekey_id) -> (user_id, device_id, prekey_id).
+-- Bug fix: signed_prekeys PK (user_id, prekey_id) -> (user_id, device_id, prekey_id).
 --
--- Cikis: coklu-cihaz link finalize'da BAGLI cihaz kendi SPK'sini yayinlarken
---   "UNIQUE constraint failed: signed_prekeys.user_id, signed_prekeys.prekey_id" -> 500.
--- Neden: her cihaz kendi prekey_id namespace'inde SPK uretir (ikisi de dusuk id'den
---   baslar); user_id ORTAK oldugundan (linked = primary'nin user_id'si) ayni prekey_id
---   farkli device'larda CAKISIYORDU. PK'ya device_id girmeli.
--- mig 0012 device_id kolonunu ekledi ama PK (user_id, prekey_id) kaldi.
+-- The symptom: while finalising a multi-device link, a LINKED device publishing its own SPK
+--   got "UNIQUE constraint failed: signed_prekeys.user_id, signed_prekeys.prekey_id" -> 500.
+-- Why: every device generates its SPK in its own prekey_id namespace (both starting from a
+--   low id), and because user_id is SHARED (a linked device carries the primary's user_id)
+--   the same prekey_id COLLIDED across devices. device_id has to be in the PK.
+-- Mig 0012 added the device_id column but the PK stayed (user_id, prekey_id).
 --
--- SQLite PK degistirilemez -> tablo rebuild. device_id NULL (legacy/birincil) -> '' sentinel
--- (NOT NULL DEFAULT '' ile PK'da NULL sorunu olmaz). signed_prekeys leaf tablo
--- (yalniz users'a referans, kimse ona referans vermiyor) -> DROP guvenli.
+-- A SQLite PK cannot be altered -> rebuild the table. device_id NULL (legacy/primary) -> the
+-- '' sentinel (NOT NULL DEFAULT '' keeps NULL out of the PK). signed_prekeys is a leaf table
+-- (it only references users and nothing references it) -> the DROP is safe.
 CREATE TABLE signed_prekeys_new (
   user_id     TEXT NOT NULL REFERENCES users(id),
   device_id   TEXT NOT NULL DEFAULT '',

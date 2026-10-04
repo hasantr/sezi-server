@@ -80,11 +80,11 @@ fn no_group_handler_gates_on_the_stateless_jwt_alone() {
     );
 }
 
-/// The creation route must NOT gate on the server-owner role. Group creation was owner-only
-/// between 2026-07-03 and 2026-08-05, and the combination of that gate with `owner_cannot_leave`
-/// made whoever administers the server a permanent member of every group on it. `owner` is a
-/// SERVER-administration role and grants nothing inside a group; reading a group's messages must
-/// require being in that group. Written as a source guard for the same reason as the two above —
+/// The creation route must NOT gate on the server-owner role. An owner-only create, combined
+/// with `owner_cannot_leave`, makes whoever administers the server a permanent member of every
+/// group on it. `owner` is a SERVER-administration role and grants nothing inside a group;
+/// reading a group's messages must require being in that group. Written as a source guard for
+/// the same reason as the two above —
 /// the property is about which middleware a handler calls, and re-adding the gate is a one-line
 /// edit that no behavioural test in this repo would notice.
 #[test]
@@ -357,8 +357,7 @@ fn every_membership_changing_handler_nudges_the_affected_devices() {
 
 /// The fan-out is bounded, and by the same number as the other one. Two group fan-outs in one
 /// worker converging on different limits would mean at least one was picked without reference to
-/// the Workers subrequest ceiling — the ceiling that produced the 2026-07-06 incident recorded in
-/// `self_provision.rs`.
+/// the Workers subrequest ceiling — the ceiling whose incident `self_provision.rs` records.
 #[test]
 fn the_group_nudge_fan_out_is_capped_at_the_house_limit() {
     assert_eq!(

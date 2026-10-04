@@ -1,38 +1,26 @@
-//! Lazy maintenance — cron-independent upkeep (part of the 2026-07-06 hardening package).
+//! Lazy maintenance — cron-independent upkeep.
 //!
-//! FIELD RATIONALE: the CF free plan caps cron triggers per account. A SECOND sezi-server
-//! deployed into the same account fails `wrangler deploy`'s schedules step with
-//! "account-plan-limits" and ends up with NO CRON, so the daily GC and the 2-minute
-//! fanout drain NEVER run: the retry queue piles up and expired-media/token cleanup
-//! stops. The fix is to let maintenance tasks also run piggybacked on requests, making
-//! the cron just one way to keep maintenance fresh rather than the ONLY way.
+//! WHY: the CF free plan caps cron triggers per account, so a SECOND sezi-server in the
+//! same account fails `wrangler deploy`'s schedules step and ends up with NO CRON — the
+//! daily GC and the 2-minute fanout drain never run, the retry queue piles up and
+//! expired-media/token cleanup stops. Maintenance therefore also runs piggybacked on
+//! requests, making the cron one way to keep it fresh rather than the only way. A
+//! cron-enabled deployment keeps its stamps fresh and this module stays quiet.
 //!
-//! TEMPLATE COMPATIBILITY: the template deployment has no `[triggers]` in
-//! `wrangler.toml` (account cron limit), so maintenance runs entirely off the lazy path;
-//! on a cron-enabled deployment the stamps stay fresh and the lazy path sleeps. The
-//! monorepo prod `wrangler.toml` `[triggers]` was left UNTOUCHED — there the cron runs
-//! and this module stays quiet.
+//! MECHANISM — three timestamps in `server_config` (epoch seconds): `maint_drain_at`,
+//! `maint_daily_at`, `maint_storage_move_at`. `scheduled()` refreshes its own stamp on
+//! every run; without a cron the stamp ages and the first eligible request runs
+//! maintenance in the background via `ctx.wait_until`, so no response is delayed.
 //!
-//! MECHANISM — three timestamps in `server_config` (the 0025 key-value table):
-//!   - `maint_drain_at`        = epoch seconds of the last fanout-drain pass
-//!   - `maint_daily_at`        = epoch seconds of the last daily GC
-//!   - `maint_storage_move_at` = epoch seconds of the last storage-move (drain) tick (phase 4)
+//! COST: no extra D1 read per request. An isolate-local `thread_local` last-checked
+//! timestamp limits D1 lookups to roughly one per 60s, and even that happens inside
+//! `wait_until`.
 //!
-//! `scheduled()` refreshes its own stamp on EVERY run, so with a working cron the stamp
-//! never goes stale and the lazy path is NEVER triggered (prod stays bit-identical).
-//! Without a cron the stamp ages, and the first eligible request runs maintenance in the
-//! background via `ctx.wait_until` — the response is never delayed.
-//!
-//! COST DISCIPLINE: NO extra D1 read per request. An isolate-local `thread_local`
-//! last-checked timestamp limits D1 lookups to roughly one per 60s, and even that lookup
-//! happens inside `wait_until` (zero added latency on the request critical path).
-//!
-//! RACE NARROWING (winner pattern): when a stamp looks stale, the stamp is pushed
-//! forward FIRST via `UPDATE ... WHERE CAST(value AS INTEGER) <= stale-cutoff RETURNING
-//! key`. D1 serializes UPDATEs, so only the FIRST winner gets a row back and the loser
-//! skips the work. Failing to win means another isolate is already running it, so each
-//! task executes once. (The tasks themselves are also concurrency-safe — see the
-//! per-function comments below — the winner pattern merely avoids pointless double work.)
+//! WINNER PATTERN: a stale-looking stamp is pushed forward FIRST via
+//! `UPDATE … WHERE CAST(value AS INTEGER) <= stale-cutoff RETURNING key`. D1 serializes
+//! UPDATEs, so of two concurrent isolates exactly one gets a row back and the loser skips
+//! the work. The tasks are individually concurrency-safe anyway; this only avoids
+//! pointless double work.
 
 use std::cell::Cell;
 
@@ -49,33 +37,24 @@ use crate::utils::now_secs;
 /// an isolate-wide memo — the same pattern self_provision uses).
 const CHECK_EVERY_SECS: u64 = 60;
 
-/// Lazy drain threshold. The cron interval is 120s but the threshold is DELIBERATELY
-/// 300s (2.5×): CF scheduled events are not second-accurate and a cron can be seconds or
-/// minutes late. At exactly 120s, cron-enabled PROD would fire the lazy path routinely in
-/// the "the stamp just passed 120s, the cron is about to run" window — a double drain is
-/// harmless, but it would break the "lazy sleeps on cron-enabled deployments" contract.
-/// The 2.5× jitter margin means lazy only wakes when the cron is TRULY dead; on a
-/// cron-less deployment the drain cadence is ~5 minutes while traffic exists, which is
-/// enough given the retry queue's own backoff buffer.
+/// Lazy drain threshold: 2.5× the 120s cron interval, on purpose. CF scheduled events are
+/// not second-accurate, so at exactly 120s a cron-enabled deployment would fire the lazy
+/// path routinely in the "stamp just aged out, cron about to run" window. The jitter margin
+/// means lazy only wakes when the cron is truly dead; cron-less, the drain cadence is then
+/// ~5 minutes while traffic exists, which the retry queue's own backoff absorbs.
 const DRAIN_LAZY_AFTER_SECS: i64 = 300;
 
-/// Lazy daily-GC threshold: 24h plus a 1h margin (same jitter rationale — the daily
-/// "0 4 * * *" cron refreshes the stamp exactly every 86400s, so a threshold with no
-/// margin would race on the boundary).
+/// Lazy daily-GC threshold: 24h plus a 1h margin, for the same boundary-race reason.
 const DAILY_LAZY_AFTER_SECS: i64 = 90_000;
 
-/// Lazy storage-move threshold (pluggable storage phase 4) — SAME rationale and cadence
-/// as the drain (2-minute cron × 2.5 jitter margin): on a cron-enabled deployment every
-/// scheduled run does a move tick and stamps it, so lazy sleeps; without a cron it runs
-/// on a ~5-minute cadence. The drain endpoint pulls the stamp to 0 (`wake_storage_move`)
-/// so the START of a move does not wait out the threshold — the first eligible request
-/// claims it within the ≤60s throttle window.
+/// Lazy storage-move threshold — same rationale and cadence as the drain. The drain
+/// endpoint pulls this stamp to 0 (`wake_storage_move`) so the START of a move does not
+/// wait out the threshold; the first eligible request claims it within ≤60s.
 const MOVE_LAZY_AFTER_SECS: i64 = 300;
 
-// Compile-time contract lock: the lazy thresholds must not drop BELOW the cron cadences
-// (drain "*/2 * * * *" = 120s, daily "0 4 * * *" = 86400s) — if they did, lazy would wake
-// routinely on cron-enabled prod (a double run is harmless, but it breaks the "prod is
-// bit-identical" contract). The drain/move asserts lock in a 2× margin.
+// Contract lock: a lazy threshold must never drop below its cron cadence (drain
+// "*/2 * * * *" = 120s, daily "0 4 * * *" = 86400s), or lazy would wake routinely on a
+// cron-enabled deployment.
 const _: () = assert!(DRAIN_LAZY_AFTER_SECS >= 2 * 120);
 const _: () = assert!(DAILY_LAZY_AFTER_SECS > 86_400);
 const _: () = assert!(MOVE_LAZY_AFTER_SECS >= 2 * 120);
@@ -93,15 +72,14 @@ thread_local! {
 
 /// Called from the `#[event(fetch)]` entry point, right after ensure_ready. Its cost on
 /// the request critical path is `Date.now()` plus a thread_local comparison — no D1, no
-/// await. If the throttle window is open, the stamp check and any resulting maintenance
-/// run ENTIRELY in the background via `ctx.wait_until`, so the response is never delayed.
-/// BEST-EFFORT: every error is logged and swallowed; the request is never affected.
+/// await; the stamp check and any resulting work run in `ctx.wait_until`. Best-effort:
+/// every error is logged and swallowed, and the request is never affected.
 pub fn maybe_run_lazy(env: &Env, ctx: &Context) {
     let now = now_secs();
     let due = LAST_CHECK.with(|c| {
         if throttle_due(c.get(), now, CHECK_EVERY_SECS) {
-            // Advance the marker IMMEDIATELY (single-threaded, so no race): subsequent
-            // requests on the same isolate touch D1 not at all for 60s.
+            // Advance immediately (single-threaded, so no race): later requests on this
+            // isolate touch D1 not at all for 60s.
             c.set(now);
             true
         } else {
@@ -134,16 +112,13 @@ async fn check_and_run(env: Env) {
             now - drain_at
         );
         crate::messages::handlers::drain_fanout_retry(&env).await;
-        // On a Pi/workerd `wrangler dev` deployment the scheduled event may never fire.
-        // Even when the membership row is already gone from D1, if the first UserInbox
-        // purge call hit a transient error the account-purge outbox converges off this
-        // same lazy drain stamp.
+        // On a Pi/workerd `wrangler dev` deployment the scheduled event may never fire, so
+        // the account-purge outbox converges off this same lazy drain stamp when the first
+        // UserInbox purge call hit a transient error.
         crate::membership::drain_purge_outbox(&env).await;
     }
-    // Pluggable storage phase 4: draining-backend move tick (≤4 blobs per run). On a
-    // cron-enabled deployment every scheduled run ticks and stamps, so this sleeps. With
-    // no draining backend, run_storage_move returns quietly after its first SELECT (one
-    // cheap query).
+    // Draining-backend move tick (≤4 blobs per run). With no draining backend,
+    // run_storage_move returns quietly after one cheap SELECT.
     if is_due(now, move_at, MOVE_LAZY_AFTER_SECS)
         && claim(&db, KEY_MOVE, now, now - MOVE_LAZY_AFTER_SECS).await
     {
@@ -200,16 +175,11 @@ async fn read_stamps(db: &D1Database) -> Result<(i64, i64, i64)> {
     Ok((drain_at, daily_at, move_at))
 }
 
-/// Winner pattern: push the stamp forward BEFORE doing the work — `UPDATE ... WHERE
-/// CAST(value AS INTEGER) <= stale-cutoff RETURNING key` returns a row only while the
-/// stamp is still stale (D1 serializes UPDATEs, so of two concurrent isolates exactly one
-/// wins and the loser skips the task). If the row does not exist yet (first boot) it is
-/// created with `INSERT OR IGNORE value='0'` first — '0' is below every threshold, hence
-/// claimable. On error → false (best-effort: the work is skipped and retried in the next
-/// window).
+/// Push the stamp forward BEFORE doing the work (see the winner pattern in the module
+/// docs). A missing row (first boot) is created with `INSERT OR IGNORE value='0'` — '0' is
+/// below every threshold, hence claimable. On error → false: the work is skipped and
+/// retried in the next window.
 async fn claim(db: &D1Database, key: &str, now: i64, stale_cutoff: i64) -> bool {
-    // Make sure the row exists (first boot). Idempotent, and only runs when a stamp is
-    // suspected stale.
     if let Ok(stmt) = db
         .prepare("INSERT OR IGNORE INTO server_config (key, value, created_at) VALUES (?, '0', ?)")
         .bind(&[d1_text(key), d1_int(now)])
@@ -246,8 +216,8 @@ async fn claim(db: &D1Database, key: &str, now: i64, stale_cutoff: i64) -> bool 
 
 // ── cron-path stamping ──────────────────────────────────────────────────────
 
-/// Called by `scheduled()` on every run (after the drain), so on a cron-enabled
-/// deployment `maint_drain_at` stays fresh and the lazy drain never wakes. Best-effort.
+/// Called by `scheduled()` on every run (after the drain), so the lazy drain never wakes
+/// on a cron-enabled deployment. Best-effort.
 pub(crate) async fn stamp_drain(env: &Env) {
     if let Ok(db) = env.d1("DB") {
         stamp(&db, KEY_DRAIN).await;
@@ -262,19 +232,16 @@ pub(crate) async fn stamp_daily(env: &Env) {
     }
 }
 
-/// Called by `scheduled()` after every move tick, so the lazy storage-move sleeps on a
-/// cron-enabled deployment (the twin of stamp_drain). Best-effort.
+/// The twin of stamp_drain, called after every move tick. Best-effort.
 pub(crate) async fn stamp_move(env: &Env) {
     if let Ok(db) = env.d1("DB") {
         stamp(&db, KEY_MOVE).await;
     }
 }
 
-/// Called by the phase-4 drain endpoint: pulling the move stamp to 0 is the "run now"
-/// signal. On a cron-less deployment the first eligible request (within the ≤60s throttle)
-/// claims it and starts the move; on a cron-enabled one it would run within ≤2 minutes
-/// anyway, and a 0 stamp is harmless there too since claim deduplicates. Best-effort — an
-/// error does not break the drain endpoint.
+/// Called by the drain endpoint: pulling the move stamp to 0 is the "run now" signal, so
+/// the first eligible request claims it instead of waiting out the threshold. Harmless on
+/// a cron-enabled deployment too, since claim deduplicates. Best-effort.
 pub(crate) async fn wake_storage_move(env: &Env) {
     let Ok(db) = env.d1("DB") else { return };
     let now = now_secs() as i64;
@@ -298,51 +265,45 @@ async fn stamp(db: &D1Database, key: &str) {
 
 // ── daily maintenance set (body SHARED by cron and lazy) ────────────────────
 
-/// The daily GC set — BIT-IDENTICAL to `scheduled()`'s daily branch, because the body was
-/// moved here verbatim from lib.rs and both the cron and the lazy path call the SAME
-/// function, so their behavior cannot diverge. Everything here is idempotent and
-/// concurrency-safe: the cleanup DELETEs affect 0 rows on a second run, gc_fanout_retry is
-/// a cutoff DELETE, and reconcile recomputes the truth (the last writer writes the same
-/// value).
+/// The daily GC set. The cron and the lazy path call this same function, so they cannot
+/// diverge. Every leg is idempotent and concurrency-safe: the cleanup DELETEs affect 0
+/// rows on a second run, gc_fanout_retry is a cutoff DELETE, and reconcile recomputes the
+/// truth (the last writer writes the same value).
 pub(crate) async fn run_daily(env: &Env) {
     if let Err(e) = cleanup_expired(env).await {
-        // Never use the Debug format: the error can carry SQL parameters/bindings
-        // (user_id, email, ...). The first 80 chars are enough — the error category shows
-        // up, the PII does not.
+        // Never the Debug format: the error can carry SQL bindings (user_id, email, …).
+        // 80 chars shows the error category without the PII.
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("cleanup error: {}", truncated);
     }
     crate::messages::handlers::gc_fanout_retry(env).await;
-    // Quota phase 0 (SHADOW): the daily authoritative reconcile — recompute drift in the
-    // best-effort storage counters (user_storage/server_stats) from the media tables
-    // (self-heal). An error does not break the rest of maintenance: log and continue.
+    // Every leg below logs and continues, so one failure does not skip the rest.
+    //
+    // Recompute drift in the best-effort storage counters (user_storage/server_stats)
+    // from the media tables.
     if let Err(e) = crate::usage::reconcile_storage(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("usage reconcile error: {}", truncated);
     }
-    // Pluggable storage phase 1: backfill the plugin-code (plugin-code/) inventory from
-    // R2 — until now those blobs had no metadata, so "where does this live" was
-    // unanswerable. Idempotent (INSERT OR IGNORE, r2-primary); new put_code calls already
-    // write their metadata inline, so this backfill only sweeps up OLD blobs. An error
-    // does not break the rest of maintenance.
+    // Backfill the plugin-code inventory from R2, so "where does this blob live" is
+    // answerable for blobs written before put_code started recording it inline.
+    // Idempotent (INSERT OR IGNORE, r2-primary).
     if let Err(e) = crate::storage::maint::backfill_plugin_code(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("plugin-code backfill error: {}", truncated);
     }
-    // Pluggable storage phase 3 (plan e, channel 1): scheduled probe of every backend
-    // whose state != 'disabled', refreshing last_health_* so the panel stays current
-    // instead of turning red between crons. An error does not break the rest of maintenance.
+    // Probe every backend whose state != 'disabled', refreshing last_health_* so the panel
+    // stays current instead of turning red between crons.
     if let Err(e) = crate::storage::probe_all(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("storage probe error: {}", truncated);
     }
-    // Pluggable storage phase 3 (plan c.4 / f#4): retry the deletion of orphan-blob
-    // tombstones (≤50 per run). A successful delete drops the row; if the backend is still
-    // down, retry_count++ and it is tried again the next day.
+    // Retry the deletion of orphan-blob tombstones (≤50 per run). A successful delete
+    // drops the row; a backend still down bumps retry_count and is tried again tomorrow.
     if let Err(e) = crate::storage::maint::retry_orphans(env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
@@ -353,12 +314,10 @@ pub(crate) async fn run_daily(env: &Env) {
 #[derive(Deserialize)]
 struct ExpiredMediaRow {
     blob_id: String,
-    // Quota phase 0 (SHADOW): size and uploader, needed to decrement the counters for a
-    // deleted blob.
+    // Needed to decrement the storage counters for a deleted blob.
     size_bytes: i64,
     uploader_id: String,
-    // Pluggable storage: the delete is routed to the blob's own backend (in phase 1 that
-    // is always 'r2-primary').
+    // The delete is routed to the blob's own backend.
     store_id: String,
 }
 
@@ -448,84 +407,49 @@ const RECONCILE_INVITE_CLAIMS_SQL: &str = "UPDATE invite_tokens SET used = 1
         SELECT 1 FROM invite_attributions ia
          WHERE ia.invite_token_hash = invite_tokens.token_hash
       )";
-/// THE RETENTION WINDOW for CONSUMED one-time prekeys, counted in `one_time_prekeys.id` — not in
-/// seconds. The table has no `created_at` column and never had one (migration `0001_init.sql`
-/// created it without, `0016_otk_device_unique.sql` rebuilt it and did not add one), so there is
-/// nothing to compare a timestamp against. `id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, which is
-/// the property that makes it usable as a clock here: AUTOINCREMENT keeps `sqlite_sequence`, so an
-/// id is never reused even after the rows carrying it are deleted, and a sweep therefore cannot
-/// walk the watermark backwards into re-deleting the keys published after it.
+/// Retention window for CONSUMED one-time prekeys, counted in `one_time_prekeys.id` rather than
+/// seconds: the table has no `created_at` and never had one. `id` is AUTOINCREMENT, so an id is
+/// never reused and a sweep cannot walk the watermark backwards into keys published after it.
 ///
-/// # A consumed row is not garbage — it is the ledger that keeps a one-time key one-time
+/// A consumed row is not garbage — it is the ledger that keeps a one-time key one-time.
+/// `replenish` appends under `INSERT OR IGNORE` against `UNIQUE (user_id, device_id, prekey_id)`
+/// with `prekey_id` derived from the public key, so republishing a key the server holds is a
+/// silent no-op, and that no-op is what stops a key being handed out twice. Delete the consumed
+/// row and the IGNORE has nothing to collide with: the key comes back `consumed = 0` and
+/// `keys/bundle` can hand a spent key to a second peer. So the window asks "how far past a spent
+/// key can a device still be before republishing it is implausible", not "when is this stale".
+/// The only realistic republish is a device rewound to before it marked those keys published (the
+/// identity-restore case in `replenish`); everything else republishes UNCONSUMED keys, which are
+/// never touched here.
 ///
-/// This is the constraint that sets the size. `keys/handlers.rs::replenish` APPENDS under
-/// `INSERT OR IGNORE` against `UNIQUE (user_id, device_id, prekey_id)`, and `prekey_id` is derived
-/// from the public key itself, so re-publishing a key the server already holds is a silent no-op.
-/// That no-op is what stops a key being handed out twice; `devices/handlers.rs` says it in as many
-/// words where it deletes a removed device's UNCONSUMED keys — "consumed=1 rows STAY: they are the
-/// record that stops a key ever being issued twice."
-///
-/// Deleting a consumed row deletes that record. Republish the same `prekey_id` afterwards and the
-/// IGNORE has nothing to collide with: the row comes back with `consumed = 0`, and `keys/bundle`
-/// can hand a second peer a one-time key that was already spent. So the window is not "how long
-/// before this is stale" — it is "how far past a spent key a device can still be before a
-/// republish of it becomes implausible".
-///
-/// The only realistic republish is a device whose local store was rewound to before it marked
-/// those keys published — the identity-restore case `replenish` already documents as the honest
-/// cost of dropping its DELETE. Everything else (a retry, an attach-replenish, a reconnect)
-/// republishes keys that are still UNCONSUMED, and unconsumed rows are never touched here.
-///
-/// # 100,000, against what evidence
-///
-/// The live relay's whole `one_time_prekeys` table was measured at 648 rows on 2026-07-29 (the row
-/// totals in `replenish`'s task-#59 note: 648 → 626). The window is ~150× that entire table, so on
-/// a server of that size the sweep never fires at all — which is the intent. It only becomes
-/// reachable on a server that has published a hundred thousand one-time keys, and at that point the
-/// oldest tombstone is a hundred thousand keys behind the newest.
-///
-/// It is also 66× the largest unconsumed pool a single ACCOUNT can hold at once (`MAX_DEVICES` = 5
-/// devices × `MAX_OTK_POOL` = 300 keys each) and 1,000× the client's `otk_pool_target` of 100. In
-/// bytes it is the ceiling this table has never had: ~100 B of payload per row plus index, so on
-/// the order of 20 MB, where before it was unbounded.
-///
-/// ⚠ `MAX_OTK_POOL` is private to `keys/handlers.rs`, so the ratio above is a documented
-/// cross-reference and not a compile-time one. Making it `pub(crate)` would let this file assert
-/// the relationship the way the cron thresholds below assert theirs.
+/// 100,000 is ~150× the live relay's entire table as measured (648 rows), so the sweep does not
+/// fire at all at that size — the intent. It is also 66× the largest unconsumed pool one account
+/// can hold (`MAX_DEVICES` × `MAX_OTK_POOL`) and 1,000× the client's `otk_pool_target`, i.e. a
+/// ~20 MB ceiling on a table that had none. ⚠ `MAX_OTK_POOL` is private to `keys/handlers.rs`, so
+/// that ratio is documented rather than asserted; making it `pub(crate)` would fix that.
 const OTK_CONSUMED_RETAIN_IDS: i64 = 100_000;
 
-/// Per-run bound on the sweep. This is a cron path, so the work has to be a known quantity rather
-/// than "whatever the backlog happens to be".
-///
-/// Twenty times the media and contact-QR limits in this same function, because it is a different
-/// kind of work: those iterate rows to make a network call each (an R2 delete), this is one D1
-/// statement with no per-row I/O. Draining a full retention window still takes ten daily passes,
-/// which is the point of the assert below — a mis-set window cannot empty the ledger in one run.
+/// Per-run bound on the sweep — a cron path needs a known quantity of work, not "whatever the
+/// backlog happens to be". Twenty times the media and contact-QR limits below because it is one
+/// D1 statement with no per-row I/O, where those make a network call per row.
 const OTK_SWEEP_LIMIT: i64 = 10_000;
 
-// Compile-time contract lock, the twin of the cron-threshold asserts above: one pass must never be
-// able to consume a whole retention window. If someone shrinks the window to tune D1 size, this
-// stops the ledger being wiped in a single night as a side effect.
+// Contract lock: one pass must never consume a whole retention window, so shrinking the window to
+// tune D1 size cannot wipe the ledger in a single night as a side effect.
 const _: () = assert!(OTK_CONSUMED_RETAIN_IDS >= 10 * OTK_SWEEP_LIMIT);
 
-/// Sweep consumed one-time prekeys that are more than `OTK_CONSUMED_RETAIN_IDS` behind the newest
-/// key in the table. Binds: retain window, per-run limit.
+/// Sweep consumed one-time prekeys more than `OTK_CONSUMED_RETAIN_IDS` behind the newest key.
+/// Binds: retain window, per-run limit. `consumed = 1` is the whole filter beyond the window —
+/// an unconsumed row is live stock, and `devices/handlers.rs` is the only place that may remove one.
 ///
-/// `consumed = 1` is the whole filter beyond the window: an UNCONSUMED row is live stock a peer can
-/// still be handed, and `devices/handlers.rs` is the only place that may remove one.
+/// The watermark is an inline `MAX(id)`, and both ways it can be wrong are safe: an EMPTY table
+/// gives NULL, so `id <= NULL` matches nothing rather than everything, and a watermark that
+/// REGRESSES (an account deletion took the newest rows) only lowers the cutoff. This statement
+/// cannot lower it itself — a row at `MAX(id)` cannot also be at or below `MAX(id) - 100000`.
 ///
-/// The watermark is `MAX(id)` read inline rather than a stored high-water mark, and the two ways
-/// that can be wrong are both safe. An EMPTY table gives `MAX(id) = NULL`, `NULL - ?` is NULL, and
-/// `id <= NULL` is NULL for every row — the statement deletes nothing instead of everything. A
-/// watermark that REGRESSES (an account deletion took the newest rows with it, `membership.rs`
-/// deletes by `user_id`) lowers the cutoff, so fewer rows qualify. This statement can never lower
-/// it itself: a row at `MAX(id)` cannot also be at or below `MAX(id) - 100000`.
-///
-/// `id` is the rowid, so `id <= cutoff` is a rowid range scan that stops at the cutoff and never
-/// walks the live tail. `LIMIT` inside the `IN (SELECT …)` rather than on the DELETE is the shape
-/// the contact-QR statements above already use; SQLite only accepts `DELETE … LIMIT` when built
-/// with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`, which is not a thing to depend on across D1 and the
-/// rusqlite tests both.
+/// `LIMIT` sits inside the `IN (SELECT …)`, as in the contact-QR statements: SQLite only accepts
+/// `DELETE … LIMIT` when built with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`, which neither D1 nor the
+/// rusqlite tests can be assumed to have.
 pub(crate) const OTK_CONSUMED_CLEANUP_SQL: &str = "DELETE FROM one_time_prekeys
       WHERE id IN (
         SELECT id FROM one_time_prekeys
@@ -546,12 +470,11 @@ pub(crate) const CONTACT_QR_OFFER_CLEANUP_SQL: &str = "DELETE FROM contact_qr_of
          WHERE expires_at_ms < ? LIMIT 500
       )";
 
-/// Sweep up expired leftovers (moved here from lib.rs verbatim; behavior unchanged).
-/// Media is already deleted the moment the recipient acks, so the media leg here is the
-/// fallback for "nobody ever fetched it and the retention window elapsed" — that window is
-/// `server_settings.retention_days`, which defaults to 30. The remaining legs keep D1 from
-/// growing: expired invite_tokens, verification_codes, refresh_tokens, device-link requests
-/// and contact-QR records.
+/// Sweep up expired leftovers. Media is already deleted the moment the recipient acks, so
+/// the media leg here is the fallback for "nobody ever fetched it and
+/// `server_settings.retention_days` elapsed". The rest keeps D1 from growing: expired
+/// invite_tokens, verification_codes, refresh_tokens, device-link requests, contact-QR
+/// records and consumed one-time prekeys.
 async fn cleanup_expired(env: &Env) -> Result<()> {
     let now = now_secs() as i64;
     let db = env.d1("DB")?;
@@ -565,17 +488,15 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         .results()?;
 
     if !rows.is_empty() {
-        // Delete per backend through the single choke point (StorageRouter). On a lite
-        // deployment (no R2 binding) any_available() is false → the blob delete is SKIPPED
-        // but the D1 metadata delete and the counter decrement still HAPPEN; otherwise
-        // cleanup would Err on every run and the LATER cleanup steps (invite/verification
-        // GC) would never be reached.
-        // PHASE 3 (plan f#4): a blob that cannot be deleted becomes a `storage_orphans`
-        // tombstone — the D1 metadata is STILL deleted so cleanup keeps flowing — and the
-        // daily `retry_orphans` tries again, so an orphan blob does not become permanent on
-        // an external backend. router.delete does NOT write health marks on the BULK path
-        // (≤500 rows × a write each would bloat it), so instead we write ONE aggregated mark
-        // per failing backend here.
+        // Deletes go per backend through the single choke point (StorageRouter). On a lite
+        // deployment (no R2 binding) any_available() is false, so the blob delete is
+        // skipped while the D1 metadata delete and counter decrement still happen —
+        // otherwise cleanup would Err every run and the legs below it would never be
+        // reached. A blob that cannot be deleted becomes a `storage_orphans` tombstone (the
+        // D1 metadata still goes) for the daily `retry_orphans`, so it does not become a
+        // permanent orphan on an external backend. router.delete writes no health marks on
+        // this bulk path (≤500 rows × a write each would bloat it), hence one aggregated
+        // mark per failing backend below.
         let router = crate::storage::StorageRouter::from_env(env).await?;
         let mut orphans: Vec<(String, String, i64)> = Vec::new(); // (store_id, key, size)
         if router.any_available() {
@@ -588,7 +509,6 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         }
         if !orphans.is_empty() {
             crate::storage::maint::insert_orphans(&db, &orphans).await;
-            // ONE health mark per failing backend (aggregated; no batch bloat).
             let mut marked: Vec<&str> = Vec::new();
             for (sid, _, _) in &orphans {
                 if !marked.contains(&sid.as_str()) {
@@ -606,9 +526,8 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         let binds: Vec<JsValue> = rows.iter().map(|r| JsValue::from_str(&r.blob_id)).collect();
         db.prepare(&sql).bind(&binds)?.run().await?;
         console_log!("cleanup: {} expired media blobs removed", rows.len());
-        // Quota phase 0 (SHADOW, best-effort): subtract the expired-and-deleted media from
-        // the storage counters (clamped at 0; an error does not break cleanup, and the daily
-        // reconcile repairs it).
+        // Best-effort: subtract the deleted media from the storage counters (clamped at 0).
+        // An error does not break cleanup, and the daily reconcile repairs it.
         let removed: Vec<(String, i64)> = rows
             .iter()
             .map(|r| (r.uploader_id.clone(), r.size_bytes))
@@ -651,9 +570,8 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         .run()
         .await?;
 
-    // 5) expired device-link requests (M2-S3.2; consuming one already deletes the row, so
-    //    a 'consumed' state is never persisted — lazy GC plus this sweep collect the
-    //    expired ones)
+    // 5) expired device-link requests (consuming one already deletes the row, so a
+    //    'consumed' state is never persisted; this sweep collects the expired ones)
     db.prepare("DELETE FROM link_requests WHERE expires_at < ?")
         .bind(&[d1_int(now)])?
         .run()
@@ -675,20 +593,11 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
         .run()
         .await?;
 
-    // 7) Consumed one-time prekeys older than the retention window. Until now nothing anywhere
-    // deleted them: `keys/bundle` turns one unconsumed row into a consumed one on every fetch by
-    // any authorized contact, `replenish` puts the replacement in, and the spent row stayed
-    // forever. `MAX_OTK_POOL` bounds the UNCONSUMED pool per device and says so; the consumed side
-    // had no ceiling at all.
-    //
-    // A leg of the daily GC rather than a fourth maintenance stamp. The cadence wanted is exactly
-    // the daily one — a window measured in a hundred thousand keys does not need a 2-minute tick —
-    // and this function is already the place whose job is "keep D1 from growing", already claimed
-    // by the daily winner-claim and already idempotent leg by leg. A separate stamp would buy a
-    // cadence nothing needs and a second thing to keep fresh.
-    //
-    // Last on purpose, so that a failure here cannot skip a leg above it. `?` still propagates:
-    // `run_daily` logs and carries on to the rest of the daily set.
+    // 7) Consumed one-time prekeys past the retention window. `MAX_OTK_POOL` bounds the
+    // unconsumed pool per device; the consumed side had no ceiling at all. A leg of the daily GC
+    // rather than a fourth maintenance stamp: a window measured in a hundred thousand keys does
+    // not need a 2-minute tick. Last on purpose, so a failure here cannot skip a leg above it —
+    // `?` still propagates and `run_daily` carries on to the rest of the daily set.
     let swept = db
         .prepare(OTK_CONSUMED_CLEANUP_SQL)
         .bind(&[d1_int(OTK_CONSUMED_RETAIN_IDS), d1_int(OTK_SWEEP_LIMIT)])?
@@ -720,9 +629,8 @@ fn parse_stamp(v: Option<&str>) -> i64 {
 }
 
 /// Has the stamp crossed the threshold? A stamp in the future (clock skew) is NOT due —
-/// saturating arithmetic treats the negative difference as 0. A bogus future stamp cannot
-/// lock things up forever, because every successful cron/lazy run pulls the stamp back to
-/// now.
+/// saturating arithmetic treats the negative difference as 0 — and cannot lock things up
+/// forever, because every successful run pulls the stamp back to now.
 fn is_due(now: i64, stamp_at: i64, after: i64) -> bool {
     now.saturating_sub(stamp_at) >= after
 }
@@ -734,8 +642,7 @@ fn throttle_due(last: u64, now: u64, every: u64) -> bool {
     last == 0 || now.saturating_sub(last) >= every
 }
 
-/// The pure-helper and SQL exercises for this module. Split out because `maintenance.rs` was
-/// about to cross the 800-line ceiling; `keys/handlers.rs` is the worked example of the move.
+/// The pure-helper and SQL exercises for this module.
 #[cfg(test)]
 #[path = "maintenance_tests.rs"]
 mod tests;

@@ -13,7 +13,7 @@
 //! admin-only (to close the "overwrite legit code" DoS); MEDIA is user data → member PUT.
 //!
 //! The server is BLIND: request and response bodies are opaque ciphertext (the client encrypts
-//! end-to-end; the key travels on the group channel). Meta lives in `plugin_media_objects` (0026),
+//! end-to-end; the key travels on the group channel). Meta lives in `plugin_media_objects`,
 //! SEPARATE from `media_objects`: it has no `expires_at` (persistent, and the daily cleanup cron
 //! never touches this table) → the quota reconcile sums both tables (see
 //! `usage::reconcile_storage`).
@@ -41,9 +41,9 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    // Lite install (R2 is OPTIONAL): with no binding, answer a clean 503 (symmetric with
-    // media/plugin_blob; the client treats it as nonretryable). AFTER the authorization gate,
-    // BEFORE the rate limit and the body read.
+    // R2 is OPTIONAL: with no binding, answer a clean 503 (symmetric with media/plugin_blob;
+    // the client treats it as nonretryable). AFTER the authorization gate, BEFORE the rate
+    // limit and the body read.
     let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
@@ -74,10 +74,10 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     if let Some(existing) = existing_size(&db, &room_id, &blob_id).await? {
         return Response::from_json(&serde_json::json!({ "id": blob_id, "size": existing }));
     }
-    // Quota Faz-1a (ENFORCEMENT): the SAME check_upload as `media` (server_stats + user_storage vs
-    // the owner's caps). FAIL-OPEN: if a cap or counter cannot be read, nothing is rejected; a NULL
-    // cap means unlimited. Runs BEFORE the body is buffered — no point holding 50 MiB we are about
-    // to reject.
+    // Quota ENFORCEMENT: the SAME check_upload as `media` (server_stats + user_storage vs the
+    // owner's caps). FAIL-OPEN: if a cap or counter cannot be read, nothing is rejected; a NULL
+    // cap means unlimited. Runs BEFORE the body is buffered — no point holding 50 MiB we are
+    // about to reject.
     if let Some(scope) = crate::quota::check_upload(&db, &user_id, size as i64).await {
         let resp = Response::from_json(&serde_json::json!({ "error": "quota_exceeded", "scope": scope }))?;
         return Ok(resp.with_status(429));
@@ -92,10 +92,10 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // so a phantom meta row left behind by a failed PUT would mean permanent quota inflation plus a
     // GET that 404s. Hence meta is written only after a successful put_new → no phantom meta can
     // exist; a failed meta write self-heals on the client's retry (R2 overwrite is idempotent and
-    // the meta INSERT simply runs again). put_new returns the store_id it wrote to (Faz 1 single
-    // backend: 'r2-primary'). FAZ 3: priority overflow + per-backend max_bytes + PUT fallback
-    // (degraded write). This is a persistent class, so a full backend gives 429
-    // quota_exceeded/server_storage and "every attempt failed the PUT" gives 503.
+    // the meta INSERT simply runs again). put_new returns the store_id it wrote to, applying
+    // priority overflow, per-backend max_bytes and PUT fallback. This is a persistent class, so a
+    // full backend gives 429 quota_exceeded/server_storage and "every attempt failed the PUT"
+    // gives 503.
     let store_id = match router
         .put_new(
             crate::storage::StorageClass::PluginMedia,
@@ -113,8 +113,8 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // concurrent PUTs — even if both passed the existence check — one loses, so nothing is counted
     // twice.
     if insert_meta(&db, &room_id, &blob_id, &user_id, size as i64, &store_id).await? {
-        // Quota Faz-0 (SHADOW) + Faz-1c (COUNTING ONLY): the SAME counters as media. BEST-EFFORT —
-        // a counter failure does NOT break the upload, and the daily reconcile repairs the drift.
+        // The SAME counters as media. BEST-EFFORT — a counter failure does NOT break the
+        // upload, and the daily reconcile repairs the drift.
         crate::usage::media_added(&db, &user_id, size as i64).await;
         crate::usage::count_bump(&db, "upload_bytes", size as i64).await;
         crate::usage::count_bump(&db, "upload_count", 1).await;
@@ -130,7 +130,7 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    // Lite install: with no binding, the same 503 as put.
+    // With no binding, the same 503 as put.
     let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
@@ -139,17 +139,16 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("plugmedia:get:{user_id}"), 600, 5 * 60).await {
         return json_err(429, "rate_limited");
     }
-    // Faz 2 multi-backend: resolve the blob's backend from the meta row
-    // (plugin_media_objects.store_id). Migration 0028 gave that column a DEFAULT of 'r2-primary', so
-    // OLD rows are populated too, and put ALWAYS writes a store_id (this channel needs no backfill)
-    // → no meta row means the blob was never uploaded → 404.
+    // Resolve the blob's backend from the meta row (plugin_media_objects.store_id). The column
+    // has a DEFAULT, and put ALWAYS writes a store_id, so no meta row means the blob was never
+    // uploaded → 404.
     let db = ctx.env.d1("DB")?;
     let store_id = match media_store_id(&db, &room_id, &blob_id).await? {
         Some(s) => s,
         None => return json_err(404, "not_found"),
     };
-    // FAZ 3 (plan f#2): backend unreachable → 503 storage_backend_unavailable plus the router's
-    // opportunistic health mark; blob absent → 404.
+    // Backend unreachable → 503 storage_backend_unavailable plus the router's health mark;
+    // blob absent → 404.
     match router
         .get(
             &store_id,
@@ -159,9 +158,9 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     {
         Ok(Some(obj)) => {
             let bytes = obj.bytes;
-            // Quota Faz-1c (COUNTING ONLY): only a SUCCESSFUL download hits the daily counters, as
-            // with media. The bytes are already in hand (no extra query). BEST-EFFORT — a counter
-            // failure never breaks the download.
+            // Only a SUCCESSFUL download hits the daily counters, as with media. The bytes are
+            // already in hand (no extra query). BEST-EFFORT — a counter failure never breaks
+            // the download.
             let n = bytes.len() as i64;
             crate::usage::count_bump(&db, "download_count", 1).await;
             crate::usage::count_bump(&db, "download_bytes", n).await;
@@ -176,9 +175,9 @@ pub async fn get_media(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     }
 }
 
-/// The blob's backend (plugin_media_objects.store_id) — Faz 2 multi-backend GET resolution.
-/// No meta row → None (the blob was never uploaded → the caller 404s). On a single-backend install
-/// this is always 'r2-primary'.
+/// The blob's backend (plugin_media_objects.store_id), for GET resolution. No meta row → None
+/// (the blob was never uploaded → the caller 404s). On a single-backend install this is always
+/// 'r2-primary'.
 async fn media_store_id(db: &D1Database, room_id: &str, blob_id: &str) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct StoreRow {

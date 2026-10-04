@@ -1,12 +1,12 @@
--- Sezgi: grup-sohbeti altyapısı (Faz 1 — üyelik).
+-- Sezgi: the group-chat substrate (membership).
 --
--- groups          : sunucu-içi grup/oda (kurucu = grup-owner).
--- group_members   : grup ALT-üyeliği — SUNUCU üyeliğinden (users) AYRI.
---                   Grup-içi rol (owner/admin/member) sunucu-rolünden bağımsız.
+-- groups          : a group/room inside the server (the creator = the group owner).
+-- group_members   : group SUB-membership — SEPARATE from SERVER membership (users).
+--                   The in-group role (owner/admin/member) is independent of the server role.
 --
--- E2E: sunucu grup İÇERİĞİNİ asla görmez (envelope opak); yalnız üyelik tutar +
--- (Faz 2) mesajı üyelerin DO inbox'larına fan-out eder. İçerik kriptosu Megolm
--- (client). Tek-sunucu kurulum → server_id kolonu YOK (users gibi).
+-- E2E: the server never sees group CONTENT (the envelope is opaque); it only holds membership
+-- and fans a message out to the members' DO inboxes. Content crypto is Megolm (client-side).
+-- A single-server install → there is NO server_id column (as with users).
 
 CREATE TABLE IF NOT EXISTS groups (
     id          TEXT PRIMARY KEY,                    -- UUID v4
@@ -24,5 +24,5 @@ CREATE TABLE IF NOT EXISTS group_members (
     PRIMARY KEY (group_id, user_id)
 );
 
--- "Üyesi olduğum gruplar" sorgusu (list_my_groups) için.
+-- For the "groups I am a member of" query (list_my_groups).
 CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);

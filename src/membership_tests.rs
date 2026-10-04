@@ -4,10 +4,138 @@
 //! `membership.rs` in `src/`, so the relative paths carry over untouched.
 
 use super::{
-    ADMIN_MEMBERSHIP_GUARD_SQL, INSERT_COUNTERPART_REVISIONS_SQL, PROMOTE_GROUP_SUCCESSORS_SQL,
-    SELF_MEMBERSHIP_GUARD_SQL, TRANSFER_CREATED_GROUPS_SQL, UPSERT_COUNTERPART_TOMBSTONES_SQL,
+    ADMIN_MEMBERSHIP_GUARD_SQL, DELETE_UNUSED_INVITES_SQL, DETACH_SPENT_INVITES_SQL,
+    INSERT_COUNTERPART_REVISIONS_SQL, PROMOTE_GROUP_SUCCESSORS_SQL, SELF_MEMBERSHIP_GUARD_SQL,
+    TRANSFER_CREATED_GROUPS_SQL, UPSERT_COUNTERPART_TOMBSTONES_SQL,
 };
 use rusqlite::{params, Connection};
+
+/// An admin with two unused invites and one used one, on a schema carrying the real genesis and
+/// one-owner indexes (0018) and the attribution ledger (0031). Foreign keys on, as on D1.
+fn admin_with_invites() -> Connection {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE users(id TEXT PRIMARY KEY,role TEXT NOT NULL,created_at INTEGER NOT NULL);
+         CREATE TABLE invite_tokens(
+           token TEXT PRIMARY KEY,used INTEGER NOT NULL DEFAULT 0,
+           used_by TEXT REFERENCES users(id),owner_user_id TEXT REFERENCES users(id),
+           expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL);
+         CREATE TABLE verification_codes(
+           email TEXT PRIMARY KEY,invite_token TEXT,expires_at INTEGER NOT NULL);
+         INSERT INTO users VALUES('owner','owner',1),('adm','admin',2),('joiner','member',3);",
+    )
+    .unwrap();
+    db.execute_batch(include_str!("../migrations/0018_one_owner.sql"))
+        .unwrap();
+    db.execute_batch(include_str!("../migrations/0031_invite_attributions.sql"))
+        .unwrap();
+    db.execute(
+        "INSERT INTO invite_tokens(token,used,used_by,owner_user_id,expires_at,created_at)
+         VALUES('unused-1',0,NULL,'adm',99,10),('unused-2',0,NULL,'adm',99,11),
+               ('spent',1,'joiner','adm',99,12)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO invite_attributions
+           (invite_token_hash,inviter_user_id,used_by,created_at,expires_at,redeemed_at,verified_at)
+         VALUES(?1,'adm','joiner',12,99,13,14)",
+        ["a".repeat(64)],
+    )
+    .unwrap();
+    db
+}
+
+/// The removal batch's invite statements, in the batch's order, then the account row itself, in
+/// one transaction — the shape of the D1 batch, where any failure rolls everything back.
+fn remove_admin(db: &mut Connection) -> rusqlite::Result<()> {
+    let tx = db.transaction()?;
+    tx.execute("UPDATE invite_attributions SET used_by=NULL WHERE used_by=?1", ["adm"])?;
+    tx.execute(
+        "UPDATE invite_attributions SET inviter_user_id=NULL WHERE inviter_user_id=?1",
+        ["adm"],
+    )?;
+    tx.execute("UPDATE invite_tokens SET used_by=NULL WHERE used_by=?1", ["adm"])?;
+    tx.execute(DELETE_UNUSED_INVITES_SQL, ["adm"])?;
+    tx.execute(DETACH_SPENT_INVITES_SQL, ["adm"])?;
+    tx.execute("DELETE FROM users WHERE id=?1", ["adm"])?;
+    tx.commit()
+}
+
+/// The fault as it was: orphaning both unused invites makes two minter-less `used = 0` rows, which
+/// `idx_one_genesis_invite` refuses — and in the real batch that refusal undid the whole removal.
+#[test]
+fn orphaning_two_unused_invites_is_what_broke_the_removal() {
+    let db = admin_with_invites();
+    let error = db
+        .execute(
+            "UPDATE invite_tokens SET owner_user_id=NULL WHERE owner_user_id=?1",
+            ["adm"],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("UNIQUE"), "{error}");
+}
+
+#[test]
+fn removing_an_admin_deletes_their_unused_invites_and_keeps_the_used_ones_history() {
+    let mut db = admin_with_invites();
+    remove_admin(&mut db).expect("the removal must commit with two unused invites outstanding");
+
+    let tokens: Vec<(String, i64, Option<String>, Option<String>)> = db
+        .prepare("SELECT token,used,used_by,owner_user_id FROM invite_tokens ORDER BY token")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        tokens,
+        vec![("spent".to_string(), 1, Some("joiner".to_string()), None)],
+        "both unused tokens are gone; the used one stays, detached from its departed minter"
+    );
+
+    let ledger: (Option<String>, String, i64) = db
+        .query_row(
+            "SELECT inviter_user_id,used_by,verified_at FROM invite_attributions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        ledger,
+        (None, "joiner".to_string(), 14),
+        "the used invite's attribution — who joined through it, and when — survives"
+    );
+
+    // Nothing the removal left behind occupies the genesis slot, so a server that later needs one
+    // can still mint it.
+    db.execute(
+        "INSERT INTO invite_tokens(token,used,used_by,owner_user_id,expires_at,created_at)
+         VALUES('genesis',0,NULL,NULL,99,20)",
+        [],
+    )
+    .expect("the genesis index is still free");
+}
+
+/// The order is the property: detaching first turns the unused rows minter-less before they are
+/// deleted, which is the index violation all over again. Pinned at source level because the SQL
+/// test above replays the order rather than reading it from `delete_membership`.
+#[test]
+fn the_removal_deletes_unused_invites_before_it_detaches_the_rest() {
+    let src = include_str!("membership.rs");
+    let delete = src
+        .find("db.prepare(DELETE_UNUSED_INVITES_SQL)")
+        .expect("the removal no longer deletes the departing member's unused invites");
+    let detach = src
+        .find("db.prepare(DETACH_SPENT_INVITES_SQL)")
+        .expect("the removal no longer detaches the departing member's used invites");
+    let account = src
+        .find("\"DELETE FROM users WHERE id=?\"")
+        .expect("the account delete moved — re-point this guard");
+    assert!(delete < detach, "unused invites must be gone before the rest are detached");
+    assert!(detach < account, "the foreign key needs the detach before the account row goes");
+}
 
 #[test]
 fn transaction_guard_rejects_owner_or_missing_target() {

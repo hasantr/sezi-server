@@ -1,20 +1,20 @@
--- Sezgi: çoklu-cihaz adresleme (M1 — cihaz kimliği + imzalı liste).
+-- Sezgi: multi-device addressing (device identity + the signed list).
 --
--- WhatsApp-yıldız modeli: 1 birincil (primary, güven kökü) + ≤4 bağlı (linked).
--- Her cihaz KENDİ Olm Account'unu çalıştırır; özel anahtar cihazlar arasında
--- ASLA taşınmaz. Cihaz-listesi BİRİNCİL cihazın Ed25519'u ile imzalıdır →
--- server listeyi SAKLAR/DAĞITIR ama ÜRETEMEZ/DEĞİŞTİREMEZ (sıfır-güven;
--- enjekte cihaz imza doğrulamasından geçemez). Asıl doğrulama client'ta,
--- buradaki kontroller savunma-derinliği.
+-- A WhatsApp-style star: 1 primary (the root of trust) + up to 4 linked devices.
+-- Every device runs its OWN Olm Account; a private key is NEVER carried between devices.
+-- The device list is signed with the PRIMARY device's Ed25519 → the server STORES and
+-- DISTRIBUTES the list but can NEITHER PRODUCE NOR ALTER it (zero trust; an injected device
+-- cannot pass signature verification). The real verification happens on the client; the
+-- checks here are defence in depth.
 --
--- devices       : (user_id, device_id) düzeyinde cihaz kaydı; imzalı listenin
---                 server-tarafı izdüşümü. revoked_at NULL = aktif.
--- device_lists  : kullanıcı-başına kanonik imzalı doküman (verbatim JSON + imza).
---                 doc_json JWS-modeli: imza, üretilen JSON string'inin AYNEN o
---                 baytları üzerinde → asla yeniden serileştirilmez.
+-- devices       : the device record at (user_id, device_id) level; the server-side
+--                 projection of the signed list. revoked_at NULL = active.
+-- device_lists  : the canonical signed document per user (verbatim JSON + signature).
+--                 doc_json follows the JWS model: the signature covers EXACTLY the bytes of
+--                 the JSON string that was produced → it is never re-serialised.
 --
--- Link/QR tabloları M2'de (bağlı cihaz akışı). Bu migration tamamen additive;
--- mevcut mesaj/auth/DO yolları DEĞİŞMEZ.
+-- The link/QR tables come with the linked-device flow. This migration is entirely additive;
+-- the existing message/auth/DO paths are UNCHANGED.
 
 CREATE TABLE IF NOT EXISTS devices (
     user_id     TEXT NOT NULL,
@@ -24,14 +24,14 @@ CREATE TABLE IF NOT EXISTS devices (
     x_pub       BLOB NOT NULL,
     label       TEXT,
     added_at    INTEGER NOT NULL,
-    revoked_at  INTEGER,                -- NULL = aktif
+    revoked_at  INTEGER,                -- NULL = active
     PRIMARY KEY (user_id, device_id)
 );
 
 CREATE TABLE IF NOT EXISTS device_lists (
     user_id     TEXT PRIMARY KEY,
-    rev         INTEGER NOT NULL,       -- kesin artan (rollback koruması)
-    doc_json    TEXT NOT NULL,          -- verbatim imzalı doküman (JWS baytları)
+    rev         INTEGER NOT NULL,       -- strictly increasing (rollback protection)
+    doc_json    TEXT NOT NULL,          -- the verbatim signed document (the JWS bytes)
     sig_b64     TEXT NOT NULL,          -- primary.sign(doc_json_utf8_bytes)
     updated_at  INTEGER NOT NULL
 );

@@ -1,30 +1,27 @@
-//! Drain/move engine (Phase 4, plan c.4 "MOVE") — moves the blobs of a `draining`
-//! backend onto the remaining active ones; when its inventory reaches 0 the backend is
-//! flipped to `disabled` automatically.
+//! Drain/move engine — moves the blobs of a `draining` backend onto the remaining active
+//! ones; when its inventory reaches 0 the backend is flipped to `disabled` automatically.
 //!
 //! RUN PATHS: the 2-minute cron (`lib.rs scheduled`, every invocation) plus the
 //! lazy-maintenance piggyback (`maintenance.rs`, claim key `maint_storage_move_at`).
 //! At most `MOVE_BATCH` blobs per run — free-plan subrequest budget: ~5 calls per blob
-//! (GET+PUT+2×D1+DELETE) → 4 blobs ≈ 20, safely inside the limit (plan c.4). Idempotent
-//! per blob: if a run dies halfway the next one picks up where it stopped, because a blob
-//! whose meta row still points at the source stays a candidate.
+//! (GET+PUT+2×D1+DELETE) → 4 blobs ≈ 20, safely inside the limit. Idempotent per blob: if
+//! a run dies halfway the next one picks up where it stopped, because a blob whose meta
+//! row still points at the source stays a candidate.
 //!
 //! GUARANTEES:
-//! - **Race protection (plan f#8):** the meta update is CONDITIONAL
-//!   (`... AND store_id=<source>` + RETURNING). 0 rows = ack/TTL deleted the blob
-//!   meanwhile → the copy already written to the target becomes a `storage_orphans`
-//!   tombstone (the daily retry removes it) → a double copy / double accounting is
-//!   impossible. 0 rows has a SECOND possible cause (a concurrent run moved it to the
-//!   same target, or the UPDATE hit a transient error), so before orphaning we check
-//!   where the meta row points RIGHT NOW (`race_action`): meta == target → our copy is
-//!   the canonical one, LEAVE IT ALONE (a wrong orphan tombstones the canonical blob =
-//!   data loss; the fail-safe direction is to not orphan).
-//! - **Source backend dies (plan f#7):** get-Err → skip the blob (the remaining counter
-//!   does not drop, so the panel shows "drain stuck" via `draining_remaining`); the next
-//!   run resumes once the backend is back.
-//! - **Reads never break (plan c.4):** a blob is read from whatever backend its meta row
-//!   names (the router loads draining/disabled backends too) → the old backend until it
-//!   moves, the new one afterwards; no 404 window anywhere in the drain.
+//! - **Race protection:** the meta update is CONDITIONAL (`... AND store_id=<source>` +
+//!   RETURNING), so a double copy / double accounting is impossible. 0 rows has more than
+//!   one cause — ack/TTL deleted the blob meanwhile, a concurrent run moved it, or the
+//!   UPDATE hit a transient error — so before orphaning the target copy we check where the
+//!   meta row points RIGHT NOW (`race_action`): meta == target → our copy is the canonical
+//!   one, LEAVE IT ALONE. A wrong orphan tombstones the canonical blob, which is data loss;
+//!   the fail-safe direction is to not orphan.
+//! - **Source backend dies:** get-Err → skip the blob (the remaining counter does not drop,
+//!   so the panel shows "drain stuck" via `draining_remaining`); the next run resumes once
+//!   the backend is back.
+//! - **Reads never break:** a blob is read from whatever backend its meta row names (the
+//!   router loads draining/disabled backends too) → the old backend until it moves, the new
+//!   one afterwards; no 404 window anywhere in the drain.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -37,7 +34,7 @@ use super::{invalidate_storage_cache, write_health, StorageClass, StorageRouter}
 use crate::d1util::{d1_int, d1_text};
 use crate::utils::now_secs;
 
-/// Max blobs moved per run (plan c.4 free-plan subrequest budget).
+/// Max blobs moved per run — the free-plan subrequest budget.
 const MOVE_BATCH: usize = 4;
 
 /// A move candidate coming from the 3-way meta-table UNION (`candidates_sql`).
@@ -94,8 +91,8 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
                 }
                 MoveOutcome::Skipped => {}
                 // No placement left (remaining backends full/closed): the rest of the batch
-                // would hit the same wall → stop; the next run retries (with the remaining
-                // counter frozen the panel shows "drain stuck" — same as plan f#7).
+                // would hit the same wall → stop; the next run retries, and the frozen
+                // remaining counter shows the panel "drain stuck".
                 MoveOutcome::NoTarget => break,
             }
         }
@@ -105,8 +102,8 @@ pub(crate) async fn run_storage_move(env: &Env) -> Result<()> {
         }
     }
 
-    // Completion check (plan c.4 "kalan 0"): a draining backend whose inventory ran empty
-    // is flipped to `disabled` and gets a final health note. The UPDATE is conditional
+    // Completion check: a draining backend whose inventory ran empty is flipped to
+    // `disabled` and gets a final health note. The UPDATE is conditional
     // (`AND state='draining'`) so an owner PATCH that changed the state meanwhile wins.
     let remaining = remaining_counts(&db, &ids).await?;
     let now = now_secs() as i64;
@@ -176,8 +173,8 @@ async fn move_one(db: &D1Database, router: &StorageRouter, row: &MoveRow) -> Mov
     let Some((key, class)) = key_and_class(&row.chan, &row.room_id, &row.blob_id) else {
         return MoveOutcome::Skipped; // unknown channel (should not happen) — skip
     };
-    // 1. Read from the source. Err = backend down / resolve failure (plan f#7): skip the
-    //    blob (router.get already did the opportunistic health mark); resume when it is back.
+    // 1. Read from the source. Err = backend down / resolve failure: skip the blob
+    //    (router.get already marked health); resume when it is back.
     let obj = match router.get(&row.store_id, &key).await {
         Ok(Some(o)) => o,
         Ok(None) => {
@@ -206,8 +203,8 @@ async fn move_one(db: &D1Database, router: &StorageRouter, row: &MoveRow) -> Mov
         // just wrote would be data loss.
         return MoveOutcome::Skipped;
     }
-    // 3. Conditional meta-UPDATE (race protection, plan f#8): only a row that still points
-    //    at the source is updated.
+    // 3. Conditional meta-UPDATE (race protection): only a row that still points at the
+    //    source is updated.
     match after_copy(conditional_meta_update(db, row, &target).await) {
         AfterCopy::OrphanTargetCopy => {
             // 0 rows: either the meta was deleted (ack/TTL race), or a concurrent run moved
@@ -221,9 +218,9 @@ async fn move_one(db: &D1Database, router: &StorageRouter, row: &MoveRow) -> Mov
             MoveOutcome::Skipped
         }
         AfterCopy::DeleteSource => {
-            // 4. Delete from the source; if that fails, tombstone it (plan c.4) — the meta
-            //    already points at the target, so the leftover source copy is tracked as an
-            //    orphan and the move still counts as PROGRESS.
+            // 4. Delete from the source; if that fails, tombstone it — the meta already
+            //    points at the target, so the leftover source copy is tracked as an orphan
+            //    and the move still counts as PROGRESS.
             if router.delete(&row.store_id, &key).await.is_err() {
                 insert_orphans(db, &[(row.store_id.clone(), key.clone(), row.size_bytes)]).await;
             }
@@ -293,8 +290,8 @@ async fn meta_store_now(db: &D1Database, row: &MoveRow) -> MetaNow {
     }
 }
 
-/// Transfer the used_bytes/object_count counters (best-effort, plan c.4; drift is repaired
-/// by the daily reconcile). One `db.batch` = one subrequest; clamped at 0 (usage.rs rule).
+/// Transfer the used_bytes/object_count counters (best-effort; drift is repaired by the
+/// daily reconcile). One `db.batch` = one subrequest; clamped at 0 (usage.rs rule).
 async fn transfer_counters(db: &D1Database, moved: &[(String, String, i64)]) {
     let now = now_secs() as i64;
     let mut stmts: Vec<D1PreparedStatement> = Vec::new();
@@ -405,7 +402,7 @@ fn meta_select_sql(chan: &str) -> Option<&'static str> {
     }
 }
 
-/// Conditional-UPDATE result → what to do after the copy (PURE; plan f#8):
+/// Conditional-UPDATE result → what to do after the copy (PURE):
 /// 1 row = the meta now points at the target → delete the source;
 /// 0 rows = suspected race → the fate of the target copy is decided by `race_action`.
 #[derive(Debug, PartialEq)]
@@ -514,7 +511,7 @@ mod tests {
     use super::*;
 
     /// The candidate key/class mapping is bit-identical to the mod.rs key scheme
-    /// (a move is a copy, the key never changes — the precondition for Faz 4).
+    /// (a move is a copy, the key never changes — the precondition for draining).
     #[test]
     fn candidate_key_and_class_schema() {
         let (k, c) = key_and_class("media", "", "b1").unwrap();
@@ -534,7 +531,7 @@ mod tests {
     #[test]
     fn candidate_sql_placeholder_order_and_limit() {
         let sql = candidates_sql(2);
-        assert_eq!(sql.matches('?').count(), 6, "3 tablo × 2 id");
+        assert_eq!(sql.matches('?').count(), 6, "3 tables × 2 ids");
         assert!(sql.contains("ORDER BY created_at ASC"));
         assert!(sql.ends_with(&format!("LIMIT {MOVE_BATCH}")));
         assert!(sql.contains("FROM media_objects"));
@@ -568,7 +565,7 @@ mod tests {
         assert_eq!(after_copy(false), AfterCopy::OrphanTargetCopy);
     }
 
-    /// Race decision (plan f#8 + concurrent-run protection): meta gone → orphan; meta on a
+    /// Race decision: meta gone → orphan; meta on a
     /// different backend → orphan; meta == TARGET → canonical, LEAVE IT; D1 unreadable →
     /// fail-safe LEAVE IT (a wrong orphan is the data-loss direction).
     #[test]

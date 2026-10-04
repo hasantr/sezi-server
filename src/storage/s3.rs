@@ -1,23 +1,20 @@
-//! S3-compatible (SigV4) backend — **the real Faz 2 implementation** (2026-07-08).
+//! S3-compatible (SigV4) backend. One implementation unlocks the widest set of candidates:
+//! Backblaze B2 (the recommended option), a second R2 bucket via its S3 endpoint, MinIO/VPS,
+//! iDrive e2, Wasabi.
 //!
-//! One implementation unlocks the widest set of candidates: Backblaze B2 (the recommended
-//! option), a second R2 bucket (via its S3 endpoint), MinIO/VPS, iDrive e2, Wasabi. The v1
-//! decision in PLUGGABLE_STORAGE_PLAN.md (b).
-//!
-//! Signing core: `crate::sigv4` (verified end-to-end against MinIO in Faz 0):
+//! Signing core: `crate::sigv4`, verified end-to-end against MinIO.
 //!   - Body-hash signatures, NOT UNSIGNED-PAYLOAD — SHA-256 is cheap and both B2 and MinIO
 //!     accept it.
 //!   - The `Host` header is never SET — workerd derives it from the URL, and the signer signs
-//!     the authority from the same URL INCLUDING the port (see the Faz 0 workerd-fetch note),
-//!     so the signed host and the request host match exactly.
+//!     the authority from the same URL INCLUDING the port, so signed host and request host
+//!     match exactly.
 //!   - Only `authorization` / `x-amz-date` / `x-amz-content-sha256` are set (plus an optional
 //!     signed `x-amz-storage-class`); `content-type` is sent unsigned, which S3 tolerates
 //!     because it ignores unsigned headers.
 //!
-//! Adapter contract (BlobStore doc + conformance): delete is idempotent (204/404→Ok), a missing
-//! get is None (404→None), put is an idempotent overwrite. v1 is **path-style**
-//! (endpoint/bucket/key); `force_path_style=false` is accepted in the config but v1 always
-//! builds path-style URLs (required by MinIO, supported by B2) — virtual-hosted is Faz 6+.
+//! Adapter contract: delete is idempotent (204/404→Ok), a missing get is None (404→None), put
+//! is an idempotent overwrite. URLs are always **path-style** (endpoint/bucket/key) — required
+//! by MinIO, supported by B2; `force_path_style=false` is accepted in the config but ignored.
 
 use serde::{Deserialize, Serialize};
 use worker::*;
@@ -28,8 +25,8 @@ fn default_true() -> bool {
     true
 }
 
-/// Schema of `storage_backends.config_json` (plan c.2). CONTAINS a secret
-/// (`secret_access_key`) → WRITE-ONLY: no endpoint ever returns this struct.
+/// Schema of `storage_backends.config_json`. CONTAINS a secret (`secret_access_key`) →
+/// WRITE-ONLY: no endpoint ever returns this struct.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct S3Config {
     pub endpoint: String,
@@ -45,7 +42,7 @@ pub struct S3Config {
     pub storage_class: Option<String>,
 }
 
-/// S3-compatible backend (Faz 2). Built from `config_json`; signing via `crate::sigv4`.
+/// S3-compatible backend. Built from `config_json`; signing via `crate::sigv4`.
 pub struct S3Store {
     endpoint: String, // normalized: no trailing '/'
     region: String,
@@ -198,6 +195,43 @@ impl S3Store {
             .unwrap_or_else(|| "application/octet-stream".into());
         let bytes = resp.bytes().await?;
         Ok(Some(BlobObject { bytes, content_type }))
+    }
+
+    /// Read a blob as a STREAM (the big-object twin of `get`), starting at `offset` bytes;
+    /// missing (404) → None. The fetch body is handed on unread, so nothing is buffered here.
+    ///
+    /// `Range` travels UNSIGNED, like content-type: SigV4 only requires the host and the
+    /// `x-amz-*` headers in SignedHeaders, and S3 acts on an unsigned Range all the same. A
+    /// backend that IGNORED it would answer 200 with the whole object while we label the response
+    /// 206 with a content-range — a silently corrupt resume — so an offset request that does not
+    /// come back 206 is an error, not a fallback.
+    pub async fn get_stream(&self, key: &str, offset: u64) -> Result<Option<super::BlobStream>> {
+        let url = self.object_url(key);
+        let unsigned = if offset > 0 {
+            vec![("range".to_string(), format!("bytes={offset}-"))]
+        } else {
+            Vec::new()
+        };
+        let mut resp = self
+            .signed_request("GET", &url, None, &[], &unsigned)
+            .await?;
+        let code = resp.status_code();
+        if code == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&code) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::RustError(format!(
+                "s3 get_stream {code}: {}",
+                truncate(&body, 200)
+            )));
+        }
+        if offset > 0 && code != 206 {
+            return Err(Error::RustError(format!(
+                "s3 get_stream: range ignored (status {code})"
+            )));
+        }
+        Ok(Some(super::BlobStream::Pumped(resp.stream()?)))
     }
 
     /// Delete a blob — IDEMPOTENT: 2xx (S3 returns 204) OR 404 → Ok. A real failure (403/5xx) →

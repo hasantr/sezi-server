@@ -1,7 +1,9 @@
--- Kurtarma-sağlamlık K3 (FCM-wake storm-fix): recipient+device başına son-wake damgası.
--- wedge/burst'te N-undelivered-mesaj → 1-wake/pencere (~20sn). İçeriksiz-wake "uyan +
--- TÜM pending'i çek" semantiği taşıdığı için debounce KAYIPSIZ (bir wake hepsini drain eder).
--- Eksik tablo (migration uygulanmamış) → fcm.rs graceful: debounce-yok = eski davranış (kırılmaz).
+-- Recovery robustness (the FCM-wake storm fix): the last-wake stamp per recipient+device.
+-- During a wedge or a burst, N undelivered messages → one wake per window (~20s). A
+-- contentless wake carries "wake up and pull ALL pending", so the debounce is LOSSLESS — a
+-- single wake drains all of them.
+-- If the table is missing (the migration was never applied) fcm.rs degrades gracefully:
+-- no debounce = the old behaviour, nothing breaks.
 
 CREATE TABLE IF NOT EXISTS push_wake_debounce (
   user_id       TEXT NOT NULL,

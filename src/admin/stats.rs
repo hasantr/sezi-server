@@ -1,18 +1,15 @@
-//! `GET /admin/stats` — server usage statistics (quota epic **Faz 0**
-//! SHADOW-MODE, **Faz 1c** widening, **Faz 3** CF Analytics dual logic).
-//! An admin/owner-gated at-a-glance summary: member and invite counts, media
-//! storage (the server_stats counter), the advertised retention, monthly video
-//! call (TURN) usage and daily media volume. REPORTING ONLY — this endpoint
-//! enforces no limit.
+//! `GET /admin/stats` — server usage statistics. An admin/owner-gated at-a-glance
+//! summary: member and invite counts, media storage (the server_stats counter), the
+//! advertised retention, monthly video call (TURN) usage and daily media volume.
+//! REPORTING ONLY — this endpoint enforces no limit.
 //!
-//! Faz 3 dual logic: with CF_API_TOKEN installed, request counts come from CF
-//! GraphQL Analytics (billing-accurate, `authoritative:true`); without it, or on
-//! error, the self-report counters are used unchanged (`authoritative:false`, the
-//! VPS/standalone path). cf_analytics.rs fails open at every layer.
+//! Dual logic: with CF_API_TOKEN installed, request counts come from CF GraphQL
+//! Analytics (billing-accurate, `authoritative:true`); without it, or on error, the
+//! self-report counters are used (`authoritative:false`, the standalone path).
+//! cf_analytics.rs fails open at every layer.
 //!
-//! If the newer counter tables (0022/0009) have not been migrated yet, the reads
-//! fail open with 0 (the turn.rs counter-read pattern), so stats-lite always
-//! works.
+//! If the counter tables have not been migrated yet, the reads fail open with 0 (the
+//! turn.rs counter-read pattern), so a minimal install still answers.
 
 use crate::auth::middleware::{require_admin, require_active_auth};
 use crate::d1util::{d1_int, d1_text};
@@ -42,7 +39,7 @@ struct CapsRow {
     max_user_storage_bytes: Option<i64>,
 }
 
-/// Pluggable storage Faz 3 (v8) — compact store badge for `/admin/stats`.
+/// Compact store badge for `/admin/stats`.
 #[derive(Deserialize)]
 struct StorageSummaryRow {
     total: i64,
@@ -95,9 +92,8 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .map(|r| r.n)
         .unwrap_or(0);
 
-    // Media storage — the server_stats SHADOW counter (0022), fed by the
-    // upload/ack/cron hooks plus the daily reconcile. Missing table/row or an
-    // error → 0 (fail-open).
+    // Media storage — the server_stats counter, fed by the upload/ack/cron hooks plus
+    // the daily reconcile. Missing table/row or an error → 0 (fail-open).
     let media = db
         .prepare("SELECT media_bytes, media_count FROM server_stats WHERE id = 1 LIMIT 1")
         .first::<MediaStatsRow>(None)
@@ -113,38 +109,35 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let media_days = crate::server::handlers::fetch_retention_days(&ctx.env).await;
     let message_days = crate::server::handlers::fetch_message_retention_days(&ctx.env).await;
 
-    // Faz 3 — CF Analytics dual logic. `fetch` fails open: with no token/account
-    // (neither env nor D1 — VPS/standalone, or simply never entered) it returns
-    // None FAST without touching the CF network (today's behaviour, bit for bit);
-    // a CF error or parse failure logs a console_warn and returns None. None means
-    // "use the self-report branch"; stats NEVER 500s.
+    // CF Analytics dual logic. `fetch` fails open: with no token/account in either env
+    // or D1 it returns None FAST without touching the CF network; a CF error or parse
+    // failure logs a console_warn and returns None. None means "use the self-report
+    // branch"; stats NEVER 500s.
     let cf = crate::cf_analytics::fetch(&ctx.env).await;
 
-    // v6: cf_configured lets the owner UI know whether a token was entered (env
-    // secret OR the D1 value the owner typed in the app). WRITE-ONLY CONTRACT: the
-    // token VALUE is returned nowhere, this endpoint included — only this bool.
-    // `is_configured` is cheap (no CF network call; fails open to false). How it
-    // differs from `authoritative`: a token that is present but failing yields
-    // configured=true + authoritative=false, so the UI can say "connected but no
-    // data".
+    // cf_configured lets the owner UI know whether a token was entered (env secret OR
+    // the D1 value the owner typed in the app). WRITE-ONLY CONTRACT: the token VALUE is
+    // returned nowhere, this endpoint included — only this bool. `is_configured` is cheap
+    // (no CF network call; fails open to false). How it differs from `authoritative`: a
+    // token that is present but failing yields configured=true + authoritative=false, so
+    // the UI can say "connected but no data".
     let cf_configured = crate::cf_analytics::is_configured(&ctx.env).await;
 
-    // v7: fcm_configured tells the owner UI whether push can be delivered at all.
-    // CAREFUL — it is true when project-id AND service-account are both present
-    // (env, or the D1 values the owner typed in the app) OR when a push relay URL
-    // resolves, and the relay falls back to a built-in default unless explicitly
-    // `off`. So this is NOT proof that the owner installed their own FCM
-    // credentials. WRITE-ONLY CONTRACT (as with cf_configured): the values are
-    // returned nowhere, this endpoint included — only this bool. `is_configured`
-    // is cheap (no call to Google, presence check only; fails open to false).
+    // fcm_configured tells the owner UI whether push can be delivered at all. CAREFUL —
+    // it is true when project-id AND service-account are both present (env, or the D1
+    // values the owner typed in the app) OR when a push relay URL resolves, and the relay
+    // falls back to a built-in default unless explicitly `off`. So this is NOT proof that
+    // the owner installed their own FCM credentials. WRITE-ONLY, as with cf_configured:
+    // the values are returned nowhere, only this bool. Presence check only, no call to
+    // Google; fails open to false.
     let fcm_mode = crate::push::fcm::mode(&ctx.env).await;
     // Whether a TURN credential can be issued at all — the owner screen needs it to say
     // whether calls between DIFFERENT networks will connect. Write-only: the bool only.
     let turn_configured = crate::turn::is_configured(&ctx.env).await;
     let fcm_configured = fcm_mode.can_push();
-    // Does the server carry the means to wipe itself? The owner checklist needs this: without a
-    // reset key the one irreversible action an owner may legitimately want is unavailable, and the
-    // only way to find out used to be to try. Presence only — the key is returned nowhere.
+    // Does the server carry the means to wipe itself? The owner checklist needs this:
+    // without a reset key the one irreversible action an owner may legitimately want is
+    // unavailable. Presence only — the key is returned nowhere.
     let reset_key_configured = crate::admin::reset::reset_key_configured(&ctx.env).await;
 
     // requests_today — CF's billing-accurate number when available, otherwise the
@@ -158,19 +151,18 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .as_ref()
         .and_then(|c| c.requests_today)
         .unwrap_or(requests_today_self);
-    // requests_month — new in v4: only CF can supply it (there is no monthly
-    // self-report counter), so it is null without CF (the client treats it as an
-    // Option and renders '—').
+    // requests_month — only CF can supply it (there is no monthly self-report counter),
+    // so it is null without CF (the client treats it as an Option and renders '—').
     let requests_month = cf.as_ref().and_then(|c| c.requests_month);
     // R2 storage as measured by CF, reported ALONGSIDE the self-report
     // `media.bytes` (it never replaces it) so the two can be reconciled. Null
     // without CF.
     let storage_cf_bytes = cf.as_ref().and_then(|c| c.r2_storage_bytes);
 
-    // Video calls (TURN) — this month's credential-issue counter (the `turn_usage`
-    // table from 0009 that turn.rs's budget guard maintains) plus the advertised
-    // cap, read from the SAME source as the guard (turn::monthly_cap). Fail-open:
-    // missing table or D1 error → 0, so stats never 500s.
+    // Video calls (TURN) — this month's credential-issue counter (the `turn_usage` table
+    // that turn.rs's budget guard maintains) plus the advertised cap, read from the SAME
+    // source as the guard (turn::monthly_cap). Fail-open: missing table or D1 error → 0,
+    // so stats never 500s.
     let turn_issued: i64 = match db
         .prepare("SELECT issued FROM turn_usage WHERE month = ? LIMIT 1")
         .bind(&[d1_text(&crate::turn::current_month_utc())])
@@ -186,25 +178,23 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     };
     let turn_cap = crate::turn::monthly_cap(&ctx.env);
 
-    // Daily media volume (Faz 1c) — fed by the count_bump hooks in
-    // media/handlers.rs; read_today fails open (missing table/row → 0).
+    // Daily media volume — fed by the count_bump hooks in media/handlers.rs; read_today
+    // fails open (missing table/row → 0).
     let upload_bytes_today = crate::usage::read_today(&db, "upload_bytes").await;
     let upload_count_today = crate::usage::read_today(&db, "upload_count").await;
     let download_count_today = crate::usage::read_today(&db, "download_count").await;
     let download_bytes_today = crate::usage::read_today(&db, "download_bytes").await;
 
-    // Monthly media volume (v5, month detail) — the SUM of this month's
-    // usage_counters day rows (read_month uses a month-prefix LIKE, the same month
-    // window as the TURN budget). read_month fails open (missing table or D1 error
-    // → 0).
+    // Monthly media volume — the SUM of this month's usage_counters day rows (read_month
+    // uses a month-prefix LIKE, the same month window as the TURN budget). Fails open
+    // (missing table or D1 error → 0).
     let upload_bytes_month = crate::usage::read_month(&db, "upload_bytes").await;
     let upload_count_month = crate::usage::read_month(&db, "upload_count").await;
     let download_count_month = crate::usage::read_month(&db, "download_count").await;
     let download_bytes_month = crate::usage::read_month(&db, "download_bytes").await;
 
-    // Quota caps (Faz 1a) — NULLABLE columns of server_settings. NULL means
-    // unlimited; an error, a missing row or a missing migration also yields null
-    // (fail-open, so stats never 500s).
+    // Quota caps — NULLABLE columns of server_settings. NULL means unlimited; an error, a
+    // missing row or a missing migration also yields null (fail-open, so stats never 500s).
     let caps = db
         .prepare(
             "SELECT max_storage_bytes, max_user_storage_bytes \
@@ -218,12 +208,10 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .map(|c| (c.max_storage_bytes, c.max_user_storage_bytes))
         .unwrap_or((None, None));
 
-    // Pluggable storage Faz 3 (plan e) — the BADGE on the panel's main card: store
-    // count, unhealthy count (last_health_ok=0 only; NULL = never probed is NOT
-    // counted) and whether anything is draining. The detail view (per-store list
-    // with secret-free identity/health) comes from `GET /admin/storage`. Fail-open:
-    // missing table (migration not applied) or D1 error → 0/false, so stats never
-    // 500s.
+    // The BADGE on the panel's main card: store count, unhealthy count (last_health_ok=0
+    // only; NULL = never probed is NOT counted) and whether anything is draining. The
+    // detail view (per-store list with secret-free identity/health) comes from
+    // `GET /admin/storage`. Fail-open: missing table or D1 error → 0/false.
     let storage = db
         .prepare(
             "SELECT COUNT(*) AS total, \
@@ -250,9 +238,7 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             "max_storage_bytes": max_storage,
             "max_user_storage_bytes": max_user_storage,
         },
-        // Faz 1c: monthly video-call (TURN) usage + daily media volume. The
-        // existing fields are untouched (an older client keeps reading the v2
-        // fields; the new blocks are additive).
+        // Monthly video-call (TURN) usage + daily media volume.
         "turn": { "issued_month": turn_issued, "cap": turn_cap },
         "today": {
             "upload_bytes": upload_bytes_today,
@@ -260,46 +246,41 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             "download_count": download_count_today,
             "download_bytes": download_bytes_today,
         },
-        // Month detail (v5, additive): this month's media volume for the "THIS
-        // MONTH" card (a usage_counters SUM). requests_month (CF-only) already
-        // lives at top level and TURN issued_month inside the turn block, so
-        // neither is repeated here.
+        // This month's media volume for the "THIS MONTH" card (a usage_counters SUM).
+        // requests_month (CF-only) already lives at top level and TURN issued_month
+        // inside the turn block, so neither is repeated here.
         "month": {
             "upload_bytes": upload_bytes_month,
             "upload_count": upload_count_month,
             "download_count": download_count_month,
             "download_bytes": download_bytes_month,
         },
-        // Faz 3 (v4, additive): the dual-logic contract fields. `backend` is where
-        // this binary runs (a future VPS/standalone port will send "standalone");
-        // `authoritative` true means the numbers match the CF bill exactly (GraphQL
-        // Analytics), false means self-report (no token, or a CF error).
-        // `storage_cf_bytes` is CF's measurement and never replaces the self-report
-        // media.bytes.
+        // The dual-logic contract fields. `backend` is where this binary runs (a future
+        // standalone port will send "standalone"); `authoritative` true means the numbers
+        // match the CF bill exactly (GraphQL Analytics), false means self-report (no
+        // token, or a CF error). `storage_cf_bytes` is CF's measurement and never replaces
+        // the self-report media.bytes.
         "backend": "cf",
         "authoritative": cf.is_some(),
         "requests_month": requests_month,
         "storage_cf_bytes": storage_cf_bytes,
-        // v6 (additive): "is a token present" bool — NEVER the value (write-only
-        // contract).
+        // "Is a token present" bool — NEVER the value (write-only contract).
         "cf_configured": cf_configured,
-        // v7 (additive): "can push be delivered" bool — NEVER the values
-        // (write-only).
+        // "Can push be delivered" bool — NEVER the values (write-only).
         "fcm_configured": fcm_configured,
-        // Which of the two ways, so the owner screen can stop implying the shared relay was
-        // something they set up. Measured on a fresh self-host server 2026-07-28: zero FCM keys
-        // in `server_config` and `fcm_configured` was still true, because the relay default is on.
+        // Which of the two ways, so the owner screen does not imply the shared relay was
+        // something they set up: a server with zero FCM keys still reports
+        // fcm_configured=true, because the relay default is on.
         "fcm_mode": fcm_mode.as_str(),
         "turn_configured": turn_configured,
-        // Additive field, shipped under the SAME `version: 8` as the storage badge — a client
-        // cannot gate on the version number for it, only on the key's presence. Absent on an
-        // older server → the client reads
-        // it as false and shows the gap, which is the safe direction: claiming a server can be
-        // reset when it cannot is the reading that wastes the owner's time at the worst moment.
+        // Shipped under the SAME `version` as the storage badge — a client cannot gate on
+        // the version number for it, only on the key's presence. Absent on an older server
+        // → the client reads it as false and shows the gap, which is the safe direction:
+        // claiming a server can be reset when it cannot wastes the owner's time at the
+        // worst moment.
         "reset_key_configured": reset_key_configured,
-        // v8 (additive, pluggable storage Faz 3): the compact store badge. Detail
-        // lives at GET /admin/storage. draining = is any store being emptied
-        // (Faz 4 drain).
+        // The compact store badge; detail lives at GET /admin/storage. draining = is any
+        // store being emptied.
         "storage": {
             "stores_total": stores_total,
             "stores_unhealthy": stores_unhealthy,

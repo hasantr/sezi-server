@@ -1,7 +1,7 @@
 //! AWS Signature Version 4 signing — **PURE RUST** (only `hmac` + `sha2` + `hex`, all already
 //! dependencies). No WebCrypto/subtle, so it runs on the host (`cargo test`) as well as under
-//! workerd/wasm. This is the seed of the Pluggable-Storage epic's S3-compatible adapter (B2 /
-//! second R2 / MinIO / iDrive e2 / Wasabi); `PLUGGABLE_STORAGE_PLAN.md` Faz 0/2.
+//! workerd/wasm. This is what makes the S3-compatible storage adapter possible (B2 / second R2 /
+//! MinIO / iDrive e2 / Wasabi).
 //!
 //! UNSIGNED-PAYLOAD IS NOT USED: signatures carry the body hash in `x-amz-content-sha256` (the
 //! blob is already in memory and SHA-256 is cheap). Both B2 and MinIO accept body-hash signing.
@@ -16,15 +16,12 @@
 //! The canonical URI is encoded ONCE for S3 (other services encode twice); this module targets
 //! the S3 path (single encoding), so `sign_request` is called with service="s3".
 //!
-//! CONSUMER: `storage/s3.rs` (wired up in Faz 2) signs every S3 request through here — every put,
-//! get and delete.
+//! CONSUMER: `storage/s3.rs` signs every S3 request through here — every put, get and delete.
 //!
-//! There is deliberately NO module-level `allow(dead_code)`. There used to be, carried over from
-//! Faz 0 when nothing called this module yet, and its own note said it would go away "at Faz 2
-//! wiring" — Faz 2 landed and it stayed. In a crypto module a blanket allow is the wrong trade: it
-//! would equally silence a signing step that quietly stopped being called. Removing it surfaced
-//! exactly three items, the `SignParts` diagnostic fields, which the known-vector tests read; the
-//! allow now sits on those three fields and nothing else.
+//! There is deliberately NO module-level `allow(dead_code)`. In a crypto module a blanket allow
+//! is the wrong trade: it would equally silence a signing step that quietly stopped being called.
+//! The only genuinely test-only items are the three `SignParts` diagnostic fields, and the allow
+//! sits on those and nothing else.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -177,9 +174,8 @@ fn parse_url(url: &str) -> Result<(String, String, String), SigV4Error> {
 struct SignParts {
     authorization: String,
     // Read only from the test module, so the `lib` build (where `cfg(test)` is off) sees them as
-    // dead. The allow is scoped to these three fields ON PURPOSE: this file used to carry a
-    // module-wide `#![allow(dead_code)]` for them, which in a crypto module means any future dead
-    // code is silenced too — including a signing step that stopped being called.
+    // dead. The allow is scoped to these three fields ON PURPOSE — a module-wide one would
+    // silence any future dead code too, including a signing step that stopped being called.
     #[cfg_attr(not(test), allow(dead_code))]
     signature: String,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -444,7 +440,7 @@ mod tests {
             "s3",
             "20260708T101112Z",
         )
-        .expect("imza");
+        .expect("signature");
         assert_eq!(out.x_amz_date, "20260708T101112Z");
         assert_eq!(out.x_amz_content_sha256, payload_hash);
         assert!(out.authorization.starts_with("AWS4-HMAC-SHA256 Credential=minioadmin/20260708/us-east-1/s3/aws4_request"));

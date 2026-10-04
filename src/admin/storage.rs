@@ -1,19 +1,18 @@
-//! `/admin/storage` — pluggable-storage management endpoints (Faz 2, 2026-07-08).
-//! From the CLIENT, the owner attaches, tests, edits and removes an external blob
-//! store (B2 / a second R2 / MinIO / any S3-compatible target) — the "zero CLI"
-//! philosophy, following cf-config and fcm-config.
+//! `/admin/storage` — pluggable-storage management endpoints. From the CLIENT, the
+//! owner attaches, tests, edits and removes an external blob store (B2 / a second R2 /
+//! MinIO / any S3-compatible target) — the "zero CLI" philosophy, following cf-config
+//! and fcm-config.
 //!
 //! SECURITY CONTRACT (identical to cf_config.rs / fcm_config.rs):
-//! - **Gates (plan e):** GET and probe use `require_admin`; POST/PATCH/DELETE/drain
-//!   use `require_owner`, because store credentials are strong secrets and only the
+//! - **Gates:** GET and probe use `require_admin`; POST/PATCH/DELETE/drain use
+//!   `require_owner`, because store credentials are strong secrets and only the
 //!   server's owner may add, change, delete or drain a store.
 //! - **WRITE-ONLY:** `config_json` (which contains the `secret_access_key`) is
 //!   returned in NO response — GET/PATCH/probe carry only identity, state, health
 //!   and counters. The secret is only ever written here; rotation means PATCHing
 //!   the config field, never reading it back.
-//! - **http:// endpoints are dev-only:** allowed when `ENV != "prod"`
-//!   (wrangler-dev + MinIO); in prod `https` is mandatory (plan Faz 0 note,
-//!   man-in-the-middle protection).
+//! - **http:// endpoints are dev-only:** allowed when `ENV != "prod"` (wrangler-dev +
+//!   MinIO); in prod `https` is mandatory, against man-in-the-middle.
 //! - **Adding means a LIVE probe:** POST and a config PATCH verify the credentials
 //!   with a PUT/GET/DELETE round-trip BEFORE persisting, so the owner never falls
 //!   into "I saved it but it does not work" (same early-validation idea as the fcm
@@ -69,11 +68,11 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .all()
         .await?
         .results()?;
-    // Faz 4: remaining-inventory count for draining stores — a UNION count over the
-    // 3 metadata tables, the SAME source the move engine uses to detect completion
-    // (storage/drain.rs). With no draining store there is NO extra query (empty list
-    // → empty map). On error we return an empty map: the list still renders, the
-    // field is not null, a draining store just shows 0 and the next GET corrects it.
+    // Remaining-inventory count for draining stores — a UNION count over the 3 metadata
+    // tables, the SAME source the move engine uses to detect completion
+    // (storage/drain.rs). With no draining store there is NO extra query. On error we
+    // return an empty map: the list still renders, the field is not null, a draining
+    // store just shows 0 and the next GET corrects it.
     let draining_ids: Vec<String> = rows
         .iter()
         .filter(|r| r.state == "draining")
@@ -97,8 +96,7 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 "last_health_at": r.last_health_at,
                 "last_health_ok": r.last_health_ok.map(|v| v != 0),
                 "last_health_err": r.last_health_err,
-                // Faz 4: a count only for a draining store, null otherwise (nothing
-                // is being moved).
+                // A count only for a draining store, null otherwise.
                 "draining_remaining": (r.state == "draining")
                     .then(|| remaining.get(&r.store_id).copied().unwrap_or(0)),
             })
@@ -362,9 +360,9 @@ pub async fn remove(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Some(r) => r,
         None => return json_err(404, "not_found"),
     };
-    // Only an empty store may be deleted; draining a full one is Faz 4's job.
-    // object_count is the D1 inventory truth (maintained by reconcile); > 0 → 409, and
-    // the client tells the owner to drain it first.
+    // Only an empty store may be deleted; emptying a full one is the drain endpoint's
+    // job. object_count is the D1 inventory truth (maintained by reconcile); > 0 → 409,
+    // and the client tells the owner to drain it first.
     if row.object_count > 0 {
         return json_err(409, "store_not_empty");
     }
@@ -427,7 +425,7 @@ pub async fn probe(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Response::from_json(&json!({ "ok": ok, "error": err }))
 }
 
-// ── POST /admin/storage/:id/drain (require_owner) — start emptying a store (Faz 4) ──
+// ── POST /admin/storage/:id/drain (require_owner) — start emptying a store ──────
 
 #[derive(Deserialize)]
 struct StateRow {
@@ -439,11 +437,10 @@ struct StateRow {
 /// and wake the move job. The engine (storage/drain.rs) rides the 2-minute cron plus
 /// the lazy path and moves at most `MOVE_BATCH` (4) blobs per run; when the inventory
 /// reaches 0 the store is automatically set to `disabled`. r2-primary can be drained
-/// too (plan e: "for whoever wants to leave R2 entirely"). Target pinning is NOT in
-/// v1 (the optional `{target_store_id?}` from plan c.4): the target is always the
-/// first remaining active store with room (the put_new policy), so the body is not
-/// read at all. Idempotent — POSTing again to an already-draining store just wakes
-/// the job and returns the current remaining count.
+/// too, for an owner leaving R2 entirely. There is no target pinning: the target is
+/// always the first remaining active store with room (the put_new policy), so the body
+/// is not read at all. Idempotent — POSTing again to an already-draining store just
+/// wakes the job and returns the current remaining count.
 pub async fn drain(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let user_id = match require_active_auth(&req, &ctx.env).await {
         Ok(auth) => auth.user_id,
@@ -519,7 +516,7 @@ fn label_ok(s: &str) -> bool {
 }
 
 /// State accepted by PATCH/POST: active/readonly/disabled only. `draining` is set
-/// exclusively by the separate drain endpoint (Faz 4).
+/// exclusively by the separate drain endpoint.
 fn state_ok(s: &str) -> bool {
     matches!(s, "active" | "readonly" | "disabled")
 }

@@ -9,7 +9,10 @@
 //!     fallback for when the app's automatic genesis fetch fails). Security-equivalent:
 //!     while there is no owner that code is already public via `GET /bootstrap` — a gate
 //!     that closes itself — so showing it here opens no extra surface. Once an owner
-//!     exists the code is NEVER shown again.
+//!     exists the code is NEVER shown again. A relay with a claim secret (`auth::claim`)
+//!     never shows it at all: /bootstrap withholds it from anyone without the secret, so
+//!     printing it here would undo the gate. That page says to claim from the machine the
+//!     relay was installed on.
 //!   - Owner EXISTS: "server is active" + how to get an invite code.
 //!   - D1 error: FAIL-OPEN neutral copy (the page still renders and claims nothing
 //!     about server state).
@@ -44,17 +47,26 @@ use crate::d1util::d1_text;
 pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // FAIL-OPEN: if the owner query fails (no D1, transient error) → None → neutral copy.
     let owner = owner_exists(&ctx.env).await;
+    // A relay with a claim secret hands its genesis code only to `/bootstrap` callers that carry
+    // it (`auth::claim`), so this page must not print it — or even mint it — or the secret
+    // would guard nothing. Decided BEFORE the mint below, which is the order that matters.
+    let claim_locked = crate::auth::claim::claim_secret_required(&ctx.env);
     // The genesis code is fetched ONLY in the no-owner state, NEVER in the owner-exists
     // or D1-error branches. Same get-or-mint path as /bootstrap, including the M10 race
     // pattern. FAIL-OPEN: if the code cannot be obtained → None → the page still renders,
     // with a "refresh in a moment" line in place of the code box.
-    let genesis = if owner == Some(false) {
+    let code = if owner == Some(false) && !claim_locked {
         match ctx.env.d1("DB") {
             Ok(db) => ensure_genesis_token(&db).await.ok(),
             Err(_) => None,
         }
     } else {
         None
+    };
+    let genesis = match (claim_locked, code.as_deref()) {
+        (true, _) => Genesis::Locked,
+        (false, Some(code)) => Genesis::Code(code),
+        (false, None) => Genesis::Unavailable,
     };
     // The address is the request's own origin (scheme://host[:port]) — exactly what the
     // user sees in the browser bar, so it stays correct behind a custom domain too.
@@ -73,7 +85,19 @@ pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let lang = forced.unwrap_or_else(|| {
         Lang::from_accept_language(req.headers().get("accept-language").ok().flatten().as_deref())
     });
-    Response::from_html(render_welcome(lang, owner, &origin, genesis.as_deref()))
+    Response::from_html(render_welcome(lang, owner, &origin, genesis))
+}
+
+/// What the fresh-install page says about the genesis code. Only the no-owner branch reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Genesis<'a> {
+    /// Shown, with its copy button — the visible fallback for the app's automatic fetch.
+    Code(&'a str),
+    /// Could not be obtained just now; the page asks for a reload.
+    Unavailable,
+    /// The relay has a claim secret: the code is never printed, and the page says where the
+    /// server can be claimed from instead.
+    Locked,
 }
 
 /// The languages the welcome page speaks. English is the default for an unrecognised or absent
@@ -156,6 +180,9 @@ pub(crate) struct Copy {
     fresh_body: &'static str,
     /// Carries `<b>` around the in-app menu path.
     fresh_paste: &'static str,
+    /// Replaces `fresh_paste` and the code box when the relay has a claim secret. Carries `<b>`
+    /// around the machine the server can be claimed from.
+    claim_locked: &'static str,
     active_title: &'static str,
     /// Carries `<b>` around "invite code".
     active_body: &'static str,
@@ -175,6 +202,7 @@ const EN: Copy = Copy {
     fresh_title: "Your Sezi server is up and running",
     fresh_body: "This server is empty — the first person to finish setup becomes its owner.",
     fresh_paste: "In the Sezi app, paste this address into <b>“Add server → Set up your own”</b> — the genesis code is fetched automatically.",
+    claim_locked: "This server was installed with a claim key, so it can only be claimed from <b>the computer it was installed on</b> — open the Sezi app there to become its owner. Everyone else joins afterwards with an invite.",
     active_title: "This Sezi server is active",
     active_body: "Ask the server's owner for an <b>invite code</b> to join.",
     neutral_title: "Sezi server",
@@ -193,14 +221,16 @@ const TR: Copy = Copy {
     fresh_title: "Sezi sunucun hazır ve çalışıyor",
     fresh_body: "Bu sunucu şu an boş — kurulumu tamamlayan ilk kişi sunucu sahibi olur.",
     fresh_paste: "Sezi uygulamasında <b>“Sunucu ekle → Kendi sunucunu kur”</b> adımına bu adresi yapıştır — kuruluş kodu otomatik alınır.",
+    claim_locked: "Bu sunucu bir sahiplenme anahtarıyla kuruldu; yalnızca <b>kurulduğu bilgisayardan</b> sahiplenilebilir — sahibi olmak için oradaki Sezi uygulamasını aç. Diğer herkes sonra davetle katılır.",
     active_title: "Bu Sezi sunucusu aktif",
     active_body: "Katılmak için sunucu sahibinden <b>davet kodu</b> iste.",
     neutral_title: "Sezi sunucusu",
     neutral_body: "Sunucu çalışıyor. Katılım durumu şu an okunamadı — Sezi uygulamasından bu adrese bağlanmayı deneyebilirsin.",
 };
 
-/// Does an owner exist? (verify's first-user-becomes-owner rule means an owner row is
-/// the marker for "this server has been claimed"; same query family as bootstrap.rs.)
+/// Does an owner exist? (verify creates the owner row only for the registration that redeemed
+/// the genesis invite, so an owner row is the marker for "this server has been claimed"; same
+/// query family as bootstrap.rs.)
 /// Cheap: one indexed SELECT with LIMIT 1. On error → None (fail-open, the page still
 /// renders).
 ///
@@ -302,11 +332,11 @@ __CONTENT__
 
 /// Build the page content (PURE → unit-testable). `owner`: `Some(false)` = fresh
 /// install, `Some(true)` = active server, `None` = D1 error (neutral copy). `genesis`
-/// is the genesis code, rendered ONLY in the `Some(false)` branch — in that state the
+/// is read ONLY in the `Some(false)` branch — in that state, without a claim secret, the
 /// code is already public via /bootstrap, so this is just a visible fallback. In the
-/// owner-exists and D1-error branches the caller passes `None` and the code is NEVER
-/// embedded.
-fn render_welcome(lang: Lang, owner: Option<bool>, origin: &str, genesis: Option<&str>) -> String {
+/// owner-exists and D1-error branches the code is NEVER embedded, whatever is passed, and
+/// [`Genesis::Locked`] never embeds it either.
+fn render_welcome(lang: Lang, owner: Option<bool>, origin: &str, genesis: Genesis) -> String {
     let c = lang.copy();
     let addr = html_escape(origin);
     // The copy button reads the address back out of the DOM (`#addr`), so no separate
@@ -316,24 +346,28 @@ fn render_welcome(lang: Lang, owner: Option<bool>, origin: &str, genesis: Option
     let addr_box = format!(
         r#"<div class="addr"><code id="addr">{addr}</code><button onclick="navigator.clipboard.writeText(document.getElementById('addr').textContent).then(()=>{{this.textContent='{copied}'}})">{copy_address}</button></div>"#
     );
-    // The genesis-code box (used only in the fresh-install branch). The code is b64u,
-    // but it is HTML-escaped defensively anyway; the copy button follows the same
-    // read-from-DOM pattern as the address one (`#gcode`). FAIL-OPEN: with no code the
-    // box is replaced by a "refresh in a moment" line and the page still renders.
-    let code_box = match genesis {
-        Some(code) => {
+    // What follows the address on a fresh install (used only in that branch): the paste
+    // instruction plus the genesis-code box, or — on a claim-locked relay — the one line that
+    // says where the server can be claimed from. The code is b64u, but it is HTML-escaped
+    // defensively anyway; the copy button follows the same read-from-DOM pattern as the
+    // address one (`#gcode`). FAIL-OPEN: with no code the box is replaced by a "refresh in a
+    // moment" line and the page still renders.
+    let claim_part = match genesis {
+        Genesis::Code(code) => {
             let code = html_escape(code);
             let (label, copy_code, note) = (c.genesis_label, c.copy_code, c.genesis_note);
             format!(
-                r#"<p class="lbl">{label}</p><div class="addr"><code id="gcode">{code}</code><button onclick="navigator.clipboard.writeText(document.getElementById('gcode').textContent).then(()=>{{this.textContent='{copied}'}})">{copy_code}</button></div><p>{note}</p>"#
+                r#"<p>{}</p><p class="lbl">{label}</p><div class="addr"><code id="gcode">{code}</code><button onclick="navigator.clipboard.writeText(document.getElementById('gcode').textContent).then(()=>{{this.textContent='{copied}'}})">{copy_code}</button></div><p>{note}</p>"#,
+                c.fresh_paste
             )
         }
-        None => format!("<p>{}</p>", c.genesis_unavailable),
+        Genesis::Unavailable => format!("<p>{}</p><p>{}</p>", c.fresh_paste, c.genesis_unavailable),
+        Genesis::Locked => format!("<p>{}</p>", c.claim_locked),
     };
     let content = match owner {
         Some(false) => format!(
-            "<div class=\"emoji\">🎉</div><h1>{}</h1><p>{}</p>{addr_box}<p>{}</p>{code_box}",
-            c.fresh_title, c.fresh_body, c.fresh_paste
+            "<div class=\"emoji\">🎉</div><h1>{}</h1><p>{}</p>{addr_box}{claim_part}",
+            c.fresh_title, c.fresh_body
         ),
         Some(true) => format!(
             "<div class=\"emoji\">✅</div><h1>{}</h1><p>{}</p>{addr_box}",
@@ -375,9 +409,10 @@ mod tests {
     fn fresh_install_page_shows_instructions_address_and_genesis_code() {
         for lang in ALL {
             let c = lang.copy();
-            let html = render_welcome(lang, Some(false), ORIGIN, Some(CODE));
+            let html = render_welcome(lang, Some(false), ORIGIN, Genesis::Code(CODE));
             assert!(html.contains(c.fresh_title));
             assert!(html.contains(c.fresh_paste), "the in-app path instruction stays");
+            assert!(!html.contains(c.claim_locked), "no claim key, no claim-key line");
             assert!(html.contains(ORIGIN));
             assert!(html.contains("charset=\"utf-8\""));
             // Hasan's 2026-07-07 call: while there is NO owner the genesis code IS shown on
@@ -395,11 +430,48 @@ mod tests {
     fn fresh_install_shows_a_retry_line_when_the_code_is_unavailable() {
         for lang in ALL {
             let c = lang.copy();
-            let html = render_welcome(lang, Some(false), ORIGIN, None);
+            let html = render_welcome(lang, Some(false), ORIGIN, Genesis::Unavailable);
             assert!(html.contains(c.fresh_title), "the page still renders in full");
             assert!(html.contains(c.genesis_unavailable));
             assert!(!html.contains("id=\"gcode\""), "the code box is not shown");
         }
+    }
+
+    /// A relay with a claim secret: the page says the server is ready and where it can be
+    /// claimed from, and carries no code box, no code and no "it is fetched automatically" line —
+    /// that last one is true only on the installing machine.
+    #[test]
+    fn a_claim_locked_server_says_where_to_claim_and_shows_no_code() {
+        for lang in ALL {
+            let c = lang.copy();
+            let html = render_welcome(lang, Some(false), ORIGIN, Genesis::Locked);
+            assert!(html.contains(c.fresh_title));
+            assert!(html.contains(ORIGIN), "the address is still there to copy");
+            assert!(html.contains(c.claim_locked));
+            assert!(!html.contains(c.fresh_paste));
+            assert!(!html.contains("id=\"gcode\""), "no code box");
+            assert!(!html.contains(c.genesis_label));
+            assert!(!html.contains(c.genesis_unavailable), "nothing to reload for");
+        }
+    }
+
+    /// The handler, not the renderer, is what keeps the code off a claim-locked page: it decides
+    /// the lock before it would mint, and mints only when unlocked. Source-level, because the
+    /// handler needs a live `Env`. Needles are split with `concat!` because this module is inline.
+    #[test]
+    fn the_handler_checks_the_claim_lock_before_it_mints_the_code() {
+        const SRC: &str = include_str!("welcome.rs");
+        let lock = SRC
+            .find(concat!("let claim_locked = crate::auth::claim::claim_secret_", "required(&ctx.env);"))
+            .expect("the welcome page no longer reads the claim lock");
+        let mint = SRC
+            .find(concat!("Ok(db) => ensure_genesis_", "token(&db)"))
+            .expect("the welcome page's genesis mint moved — re-point this guard");
+        assert!(lock < mint);
+        assert!(
+            SRC.contains(concat!("if owner == Some(false) && !claim_", "locked {")),
+            "the mint must be skipped on a claim-locked relay"
+        );
     }
 
     #[test]
@@ -408,7 +480,7 @@ mod tests {
             let c = lang.copy();
             // Defensive lock: even if genesis is accidentally passed as Some, the
             // owner-exists branch NEVER embeds the code (render is the single authority).
-            let html = render_welcome(lang, Some(true), ORIGIN, Some(CODE));
+            let html = render_welcome(lang, Some(true), ORIGIN, Genesis::Code(CODE));
             assert!(html.contains(c.active_title));
             assert!(html.contains(c.active_body));
             // An active server does NOT show the setup instructions (the genesis gate closed).
@@ -422,7 +494,7 @@ mod tests {
     fn a_d1_error_returns_a_neutral_page_fail_open_without_leaking_the_code() {
         for lang in ALL {
             let c = lang.copy();
-            let html = render_welcome(lang, None, ORIGIN, Some(CODE));
+            let html = render_welcome(lang, None, ORIGIN, Genesis::Code(CODE));
             assert!(html.contains(c.neutral_body));
             // The neutral page CLAIMS nothing: neither "ready" nor "active".
             assert!(!html.contains(c.fresh_title));
@@ -434,7 +506,8 @@ mod tests {
 
     #[test]
     fn origin_and_code_are_html_escaped() {
-        let html = render_welcome(Lang::En, Some(false), "https://a<script>b", Some("k<img>d"));
+        let html =
+            render_welcome(Lang::En, Some(false), "https://a<script>b", Genesis::Code("k<img>d"));
         assert!(!html.contains("a<script>b"));
         assert!(html.contains("a&lt;script&gt;b"));
         assert!(!html.contains("k<img>d"));
@@ -445,9 +518,13 @@ mod tests {
     #[test]
     fn the_page_skeleton_fills_every_injection_point() {
         for lang in ALL {
-            for (owner, genesis) in
-                [(Some(true), None), (Some(false), Some(CODE)), (Some(false), None), (None, None)]
-            {
+            for (owner, genesis) in [
+                (Some(true), Genesis::Unavailable),
+                (Some(false), Genesis::Code(CODE)),
+                (Some(false), Genesis::Unavailable),
+                (Some(false), Genesis::Locked),
+                (None, Genesis::Unavailable),
+            ] {
                 let html = render_welcome(lang, owner, ORIGIN, genesis);
                 for placeholder in ["__CONTENT__", "__LANG__", "__FOOT__"] {
                     assert!(!html.contains(placeholder), "{placeholder} must be filled");
@@ -463,8 +540,9 @@ mod tests {
     /// thing, which is the bug that hard-coding it caused in the first place.
     #[test]
     fn the_html_lang_attribute_matches_the_rendered_copy() {
-        assert!(render_welcome(Lang::En, Some(true), ORIGIN, None).contains(r#"<html lang="en">"#));
-        assert!(render_welcome(Lang::Tr, Some(true), ORIGIN, None).contains(r#"<html lang="tr">"#));
+        let page = |lang| render_welcome(lang, Some(true), ORIGIN, Genesis::Unavailable);
+        assert!(page(Lang::En).contains(r#"<html lang="en">"#));
+        assert!(page(Lang::Tr).contains(r#"<html lang="tr">"#));
     }
 
     #[test]

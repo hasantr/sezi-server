@@ -1,8 +1,7 @@
--- Mesaj bekletme süresi (message retention) — admin-ayarlı.
--- message_retention_days: teslim EDİLMEYEN mesaj her alıcının Durable Object
--- `pending` kuyruğunda en çok kaç gün tutulur (DO alarm temizlik penceresi).
--- Önceden DO'da hard-coded 30 gündü; artık owner D1'den ayarlar (medya
--- retention_days deseninin ikizi). Teslim edilen mesaj zaten ack'te silinir
--- (relay modeli) — bu pencere yalnız "alıcı hiç bağlanmadı" senaryosu içindir.
--- /capabilities bunu `retention.message_days` olarak ilan eder; owner düzenler.
+-- Message retention — admin-configurable.
+-- message_retention_days: how many days an UNDELIVERED message is kept in each recipient's
+-- Durable Object `pending` queue (the DO alarm's cleanup window). The owner sets it from D1
+-- (the twin of the media retention_days pattern). A delivered message is already deleted on
+-- ack (the relay model) — this window is only for the "the recipient never connected" case.
+-- /capabilities announces it as `retention.message_days`; the owner edits it.
 ALTER TABLE server_settings ADD COLUMN message_retention_days INTEGER NOT NULL DEFAULT 30;

@@ -1,15 +1,14 @@
-//! Plugin/feed server log — an append-only ENCRYPTED log per (room, plugin) (Faz-2 / WORKER).
+//! Plugin/feed server log — an append-only ENCRYPTED log per (room, plugin).
 //!
-//! `PLUGIN_FEED_LOG_SPEC.md` Faz-2. The server is BLIND: an entry's `ciphertext`/`blob` is opaque
-//! and it never reads the signature; it only orders (a server-assigned monotonic `seq`), stores and
-//! serves from a cursor. Flow: client → handler (validates JWT + active membership + author
-//! binding) → the `PluginRoomLog` DO (id_from_name(room) → atomic seq + insert) → `sync(since)`
-//! cursor pull.
+//! The server is BLIND: an entry's `ciphertext`/`blob` is opaque and it never reads the signature;
+//! it only orders (a server-assigned monotonic `seq`), stores and serves from a cursor. Flow:
+//! client → handler (validates JWT + active membership + author binding) → the `PluginRoomLog` DO
+//! (id_from_name(room) → atomic seq + insert) → `sync(since)` cursor pull.
 //!
 //! Security is two-layered: (server-honest) the handler enforces `author_id == JWT.user &&
 //! author_device_id == JWT.device`, so a malicious MEMBER cannot forge entries; (zero-trust) the
-//! reading CLIENT verifies `sig`, so not even a malicious SERVER can (signing/decryption live in
-//! CORE, Faz-3). The DO is nothing but opaque storage plus a sequencer.
+//! reading CLIENT verifies `sig`, so not even a malicious SERVER can — signing and decryption live
+//! in CORE. The DO is nothing but opaque storage plus a sequencer.
 
 use crate::auth::middleware::{device_revoked, require_auth_device};
 use crate::groups::group_role;
@@ -22,11 +21,10 @@ use worker::*;
 /// Base64 ceiling for inline ciphertext (anything larger goes to an R2 blob — a later slice).
 /// Sized to the message envelope limit (~22KB raw plus the base64 expansion margin).
 const MAX_INLINE_B64: usize = 32 * 1024;
-/// B4 (Codex HIGH): ceiling for the blob/meta fields. blob_id/blob_hash/aad/nonce and the hash
-/// chain are short references (the real payload lives in R2), so 4KB is more than enough, and it
-/// bounds the DO row for EVERY content_kind. The old gate only limited inline entries, which let a
-/// `blob` (or any other) kind smuggle arbitrarily large ciphertext and inflate both the DO log and
-/// every reader's sync.
+/// Ceiling for the blob/meta fields. blob_id/blob_hash/aad/nonce and the hash chain are short
+/// references (the real payload lives in R2), so 4KB is more than enough, and it bounds the DO row
+/// for EVERY content_kind — a limit that applied only to inline entries would let a `blob` kind
+/// smuggle arbitrarily large ciphertext and inflate both the DO log and every reader's sync.
 const MAX_FIELD_B64: usize = 4 * 1024;
 /// Entry limit for one sync page (the receipt_sync pattern; `more` signals continuation).
 const SYNC_LIMIT: i64 = 500;
@@ -270,8 +268,8 @@ impl PluginRoomLog {
 /// RESILIENT (fail-open at 0): if the `plugin_epoch_floor` table does not exist yet (migration not
 /// applied) or the query errors, return floor=0 (no restriction) and NEVER 500 an append. The worst
 /// case is a floor of 0 — forward-secrecy enforcement stays passive until the migration lands —
-/// which keeps the data path intact. (Seen in the field: new worker code with the migration pending
-/// made every append 500; this closes that.)
+/// which keeps the data path intact. Without this, worker code deployed ahead of its migration
+/// makes every append 500.
 pub async fn epoch_floor(db: &D1Database, room_id: &str) -> Result<i64> {
     #[derive(Deserialize)]
     struct FloorRow {
@@ -313,19 +311,13 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Ok(pair) => pair,
         Err(resp) => return Ok(resp),
     };
-    // Per-user append rate limit (the message-send pattern; guards against DoS/log inflation).
-    // The KV binding is OPTIONAL (template diet): without it we continue unlimited — see
-    // ratelimit::check_rate_limit_env.
+    // Per-user append rate limit, against DoS and log inflation. The KV binding is OPTIONAL:
+    // without it `check_rate_limit_env` fails open.
     if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("plog:append:{user_id}"), 300, 60).await {
         return json_err(429, "rate_limited");
     }
     // Device binding: the writer's device is taken from the TOKEN, never from the request body, so a
     // malicious member cannot append as another device. A revoked device is refused below.
-    //
-    // (This used to be labelled "the S3 token claim". Nothing here touches S3 — `storage/s3.rs` is an
-    // unrelated subsystem that arrived later — and the label's original meaning is not recoverable from
-    // the code, so it is gone rather than guessed at. An initialism that collides with a real module
-    // name is worse than no initialism.)
     if device_revoked(&ctx.env, &user_id, &device_id).await? {
         return json_err(401, "device_revoked");
     }
@@ -355,7 +347,7 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     {
         return json_err(403, "author_mismatch");
     }
-    // FORWARD-SECRECY (Faz-D) EPOCH-FLOOR gate: the floor was bumped when a member left, so
+    // FORWARD-SECRECY EPOCH-FLOOR gate: the floor was bumped when a member left, so
     // `key_epoch < floor` is an attempt to write new data under an OLD epoch → REJECT with
     // `409 epoch_stale`. Neither the ejected member nor a writer left behind can punch through
     // forward secrecy with a stale epoch after the removal. The client catches the 409 → refreshes
@@ -365,12 +357,10 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     if entry.key_epoch < floor {
         return json_err(409, "epoch_stale");
     }
-    // Size ceilings (B4 — Codex HIGH). The old gate applied ONLY to inline entries, so a `blob` (or
-    // any other) content_kind slipped past every size check and could inflate the DO log and every
-    // reader's sync. Now they apply to ALL kinds: inline → ciphertext is mandatory and
-    // ≤ MAX_INLINE_B64; any kind → ciphertext ≤ MAX_INLINE_B64 (stops a `blob` kind from smuggling
-    // bulk data through the ciphertext field) plus every short field ≤ MAX_FIELD_B64. Together these
-    // bound the DO row size (≈ ciphertext + a few fields) deterministically.
+    // Size ceilings, applied to ALL content kinds and not just inline ones: inline → ciphertext is
+    // mandatory and ≤ MAX_INLINE_B64; any kind → ciphertext ≤ MAX_INLINE_B64 (stops a `blob` kind
+    // from smuggling bulk data through the ciphertext field) plus every short field ≤
+    // MAX_FIELD_B64. Together these bound the DO row size (≈ ciphertext + a few fields).
     if entry.content_kind == "inline" {
         let len = entry.ciphertext_b64.as_ref().map(|s| s.len()).unwrap_or(0);
         if len == 0 || len > MAX_INLINE_B64 {
@@ -412,9 +402,9 @@ pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Ok(pair) => pair,
         Err(resp) => return Ok(resp),
     };
-    // Device binding + revoked gate (B6 — Codex HIGH: append had it, sync did NOT, so a removed or
-    // revoked device could still PULL server-log ciphertext for as long as its access token lived —
-    // short, but not zero. Mirror the append pattern: extract the token device, revoked → 401).
+    // Device binding + revoked gate, mirroring append: extract the token device, revoked → 401.
+    // Without it a removed or revoked device could still PULL server-log ciphertext for as long as
+    // its access token lived — short, but not zero.
     if device_revoked(&ctx.env, &user_id, &device_id).await? {
         return json_err(401, "device_revoked");
     }

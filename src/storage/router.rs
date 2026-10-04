@@ -1,26 +1,21 @@
-//! `StorageRouter` — placement + resolution. **Handlers talk to NOTHING ELSE**
-//! (single choke-point; replaces `MediaStore`).
+//! `StorageRouter` — placement + resolution. **Handlers talk to NOTHING ELSE** (single
+//! choke-point). `from_env` loads D1 `storage_backends` → multi-backend resolution.
 //!
-//! FAZ 2 (2026-07-08): `from_env` loads D1 `storage_backends` → multi-backend resolution.
-//!   - **60s per-isolate config cache** (the maintenance.rs CHECK_EVERY_SECS pattern): only
-//!     the D1 config snapshot is cached (plain data — no JsValue, no bindings), so the hot
-//!     path costs no D1 round-trip per request. The live `BlobStore` handles (R2 binding /
-//!     S3Store) are rebuilt per request for next to nothing (a binding lookup never hits the
-//!     network; an S3Store is just a struct).
-//!   - A `/admin/storage` mutation drops its own isolate's cache IMMEDIATELY via
-//!     `invalidate_storage_cache`; other isolates catch up within 60s (plan f#12 — the
-//!     window is harmless).
-//!
-//! SINGLE-BACKEND BEHAVIOUR IS UNCHANGED: with no S3 rows (just migration 0028's
-//! `r2-primary` default) reads and writes resolve to R2 exactly as before. If D1 is
-//! unreadable or the table is missing → fall back to a single `r2-primary` (active when the
-//! binding exists; on Lite any_available=false).
-//!
-//! FAZ 3 (2026-07-08): put_new priority overflow + per-backend max_bytes enforcement +
-//! fall through to the next eligible backend on PUT failure (degraded write) + opportunistic
-//! health marking (put/get Err → last_health_ok=0). `readonly`/`disabled` are EXCLUDED from
-//! placement (readonly still serves reads/deletes). `storage_orphans` cleanup + drain live
-//! in maintenance.rs / Faz 4.
+//! - **60s per-isolate config cache** (the maintenance.rs CHECK_EVERY_SECS pattern): only the
+//!   D1 config snapshot is cached (plain data — no JsValue, no bindings), so the hot path
+//!   costs no D1 round-trip per request. The live `BlobStore` handles (R2 binding / S3Store)
+//!   are rebuilt per request for next to nothing (a binding lookup never hits the network; an
+//!   S3Store is just a struct). An `/admin/storage` mutation drops its own isolate's cache
+//!   IMMEDIATELY via `invalidate_storage_cache`; other isolates catch up within the TTL.
+//! - **A single backend behaves exactly as a plain R2 install:** with no S3 rows (just the
+//!   `r2-primary` default) reads and writes resolve to R2. If D1 is unreadable or the table is
+//!   missing → fall back to a single `r2-primary` (active when the binding exists; on Lite
+//!   any_available=false).
+//! - **Placement:** priority overflow + per-backend max_bytes enforcement + fall through to
+//!   the next eligible backend on PUT failure (degraded write) + opportunistic health marking
+//!   (put/get Err → last_health_ok=0). `readonly`/`disabled` are EXCLUDED from placement
+//!   (readonly still serves reads/deletes). `storage_orphans` cleanup and drain live in
+//!   maintenance.rs / drain.rs.
 
 use std::cell::RefCell;
 
@@ -38,10 +33,10 @@ const CACHE_TTL_SECS: u64 = 60;
 pub enum PlacementError {
     /// There ARE active backends but all of them are at `max_bytes` → 429
     /// `quota_exceeded/server_storage` (the client already understands this quota contract —
-    /// op_result treats it as nonretryable). Plan f#5.
+    /// op_result treats it as nonretryable).
     AllFull,
     /// Active backends with room were tried and EVERY one failed the PUT (degraded writes
-    /// exhausted) → 503 `upload_failed` (retryable op). Plan f#1.
+    /// exhausted) → 503 `upload_failed` (retryable op).
     AllFailed,
     /// No writable (`active`) backend at all (everything readonly/disabled) → 503
     /// `upload_failed`. The `any_available` gate normally catches this first; this covers the
@@ -70,15 +65,13 @@ pub fn placement_err_response(e: PlacementError) -> Result<Response> {
 #[derive(Clone, Deserialize)]
 struct StoreConfig {
     store_id: String,
-    kind: String, // 'r2_binding' | 's3'  (Faz 6: 'webdav')
+    kind: String, // 'r2_binding' | 's3'
     state: String,
-    // No `priority` field: the row's priority only ever fed `StoreMeta.priority`, which nothing
-    // read. Ordering is the SQL's job (`ORDER BY priority`) and serde simply ignores the column,
-    // so dropping it here changes no behaviour. `admin/storage.rs` still surfaces priority to the
-    // owner panel from its own query.
+    // No `priority` field on purpose: ordering is the SQL's job (`ORDER BY priority`), and
+    // `admin/storage.rs` surfaces priority to the owner panel from its own query.
     max_bytes: Option<i64>,
-    // Faz 3: usage estimate at placement time, for per-backend cap enforcement (best-effort;
-    // fed by the daily reconcile + media_added/removed; the ≤60s cache may be stale — soft cap).
+    // Usage estimate at placement time, for per-backend cap enforcement (best-effort; fed by
+    // the daily reconcile + media_added/removed; the cached snapshot may be stale — soft cap).
     #[serde(default)]
     used_bytes: i64,
     config_json: String,
@@ -97,7 +90,7 @@ thread_local! {
 
 /// Called after an `/admin/storage` mutation (POST/PATCH/DELETE) → drop THIS isolate's
 /// config cache so the next `from_env` reloads from D1. Other isolates catch up within their
-/// own 60s TTL (plan f#12).
+/// own 60s TTL.
 pub fn invalidate_storage_cache() {
     CONFIG_CACHE.with(|c| *c.borrow_mut() = None);
 }
@@ -106,11 +99,9 @@ pub fn invalidate_storage_cache() {
 pub struct StoreMeta {
     pub store_id: String,
     pub state: String,
-    // `priority` used to sit here behind an allow(dead_code), "carried for a future consumer
-    // (drain target selection / panel diagnostics)". Faz 3 and Faz 4 both landed without one: the
-    // drain relies on the SQL's own `ORDER BY priority` plus `classify_placement`, and the panel
-    // reads priority from its own D1 query in `admin/storage.rs`. A field nothing reads is not a
-    // snapshot, it is weight — adding it back is one line if a reader ever appears.
+    // No `priority` here: the drain relies on the SQL's own `ORDER BY priority` plus
+    // `classify_placement`, and the panel reads priority from its own D1 query in
+    // `admin/storage.rs`. Adding the field back is one line if a reader ever appears.
     /// NULL = unlimited; when set, placement enforces `used_bytes + size <= max_bytes`.
     pub max_bytes: Option<i64>,
     /// Usage estimate at placement time (best-effort, from the cache — soft cap).
@@ -163,21 +154,21 @@ impl StorageRouter {
     }
 
     /// Is media storage CONFIGURED at all — i.e. is there at least one usable backend?
-    /// FAZ 3: `disabled` backends do NOT count (fully closed); `active/readonly/draining` do
-    /// (reads keep working at minimum). On a Lite+B2 install (no R2 binding, S3 active) this
-    /// is true → capabilities report `media=true` (plan f#11). No non-disabled backend → 503
-    /// `media_not_configured` (plan f#10, bit-identical on Lite).
+    /// `disabled` backends do NOT count (fully closed); `active/readonly/draining` do (reads
+    /// keep working at minimum). On an install with no R2 binding but an active S3 this is
+    /// true → capabilities report `media=true`. No non-disabled backend → 503
+    /// `media_not_configured`.
     pub fn any_available(&self) -> bool {
         self.stores.iter().any(|(m, _)| m.state != "disabled")
     }
 
     /// Place a new blob → returns the store_id it was written to (the caller records it in the
-    /// meta row). FAZ 3 POLICY (plan c.4/f): among the `active` backends in priority order,
-    /// write to the FIRST one where `used_bytes + size <= max_bytes`; on a PUT failure mark
-    /// health opportunistically and fall through to the NEXT eligible backend (degraded write).
-    /// All full → `AllFull` (→ 429 quota); every attempt failed the PUT → `AllFailed` (→ 503);
-    /// no active backend → `NoActive`. With a lone r2-primary (max_bytes NULL) this is just
-    /// "write to the first backend" → BIT-IDENTICAL to the old behaviour.
+    /// meta row). POLICY: among the `active` backends in priority order, write to the FIRST
+    /// one where `used_bytes + size <= max_bytes`; on a PUT failure mark health and fall
+    /// through to the NEXT eligible backend (degraded write). All full → `AllFull` (→ 429
+    /// quota); every attempt failed the PUT → `AllFailed` (→ 503); no active backend →
+    /// `NoActive`. With a lone r2-primary (max_bytes NULL) this is just "write to the first
+    /// backend".
     pub async fn put_new(
         &self,
         _class: StorageClass,
@@ -214,11 +205,69 @@ impl StorageRouter {
         Err(PlacementError::AllFailed)
     }
 
+    /// Place a blob WITHOUT the per-candidate clone `put_new` makes.
+    ///
+    /// `put_new` falls through to the next backend when a PUT fails, and to keep the bytes for
+    /// that second attempt it clones them — on EVERY attempt, including the only one a
+    /// single-backend install makes. At 50 MiB that is affordable; a 30 MB instrument pack in a
+    /// 128 MB isolate would be held twice for nothing. This one MOVES the bytes into the first
+    /// eligible backend and reports the failure instead, which is the right trade for an object
+    /// the operator uploads by hand and can simply upload again.
+    pub async fn put_once(
+        &self,
+        _class: StorageClass,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> std::result::Result<String, PlacementError> {
+        let size = bytes.len() as i64;
+        let plan = classify_placement(
+            self.stores.iter().map(|(m, _)| PlacementSlot {
+                state: &m.state,
+                max_bytes: m.max_bytes,
+                used_bytes: m.used_bytes,
+            }),
+            size,
+        );
+        let idx = match plan {
+            Placement::Candidates(idxs) => idxs[0],
+            Placement::AllFull => return Err(PlacementError::AllFull),
+            Placement::NoActive => return Err(PlacementError::NoActive),
+        };
+        let (meta, store) = &self.stores[idx];
+        match store.put(key, bytes, content_type).await {
+            Ok(()) => Ok(meta.store_id.clone()),
+            Err(e) => {
+                write_health(&self.env, &meta.store_id, false, Some(&short(&e))).await;
+                console_warn!("storage: put_once fail {} → {e:?}", meta.store_id);
+                Err(PlacementError::AllFailed)
+            }
+        }
+    }
+
+    /// Stream a blob out of the backend recorded in store_id — the `get` twin for an object too
+    /// big to hold in memory. `offset` is the start byte of an open-ended range (0 = the whole
+    /// object). Health marking matches `get`.
+    pub async fn get_stream(
+        &self,
+        store_id: &str,
+        key: &str,
+        offset: u64,
+    ) -> Result<Option<super::BlobStream>> {
+        let store = self.resolve(store_id)?;
+        match store.get_stream(key, offset).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                write_health(&self.env, store_id, false, Some(&short(&e))).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Read from the backend recorded in store_id. Unknown store_id → Err: either the blob's
-    /// backend is missing from this isolate's cache (the ≤60s window after it was added — plan
-    /// f#12) or its config failed to parse (plan f#9 → 503 degrade). A genuine backend error →
-    /// opportunistic health mark + Err (the caller returns 503 `storage_backend_unavailable`,
-    /// retryable — plan f#2).
+    /// backend is missing from this isolate's cache (the ≤60s window after it was added) or its
+    /// config failed to parse. A genuine backend error → health mark + Err (the caller returns
+    /// 503 `storage_backend_unavailable`, retryable).
     pub async fn get(&self, store_id: &str, key: &str) -> Result<Option<BlobObject>> {
         let store = self.resolve(store_id)?;
         match store.get(key).await {
@@ -235,7 +284,7 @@ impl StorageRouter {
     /// BULK (cleanup ≤500 / orphan retry ≤50), and a per-row health write would blow up those
     /// batches. The bulk path writes its own aggregated health mark (maintenance.rs); the
     /// single ack path propagates the Err to the caller, which KEEPS the meta row so the delete
-    /// is retried (plan f#3).
+    /// is retried.
     pub async fn delete(&self, store_id: &str, key: &str) -> Result<()> {
         self.resolve(store_id)?.delete(key).await
     }
@@ -285,7 +334,7 @@ fn classify_placement<'a>(
     let mut any_active = false;
     for (idx, s) in slots.enumerate() {
         if s.state != "active" {
-            continue; // readonly/draining/disabled → excluded from placement (plan f#6)
+            continue; // readonly/draining/disabled → excluded from placement
         }
         any_active = true;
         let fits = match s.max_bytes {
@@ -306,9 +355,8 @@ fn classify_placement<'a>(
 }
 
 /// Load D1 `storage_backends` in priority order. FAULT-TOLERANT: missing table / D1 error /
-/// no rows → fall back to a single `r2-primary` (preserving today's single-backend behaviour;
-/// active when the binding exists, while on Lite build_stores yields nothing → any_available
-/// false).
+/// no rows → fall back to a single `r2-primary` (active when the binding exists; with no
+/// binding build_stores yields nothing → any_available false).
 async fn load_configs(env: &Env) -> Vec<StoreConfig> {
     let Ok(db) = env.d1("DB") else {
         return fallback_configs();
@@ -330,10 +378,9 @@ async fn load_configs(env: &Env) -> Vec<StoreConfig> {
     rows
 }
 
-/// Fallback: `r2-primary` only (covers the migration/missing-table window and D1 errors —
-/// bit-identical to today's single-backend behaviour). Note this ignores an r2-primary that is
-/// actually `disabled` in D1: if D1 cannot be read, the safest assumption is to try the R2
-/// binding as active.
+/// Fallback: `r2-primary` only (covers the missing-table window and D1 errors). Note this
+/// ignores an r2-primary that is actually `disabled` in D1: if D1 cannot be read, the safest
+/// assumption is to try the R2 binding as active.
 fn fallback_configs() -> Vec<StoreConfig> {
     vec![StoreConfig {
         store_id: PRIMARY_STORE_ID.to_string(),
@@ -346,10 +393,10 @@ fn fallback_configs() -> Vec<StoreConfig> {
 }
 
 /// Build the live `BlobStore`s from the config snapshot. A backend that cannot be built is
-/// SKIPPED (opportunistic degrade): r2_binding with no MEDIA binding (Lite) → skip; s3 whose
-/// config fails to parse → log and skip (a get for a blob on that backend hits resolve Err →
-/// 503, plan f#9). `disabled` backends are loaded too so reads/deletes keep working — put_new
-/// filters on `active` anyway.
+/// SKIPPED (opportunistic degrade): r2_binding with no MEDIA binding → skip; s3 whose config
+/// fails to parse → log and skip (a get for a blob on that backend hits resolve Err → 503).
+/// `disabled` backends are loaded too so reads/deletes keep working — put_new filters on
+/// `active` anyway.
 fn build_stores(env: &Env, configs: Vec<StoreConfig>) -> Vec<(StoreMeta, BlobStore)> {
     let mut out = Vec::new();
     for cfg in configs {
@@ -364,7 +411,7 @@ fn build_stores(env: &Env, configs: Vec<StoreConfig>) -> Vec<(StoreMeta, BlobSto
                 store,
             )),
             Err(e) => {
-                // Lite (binding_missing) is silently normal; an s3 parse failure is an owner
+                // A missing binding is silently normal; an s3 parse failure is an owner
                 // mistake → warn.
                 if cfg.kind != "r2_binding" {
                     console_warn!("storage: could not build '{}' ({}): {e}", cfg.store_id, cfg.kind);
@@ -389,14 +436,14 @@ mod tests {
 
     #[test]
     fn a_single_unlimited_active_store_is_picked_first() {
-        // A lone r2-primary (max NULL) → always the first candidate (bit-identical behaviour).
+        // A lone r2-primary (max NULL) → always the first candidate.
         let p = classify_placement([slot("active", None, 0)].into_iter(), 100);
         assert_eq!(p, Placement::Candidates(vec![0]));
     }
 
     #[test]
     fn overflow_skips_the_full_store_and_falls_to_the_next() {
-        // idx0 is full (0+100 > 10), idx1 has room → only idx1 qualifies (plan f#5 overflow).
+        // idx0 is full (0+100 > 10), idx1 has room → only idx1 qualifies.
         let p = classify_placement(
             [slot("active", Some(10), 0), slot("active", None, 0)].into_iter(),
             100,
@@ -426,7 +473,7 @@ mod tests {
 
     #[test]
     fn readonly_and_disabled_are_excluded_from_placement() {
-        // readonly + disabled on their own → NoActive (plan f#6: readonly is not writable).
+        // readonly + disabled on their own → NoActive (readonly is not writable).
         let p = classify_placement(
             [slot("readonly", None, 0), slot("disabled", None, 0)].into_iter(),
             100,
@@ -442,7 +489,7 @@ mod tests {
 
     #[test]
     fn every_active_store_full_yields_allfull() {
-        // Two active backends, both full → AllFull (→ 429 quota, plan f#5).
+        // Two active backends, both full → AllFull (→ 429 quota).
         let p = classify_placement(
             [slot("active", Some(10), 5), slot("active", Some(20), 20)].into_iter(),
             100,

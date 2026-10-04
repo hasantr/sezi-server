@@ -14,13 +14,11 @@ impl UserInbox {
             WebSocketIncomingMessage::String(s) => s,
             WebSocketIncomingMessage::Binary(_) => return Ok(()),
         };
-        // W1 (delivered_live false-positive fix): ANY inbound frame proves the
-        // client→server direction is GENUINELY alive. Refresh `last_seen_ms` in the socket
-        // attachment; notify_inner uses that stamp as its zombie-socket test (the client
-        // pings every 5s, so a live socket is always fresh, while a half-open socket left
-        // behind by a MIUI background kill goes stale → delivery to it does not count as
-        // "live" → an FCM wake is triggered instead). Errors are swallowed: no attachment
-        // or a parse failure (e.g. a pre-S1 connection) simply skips the refresh.
+        // ANY inbound frame proves the client→server direction is genuinely alive, so the stamp
+        // refreshes here. `notify_inner` uses it as its zombie-socket test: the client pings every
+        // 5s, so a live socket stays fresh while a half-open one left by a background kill goes
+        // stale, and delivery to it stops counting as "live" (an FCM wake goes out instead).
+        // Errors are swallowed — a missing attachment just skips the refresh.
         if let Ok(Some(mut att)) = ws.deserialize_attachment::<Attachment>() {
             att.last_seen_ms = Some((now_secs() * 1000) as i64);
             let _ = ws.serialize_attachment(att);
@@ -40,11 +38,9 @@ impl UserInbox {
                 if ids.is_empty() {
                     return Ok(());
                 }
-                // A1 completion: msg_uids PARALLEL to `ids` (populated for a visible 1:1
-                // message). The delivered receipt now carries uids just like read does, so the
-                // sender's SIBLING can advance its `oc-{msg_uid}` row from Sent to Delivered.
-                // The id→uid mapping travels as a uid array in `ids` order on the
-                // `/forward-delivered` payload.
+                // msg_uids PARALLEL to `ids`. The delivered receipt carries uids like read does,
+                // so the sender's SIBLING can advance its `oc-{msg_uid}` row to Delivered; the
+                // mapping travels as a uid array in `ids` order on `/forward-delivered`.
                 let ack_uids: Vec<String> = value
                     .get("uids")
                     .and_then(|v| v.as_array())
@@ -60,30 +56,20 @@ impl UserInbox {
                     .zip(ack_uids.iter().cloned())
                     .filter(|(_, u)| !u.is_empty())
                     .collect();
-                // `success` is optional and defaults to true (backwards compatibility).
-                // When false the queue is still drained but no `delivered` is forwarded to
-                // the sender (a `delivery_failed` goes out instead, see below). The client
-                // sends it to clear the queue after a decrypt failure (MAC mismatch and
-                // friends), which is exactly when we must not paint a second tick.
-                // See project_olm_2tik_fix.
+                // `success` is optional, defaulting to true. False still drains the queue but
+                // sends `delivery_failed` instead of `delivered`: the client uses it to clear the
+                // queue after a decrypt failure, which is exactly when a second tick would lie.
                 let success = value
                     .get("success")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                // M2-S2.3 ack isolation: SELECT+DELETE only rows belonging to THIS device.
-                // FIX-2(b) (HIGH — NULL tolerance RESTORED): with a concrete device, filter
-                // on `AND (device_id = ? OR device_id IS NULL)`. RATIONALE: a NULL pending row
-                // is now LEGITIMATE — it means a user who never published a device list
-                // (group fallback FIX-1, the LEFT JOIN). Such a user is a SINGLE logical
-                // device, so the device that connects must be able to ack its own NULL rows;
-                // otherwise a delivered message is never removed from the queue and we get a
-                // redelivery loop. This is safe because NULL only arises for an
-                // unpublished-single-device user (the 1:1 path REQUIRES device_id [FIX-2(a)],
-                // so NULL never comes from 1:1) → no multi-device ambiguity. Red-team #18's
-                // argument for dropping the tolerance is void since FIX-1.
-                // S3-TODO: revisit if a multi-device user can ever own a NULL row (NULL would
-                // no longer imply "one device" → the risk of deleting another device's row
-                // comes back).
+                // Ack isolation: SELECT+DELETE only rows belonging to THIS device, plus NULL ones
+                // — `AND (device_id = ? OR device_id IS NULL)`. A NULL pending row is legitimate:
+                // it belongs to a member who never published a device list (the group fallback's
+                // LEFT JOIN), who is therefore a SINGLE logical device that must be able to ack
+                // its own rows, or the message is never removed and redelivers forever. Safe only
+                // because the 1:1 path REQUIRES a device_id, so NULL never means ambiguity.
+                // Revisit if a multi-device user can ever own a NULL row.
                 let ack_device: Option<String> = ws
                     .deserialize_attachment::<Attachment>()
                     .ok()
@@ -91,13 +77,9 @@ impl UserInbox {
                     .map(|a| a.device_id);
                 let placeholders: String =
                     (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-                // The socket's own device is always known now, so the device-blind fallback for a
-                // claim-less token is gone. `ack_device` stays an Option only because the
-                // attachment itself may be missing on a socket that was never attached.
-                //
-                // `OR device_id IS NULL` STAYS, and is not the same thing: it is about the PENDING
-                // ROW, not the token. See the FIX-2(b) note above — a NULL row belongs to a member
-                // who has not published a device list yet.
+                // `ack_device` is an Option only because the attachment may be missing on a socket
+                // that was never attached — not because a token can lack a device claim. The
+                // `OR device_id IS NULL` above is a different thing: it is about the pending ROW.
                 let (dev_clause, mut extra_arg): (&str, Option<JsValue>) = match &ack_device {
                     Some(d) => (
                         " AND (device_id = ? OR device_id IS NULL)",
@@ -196,20 +178,17 @@ impl UserInbox {
                     }
                 }
             }
-            // NO `typing` ARM, deliberately — the frame-kind list on `handle_ws_message` above
-            // omits it for the same reason. The typing indicator does not travel as a WS frame: it is an E2E-encrypted
+            // NO `typing` ARM, deliberately. The indicator is an E2E-encrypted
             // `InnerMessage::Typing` inside an ordinary `send`, so the server never sees it as
-            // typing. A frame arm existed here until 2026-08-05, sent by nothing, and it was the
-            // one path in this file that authorized nothing.
+            // typing — a frame arm here would be the one path in this file authorizing nothing.
             "ping" => {
-                // Application-level keepalive: returning a pong is mandatory for the
-                // client's zombie detection. Without it the client still sees an open TCP
-                // connection while, after a server-side hibernation/migration, the receive
-                // path is actually broken.
+                // Application-level keepalive; the pong is mandatory for the client's zombie
+                // detection. Without it the client sees an open TCP connection while, after a
+                // hibernation or migration, the receive path is broken.
                 let _ = ws.send_with_str(r#"{"type":"pong"}"#);
             }
-            // Sprint 8: the client confirms it received the forwarded receipts → drop them
-            // from the queue. Frame: { type: "forward_ack", ids: [...] }
+            // The client confirms it received the forwarded receipts → drop them from the queue.
+            // Frame: `{ type: "forward_ack", ids: [...] }`
             "forward_ack" => {
                 if let Some(ids_val) = value.get("ids") {
                     if let Ok(ids) = serde_json::from_value::<Vec<i64>>(ids_val.clone()) {
@@ -217,16 +196,14 @@ impl UserInbox {
                     }
                 }
             }
-            // Layer-4: the client asks for durable receipt_state past its cursor and gets a
-            // `receipt_batch` (delivered/read state) back. Clients trigger this on connect,
-            // on a `receipt_update` notification and periodically. (See receipt.rs.)
+            // The client asks for durable receipt_state past its cursor and gets a `receipt_batch`
+            // back — on connect, on a `receipt_update` notification, and periodically.
             "receipt_sync" => {
                 let since = value.get("since").and_then(|v| v.as_i64()).unwrap_or(0);
                 self.receipt_sync(&ws, since);
             }
-            // Sibling-read durable cursor (2026-06-28): a device of U reports the msg_uids it
-            // read over the HOT socket → self_read_state set-once + self_read_update/delta to
-            // U's other devices.
+            // A device reports over the hot socket the msg_uids it read → self_read_state
+            // set-once, plus a self_read_update delta to that user's other devices.
             "self_read" => {
                 if let Some(uids_val) = value.get("uids") {
                     if let Ok(uids) = serde_json::from_value::<Vec<String>>(uids_val.clone()) {
@@ -241,30 +218,25 @@ impl UserInbox {
                 let since = value.get("since").and_then(|v| v.as_i64()).unwrap_or(0);
                 self.self_read_sync(&ws, since);
             }
-            // WS-send (field report 2026-06-02 + the M2-S2.3 WIRE-CUT batch): send the message
-            // over the HOT socket instead of an HTTP POST → no per-message TLS/ECH handshake
-            // (~85-150ms, versus ~470ms for a cold HTTP request). This arm runs in the SENDER's
-            // DO and does a cross-DO POST /notify to the recipient (SAME logic as
-            // handlers::send → notify_inner stores, assigns an id and pushes).
+            // WS-send: the message goes over the HOT socket instead of an HTTP POST, so it costs
+            // no per-message TLS/ECH handshake (~85-150ms against ~470ms for a cold request).
+            // This arm runs in the SENDER's DO and cross-DO POSTs /notify to the recipient, the
+            // same logic as `handlers::send`.
             //
-            // M2-S2.3: the frame carries an `envelopes[]` batch (HTTP and WS-send are
-            // bit-identical). For 1:1 there is one envelope per device
-            // ({device_id, envelope_b64}); for a group a single element without a device_id.
-            // The envelopes[] loop does a per-device /notify and answers with ONE
+            // Wire: an `envelopes[]` batch, bit-identical to HTTP — one envelope per device for
+            // 1:1 ({device_id, envelope_b64}), a single element without a device_id for a group.
+            // The loop /notifies per device and answers ONE
             // `send_ack_batch{ref, acks:[{device_id,id}], ts}`. PARTIAL FAILURE: a device whose
-            // /notify 500s DROPS OUT of the ack list, and the batch is still a send_ack_batch;
-            // send_err is sent ONLY when no device succeeded. With N=1 the single element
-            // yields a single ack, i.e. today's single-envelope flow. `ref` is ALWAYS answered.
+            // /notify 500s drops out of the ack list and it is still a send_ack_batch; send_err
+            // goes out only when NO device succeeded. `ref` is ALWAYS answered.
             "send" => {
                 let reff = value.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let recipient_id =
                     value.get("recipient_id").and_then(|v| v.as_str()).unwrap_or("");
                 let group_id = value.get("group_id").and_then(|v| v.as_str());
-                // SECURITY (checkpoint 3 — Codex's "biggest miss"): WS-send carries 1:1 ONLY.
-                // Groups go through the HTTP `/messages/send` fan-out, which checks MEMBERSHIP
-                // via `group_role`. A WS-send with a group_id opened a group-injection path
-                // with no membership check → REJECT it and push groups to HTTP. `ref` is
-                // always answered.
+                // SECURITY: WS-send carries 1:1 ONLY. Groups go through the HTTP
+                // `/messages/send` fan-out, which checks MEMBERSHIP via `group_role`; accepting a
+                // group_id here would be group injection with no membership check.
                 if group_id.is_some() {
                     let _ = ws.send_with_str(
                         serde_json::json!({"type":"send_err","ref":reff,"code":"group_via_http"})
@@ -280,7 +252,6 @@ impl UserInbox {
                     .flatten();
                 let sender_id = attach.as_ref().map(|a| a.user_id.clone());
                 let sender_device_id = attach.as_ref().map(|a| a.device_id.clone());
-                // M2-S2.3: parse envelopes[] as EnvItem{device_id?, envelope_b64}.
                 let env_items: Vec<(Option<String>, String)> = value
                     .get("envelopes")
                     .and_then(|v| v.as_array())
@@ -301,24 +272,19 @@ impl UserInbox {
                             .collect()
                     })
                     .unwrap_or_default();
-                // The 1:1 path needs a recipient; the group path is keyed by group_id with an
-                // empty recipient. WS-send currently carries only 1:1 (groups fan out over
-                // HTTP in handlers), but the recipient-length check is still skipped when a
-                // group_id is present.
+                // The 1:1 path needs a recipient; a group is keyed by group_id with an empty one,
+                // so the recipient-length check is skipped when a group_id is present.
                 let is_group = group_id.is_some();
-                // Validation (parity with handlers::send): auth + ref + batch size + per-
-                // envelope size + (1:1) uuid length + not-self-or-a-different-device.
+                // Validation at parity with `handlers::send`: auth + ref + batch size + envelope
+                // size + (1:1) uuid length + not-self-or-a-different-device.
                 let envelopes_ok = !env_items.is_empty()
                     && env_items.len() <= 100
                     && env_items
                         .iter()
                         .all(|(_, e)| e.len() >= 20 && e.len() <= 64 * 1024);
-                // FIX-2(a) (HIGH — orphan NULLs, parity with handlers::send): on the 1:1 path
-                // (is_group=false) every EnvItem.device_id MUST be concrete. The sender knows
-                // the recipient's devices from the bundle, so each envelope targets a concrete
-                // device; a 1:1 body with device_id=None is a buggy/old client and would create
-                // orphan NULL pending rows. (The self-send branch already implies device_id is
-                // Some and must differ from the sender's device.)
+                // On the 1:1 path every device_id MUST be concrete — the sender knows the
+                // recipient's devices from the bundle, and a `None` would create orphan NULL
+                // pending rows nothing acks.
                 let recipient_ok = is_group
                     || (recipient_id.len() == 36
                         && env_items.iter().all(|(d, _)| d.is_some())
@@ -341,11 +307,8 @@ impl UserInbox {
                 }
                 let sender_id = sender_id.unwrap();
                 let sender_device_id = sender_device_id.unwrap();
-                // R1 (security, device-lifecycle audit): close the WS-send revoke asymmetry.
-                // HTTP `/messages/send` (`messages::handlers::send`) calls device_revoked but WS-send did
-                // not, so a revoked device could still INJECT 1:1 messages over the HOT socket
-                // (outbound-injection asymmetry). Closed with fail-closed parity (`ref` is
-                // still answered).
+                // Revoke parity with HTTP `/messages/send`, fail-closed: without it a revoked
+                // device can still INJECT 1:1 messages over the hot socket.
                 match crate::auth::middleware::account_device_active(&self.env, &sender_id, &sender_device_id).await {
                     Ok(false) => {
                         let _ = ws.send_with_str(
@@ -399,17 +362,11 @@ impl UserInbox {
                         return Ok(());
                     }
                 }
-                // H2 (DoS — rate-limit parity for the hot WS path): HTTP `/messages/send`
-                // (`messages::handlers::send`) enforces a per-user `msg:send:{sender_id}` 300/60s KV
-                // sliding window; hot WS-send BYPASSED it, so a client could inject unlimited
-                // messages over the socket and bloat the recipient DO's SQLite. Uses the SAME
-                // KV bucket and parameters → one shared limit (HTTP + WS together 300/60s).
-                // Placed AFTER the revoke check and BEFORE the /notify to the recipient DO.
-                // The KV binding comes from self.env (same as the HTTP path).
-                // TEMPLATE DIET: the self-host template ships NO RATE_LIMIT KV binding (deploy
-                // screen simplicity + name clashes), so a missing binding or a KV error is
-                // fail-open and traffic continues unlimited (bit-identical on a prod install
-                // that does have the KV).
+                // Rate-limit parity for the hot path: the SAME KV bucket and parameters as HTTP
+                // `/messages/send`, so the two share one 300/60s per-user limit rather than
+                // leaving the socket an unlimited way to bloat the recipient DO's SQLite. It runs
+                // after the revoke check and before the /notify. A missing RATE_LIMIT KV binding
+                // (the self-host template ships none) is fail-open.
                 if !crate::ratelimit::check_rate_limit_env(
                     &self.env,
                     &crate::messages::handlers::send_rate_limit_key(&sender_id),
@@ -422,6 +379,45 @@ impl UserInbox {
                         serde_json::json!({"type":"send_err","ref":reff,"code":"rate_limited"})
                             .to_string()
                             .as_str(),
+                    );
+                    return Ok(());
+                }
+                // The recipient's published devices, resolved ONCE for the batch, at parity with
+                // `handlers::send`. `device_revoked` answers false for a device that DOES NOT
+                // EXIST, so checking only that accepts envelopes aimed at invented device ids:
+                // each becomes a `pending` row nobody can ack, and `pending` evicts oldest-first
+                // at 10 000 rows — enough of them push the victim's real backlog out of their own
+                // inbox.
+                let recipient_devices = match crate::messages::recipient_devices::
+                    load_recipient_devices(&authz_db, recipient_id)
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(_) => {
+                        let _ = ws.send_with_str(
+                            serde_json::json!({"type":"send_err","ref":reff,"code":"authorization_unavailable"})
+                                .to_string()
+                                .as_str(),
+                        );
+                        return Ok(());
+                    }
+                };
+                // ALL-OR-NOTHING, as on the HTTP path: one fabricated target refuses the whole
+                // batch, so the sender learns its device list is wrong instead of half-succeeding.
+                if env_items.iter().any(|(dev, _)| {
+                    dev.as_deref().map(|d| {
+                        recipient_devices.verdict(d)
+                            == crate::messages::recipient_devices::DeviceVerdict::Unknown
+                    }) == Some(true)
+                }) {
+                    let _ = ws.send_with_str(
+                        serde_json::json!({
+                            "type": "send_err",
+                            "ref": reff,
+                            "code": crate::messages::recipient_devices::UNKNOWN_DEVICE_CODE,
+                        })
+                        .to_string()
+                        .as_str(),
                     );
                     return Ok(());
                 }
@@ -439,46 +435,31 @@ impl UserInbox {
                 let push_db = self.env.d1("DB").ok();
                 let mut acks: Vec<serde_json::Value> = Vec::with_capacity(env_items.len());
                 for (dev, env_b64) in &env_items {
-                    // D-M12: do not deliver to a revoked RECIPIENT device over the hot WS path
-                    // either. This loop does NOT go through handlers.rs (it is its own
-                    // per-device delivery path), so without the gate here the hot path would
-                    // stay open to revoked devices. Revoked → skip that device (no pending row,
-                    // no ack; active devices are delivered to normally); a D1 error is
-                    // fail-closed send_err (the `account_device_active` idiom used by the send arm
-                    // above). Matches
-                    // the behaviour of the group JOIN.
+                    // This loop is its own per-device delivery path and does NOT go through
+                    // handlers.rs, so the revoked-RECIPIENT gate has to be repeated here or the
+                    // hot path stays open to revoked devices. Revoked → skip the device (no
+                    // pending row, no ack), matching the group JOIN; an UNKNOWN device or a D1
+                    // error already refused the whole batch above.
                     if let Some(d) = dev.as_deref() {
-                        match crate::auth::middleware::device_revoked(&self.env, recipient_id, d)
-                            .await
+                        if recipient_devices.verdict(d)
+                            != crate::messages::recipient_devices::DeviceVerdict::Active
                         {
-                            Ok(true) => continue,
-                            Ok(false) => {}
-                            Err(_) => {
-                                let _ = ws.send_with_str(
-                                    serde_json::json!({"type":"send_err","ref":reff,"code":"authorization_unavailable"})
-                                        .to_string()
-                                        .as_str(),
-                                );
-                                return Ok(());
-                            }
+                            continue;
                         }
                     }
                     let payload = serde_json::json!({
                         "sender_id": sender_id,
                         "sender_device_id": sender_device_id,
                         "recipient_device_id": dev,
-                        // W1 backstop: the RECIPIENT user_id, which notify_inner persists so the
-                        // alarm can FCM-wake stuck pending rows (an offline DO cannot otherwise
-                        // know its own user).
+                        // notify_inner persists this so the alarm can FCM-wake stuck pending rows;
+                        // an offline DO has no other way to know its own user.
                         "recipient_id": recipient_id,
                         "envelope_b64": env_b64,
                         "group_id": group_id,
-                        // No `silent` here, deliberately: this is the hot WS fan-out for CONTENT.
-                        // Control traffic reaches the server over `send_one_via_http` (the core's
-                        // singleton path) and never through a WS send frame, so there is nothing to
-                        // carry. `NotifyBody.silent` defaults to false, which is the correct answer
-                        // for every message that does arrive here. If control sends are ever routed
-                        // over WS, the frame must start carrying the flag or those wakes come back.
+                        // No `silent`, deliberately: this is the hot fan-out for CONTENT, and
+                        // control traffic reaches the server over `send_one_via_http` instead. If
+                        // control sends are ever routed over WS, the frame must start carrying
+                        // the flag or their wakes come back.
                     })
                     .to_string();
                     let mut init = RequestInit::new();
@@ -531,16 +512,14 @@ impl UserInbox {
                     );
                 }
             }
-            // WS-read (field report 2026-06-02): take the read (third tick) receipt over the HOT
-            // socket → no per-receipt TLS/ECH handshake (cold HTTP /messages/read is ~470ms, and
-            // once WS-send moved messages onto the socket the HTTP connection goes cold). This
-            // arm runs in the READER's DO and does a cross-DO /forward-read to the sender's
-            // (peer_id) DO. NOT via forward_signal + the consume-once forward_queue: /forward-read
-            // routes to `apply_receipt`, because delivered/read are durable `receipt_state` now
-            // and the DO actively drains those kinds OUT of forward_queue. `forward_signal` has
-            // one caller left, delivery_failed. Fire-and-forget, NO ack: read state is idempotent and
-            // cosmetic, the client does not wait for it, and a loss is retriggered by the
-            // viewport.
+            // WS-read: the third-tick receipt over the HOT socket, avoiding a per-receipt TLS/ECH
+            // handshake (cold HTTP is ~470ms, and once WS-send moved messages onto the socket the
+            // HTTP connection is always cold). Runs in the READER's DO and cross-DO /forward-reads
+            // to the sender's. NOT via forward_signal + the consume-once forward_queue:
+            // delivered/read are durable `receipt_state` now, and the DO drains those kinds OUT of
+            // that queue — `forward_signal`'s one remaining caller is delivery_failed.
+            // Fire-and-forget, NO ack: read state is idempotent and cosmetic, and a loss is
+            // retriggered by the viewport.
             "read" => {
                 let peer_id = value.get("peer_id").and_then(|v| v.as_str()).unwrap_or("");
                 let ids: Vec<i64> = value
@@ -548,9 +527,8 @@ impl UserInbox {
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
                     .unwrap_or_default();
-                // #11 Layer-4b: msg_uids PARALLEL to `ids` (supplied by the reader) — carried to
-                // the sender's DO so a sibling device can match its oc- row. Missing → empty
-                // (backwards compatible).
+                // msg_uids PARALLEL to `ids`, carried to the sender's DO so a sibling device can
+                // match its oc- row. Missing → empty.
                 let uids: Vec<String> = value
                     .get("uids")
                     .and_then(|v| v.as_array())
@@ -599,16 +577,11 @@ impl UserInbox {
                 ) {
                     return Ok(());
                 }
-                // H2 (DoS — rate-limit parity for the hot WS path): WS-read could likewise
-                // inject forwards into the peer DO without any limit. Uses the SAME separate
-                // bucket as HTTP read (`msg:read:{reader_id}`, 300/60s) → HTTP + WS reads are
-                // bounded together, and legitimate read traffic does not eat the send quota.
-                // Fire-and-forget: over the limit → swallow silently (read is cosmetic and
-                // idempotent; the client retriggers from the viewport and expects no ack).
-                // Placed BEFORE the forward to the peer DO. TEMPLATE DIET: the KV binding is
-                // OPTIONAL — with no binding (or a KV error) the limiter is fail-open and
-                // traffic continues unlimited; the older behaviour was fail-closed when the
-                // binding was absent, but the template no longer ships it.
+                // Rate-limit parity again, before the forward to the peer DO: the same SEPARATE
+                // bucket as HTTP read (`msg:read:{reader_id}`, 300/60s), so reads are bounded
+                // together and legitimate read traffic does not eat the send quota. Over the
+                // limit is swallowed silently, as this arm is fire-and-forget. A missing KV
+                // binding is fail-open.
                 if !crate::ratelimit::check_rate_limit_env(
                     &self.env,
                     &crate::messages::handlers::read_rate_limit_key(&reader_id),

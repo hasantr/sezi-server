@@ -1,14 +1,15 @@
--- Sezgi: grup KATILIM ONAYI (consent-first; Faz 6 #3).
+-- Sezgi: group JOIN CONSENT (consent-first).
 --
--- "Eklenmek ≠ otomatik katılmak": bir kullanıcı gruba eklenince SESSİZCE üye
--- olmaz; 'pending' durumda davet alır → KABUL (active) veya RED (satır silinir).
---   status   : 'pending' | 'active'  (yalnız active üye mesaj alır/gönderir/sayılır)
---   added_by : daveti gönderen (kabul edince ona GroupJoinAccepted → o anahtarı
---              dağıtır; E2E: anahtar yalnız kabulden SONRA akar).
+-- "Being added ≠ joining automatically": a user added to a group does NOT become a member
+-- SILENTLY; they receive an invite in the 'pending' state → ACCEPT (active) or DECLINE (the
+-- row is deleted).
+--   status   : 'pending' | 'active'  (only an active member sends, receives and counts)
+--   added_by : who sent the invite (on acceptance they receive GroupJoinAccepted and
+--              distribute the key; E2E: the key only flows AFTER the acceptance).
 --
--- Geriye-uyum: DEFAULT 'active' → mevcut (zaten katılmış) üyeler + eski satırlar
--- active kalır. YALNIZ yeni eklenenler (create_group ilk üyeler + add-member)
--- pending yazılır. added_by NULL = eski satır / kurucu.
+-- Backward compatibility: DEFAULT 'active' → existing (already joined) members and old rows
+-- stay active. ONLY newly added members (the first members of create_group + add-member) are
+-- written as pending. added_by NULL = an old row, or the creator.
 
 ALTER TABLE group_members ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE group_members ADD COLUMN added_by TEXT;

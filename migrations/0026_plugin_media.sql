@@ -1,13 +1,13 @@
--- Üye-yüklenebilir KALICI eklenti-medya blob meta tablosu (kota muhasebesi).
+-- Metadata for DURABLE, member-uploadable plugin-media blobs (for quota accounting).
 --
--- media_objects'ten BİLİNÇLİ AYRI: expires_at YOK → KALICI (günlük cleanup cron'u
--- bu tabloya DOKUNMAZ; ack-delete de yok). room-scope'lu (IDOR kapalı — R2 anahtarı
--- plugin-media/{room}/{id}). PRIMARY KEY(room_id, blob_id) = idempotent-PUT +
--- ON CONFLICT çift-sayım koruması.
+-- DELIBERATELY SEPARATE from media_objects: there is NO expires_at → the rows are DURABLE (the
+-- daily cleanup cron does NOT TOUCH this table, and there is no ack-delete either).
+-- Room-scoped (IDOR closed — the R2 key is plugin-media/{room}/{id}).
+-- PRIMARY KEY(room_id, blob_id) = an idempotent PUT + ON CONFLICT double-count protection.
 --
--- Kota: user_storage/server_stats sayaçları HEM media_objects HEM bu tablodan
--- reconcile edilir (usage::reconcile_storage) → check_upload depolama cap'ini iki
--- kanalın TOPLAMINA uygular. size_bytes = content-length (server E2E-kör; içerik sayılmaz).
+-- Quota: the user_storage/server_stats counters are reconciled from BOTH media_objects AND
+-- this table (usage::reconcile_storage) → check_upload applies the storage cap to the SUM of
+-- the two channels. size_bytes = content-length (the server is E2E-blind; content is not counted).
 CREATE TABLE IF NOT EXISTS plugin_media_objects (
   room_id     TEXT NOT NULL,
   blob_id     TEXT NOT NULL,
@@ -17,6 +17,6 @@ CREATE TABLE IF NOT EXISTS plugin_media_objects (
   PRIMARY KEY (room_id, blob_id)
 );
 
--- Per-user kota reconcile'ı uploader_id GROUP BY yapar (+ kullanıcı-silmede olası
--- temizlik) → yükleyen üstünden index.
+-- The per-user quota reconcile does a GROUP BY on uploader_id (and a user deletion may need
+-- to clean up by it) → index on the uploader.
 CREATE INDEX IF NOT EXISTS idx_plugin_media_uploader ON plugin_media_objects (uploader_id);

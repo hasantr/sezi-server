@@ -1,12 +1,14 @@
--- 0027: server_plugin_policy — server-çapı eklenti kullanılabilirlik politikası.
+-- 0027: server_plugin_policy — the server-wide plugin availability policy.
 --
--- Owner/admin, client'taki server-yönetim ekranından bir eklentiyi server çapında
--- KULLANILAMAZ (DISABLED) işaretler. DEFAULT herkes ENABLED → yalnız DISABLED olan
--- eklentiler burada satır tutar (satır varlığı = disabled). Boş tablo = tümü açık.
+-- From the server-administration screen in the client, an owner/admin marks a plugin
+-- UNAVAILABLE (DISABLED) across the whole server. Everything is ENABLED by DEFAULT → only the
+-- DISABLED plugins hold a row here (the existence of a row = disabled). An empty table =
+-- everything is on.
 --
--- Tek-server-tek-DB mimaride server_id kolonu GEREKMEZ (server_config/server_settings
--- deseni: tablo tek sunucunun state'i). Okuma: GET /plugin-policy (HERHANGİ aktif üye →
--- client picker'ı filtreler). Yazma: POST /admin/plugin-policy (require_admin: admin|owner).
+-- In a one-server-one-database architecture no server_id column is NEEDED (the
+-- server_config/server_settings pattern: the table is the state of the single server).
+-- Read: GET /plugin-policy (ANY active member → it filters the client's picker).
+-- Write: POST /admin/plugin-policy (require_admin: admin|owner).
 
 CREATE TABLE IF NOT EXISTS server_plugin_policy (
   plugin_id   TEXT PRIMARY KEY,

@@ -10,15 +10,37 @@
 /// Uniqueness comes from the `invite_attributions.invite_token_hash` primary key: the
 /// first INSERT wins, and a second redeem gets zero RETURNING rows even while
 /// `invite_tokens.used` is still 0. Bind order: `token_hash, redeemed_at, raw_token,
-/// now, token_hash`.
+/// now, token_hash, genesis_allowed` (the last is 1 or 0, see below).
+///
+/// **The genesis fact is decided here and nowhere else.** An invite with no minter
+/// (`owner_user_id IS NULL`, see `auth::bootstrap`) is the genesis invite, and the snapshot
+/// records that in `genesis`, which is what verify grants `owner` from. Recording it at the claim
+/// rather than re-reading it at verify matters because the inputs move: `inviter_user_id` is
+/// cleared when an inviter is removed, and the `users` table is whatever it is by then.
+///
+/// The second predicate closes the genesis door the way `/bootstrap` does: once the server has an
+/// owner, a minter-less invite claims nothing. That covers the leftovers that look like a genesis
+/// invite without being one — before 2026-10-04 removing an admin turned their unused invites into
+/// minter-less rows (`membership.rs`), and an open-mode server never redeemed the genesis invite
+/// the welcome page minted. Redeem answers those `invalid_invite`.
+///
+/// `genesis_allowed` is the claim secret's second gate (`auth::claim`). `/bootstrap` withholds
+/// the genesis invite from a request without the secret, but a genesis invite minted BEFORE the
+/// secret was configured — printed on the welcome page, say — would otherwise still claim the
+/// server. Redeem passes 0 when a secret is configured and the request does not carry it, and the
+/// genesis door stays shut inside the same statement, with no window between a check and the
+/// claim. A minted (non-genesis) invite never depends on it.
 pub(crate) const CLAIM_INVITE_SQL: &str = "INSERT INTO invite_attributions
        (invite_token_hash, email_hint, inviter_user_id, inviter_ed_pub, used_by,
-        created_at, expires_at, redeemed_at, verified_at)
+        created_at, expires_at, redeemed_at, verified_at, genesis)
      SELECT ?, it.email_hint, it.owner_user_id, u.identity_ed_pub, NULL,
-            it.created_at, it.expires_at, ?, NULL
+            it.created_at, it.expires_at, ?, NULL,
+            CASE WHEN it.owner_user_id IS NULL THEN 1 ELSE 0 END
        FROM invite_tokens it
        LEFT JOIN users u ON u.id = it.owner_user_id
       WHERE it.token = ? AND it.used = 0 AND it.expires_at > ? AND it.token_hash = ?
+        AND (it.owner_user_id IS NOT NULL
+             OR (? = 1 AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'owner')))
      ON CONFLICT(invite_token_hash) DO NOTHING
      RETURNING invite_token_hash";
 
@@ -38,10 +60,13 @@ pub(crate) const UPGRADE_LEGACY_CLAIM_SQL: &str = "INSERT INTO invite_attributio
      RETURNING invite_token_hash";
 
 /// Read the inviter identity for the verify response from the immutable snapshot,
-/// which is independent of both the raw token secret and the source row's TTL.
+/// which is independent of both the raw token secret and the source row's TTL — and, in the same
+/// read, whether the claim was the genesis invite (see [`CLAIM_INVITE_SQL`]). No row means no
+/// claim reached this e-mail, which is never the genesis.
 pub(crate) const LOAD_INVITER_SQL: &str =
     "SELECT ia.inviter_user_id AS owner_user_id,
-            CASE WHEN ia.inviter_ed_pub IS NULL THEN NULL ELSE hex(ia.inviter_ed_pub) END AS inviter_ed_pub
+            CASE WHEN ia.inviter_ed_pub IS NULL THEN NULL ELSE hex(ia.inviter_ed_pub) END AS inviter_ed_pub,
+            ia.genesis AS genesis
        FROM invite_attributions ia
       WHERE ia.invite_token_hash = (
         SELECT invite_token_hash FROM verification_codes WHERE email = ?
@@ -119,7 +144,13 @@ mod tests {
     use crate::auth::hashing::sha256_hex;
     use rusqlite::{params, Connection, OptionalExtension};
 
-    const MIGRATION: &str = include_str!("../../migrations/0031_invite_attributions.sql");
+    /// 0031 creates the ledger and 0039 adds its `genesis` column; every statement in this file
+    /// reads the ledger as it stands after both, so the tests apply them as one step.
+    const MIGRATION: &str = concat!(
+        include_str!("../../migrations/0031_invite_attributions.sql"),
+        "\n;\n",
+        include_str!("../../migrations/0039_genesis_claim.sql")
+    );
     const CONTACTS_MIGRATION: &str =
         include_str!("../../migrations/0032_contacts_directory_v2.sql");
 
@@ -129,7 +160,8 @@ mod tests {
             "PRAGMA foreign_keys = ON;
              CREATE TABLE users (
                id TEXT PRIMARY KEY,
-               identity_ed_pub BLOB
+               identity_ed_pub BLOB,
+               role TEXT NOT NULL DEFAULT 'member'
              );
              CREATE TABLE server_settings (
                id INTEGER PRIMARY KEY CHECK(id = 1)
@@ -188,7 +220,7 @@ mod tests {
         .unwrap();
         db.query_row(
             CLAIM_INVITE_SQL,
-            params![hash, now, token, now, hash],
+            params![hash, now, token, now, hash, 1],
             |r| r.get(0),
         )
         .optional()

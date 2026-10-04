@@ -12,6 +12,7 @@ mod d1util;
 mod devices;
 mod email;
 mod groups;
+mod instrument_pack;
 mod keys;
 mod maintenance;
 mod media;
@@ -42,65 +43,53 @@ fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Daily cleanup cron — driven by `[triggers] crons` in wrangler.toml. The daily
-/// body lives in `maintenance::run_daily`, the function SHARED by the cron and the
-/// lazy path (it was moved there verbatim). Every cron run refreshes its own
-/// timestamp, so on a cron-enabled deployment the lazy path stays asleep (see the
-/// maintenance.rs module header); on a cron-less template deployment all
-/// maintenance runs off the lazy path instead.
+/// Daily cleanup cron — driven by `[triggers] crons` in wrangler.toml. The daily body is
+/// `maintenance::run_daily`, SHARED with the lazy path. Every cron run refreshes its own timestamp,
+/// so on a cron-enabled deployment the lazy path stays asleep (see the maintenance.rs header); on a
+/// cron-less template deployment all maintenance runs off the lazy path instead.
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    // Self-host phase-A boot guard: the cron can cold-start an isolate BEFORE any
-    // fetch does (on a fresh fork the drain touches the 0021 fanout_retry table), so
-    // migrations and key provisioning must be guaranteed here as well. Memoized →
-    // no-op on a warm isolate, and a complete no-op on env-secret + wrangler-migrated
-    // prod.
+    // Boot guard: the cron can cold-start an isolate BEFORE any fetch does, and the drain touches
+    // tables a fresh fork has not created, so migrations and key provisioning must be guaranteed
+    // here too. Memoized → a no-op on a warm isolate, and on an already-provisioned deployment.
     self_provision::ensure_ready(&env).await;
-    // W4-b: drain the durable retry queue on EVERY scheduled invocation (Fable #4:
-    // matching on the cron string is BRITTLE → run the drain UNCONDITIONALLY, so both
-    // the frequent "*/2 * * * *" trigger and the daily "0 4 * * *" one drain).
+    // Drain the durable retry queue on EVERY scheduled invocation: matching on the cron string is
+    // brittle, so both the frequent trigger and the daily one drain.
     crate::messages::handlers::drain_fanout_retry(&env).await;
     membership::drain_purge_outbox(&env).await;
-    // Lazy-maintenance stamp: with a live cron the drain stamp is always fresh, so
-    // the fetch-path lazy drain NEVER wakes up (prod stays bit-identical).
+    // With a live cron the drain stamp is always fresh, so the fetch-path lazy drain never wakes.
     maintenance::stamp_drain(&env).await;
-    // Pluggable storage phase 4: draining-backend move tick (≤4 blobs per run; exits
-    // quietly after one cheap SELECT when no backend is draining). Like the fanout
-    // drain it runs on EVERY invocation; the stamp keeps the lazy storage-move asleep
-    // on cron-enabled deployments.
+    // Draining-backend move tick (≤4 blobs per run; exits after one cheap SELECT when no backend
+    // is draining). Like the fanout drain it runs on EVERY invocation, and its stamp likewise keeps
+    // the lazy storage-move asleep.
     if let Err(e) = storage::drain::run_storage_move(&env).await {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
         console_log!("storage move error: {}", truncated);
     }
     maintenance::stamp_move(&env).await;
-    // MINOR-2 (Fable+Codex): bail out early on the frequent cron (no cleanup/GC). The
-    // daily "0 4 * * *" AND any unexpected normalization surprise FALL THROUGH to
-    // cleanup (fail-toward-running: noisy but SAFE; the old `!= "0 4"` direction would
-    // have SILENTLY skipped cleanup+GC on a surprise = media-GC and TTL-GC stall).
-    // cleanup is idempotent → an extra run is harmless. The drain already ran
-    // unconditionally above → it is never skipped.
+    // Bail out early on the frequent cron (no cleanup/GC). The test is written this way round so
+    // that the daily trigger AND any unexpected cron string FALL THROUGH to cleanup: cleanup is
+    // idempotent, so an extra run is harmless, while the opposite direction would silently stall
+    // media-GC and TTL-GC on a surprise. The drain above already ran unconditionally.
     if event.cron() == "*/2 * * * *" {
         return;
     }
-    // Daily set (cleanup + fanout TTL-GC + quota reconcile) — the same body the lazy
-    // path runs, bit for bit, plus the daily stamp that puts lazy daily-GC to sleep.
+    // Daily set (cleanup + fanout TTL-GC + quota reconcile) — the same body the lazy path runs,
+    // plus the daily stamp that puts lazy daily-GC to sleep.
     maintenance::run_daily(&env).await;
     maintenance::stamp_daily(&env).await;
 }
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    // Self-host phase-A boot guard: D1 self-migration (A2) + key self-provisioning
-    // (A1). Memoized per isolate → runs on the first request, no-op afterwards (NO D1
-    // round-trip is added to the hot path). On an env-secret + wrangler-migrated
-    // deployment (our prod) it degenerates to a complete no-op. Must run BEFORE
+    // Boot guard: D1 self-migration + key self-provisioning. Memoized per isolate, so it runs on
+    // the first request and adds no D1 round-trip to the hot path afterwards. Must run BEFORE
     // /sync: sync_ws validates a token, so the signing key has to be ready.
     self_provision::ensure_ready(&env).await;
 
-    // Lazy-maintenance (cron-less deployments): the request-piggybacked maintenance
-    // trigger. Cost on the request critical path is a thread_local time comparison
-    // (no D1, no await); the stamp check and any resulting work happen in the
+    // Lazy maintenance, for cron-less deployments: the cost on the critical path is a thread_local
+    // time comparison (no D1, no await), and the stamp check plus any resulting work happen in the
     // background via `ctx.wait_until`.
     maintenance::maybe_run_lazy(&env, &ctx);
 
@@ -157,8 +146,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // The destruction kit itself: the owner sets it from the app, so a server deployed with the
         // dashboard button is not left unable to reset itself for want of shell access.
         .post_async("/admin/reset-key", admin::reset::set_reset_key)
-        // Virtual server directory + account-level contacts (V2). Directory
-        // pages never expose email, last-seen, devices or raw key material.
+        // Virtual server directory + account-level contacts (V2). Directory pages never expose
+        // email, last-seen, devices or raw key material.
         .get_async("/directory", contacts::directory)
         .get_async("/directory/changes", contacts::directory_changes)
         .get_async("/directory/visibility", contacts::get_visibility)
@@ -179,15 +168,14 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/contacts/qr/offers", contact_qr::create_offer)
         .post_async("/contacts/qr/claims", contact_qr::claim_offer)
         .get_async("/contacts/qr/offers/:id/status", contact_qr::offer_status)
-        // CF Analytics config — owner self-service (owner ONLY; WRITE-ONLY: the token
-        // can only be written here, no endpoint ever hands it back).
+        // CF Analytics config — owner ONLY and WRITE-ONLY: the token can be written here, and no
+        // endpoint ever hands it back.
         .patch_async("/admin/cf-config", admin::cf_config::set_cf_config)
-        // FCM push config — owner self-service (owner ONLY; WRITE-ONLY: the service
-        // account can only be written here, no endpoint ever hands it back).
+        // FCM push config — owner ONLY and WRITE-ONLY, same contract as cf-config.
         .patch_async("/admin/fcm-config", admin::fcm_config::set_fcm_config)
         .patch_async("/admin/turn-config", admin::turn_config::set_turn_config)
-        // Quota epic phase 0: self-reported usage statistics (admin/owner-gated;
-        // SHADOW MODE — reporting only, no limit is enforced).
+        // Self-reported usage statistics, admin/owner-gated. SHADOW MODE: reporting only, no
+        // limit is enforced.
         .get_async("/admin/stats", admin::stats::stats)
         // Server-wide plugin policy. GET = require_active_auth, i.e. any caller whose account
         // still exists and whose token-bound device is not revoked (their plugin picker filters
@@ -200,19 +188,17 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             "/admin/plugin-policy",
             admin::plugin_policy::set_plugin_policy,
         )
-        // Pluggable storage (phases 2+4) — the owner attaches and manages external blob
-        // backends. GET/probe = require_admin; POST/PATCH/DELETE/drain = require_owner
-        // (backend credentials are powerful). config_json (a secret) is returned by NO
-        // response — WRITE-ONLY, same contract as cf/fcm-config. drain (phase 4) marks
-        // a backend for evacuation; the move engine itself lives in storage/drain.rs.
+        // Pluggable storage — the owner attaches and manages external blob backends. GET/probe =
+        // require_admin; POST/PATCH/DELETE/drain = require_owner, because backend credentials are
+        // powerful. `config_json` is a secret returned by NO response — WRITE-ONLY, same contract
+        // as cf/fcm-config. drain marks a backend for evacuation; the move engine is storage/drain.rs.
         .get_async("/admin/storage", admin::storage::list)
         .post_async("/admin/storage", admin::storage::add)
         .patch_async("/admin/storage/:id", admin::storage::update)
         .delete_async("/admin/storage/:id", admin::storage::remove)
         .post_async("/admin/storage/:id/probe", admin::storage::probe)
         .post_async("/admin/storage/:id/drain", admin::storage::drain)
-        // Groups (phase 1 — membership; member-level, not server-admin). Fan-out is
-        // phase 2.
+        // Groups — membership, member-level rather than server-admin.
         .post_async("/groups", groups::create_group)
         .get_async("/groups", groups::list_my_groups)
         .get_async("/groups/:id/members", groups::group_members)
@@ -223,63 +209,66 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/groups/:id/accept", groups::accept_invite)
         .post_async("/groups/:id/decline", groups::decline_invite)
         .delete_async("/groups/:id", groups::delete_group)
-        // Multi-device (M1 — store and serve the signed device list; additive).
+        // Multi-device: store and serve the signed device list.
         .put_async("/devices/list", devices::handlers::put_list)
         .get_async("/devices/list/:user_id", devices::handlers::get_list)
         // What the server OBSERVED about my own devices, beside the signed list rather than
         // inside it — the primary signs that document and cannot know when another device last
         // connected. Self only.
         .get_async("/devices/activity", devices::handlers::get_activity)
-        // Multi-device (M2-S3.2 — QR link flow; all POST, see devices/link.rs).
+        // QR device-link flow; all POST, see devices/link.rs.
         .post_async("/devices/link-start", devices::link::link_start)
         .post_async("/devices/link-approve", devices::link::link_approve)
         .post_async("/devices/link-status", devices::link::link_status)
         .get_async("/keys/:user_id/bundle", keys::handlers::bundle)
         .post_async("/keys/otks/replenish", keys::handlers::replenish)
-        // Diagnostic (task #53): the caller's OWN unconsumed pool depth. `bundle` claims an OTK
+        // Diagnostic: the caller's OWN unconsumed pool depth. `bundle` claims an OTK
         // per active device on every fetch while the core counts only the PreKeys it decrypts,
         // so the local number is not a proxy for this one — the core logs both together.
         .get_async("/keys/otks/count", keys::handlers::otk_count)
         .post_async("/keys/signed-prekey", keys::handlers::rotate_signed_prekey)
         .post_async("/messages/send", messages::handlers::send)
         .post_async("/messages/read", messages::handlers::read)
-        // Shared-root #1: the HTTP twin of receipt-sync — a device without a live WS
-        // pulls its own ticks by cursor, returning {rows,more} bit-identical to the WS
-        // `receipt_sync` frame.
+        // The HTTP twin of receipt-sync: a device without a live WS pulls its own ticks by cursor,
+        // returning {rows,more} identical to the WS `receipt_sync` frame.
         .get_async("/messages/receipt-sync", messages::handlers::receipt_sync)
-        // Durable sibling-read cursor (2026-06-28): a user's device reports the msg_uids
-        // it has read to its own inbox DO (self_read_state), plus a cursor pull. The
-        // read-your-own-messages twin of receipt-sync.
+        // Durable sibling-read cursor: a device reports the msg_uids it has read to its own inbox
+        // DO (self_read_state), plus a cursor pull. The read-your-own-messages twin of the above.
         .post_async("/messages/self-read", messages::handlers::self_read)
         .get_async(
             "/messages/self-read-sync",
             messages::handlers::self_read_sync,
         )
-        // Plugin/feed server log (phase 2): per-(room, plugin) append-only encrypted
-        // log. append = JWT + active member + author binding → DO; sync = cursor pull.
-        // The server stays BLIND to the contents.
+        // Plugin/feed server log: a per-(room, plugin) append-only encrypted log. append = JWT +
+        // active member + author binding → DO; sync = cursor pull. The server stays BLIND to the
+        // contents.
         .post_async("/plugin-log/:room/:plugin/append", plugin_log::append)
         .get_async("/plugin-log/:room/:plugin/sync", plugin_log::sync)
         .post_async("/plugin-blob/:room/:id", plugin_blob::put_code)
         .get_async("/plugin-blob/:room/:id", plugin_blob::get_code)
-        // Member-uploadable PERSISTENT plugin media — plugin_blob's member-PUT, 50 MiB
-        // sibling: active-member PUT/GET, room-scoped R2, and quota/usage counters
-        // SHARED with the regular media channel.
+        // Member-uploadable PERSISTENT plugin media — plugin_blob's member-PUT, 50 MiB sibling:
+        // active-member PUT/GET, room-scoped R2, quota/usage counters SHARED with regular media.
         .post_async("/plugin-media/:room/:id", plugin_media::put_media)
         .get_async("/plugin-media/:room/:id", plugin_media::get_media)
+        // The operator-hosted instrument pack (music studio): one SoundFont per server. PUT and
+        // DELETE are owner-only; both GETs take any active member token. This is the ONE object
+        // the relay stores and serves in PLAINTEXT — see instrument_pack.rs for why. The static
+        // `meta` segment sits above the bare path, which matchit resolves without ambiguity.
+        .put_async("/admin/instrument-pack", instrument_pack::put_pack)
+        .delete_async("/admin/instrument-pack", instrument_pack::delete_pack)
+        .get_async("/instrument-pack/meta", instrument_pack::meta)
+        .get_async("/instrument-pack", instrument_pack::download)
         .post_async("/media/upload", media::handlers::upload)
-        // Avatar blob (Profile Photo epic §2.3): E2E-encrypted, single-slot, exempt from
-        // retention. The static `avatar` segment sits at the same level as the `:id`
-        // param — matchit prefers static segments, exactly like the /media/upload +
-        // /media/:id/ack mix already in the POST tree, so there is no conflict.
+        // Avatar blob: E2E-encrypted, single-slot, exempt from retention. The static `avatar`
+        // segment sits at the same level as the `:id` param — matchit prefers static segments,
+        // like the /media/upload + /media/:id/ack mix already here, so there is no conflict.
         .post_async("/media/avatar", media::avatar::upload)
         .get_async("/media/avatar/:id", media::avatar::download)
         .get_async("/media/:id", media::handlers::download)
         .post_async("/media/:id/ack", media::handlers::ack)
         .post_async("/push/register", push::handlers::register)
         .post_async("/push/unregister", push::handlers::unregister)
-        // TURN credentials for calls (calls phase 1.5 — relaying over the internet;
-        // budget-gated).
+        // TURN credentials for calls — relaying over the internet, budget-gated.
         .post_async("/turn/credentials", turn::credentials)
         .run(req, env)
         .await?;
@@ -289,25 +278,18 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
 /// Let a browser talk to this server.
 ///
-/// Native clients never needed this: an app makes the request it means to make. A page cannot —
-/// the browser refuses to hand back a cross-origin response unless the server says it may, and
-/// with an `Authorization` header it will not even send the request until a preflight `OPTIONS`
-/// says the header is allowed. Without these five lines the web client fails on every call,
-/// before anything reaches D1, with an error the page is not told the reason for.
+/// A native app makes the request it means to make; a page cannot. The browser will not hand back
+/// a cross-origin response unless the server says it may, and with an `Authorization` header it
+/// will not send the request at all until a preflight `OPTIONS` allows the header.
 ///
-/// **`*`, and it is not a weakening.** CORS is not an authorization boundary — it never was. It
-/// governs what one ORIGIN may read from another in a browser, and this API is authorized by a
-/// bearer token that a page can only hold if the user put it there. Anything a hostile page could
-/// reach with `*` it could already reach with curl, minus the token, which is exactly what
-/// `Allow-Origin: *` also forbids: the wildcard makes credentialed requests illegal, so no cookie
-/// or client certificate can ride along even if one existed.
+/// **`*`, and it is not a weakening.** CORS is not an authorization boundary: it governs what one
+/// ORIGIN may read from another in a browser, and this API is authorized by a bearer token a page
+/// only holds if the user put it there. The wildcard also makes credentialed requests illegal, so
+/// no cookie or client certificate can ride along. An echoed allow-list buys nothing — a
+/// self-hosted server cannot know which page its owner runs the web client from.
 ///
-/// The alternative — echoing back an allow-list of origins — buys nothing here. A self-hosted
-/// Sezgi server has no idea which page its owner will run the web client from, and an allow-list
-/// nobody can populate is a list of one wildcard written the long way.
-///
-/// `/sync` is not covered and does not need to be: a WebSocket handshake is exempt from the
-/// same-origin policy, which is also why its token travels as a subprotocol.
+/// `/sync` is not covered and need not be: a WebSocket handshake is exempt from the same-origin
+/// policy, which is also why its token travels as a subprotocol.
 fn apply_cors(headers: &mut Headers) -> Result<()> {
     headers.set("Access-Control-Allow-Origin", "*")?;
     headers.set(
@@ -316,15 +298,21 @@ fn apply_cors(headers: &mut Headers) -> Result<()> {
     )?;
     // `x-sezi-scope-*` is the media upload's group gate (`media/handlers.rs`). A header the client
     // sends but this list omits fails the preflight, and the browser reports it as a generic CORS
-    // failure — so the two have to be kept in step by hand.
+    // failure — so the two have to be kept in step by hand. `x-pack-name` is the instrument
+    // pack's display name, and `If-None-Match` its conditional GET: neither is CORS-safelisted,
+    // so a browser that sent one without this line would be refused before the request left.
     headers.set(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, x-sezi-scope-kind, x-sezi-scope-id",
+        "Authorization, Content-Type, If-None-Match, Range, x-sezi-scope-kind, x-sezi-scope-id, x-pack-name",
     )?;
     // Without this a page can read only the six CORS-safelisted response headers, so
     // `content-length` — which the media download path checks before allocating — comes back
-    // absent rather than wrong.
-    headers.set("Access-Control-Expose-Headers", "Content-Length, Content-Type")?;
+    // absent rather than wrong. `ETag`/`Content-Range`/`Accept-Ranges` are the instrument pack's
+    // resume machinery: unexposed, a page cannot tell a resumed download from a fresh one.
+    headers.set(
+        "Access-Control-Expose-Headers",
+        "Content-Length, Content-Type, ETag, Content-Range, Accept-Ranges",
+    )?;
     // One preflight per day per (origin, method, header set) instead of one per request.
     headers.set("Access-Control-Max-Age", "86400")?;
     Ok(())
@@ -341,11 +329,9 @@ async fn jwks(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
 /// WS /sync upgrade: validate the token, then proxy the original request to the
 /// user's DO stub (the WS pair is established inside the DO via header passthrough).
 ///
-/// Auth pattern: `Sec-WebSocket-Protocol: sezgi.bearer.v1, <access_token>`.
-/// The first subprotocol is the scheme name, the second is the credential. This is
-/// the standard "token via subprotocol" technique — the token is not in the URL
-/// query, so it never surfaces in CF Workers tail debug logs (URLs are logged,
-/// headers are not).
+/// Auth: `Sec-WebSocket-Protocol: sezgi.bearer.v1, <access_token>` — the first subprotocol names
+/// the scheme, the second carries the credential. The token stays out of the URL query, so it
+/// never surfaces in Workers tail logs (URLs are logged, headers are not).
 async fn sync_ws(req: Request, env: Env) -> Result<Response> {
     let token = match extract_bearer_subprotocol(&req) {
         Ok(t) => t,
@@ -374,8 +360,8 @@ async fn sync_ws(req: Request, env: Env) -> Result<Response> {
     stub.fetch_with_request(req).await
 }
 
-/// Parse `Sec-WebSocket-Protocol: sezgi.bearer.v1, <token>` and return the token.
-/// The legacy `?token=` query param is no longer supported (hard cutover).
+/// Parse `Sec-WebSocket-Protocol: sezgi.bearer.v1, <token>` and return the token. A `?token=`
+/// query param is not accepted.
 pub(crate) fn extract_bearer_subprotocol(
     req: &Request,
 ) -> std::result::Result<String, &'static str> {

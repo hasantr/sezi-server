@@ -26,20 +26,19 @@ const ACCESS_TTL_SEC: u64 = 15 * 60;
 
 /// May a refresh naming `claim` renew a token ISSUED to `row`?
 ///
-/// **The row is the authority; the claim can only refuse.** This used to be
-/// `body.device_id.or(row.device_id)`, i.e. the caller could NAME the device the session
-/// belonged to. Device ids are public — `GET /devices/list/:user_id` serves them — so a refresh
-/// token bound to a device that had just been revoked could name a live sibling instead: the
-/// revocation check then interrogated the sibling and passed, and `sign_access_token` minted an
-/// access token CLAIMING the sibling. That is a forged device identity on every path that trusts
-/// the token's device claim (message send's `sender_device_id` binding, the OTK pool scope,
-/// `plugin_blob::gate`).
+/// **The row is the authority; the claim can only refuse.** Never
+/// `body.device_id.or(row.device_id)`: device ids are public — `GET /devices/list/:user_id`
+/// serves them — so a refresh token bound to a just-revoked device could name a live sibling
+/// instead, the revocation check would interrogate the sibling and pass, and
+/// `sign_access_token` would mint an access token CLAIMING the sibling. That is a forged device
+/// identity on every path that trusts the token's device claim (message send's
+/// `sender_device_id` binding, the OTK pool scope, `plugin_blob::gate`).
 ///
 /// `Err(())` = the claim CONTRADICTS the row (→ 403). No claim at all is fine; the row still
 /// decides, and the row is still what gets the revocation check.
 fn check_device_claim(row: &str, claim: Option<&str>) -> std::result::Result<(), ()> {
-    // `''` was the sentinel of the device-less population, never a device. Normalising it here
-    // is what stops `device_id: ""` from reading as agreement with a real binding.
+    // `''` is not a device. Normalising it here stops `device_id: ""` from reading as
+    // agreement with a real binding.
     match claim.filter(|d| !d.is_empty()) {
         Some(c) if c != row => Err(()),
         _ => Ok(()),
@@ -81,11 +80,6 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         _ => return json_err(401, "invalid_refresh"),
     };
 
-    db.prepare("UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?")
-        .bind(&[d1_text(&old_hash)])?
-        .run()
-        .await?;
-
     let user_id = row.user_id;
     // A row that names no device cannot exist: `auth::verify`, this handler, `auth::relogin` and
     // `devices::link` all bind one. Refusing is the honest answer — the alternative is minting a
@@ -96,14 +90,13 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         None => return json_err(401, "invalid_refresh"),
     };
     // The stored row decides which device this session belongs to; the body may only reject.
-    // See `check_device_claim` for what a caller-chosen device_id used to buy an attacker.
+    // See `check_device_claim` for what a caller-chosen device_id would buy an attacker.
     if check_device_claim(device_id, body.device_id.as_deref()).is_err() {
         return json_err(403, "device_mismatch");
     }
-    // M2-S3.5: a REMOVED device must not RESURRECT its session through /auth/refresh
-    // (parity with relogin.rs). The device is revoked → 401, so it gets no new access token and
-    // the session dies within the access TTL (15 min). Defence on top of the older token
-    // deletion, and it now covers every refresh rather than only those that named a device.
+    // A REMOVED device must not RESURRECT its session through /auth/refresh (parity with
+    // relogin.rs). Revoked → 401, so it gets no new access token and the session dies within
+    // the access TTL (15 min). Defence on top of the token deletion, covering every refresh.
     {
         #[derive(Deserialize)]
         struct RevRow {
@@ -121,18 +114,32 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
     let access_token = sign_access_token(&ctx.env, &user_id, device_id)?;
     let new_refresh = b64u_encode(&random_bytes(32));
     let new_hash = sha256_hex(&new_refresh);
-    db.prepare(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
-         VALUES (?, ?, ?, 0, ?, ?)",
-    )
-    .bind(&[
-        d1_text(&new_hash),
-        d1_text(&user_id),
-        d1_int((now + REFRESH_TTL_SEC) as i64),
-        d1_int(now as i64),
-        d1_text(device_id),
-    ])?
-    .run()
+    // ROTATION IS ONE WRITE. A standalone revoke UPDATE, with the successor INSERTed later,
+    // strands a caller whenever anything in between fails — `sign_access_token` on a broken key,
+    // a D1 error, an isolate eviction, a dropped response — leaving a permanently logged-out
+    // device holding a 30-day token the server already revoked. A D1 batch is an implicit
+    // transaction, so the old token is revoked IF AND ONLY IF its replacement exists. Order
+    // inside the batch is revoke-then-insert: both commit or neither does, so the order cannot
+    // strand anyone, but it reads the way rotation means.
+    //
+    // The revoke also sits BEHIND the device checks: a refresh refused with 403
+    // `device_mismatch` or 401 `device_revoked` issues no successor AND burns no token.
+    // Refusing a request and destroying the credential it presented are not the same act.
+    db.batch(vec![
+        db.prepare("UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?")
+            .bind(&[d1_text(&old_hash)])?,
+        db.prepare(
+            "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
+             VALUES (?, ?, ?, 0, ?, ?)",
+        )
+        .bind(&[
+            d1_text(&new_hash),
+            d1_text(&user_id),
+            d1_int((now + REFRESH_TTL_SEC) as i64),
+            d1_int(now as i64),
+            d1_text(device_id),
+        ])?,
+    ])
     .await?;
 
     // The heartbeat of a session that is actually being used — a device renews here about every
@@ -156,6 +163,131 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
 #[cfg(test)]
 mod tests {
     use super::check_device_claim;
+    use rusqlite::{params, Connection};
+
+    /// `include_str!` binds at compile time and resolves relative to THIS file — the
+    /// `groups_tests.rs` trick. Because this module is INLINE in `refresh.rs`, `SRC` contains the
+    /// test source too, so every needle below is assembled with `concat!` and cannot match itself.
+    const SRC: &str = include_str!("refresh.rs");
+
+    /// The needle for the revoke statement, split so it does not appear literally in `SRC`.
+    fn revoke_needle() -> String {
+        concat!("UPDATE refresh_tokens SET revoked", " = 1 WHERE token_hash = ?").to_string()
+    }
+
+    /// `SRC` up to this test module. The rusqlite tests below run the very statements the guard
+    /// counts, so without the cut every needle would find its own fixtures and the count would
+    /// measure the tests instead of the handler.
+    fn handler_src() -> &'static str {
+        let marker = concat!("#[cfg(", "test)]");
+        &SRC[..SRC.find(marker).expect("the test module marker moved")]
+    }
+
+    fn rotation_schema() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE refresh_tokens (
+                 token_hash TEXT PRIMARY KEY,
+                 user_id TEXT NOT NULL,
+                 expires_at INTEGER NOT NULL,
+                 revoked INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL,
+                 device_id TEXT
+             );
+             INSERT INTO refresh_tokens VALUES ('old', 'u', 9999, 0, 1, 'dev-a');",
+        )
+        .unwrap();
+        c
+    }
+
+    fn revoked_flag(c: &Connection, hash: &str) -> i64 {
+        c.query_row(
+            "SELECT revoked FROM refresh_tokens WHERE token_hash = ?",
+            params![hash],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The stranding hazard: revoking the old token in a standalone UPDATE and INSERTing the
+    /// successor later leaves a client holding a revoked token with no replacement — permanently
+    /// logged out while still holding a 30-day credential — whenever anything in between fails.
+    ///
+    /// Portable rusqlite stands in for D1, whose `batch` is an implicit transaction: revoke and
+    /// issue either both land or neither does.
+    #[test]
+    fn a_failed_successor_insert_leaves_the_old_token_usable() {
+        let mut c = rotation_schema();
+        // The successor collides with a row that already exists → the INSERT fails mid-batch.
+        c.execute(
+            "INSERT INTO refresh_tokens VALUES ('taken', 'u', 9999, 0, 1, 'dev-a')",
+            [],
+        )
+        .unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute(
+            "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?",
+            params!["old"],
+        )
+        .unwrap();
+        let insert = tx.execute(
+            "INSERT INTO refresh_tokens VALUES ('taken', 'u', 9999, 0, 2, 'dev-a')",
+            [],
+        );
+        assert!(insert.is_err(), "the successor write must be the failing half");
+        drop(tx); // no commit → rollback, which is what a failed D1 batch does
+        assert_eq!(
+            revoked_flag(&c, "old"),
+            0,
+            "no successor was issued, so the client's existing token must still work"
+        );
+    }
+
+    /// The success path still rotates: the old token dies exactly when its replacement is born.
+    #[test]
+    fn a_successful_rotation_revokes_the_old_token_and_issues_the_new_one() {
+        let mut c = rotation_schema();
+        let tx = c.transaction().unwrap();
+        tx.execute(
+            "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?",
+            params!["old"],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO refresh_tokens VALUES ('new', 'u', 9999, 0, 2, 'dev-a')",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(revoked_flag(&c, "old"), 1);
+        assert_eq!(revoked_flag(&c, "new"), 0);
+    }
+
+    /// Source guard: the two writes must stay in ONE batch. A behavioural test cannot see this —
+    /// the bug was never inside a statement, it was the gap BETWEEN two of them — so the
+    /// assertion is over the source, the `groups_tests.rs` shape.
+    #[test]
+    fn the_rotation_writes_stay_inside_a_single_batch() {
+        let src = handler_src();
+        let revoke = revoke_needle();
+        assert_eq!(
+            src.matches(&revoke).count(),
+            1,
+            "expected exactly one revoke statement in refresh.rs"
+        );
+        let batch_at = src
+            .find("db.batch(vec![")
+            .expect("the rotation batch is gone — the revoke and the insert have been split apart");
+        assert!(
+            src.find(&revoke).unwrap() > batch_at,
+            "the revoke escaped the batch and runs on its own again"
+        );
+        assert_eq!(
+            src.matches(concat!(".run", "()")).count(),
+            0,
+            "a standalone statement execution in refresh.rs means a rotation write left the batch"
+        );
+    }
 
     /// The whole point: whatever the caller asks for, the session's device is the stored one.
     #[test]
@@ -170,8 +302,7 @@ mod tests {
         assert_eq!(check_device_claim("dev-a", None), Ok(()));
     }
 
-    /// `''` was the sentinel of the device-less population, never a device. It must not read as
-    /// agreement with a real binding now that the population is gone.
+    /// `''` is not a device, and must not read as agreement with a real binding.
     #[test]
     fn the_empty_sentinel_is_not_a_device() {
         assert_eq!(

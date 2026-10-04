@@ -15,11 +15,9 @@ const ACCOUNT_EXISTS_SQL: &str = "SELECT 1 AS n FROM users WHERE id = ? LIMIT 1"
 /// Extract the bearer token from the request headers.
 pub fn extract_bearer(req: &Request) -> Option<String> {
     let auth = req.headers().get("authorization").ok().flatten()?;
-    // Hardening #15: `split_at(7)` PANICS when byte 7 is not a char boundary (a
-    // multi-byte UTF-8 header such as "Bearé…"), which would be a DoS on every
-    // authenticated route. Checking the byte prefix instead is safe: if the first 7
-    // bytes are ASCII "Bearer " then byte 7 is definitely a char boundary, so
-    // `auth[7..]` cannot panic.
+    // Check the BYTE prefix, never `split_at(7)`: byte 7 of a multi-byte header ("Bearé…")
+    // is not a char boundary and slicing there panics — a DoS on every authenticated route.
+    // Past an ASCII "Bearer " prefix, `auth[7..]` is guaranteed safe.
     let bytes = auth.as_bytes();
     if bytes.len() < 8 || !bytes[..7].eq_ignore_ascii_case(b"Bearer ") {
         return None;
@@ -30,9 +28,7 @@ pub fn extract_bearer(req: &Request) -> Option<String> {
 /// Has a device been REVOKED (dropped from the device list, so `devices.revoked_at`
 /// is SET)? Called on live-token paths — message send and WS delivery, plus key
 /// publish, plugin log/blob and push registration — so a stolen device is rejected
-/// before its access token's 15 minute TTL runs out. refresh/relogin are already
-/// revocation-aware; this closes the live-token send/session surface. Event driven:
-/// one query per request, with NO polling loop.
+/// before its access token's 15 minute TTL runs out. One query per request, no polling.
 ///
 /// A device with no `devices` row is NOT revoked — that is the registration bootstrap window,
 /// before the first `PUT /devices/list` creates any row, and `put_list` depends on it.
@@ -75,10 +71,9 @@ mod tests {
     use super::{ACCOUNT_DEVICE_ACTIVE_SQL, ACCOUNT_EXISTS_SQL};
     use rusqlite::{params, Connection, OptionalExtension};
 
-    /// D-M12: a portable check of the query behind `device_revoked`. The 1:1 send path
-    /// (handlers.rs + ws.rs) uses it to gate whether the RECIPIENT device is revoked:
-    /// revoked_at set → revoked (delivery skipped); NULL or missing row → not revoked
-    /// (delivered).
+    /// A portable check of the query behind `device_revoked`, which the 1:1 send path
+    /// (handlers.rs + ws.rs) uses to gate the RECIPIENT device: revoked_at set → revoked
+    /// (delivery skipped); NULL or missing row → not revoked (delivered).
     #[test]
     fn device_revoked_sql_detects_revoked_recipient_device() {
         let c = Connection::open_in_memory().unwrap();
@@ -229,22 +224,16 @@ const SEEN_THROTTLE_MS: i64 = 15 * 60 * 1000;
 
 /// Record that this device was here, at most once per [`SEEN_THROTTLE_MS`].
 ///
-/// **Called from exactly two places, and NOT from `validate_active_token`.** It was there first,
-/// which put a D1 statement behind all sixty-eight endpoints that gate on an active session —
-/// message send among them — for a field that decorates a device row. The `WHERE` clause throttles
-/// the WRITE, but the statement still runs, so the cost was a round trip per request, always.
+/// **Called from exactly two places, and NOT from `validate_active_token`** — calling it there
+/// puts a D1 round trip behind every endpoint that gates on an active session, for a field that
+/// only decorates a device row. The two callers answer the same question for a fraction of that:
+/// the `/sync` upgrade ("this device connected") and `/auth/refresh` (an active session does it
+/// every quarter of an hour). A device in use hits both; one that is not hits neither.
 ///
-/// The two callers give the same answer for a fraction of that: the `/sync` upgrade, which is
-/// exactly "this device connected", and `/auth/refresh`, which an active session performs on its
-/// own every quarter of an hour. A device in use hits both; one that is not hits neither, which is
-/// the thing being measured.
-///
-/// The read is the throttle: `WHERE last_seen_at IS NULL OR last_seen_at < ?` makes the write
-/// its own condition, so there is no second round trip to decide whether to write. NULL is
-/// included on purpose — it is what every device that predates the column looks like.
-///
-/// MILLISECONDS, matching `devices.added_at` — which the row is read beside. The same table's
-/// `revoked_at` is in SECONDS; that is older and not something to copy.
+/// The read IS the throttle: `WHERE last_seen_at IS NULL OR last_seen_at < ?` makes the write its
+/// own condition, so nothing round-trips to decide whether to write. NULL is deliberate — it is
+/// what a device predating the column looks like. MILLISECONDS, matching `devices.added_at`; the
+/// same table's `revoked_at` is in SECONDS and is not the one to copy.
 pub(crate) async fn touch_device_seen(
     env: &Env,
     user_id: &str,
@@ -309,10 +298,8 @@ pub fn require_auth(req: &Request, env: &Env) -> std::result::Result<String, Res
 /// Authentication that also yields the device the token is bound to.
 ///
 /// The device-addressing routes (key publish, OTK pool, message send, push, plugin log/blob)
-/// each used to call `require_auth` and then re-derive the device with a second
-/// `extract_bearer` + full token verification, and each carried its own branch for the claim
-/// being absent. One verification, one shape, and the absent case is gone: `verify_access_token`
-/// already refuses a token that names no device, so reaching here means there is one.
+/// reach for this instead of `require_auth` plus a second verification: one verification, and
+/// no absent-device branch — `verify_access_token` already refuses a token that names no device.
 pub fn require_auth_device(
     req: &Request,
     env: &Env,

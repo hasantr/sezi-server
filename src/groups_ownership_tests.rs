@@ -20,8 +20,8 @@ use crate::groups::transfer::{
 };
 use rusqlite::{params, Connection};
 
-/// `groups` + `group_members` as migrations 0006/0008 define them, narrowed to the columns the
-/// transfer reads or writes. C owns group `g`, B is an admin, M a member, P a pending invitee.
+/// `groups` + `group_members` as the migrations define them, narrowed to the columns the transfer
+/// reads or writes. C owns group `g`, B is an admin, M a member, P a pending invitee.
 fn transfer_fixture() -> Connection {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch(
@@ -85,8 +85,8 @@ fn run_transfer(db: &Connection, caller: &str, target: &str) {
 
 /// The ordering property, checked BETWEEN the statements and not only at the end: demote first
 /// (1 owner → 0), promote second (0 → 1). Two owner rows must never exist at any point — at group
-/// scope nothing would stop them being written, since 0018's `idx_one_owner` is a partial UNIQUE
-/// index on `users`, i.e. the SERVER role, not on `group_members`.
+/// scope nothing would stop them being written, since `idx_one_owner` is a partial UNIQUE index
+/// on `users`, i.e. the SERVER role, not on `group_members`.
 #[test]
 fn the_ordered_transfer_never_yields_two_owners() {
     let db = transfer_fixture();

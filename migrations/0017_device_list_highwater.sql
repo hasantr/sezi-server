@@ -1,19 +1,20 @@
--- 0017: Model-B Layer-1 BLOCKER fix — cihaz-listesi rev HIGH-WATER (revoke-resurrection).
+-- 0017: the device-list rev HIGH WATER — the revoke-resurrection fix.
 --
--- Sorun: `device_lists` satırı D1-churn'de kaybolursa, eski (silme-öncesi,
--- tombstone'suz) primary-imzalı bir doc fresh-insert olarak kabul edilip
--- aktif-cihaz upsert'i `revoked_at=NULL` ile ÇIKARILMIŞ bir cihazı diriltebiliyordu
--- (Codex BLOCKER, 2026-06-16). Tombstone yalnız restore-eden doc ONU TAŞIYORSA korur;
--- silme-öncesi bayat doc taşımaz.
+-- The problem: if the `device_lists` row is lost to D1 churn, an old primary-signed doc (from
+-- before the deletion, carrying no tombstone) would be accepted as a fresh insert, and the
+-- active-device upsert could resurrect a REMOVED device with `revoked_at=NULL`. A tombstone
+-- only protects when the restoring doc CARRIES it, and a stale pre-deletion doc does not.
 --
--- Fix: `users.device_list_rev` = bu kullanıcının GÖRÜLEN en yüksek cihaz-listesi rev'i,
--- `device_lists` blob'undan BAĞIMSIZ kolon (satır kaybına dayanıklı). Worker
--- `validate_and_store_signed_list` artık `doc.rev < device_list_rev` PUT'unu reddeder
--- (bayat → resurrection engellenir) ve kazanan yazar high_water'ı MAX ile ilerletir.
--- EŞİT-rev (== high_water) RESTORE için izinli (imza zaten doğrulandı = gerçek en-güncel doc).
+-- The fix: `users.device_list_rev` = the highest device-list rev ever SEEN for this user, a
+-- column INDEPENDENT of the `device_lists` blob, so it survives the loss of that row. The
+-- worker's `validate_and_store_signed_list` now rejects a PUT whose `doc.rev <
+-- device_list_rev` (stale → the resurrection is blocked) and the winning writer advances the
+-- high water with MAX. An EQUAL rev (== high_water) is allowed so a RESTORE still works (the
+-- signature is already verified = it really is the newest doc).
 --
--- Backfill: mevcut device_lists.rev'den başlat (deploy-anı penceresi sıfır olsun;
--- yoksa high_water 0'dan başlar + ilk PUT'ta yakalar — yine güvenli ama backfill temiz).
+-- Backfill: start from the existing device_lists.rev so the deploy-moment window is zero.
+-- Without it the high water starts at 0 and catches up on the first PUT — still safe, but the
+-- backfill is cleaner.
 
 ALTER TABLE users ADD COLUMN device_list_rev INTEGER NOT NULL DEFAULT 0;
 

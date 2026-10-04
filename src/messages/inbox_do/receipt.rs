@@ -1,14 +1,13 @@
-//! Model-B Layer-4 — account-level durable log of receipts (delivered/read).
+//! Account-level durable log of receipts (delivered/read).
 //!
-//! Fixes the sibling-race / zombie-socket / reconnect-gap defects the consume-once
-//! `forward_queue` transport (push-to-all-sockets + global ack DELETE) had on
-//! multi-device accounts: delivered/read now live as **durable state** (`receipt_state`)
-//! in A's UserInbox DO, and every A device **syncs idempotently from its own seq
-//! cursor**. The WS is only a notification channel.
+//! delivered/read live as **durable state** (`receipt_state`) in A's UserInbox DO, and
+//! every A device **syncs idempotently from its own seq cursor**; the WS is only a
+//! notification channel. A consume-once transport (push-to-all-sockets + a global ack
+//! DELETE) cannot do this on a multi-device account — it loses receipts to sibling races,
+//! zombie sockets and reconnect gaps.
 //!
 //! - Granularity: B's per-device `remote_id` (the id the receipt arrived for). Rolling
-//!   that up to a logical message stays CLIENT-side in `mdd` (the existing proven path;
-//!   only the transport changed).
+//!   that up to a logical message stays CLIENT-side in `mdd`.
 //! - `seq` is an account-global monotonic high-water mark (`receipt_meta`). Even when the
 //!   table is retention-purged the high-water NEVER goes backwards → cursors stay
 //!   consistent (a new row can never land below an old cursor).
@@ -43,9 +42,9 @@ struct ReceiptStateRow {
     #[serde(default)]
     read_at: Option<i64>,
     seq: i64,
-    /// #11 Layer-4b: the sender's local_id (the E2E msg_uid). A sibling device matches it
-    /// via `oc-{msg_uid}`. Rows predating the column are NULL → None (sibling convergence
-    /// is skipped for them).
+    /// The sender's local_id (the E2E msg_uid). A sibling device matches it via
+    /// `oc-{msg_uid}`. Rows predating the column are NULL → None (sibling convergence is
+    /// skipped for them).
     #[serde(default)]
     msg_uid: Option<String>,
 }
@@ -76,7 +75,7 @@ impl UserInbox {
             // written to measure, and reading it that way is how it stayed open. It is now an
             // ALARM: a hit means a caller lost its guard.
             //
-            // The real gap lives on the client and is closed there (#20): a device whose row
+            // The real gap lives on the client and is closed there: a device whose row
             // came from M4 link-time sync has `msg_id: None`, so the sibling that DOES hold a
             // remote_id relays the receipt (`handle_read_self_sync`). What remains is only the
             // case where NO device of the account holds one — see `receipt_uid_state`.
@@ -92,7 +91,7 @@ impl UserInbox {
         let storage = self.state.storage();
         let sql = storage.sql();
         // Every CHANGED row gets an ATOMICALLY unique, strictly increasing seq: bump and read
-        // the high-water with `UPDATE ... RETURNING` BEFORE writing the row (Codex HIGH-2).
+        // the high-water with `UPDATE ... RETURNING` BEFORE writing the row.
         // That rules out seq reuse on a failed meta-update / DO eviction, and with it the
         // silent skip on a device whose cursor has already moved past; the worst case is an
         // unused seq gap (harmless, the cursor jumps over it). A unique seq per row also
@@ -105,14 +104,13 @@ impl UserInbox {
         let mut delta_rows: Vec<serde_json::Value> = Vec::new();
 
         for (i, &rid) in ids.iter().enumerate() {
-            // #11 Layer-4b: the msg_uid for this id (the sender's local_id; the reader supplies
-            // it from the E2E payload — the server is blind and cannot derive it). A sibling
-            // device matches it against its `oc-{msg_uid}` row (read convergence without mdd).
-            // Empty/missing → None.
+            // The msg_uid for this id (the sender's local_id; the reader supplies it from the
+            // E2E payload — the server is blind and cannot derive it). A sibling device
+            // matches it against its `oc-{msg_uid}` row. Empty/missing → None.
             let uid: Option<&str> = uids.get(i).map(|s| s.as_str()).filter(|s| !s.is_empty());
-            // Current state (for set-once). msg_uid is read too (Codex Q4: a uid arriving
-            // LATER must count as a change — otherwise a read row created without a uid would
-            // NEVER learn it, no seq bump would happen, and no sibling could match it).
+            // Current state (for set-once). msg_uid is read too, because a uid arriving LATER
+            // must count as a change — otherwise a read row created without a uid would NEVER
+            // learn it, no seq bump would happen, and no sibling could match it.
             let existing = match sql.exec_raw(
                 "SELECT delivered_at, read_at, msg_uid FROM receipt_state WHERE peer_id = ? AND remote_id = ?",
                 Some(vec![
@@ -131,13 +129,13 @@ impl UserInbox {
             // BOTH delivered and read set delivered_at (read implies delivered).
             let new_d = old_d.or(Some(ts_ms));
             let new_r = if is_read { old_r.or(Some(ts_ms)) } else { old_r };
-            // #11 Q4: the uid arrived for the first time (stored NULL, incoming Some) → write
-            // and bump the seq even when no tick changed, so siblings see the uid on re-sync.
+            // The uid arrived for the first time (stored NULL, incoming Some) → write and bump
+            // the seq even when no tick changed, so siblings see the uid on re-sync.
             let uid_newly = uid.is_some() && old_uid.is_none();
             if (new_d, new_r) == (old_d, old_r) && !uid_newly {
                 continue; // nothing changed (and the uid is not new either) → idempotent skip.
             }
-            // Atomic seq reservation (HIGH-2): bump and read the new value in one statement.
+            // Atomic seq reservation: bump and read the new value in one statement.
             let seq = match sql.exec_raw(
                 "UPDATE receipt_meta SET v = v + 1 WHERE k = 'seq' RETURNING v",
                 sql_no_args(),
@@ -210,13 +208,13 @@ impl UserInbox {
         for ws in self.state.get_websockets() {
             let _ = ws.send_with_str(payload.as_str());
         }
-        // LATENCY fast-path: push the changed rows DIRECTLY to the SAME sockets (`receipt_delta`).
-        // The sender applies its second tick instantly, WITHOUT the `receipt_sync` pull round-trip
-        // → closes the structural "the second tick is never snappy" complaint. The durable model
-        // is PRESERVED: the `receipt_update` above still goes out, so the client catches up via an
-        // authoritative pull (the delta is applied NON-ROOTED and does not advance the cursor →
-        // no cross-page gap-skip risk). An old client does not know `receipt_delta` and ignores it
-        // (forward-compatible; it keeps working off receipt_update).
+        // LATENCY fast-path: push the changed rows DIRECTLY to the SAME sockets
+        // (`receipt_delta`), so the sender applies its second tick without waiting for a
+        // `receipt_sync` pull round-trip. The durable model is PRESERVED — the `receipt_update`
+        // above still goes out and the client catches up via an authoritative pull, while the
+        // delta is applied NON-ROOTED and does not advance the cursor, so there is no
+        // cross-page gap-skip risk. A client that does not know `receipt_delta` ignores it and
+        // keeps working off receipt_update.
         if !delta_rows.is_empty() {
             let delta = serde_json::json!({
                 "type": "receipt_delta",
@@ -230,15 +228,13 @@ impl UserInbox {
         }
     }
 
-    // (receipt_seq_current was removed — a seq is now reserved per row with an atomic
-    //  `UPDATE ... RETURNING`; there is no separate high-water read.)
 
     /// Serializes the `receipt_state` rows past the cursor (`seq > since ORDER BY seq ASC
     /// LIMIT 500`) into a transport-agnostic `{rows, more}` payload (NO type tag — the WS
     /// wrapper adds it). The WS frame and HTTP `GET /messages/receipt-sync` share this
-    /// builder, which guarantees BIT-IDENTICAL rows. SQL error → `None` (WS: send no frame,
-    /// as before; HTTP: the caller turns it into an empty batch → the cursor does not
-    /// advance and the next event re-pulls).
+    /// builder, which guarantees BIT-IDENTICAL rows. SQL error → `None` (WS: send no frame;
+    /// HTTP: the caller turns it into an empty batch → the cursor does not advance and the
+    /// next event re-pulls).
     pub(crate) fn receipt_sync_payload(&self, since: i64) -> Option<serde_json::Value> {
         let storage = self.state.storage();
         let rows: Vec<ReceiptStateRow> = match storage.sql().exec_raw(
@@ -263,7 +259,7 @@ impl UserInbox {
                 })
             })
             .collect();
-        // Echo `since` back (shared-root #1 gap-skip fix): it lets the client tell a page
+        // Echo `since` back to close a gap-skip: it lets the client tell a page
         // rooted at its cursor (since <= cursor) from a pagination continuation
         // (since = max_seq > cursor), so it advances the durable cursor only on a rooted
         // page and never skips a gap across pages.

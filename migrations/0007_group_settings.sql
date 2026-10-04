@@ -1,18 +1,19 @@
--- Sezgi: grup AYAR TORBASI (protokol substratı Faz 1).
+-- Sezgi: the group SETTINGS BAG (the protocol substrate).
 --
--- Grupları sabit-özellik yerine ESNEK substrata çevirmenin ilk adımı: oda
--- ayarları iki katman.
---   1. SUNUCU-kolonları — sunucunun ACT etmesi gereken ayarlar (sunucu okur +
---      davranış değiştirir; ileride dizin/auto-join):
---        visibility  : 'private' | 'public' (üye-dizini görünürlüğü — Faz 5)
---        auto_join   : 0 | 1 (yeni sunucu-üyesi otomatik katılır — Faz 5)
---   2. CLIENT JSON torbası — sunucunun umursamadığı, yalnız client/eklentilerin
---      okuduğu her şey (tema, eklenti-config, sıralama…). Opak blob; sunucu
---      sadece saklar. Yeni özellik = yeni anahtar, ŞEMA DEĞİŞMEZ.
---        settings_json : TEXT (NULL = boş torba)
+-- The first step in turning groups from a fixed feature into a FLEXIBLE substrate: room
+-- settings come in two layers.
+--   1. SERVER columns — settings the server has to ACT on (it reads them and changes its
+--      behaviour; the directory / auto-join):
+--        visibility  : 'private' | 'public' (visibility in the member directory)
+--        auto_join   : 0 | 1 (a new server member joins automatically)
+--   2. The CLIENT JSON bag — everything the server does not care about and only the client
+--      or its plugins read (theme, plugin config, ordering…). An opaque blob; the server
+--      only stores it. A new feature = a new key, and the SCHEMA DOES NOT CHANGE.
+--        settings_json : TEXT (NULL = an empty bag)
 --
--- E2E korunur: ayarlar içerik DEĞİL (üyelik-meta gibi). Faz 1 yalnız boru-döşeme
--- (okuma/yazma); visibility/auto_join'i tüketen dizin + verify-hook Faz 5.
+-- E2E is preserved: settings are NOT content (they are membership metadata). This step only
+-- lays the pipe (read/write); the directory and the verify hook that consume
+-- visibility/auto_join come later.
 
 ALTER TABLE groups ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private';
 ALTER TABLE groups ADD COLUMN auto_join INTEGER NOT NULL DEFAULT 0;

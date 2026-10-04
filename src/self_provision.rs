@@ -1,41 +1,30 @@
-//! Self-provisioning — self-host phase A (the prerequisite for a zero-CLI deploy).
+//! Self-provisioning — the prerequisite for a zero-CLI deploy: someone who forks the worker into
+//! THEIR OWN CF account must get a working server without ever learning `wrangler secret put` or
+//! `wrangler d1 migrations apply`. Two legs.
 //!
-//! Goal: someone who forks the worker on GitHub and installs it into THEIR OWN CF
-//! account via Deploy-to-Cloudflare should get a working server WITHOUT ever learning
-//! `wrangler secret put` or `wrangler d1 migrations apply`. Two legs:
+//! **Keys** (`JWT_SIGNING_KEY` + `ADMIN_INVITE_KEY`) resolve env-first, then D1, then
+//! generate-and-persist:
+//!   1. An env secret ALWAYS wins, so an owner can move the key into a real secret. That path
+//!      never touches D1 and needs no memo (reading env is synchronous).
+//!   2. Otherwise D1 `server_config`, memoized per isolate — the JWT key is read on every
+//!      request, and a WASM isolate is single-threaded so a `thread_local` is enough.
+//!   3. Otherwise generate and persist. `ON CONFLICT DO NOTHING` plus a re-SELECT is the race
+//!      guard: two concurrent cold starts must not end up on different keys.
 //!
-//! **A1 — Key self-provisioning** (`JWT_SIGNING_KEY` + `ADMIN_INVITE_KEY`):
-//! env-first / D1-fallback / GENERATE-and-persist (the durable-key variant of
-//! cf_analytics's `resolve_cfg` pattern):
-//!   1. If the env secret exists it is used — today's behavior is BIT-IDENTICAL, and an
-//!      env-set value ALWAYS wins so a security-conscious owner can move the key into a
-//!      secret. This path NEVER touches D1 and needs no memoization (reading env is
-//!      synchronous and cheap).
-//!   2. Otherwise read D1 `server_config` (0025) and cache it per isolate. The JWT key
-//!      is read on EVERY request — a hot path — so a thread_local memo keeps the D1
-//!      round-trip out of it (a WASM isolate is single-threaded).
-//!   3. Failing that (a fresh fork's first boot) GENERATE the key and persist it to D1.
-//!      Race guard: `ON CONFLICT DO NOTHING` plus a re-SELECT after persisting, so two
-//!      concurrent cold starts NEVER end up using different keys (D1 is the one truth).
+//! The key then sits at rest in D1 (CF's encrypted disks) — the self-host honest-server model. No
+//! endpoint returns it.
 //!
-//! SECURITY NOTE: the key sits at rest in D1 (on CF's encrypted disks) — this is the
-//! self-host honest-server model. The key is returned by NO endpoint; it stays inside
-//! the worker.
+//! **D1 self-migration**: `migrations/*.sql` are embedded with `include_str!` and everything the
+//! `_sezi_migrations` table says is missing is applied in ONE `db.batch`. One batch, not a batch
+//! plus a tracking INSERT per file: the Workers free plan caps subrequests at ~50 per request, and
+//! the per-file shape needed 50+ D1 calls on a fresh install's first boot, was cut off midway and
+//! left deterministic 500s. One batch is ~4 calls and makes the pending set all-or-nothing.
 //!
-//! **A2 — D1 self-migration**: `migrations/*.sql` are embedded via `include_str!`, and
-//! on the first request everything missing according to the `_sezi_migrations` tracking
-//! table is applied in ONE `db.batch`. (The 2026-07-06 free-plan incident: the Workers
-//! free plan caps subrequests at ~50 per request, and the old one-batch-plus-tracking-
-//! INSERT-per-file pattern needed ~50+ D1 calls on a fresh install's first boot, so it
-//! was cut off midway → deterministic 500s from jwks/verify. A single batch brings the
-//! first boot down to ~4 D1 calls and makes the whole pending set all-or-nothing.)
-//! wrangler compatibility (CRITICAL): our existing prod applied its migrations with
-//! `wrangler d1 migrations apply`, so the records in wrangler's own `d1_migrations`
-//! table COUNT as applied and no migration ever re-runs in prod. Extra belt: a benign
-//! schema conflict ("duplicate column name" / "already exists") falls back to
-//! tolerant-apply (see `apply_one` below). The CLI path keeps working —
-//! `wrangler.toml migrations_dir` is still there and self-migration is only an
-//! additional safety net.
+//! wrangler compatibility (CRITICAL): a prod that applied its migrations with
+//! `wrangler d1 migrations apply` has records in wrangler's own `d1_migrations` table, which COUNT
+//! as applied so nothing re-runs. Belt: a benign schema conflict ("duplicate column name" /
+//! "already exists") falls back to tolerant-apply (`apply_one`). The CLI path still works;
+//! self-migration is only the safety net.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -190,6 +179,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0037_device_last_seen",
         include_str!("../migrations/0037_device_last_seen.sql"),
     ),
+    (
+        "0038_instrument_pack",
+        include_str!("../migrations/0038_instrument_pack.sql"),
+    ),
+    (
+        "0039_genesis_claim",
+        include_str!("../migrations/0039_genesis_claim.sql"),
+    ),
 ];
 
 thread_local! {
@@ -209,14 +206,11 @@ thread_local! {
 /// env-secret + wrangler-migrated deployment (our prod) it degenerates to a COMPLETE
 /// no-op.
 pub async fn ensure_ready(env: &Env) {
-    // KEYS FIRST, MIGRATIONS SECOND (the 2026-07-07 free-plan incident): a free CF
-    // account has a tight per-request subrequest budget, and when the key path competed
-    // with the heavy migration batch inside the SAME request it starved and jwks/verify
-    // returned 500 — the migrations created the tables, so bootstrap/welcome worked, but
-    // no key could be generated. ensure_keys creates its own `server_config` table and
-    // does NOT depend on migration 0025, so it finishes in a handful of subrequests; the
-    // migrations run afterwards and even if they exhaust the budget the key is already
-    // in place.
+    // KEYS FIRST, MIGRATIONS SECOND. A free CF account's per-request subrequest budget is tight,
+    // and with the key path competing against the migration batch in the SAME request the keys
+    // starve: the tables get created (so bootstrap/welcome work) while jwks/verify 500s for want
+    // of a key. `ensure_keys` creates its own `server_config` and depends on no migration, so it
+    // finishes in a handful of subrequests and the key is in place whatever the batch does.
     ensure_keys(env).await;
     ensure_migrations(env).await;
 }
@@ -246,19 +240,16 @@ pub async fn ensure_keys(env: &Env) {
     .await;
 }
 
-/// The fallback for jwt.rs's `load_signing_key`: the PEM resolved from or generated for
-/// D1 at boot. It is NEVER populated while an env secret exists — in that case jwt.rs
-/// takes the env path directly, exactly as it does today.
+/// The fallback for jwt.rs's `load_signing_key`: the PEM resolved from or generated for D1 at
+/// boot. Never populated while an env secret exists — jwt.rs takes the env path directly.
 pub fn cached_jwt_pem() -> Option<String> {
     JWT_PEM.with(|c| c.borrow().clone())
 }
 
-/// Resolve ADMIN_INVITE_KEY — env first, then the self-provision cache.
-/// NOTE: as of 2026-07 NO code reads this key yet (it is documented in wrangler.toml and
-/// referenced by a "harden this gate later" note in bootstrap.rs). Self-provision
-/// GENERATES it on a fresh fork anyway so it is ready; the future consumer (the
-/// bootstrap gate) will call this function.
-#[allow(dead_code)]
+/// Resolve ADMIN_INVITE_KEY — env first, then the self-provision cache. Its consumer is
+/// `auth::bootstrap`'s ghost-owner recovery, the one branch of the public `GET /bootstrap` that
+/// deletes an owner row and reopens genesis. Generated on a fresh fork, so an installation that
+/// never set the secret still has one. `None` means neither source had a key: fail CLOSED.
 pub fn resolve_admin_invite_key(env: &Env) -> Option<String> {
     if let Ok(s) = env.secret("ADMIN_INVITE_KEY") {
         return Some(s.to_string());
@@ -276,43 +267,32 @@ async fn ensure_one_key(
     generate: fn() -> Result<String>,
     validate: fn(&str) -> bool,
 ) {
-    // 1) env secret → accepted ONLY if non-empty AND it passes validate (then skip D1).
-    //    CRITICAL (the 2026-07-07 free-account incident): on the button-deploy runtime
-    //    (newer wrangler) an UNSET secret can come back as `Ok("")` where the old runtime
-    //    returned `Err`. Checking `is_ok()` let an empty/corrupt value take the env-first
-    //    branch and BYPASS self-heal → jwks/verify 500 with "PEM type label invalid". Now
-    //    an empty or invalid env secret is IGNORED and self-provision (D1 or generation)
-    //    takes over. Prod with a valid env secret is bit-identical: non-empty + validate
-    //    → early return.
+    // An env secret counts ONLY if non-empty AND it validates — `is_ok()` alone is not enough:
+    // on the button-deploy runtime an UNSET secret comes back as `Ok("")`, which would take the
+    // env-first branch, bypass self-heal, and 500 every jwks/verify with "PEM type label invalid".
     if let Ok(s) = env.secret(env_name) {
         let v = s.to_string();
         if !v.trim().is_empty() && validate(&v) {
             return;
         }
     }
-    // 2) Isolate cache is populated → done (hot path, no D1 round-trip).
     if cache.with(|c| c.borrow().is_some()) {
         return;
     }
-    // 3) Read from D1 (and VALIDATE; a corrupt value is regenerated = self-heal), or
-    //    4) generate and persist. On error: console_error and leave the cache empty, so
-    //    the NEXT request tries again (self-heal across transient D1 errors). This path
-    //    only ever runs on deployments without an env secret anyway.
+    // On error the cache is left EMPTY so the next request retries — self-heal across a transient
+    // D1 error. This path only runs on deployments without an env secret.
     match resolve_from_db(env, db_key, generate, validate).await {
         Ok(v) => cache.with(|c| *c.borrow_mut() = Some(v)),
         Err(e) => console_error!("self_provision: {} cozulemedi: {}", db_key, e),
     }
 }
 
-/// Read D1 `server_config` and VALIDATE it; if the value is corrupt or missing, generate
-/// and persist a new one.
+/// Read D1 `server_config` and VALIDATE it; a corrupt or missing value is generated and persisted.
 ///
-/// SELF-HEAL (the 2026-07-06 sezi-server2 incident): an old/broken build had written an
-/// INVALID JWT PEM into D1, and current code used it blindly, so every token signature
-/// and every jwks request 500'd — registration died halfway, leaving a ghost owner and a
-/// permanently wedged server. The rule: a user must NEVER have to clean the worker's
-/// internals by hand, so any value read from D1 that FAILS validate is regenerated and
-/// overwritten.
+/// The validate step is the SELF-HEAL: an invalid JWT PEM written by a broken build and then used
+/// blindly 500s every signature and every jwks request, which wedges a server permanently (it has
+/// happened, half-way through a registration, leaving a ghost owner). Nobody should have to clean
+/// the worker's internals by hand, so a stored value that fails validate is overwritten.
 async fn resolve_from_db(
     env: &Env,
     db_key: &str,
@@ -320,9 +300,8 @@ async fn resolve_from_db(
     validate: fn(&str) -> bool,
 ) -> Result<String> {
     let db = env.d1("DB")?;
-    // The key path creates `server_config` ITSELF, independently of migration 0025, so
-    // ensure_keys can run BEFORE the migrations (see the ordering rationale in
-    // ensure_ready). IF NOT EXISTS makes migration 0025 a no-op when it runs later.
+    // The key path creates `server_config` ITSELF, so `ensure_keys` can run BEFORE the migrations
+    // (ordering rationale in `ensure_ready`). IF NOT EXISTS makes the later migration a no-op.
     db.prepare(
         "CREATE TABLE IF NOT EXISTS server_config \
          (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL)",
@@ -333,15 +312,15 @@ async fn resolve_from_db(
         if validate(&v) {
             return Ok(v);
         }
-        // Corrupt record → regenerate and INSERT OR REPLACE. Deliberate: ON CONFLICT
-        // DO NOTHING would PRESERVE the corrupt record, and here overwriting is mandatory.
+        // INSERT OR REPLACE, deliberately: ON CONFLICT DO NOTHING would PRESERVE the corrupt
+        // record, and here overwriting is the whole point.
         console_warn!(
             "self_provision: {} the D1 record is CORRUPT (it did not validate) → regenerating (self-heal; 2026-07-06 sezi-server2 vakasi)",
             db_key
         );
         let candidate = generate()?;
-        // Paranoia: validate even what we just generated, so that if the generator and
-        // the validator ever diverge we do not persist a corrupt value into D1.
+        // Validate even what was just generated: if generator and validator ever diverge, a
+        // corrupt value must not reach D1.
         if !validate(&candidate) {
             return Err(Error::RustError(format!(
                 "self_provision: {db_key} generated value failed validation (generator/validator mismatch?)"
@@ -361,21 +340,17 @@ async fn resolve_from_db(
             "self_provision: {} regenerated and written to D1 (over the corrupt record)",
             db_key
         );
-        // Race note: if two isolates self-heal at the same time, the last writer wins the
-        // REPLACE. That is harmless because both values are freshly generated and
-        // validated: the loser keeps using its own value, and once isolates recycle
-        // everyone converges on the winner in D1. A corrupt record cannot reappear —
-        // every value written passed validate.
+        // Two isolates self-healing at once: last writer wins the REPLACE, harmlessly. Both
+        // values validated, the loser keeps using its own, and isolates converge on D1's winner
+        // as they recycle.
         return Ok(candidate);
     }
 
-    // A fresh fork's first boot: GENERATE and persist. RACE GUARD: two concurrent cold
-    // starts may generate at the same time, so `ON CONFLICT DO NOTHING` lets the first
-    // writer win (the loser is a no-op) and a re-SELECT AFTER persisting reads the winning
-    // value back. Two instances therefore NEVER use different keys — whatever ends up in
-    // use is the single truth stored in D1.
+    // A fresh fork's first boot. RACE GUARD: `ON CONFLICT DO NOTHING` lets the first of two
+    // concurrent cold starts win, and the re-SELECT AFTER persisting reads the winner back — so
+    // two instances never end up on different keys.
     let candidate = generate()?;
-    // Paranoia (same rationale as above): never persist a corrupt value into D1.
+    // Same reason as above: never persist a value that does not validate.
     if !validate(&candidate) {
         return Err(Error::RustError(format!(
             "self_provision: {db_key} generated value failed validation (generator/validator mismatch?)"
@@ -397,9 +372,8 @@ async fn resolve_from_db(
         db_key
     );
     match read_config(&db, db_key).await? {
-        // The winner must pass validate too: if an old or broken writer won the race
-        // (theoretically possible), do not use its value — fall back to our own fresh one,
-        // and the next boot's corrupt-record branch will repair D1.
+        // The race winner must validate too. If a broken writer won, use our own fresh value and
+        // let the next boot's corrupt-record branch repair D1.
         Some(winner) if validate(&winner) => Ok(winner),
         Some(_) => {
             console_warn!(
@@ -415,15 +389,13 @@ async fn resolve_from_db(
 
 // ── Key validators (pure → unit-tested) ─────────────────────────────────────
 
-/// Is a JWT PEM read from D1 valid? It is checked with the very parser jwt.rs WILL use
-/// (`parse_signing_pem`), so "passed validate but blew up while signing" is impossible —
-/// it is literally the same function.
+/// Is a JWT PEM read from D1 valid? Checked with the very parser signing will use, so "passed
+/// validate but blew up while signing" is impossible — it is the same function.
 fn validate_jwt_pem(v: &str) -> bool {
     crate::auth::jwt::parse_signing_pem(v).is_ok()
 }
 
-/// A reasonable gate for the admin-invite key: not empty and not just whitespace is
-/// enough — it is an opaque shared secret with no required format.
+/// Non-empty is the whole gate: the admin-invite key is an opaque shared secret with no format.
 fn validate_invite_key(v: &str) -> bool {
     !v.trim().is_empty()
 }
@@ -441,10 +413,9 @@ async fn read_config(db: &D1Database, key: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.value))
 }
 
-/// Generate an Ed25519 JWT signing key — the SAME crate as jwt.rs's verifier
-/// (ed25519-dalek) and the SAME format (PKCS8 PEM; the `from_pkcs8_pem` round-trip is
-/// unit-tested). `LineEnding::LF` produces a PEM with real newlines, so the `"\\n"→"\n"`
-/// replacement jwt.rs performs for env secrets is a no-op on this value.
+/// Generate an Ed25519 JWT signing key — the same crate and format as the verifier (PKCS8 PEM).
+/// `LineEnding::LF` gives real newlines, so the `"\\n"→"\n"` fix-up jwt.rs applies to env secrets
+/// is a no-op here.
 fn generate_jwt_signing_pem() -> Result<String> {
     use ed25519_dalek::pkcs8::{spki::der::pem::LineEnding, EncodePrivateKey};
     let mut seed = [0u8; 32];
@@ -457,8 +428,7 @@ fn generate_jwt_signing_pem() -> Result<String> {
     Ok(pem.to_string())
 }
 
-/// Generate an ADMIN_INVITE_KEY: 32 CSPRNG bytes → base64url, unpadded, 43 chars. In the
-/// worker the RNG is getrandom (js feature), the same path utils.rs `random_b64u` uses.
+/// Generate an ADMIN_INVITE_KEY: 32 CSPRNG bytes → unpadded base64url, 43 chars.
 fn generate_admin_invite_key() -> Result<String> {
     Ok(crate::utils::random_b64u(32))
 }
@@ -472,25 +442,19 @@ async fn ensure_migrations(env: &Env) {
     let db = match env.d1("DB") {
         Ok(d) => d,
         Err(e) => {
-            console_error!("self_provision: D1 binding yok: {}", e);
+            console_error!("self_provision: no D1 binding: {}", e);
             return;
         }
     };
-    // FAIL-SOFT (not fail-open, but not a 500 either): if a migration fails, keep serving
-    // with the CURRENT schema instead of 500ing requests. Rationale: migrations are
-    // batch-atomic (there is no half-applied schema), so a failure just means the schema
-    // stayed old — endpoints that work on the old schema keep working, and the ones that
-    // need the new columns already return a meaningful error. A hard block would look like
-    // "the server is dead" to a self-host operator; this way only new features stall and
-    // the log explains why.
+    // FAIL-SOFT: a failed migration keeps serving on the CURRENT schema rather than 500ing.
+    // Migrations are batch-atomic, so failure only means the schema stayed old — old endpoints
+    // keep working and new ones already answer meaningfully. To a self-host operator a hard block
+    // looks like a dead server; this way only new features stall and the log says why.
     //
-    // The flag is set ONLY ON SUCCESS (the 2026-07-06 free-plan incident): the old
-    // "set before trying" choice left a first boot that got cut off at the subrequest limit
-    // POISONED for the whole isolate lifetime — the migrations never finished and were
-    // never retried, giving deterministic jwks/verify 500s. New rule: do NOT set the flag
-    // on Err, so the next request tries again (migrations are tolerant and batch-atomic,
-    // hence SAFE to repeat). The risk of a persistent retry loop beats permanent poisoning
-    // after a truncated boot, and once the batch succeeds it is a single shot anyway.
+    // The flag is set ONLY ON SUCCESS. Setting it before trying poisons the whole isolate when a
+    // first boot is cut off at the subrequest limit: the migrations never finish and are never
+    // retried. Repeating them is safe (tolerant and batch-atomic), so a retry loop is the better
+    // risk.
     match run_migrations(&db).await {
         Ok(()) => MIGRATIONS_CHECKED.with(|c| c.set(true)),
         Err(e) => console_error!(
@@ -524,13 +488,10 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         .map(|r| r.name)
         .collect();
 
-    // wrangler compatibility (CRITICAL): our prod applied its migrations with
-    // `wrangler d1 migrations apply`, and wrangler records them in its own `d1_migrations`
-    // table with names like "0001_init.sql". COUNT those records as applied, so the first
-    // self-migration in prod re-runs NOTHING and the deploy is a no-op. FAIL-OPEN: if the
-    // table does not exist (a fresh fork whose DB never met wrangler) just ignore it. The
-    // merge happens on every isolate boot via one cheap SELECT, so if someone later applies
-    // a migration through the CLI, self-migration sees it as applied too.
+    // wrangler compatibility (CRITICAL): wrangler records its own applies in `d1_migrations` as
+    // "0001_init.sql". Counting those as applied is what makes the first self-migration on a
+    // CLI-migrated DB a no-op. FAIL-OPEN when the table is absent (a fork whose DB never met
+    // wrangler). Re-merged on every isolate boot, so a later CLI apply is seen too.
     if let Ok(res) = db.prepare("SELECT name FROM d1_migrations").all().await {
         if let Ok(rows) = res.results::<NameRow>() {
             for r in rows {
@@ -544,20 +505,15 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         .filter(|(name, _)| !applied.contains(*name))
         .copied()
         .collect();
-    // Prod bit-identity guard: on a wrangler-seeded deployment nothing is pending, so the
-    // single batch is NEVER built (early return, preserving today's no-op prod deploy).
+    // With nothing pending the batch is never built, so a seeded deployment stays a no-op.
     if pending.is_empty() {
         return Ok(());
     }
 
-    // SINGLE BATCH (the 2026-07-06 free-plan subrequest budget): the statements of ALL
-    // pending files plus each file's tracking INSERT go into one `db.batch` in file order —
-    // one subrequest, one implicit transaction. The old batch-plus-INSERT-per-file pattern
-    // cost ~50 D1 calls on a fresh install and got cut off at the Workers free plan's
-    // ~50-subrequest gate during the first boot. Atomicity got STRONGER too: the 0017-style
-    // trap ("a bare ALTER followed by an UPDATE") is now all-or-nothing across the WHOLE
-    // pending set rather than just within a file, so a truncated/half-applied schema is
-    // impossible.
+    // SINGLE BATCH: every pending file's statements plus its tracking INSERT, in file order, in
+    // one `db.batch` — one subrequest, one implicit transaction. This is what fits a fresh
+    // install's first boot inside the free plan's ~50-subrequest gate, and it makes the
+    // "bare ALTER then UPDATE" trap all-or-nothing across the WHOLE pending set.
     let merged = merge_pending_statements(&pending);
     let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(merged.len());
     for m in &merged {
@@ -582,13 +538,9 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         Err(e) => {
             let msg = e.to_string();
             if is_benign_schema_conflict(&msg) {
-                // A schema conflict (duplicate column / already exists) means either two
-                // concurrent cold starts raced, or this DB was wrangler-migrated but its
-                // `d1_migrations` table was unreachable. The single batch rolled back and
-                // left the schema untouched, so fall back to FILE-BY-FILE tolerant-apply:
-                // conflicting files count as applied and genuinely missing ones run. A rare
-                // path whose subrequest cost matches the old pattern (≤2 calls per file),
-                // which was deemed acceptable.
+                // A schema conflict means two cold starts raced, or this DB was wrangler-migrated
+                // with its `d1_migrations` unreachable. The batch rolled back untouched, so fall
+                // back to file-by-file tolerant-apply — rare, and it costs ≤2 calls per file.
                 console_warn!(
                     "self_provision: single-batch schema conflict ({}) → falling back to a tolerant file-by-file pass",
                     msg
@@ -598,10 +550,8 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
                 }
                 Ok(())
             } else {
-                // A REAL error. A single batch cannot tell us which file blew up, so pass
-                // D1's raw error text through verbatim — the SQLite message usually gives
-                // the file away via a table/column name — and if per-file diagnosis is
-                // needed, the fallback path already reports the file name.
+                // A REAL error. One batch cannot say which file blew up, so D1's raw text passes
+                // through verbatim — its table/column name usually gives the file away.
                 Err(Error::RustError(format!(
                     "single-batch migration ({} pending): {msg}",
                     pending.len()
@@ -611,16 +561,11 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
     }
 }
 
-/// Apply one migration ATOMICALLY — now called ONLY from the single batch's benign
-/// schema-conflict fallback (the main path is `run_migrations`'s single batch; this one
-/// takes over when per-file tolerant-apply is needed). A D1 batch is an implicit
-/// transaction: if even one statement errors, ALL of it rolls back — the same pattern as
-/// devices/handlers.rs. That atomicity closes the 0017-style trap within a file: in a file
-/// with "a bare ALTER (duplicate column) followed by an UPDATE", the ALTER's error rolls
-/// the WHOLE batch back so the UPDATE NEVER runs on its own. If it did, it would drag the
-/// live `device_list_rev` high-water backwards — a data regression, found by the 2026-07-06
-/// migration audit. The single-batch main path strengthens this further: all-or-nothing
-/// applies to the ENTIRE pending set.
+/// Apply one migration ATOMICALLY — called only from the single batch's benign schema-conflict
+/// fallback. A D1 batch is an implicit transaction, so one erroring statement rolls all of it
+/// back. That is what closes the "bare ALTER (duplicate column) followed by an UPDATE" trap: the
+/// ALTER's error takes the UPDATE with it, and an UPDATE that ran alone would drag the live
+/// `device_list_rev` high-water backwards.
 async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
     let statements = split_sql_statements(sql);
     if statements.is_empty() {
@@ -637,15 +582,11 @@ async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
         Err(e) => {
             let msg = e.to_string();
             if is_benign_schema_conflict(&msg) {
-                // TOLERANT-APPLY: "duplicate column name" / "already exists" means the
-                // schema ALREADY contains this migration — either a wrangler-migrated DB
-                // whose `d1_migrations` record was unreachable, or the losing side of a
-                // migration race between two concurrent cold starts. The batch rolled back,
-                // so the existing schema was NOT touched; count it as applied and continue.
-                // (Surveying the embedded files, the only non-idempotent classes are bare
-                // ALTER ADD COLUMN — SQLite has no IF NOT EXISTS for it — and the CREATEs
-                // without IF NOT EXISTS in 0014/0015/0016; both produce only these two
-                // messages.)
+                // TOLERANT-APPLY: "duplicate column name" / "already exists" means the schema
+                // ALREADY has this migration. The batch rolled back without touching it, so count
+                // it applied. The only non-idempotent statements in the embedded files are bare
+                // ALTER ADD COLUMN (SQLite has no IF NOT EXISTS for it) and a few CREATEs without
+                // IF NOT EXISTS — both produce exactly these two messages.
                 console_warn!(
                     "self_provision: migration treated as already applied ({}): {}",
                     name,
@@ -653,9 +594,8 @@ async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
                 );
                 record_applied(db, name).await
             } else {
-                // A REAL error: do not record it and STOP the chain (later migrations may
-                // depend on this one). The caller behaves fail-soft, and the next isolate
-                // boot retries.
+                // A REAL error: do not record it and STOP the chain — later migrations may depend
+                // on this one. The caller is fail-soft and the next isolate boot retries.
                 Err(Error::RustError(format!("migration {name}: {msg}")))
             }
         }
@@ -706,15 +646,12 @@ fn normalize_migration_name(raw: &str) -> &str {
     t.strip_suffix(".sql").unwrap_or(t)
 }
 
-/// Split a SQL file into statements. NOT a naive `;` split: migration comments do contain
-/// `;` — a real example is 0014's inline column comment, which is written in Turkish and
-/// carries a `;` mid-sentence — and a naive split would cut that CREATE TABLE in half.
-/// that CREATE TABLE in half.
-/// This is a small state machine aware of string literals (including the `''` escape),
-/// `--` line comments and `/* */` block comments. Comments are STRIPPED so D1's prepare
-/// receives pure SQL, and a `;` only terminates a statement in normal context. Triggers
-/// (with `;` inside BEGIN...END) do NOT appear in the migration files; if one is ever
-/// added this splitter will not suffice and will have to be revisited then.
+/// Split a SQL file into statements. NOT a naive `;` split — migration comments contain `;` (0014
+/// has one mid-sentence), and a naive split cuts that CREATE TABLE in half. So: a small state
+/// machine over string literals (including the `''` escape), `--` line comments and `/* */`
+/// blocks; comments are STRIPPED so D1 prepares pure SQL, and a `;` terminates only in normal
+/// context. Triggers (a `;` inside BEGIN…END) do not appear in the files; adding one means
+/// revisiting this.
 fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -777,12 +714,10 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     out
 }
 
-/// Tolerant-apply classification: ONLY "the schema is already like this" errors are benign.
-/// The SQLite messages are "duplicate column name: X" (re-running a bare ALTER ADD COLUMN,
-/// which many migrations from 0003 onward use — SQLite has no IF NOT EXISTS for it) and
-/// "table/index X already exists" (re-running a CREATE without IF NOT EXISTS, i.e.
-/// 0014/0015/0016). A UNIQUE violation, "no such table", a syntax error and the like are
-/// REAL errors and are never swallowed.
+/// Tolerant-apply classification: ONLY "the schema is already like this" is benign — SQLite's
+/// "duplicate column name: X" (a re-run bare ALTER ADD COLUMN) and "table/index X already exists"
+/// (a re-run CREATE without IF NOT EXISTS). A UNIQUE violation, "no such table" or a syntax error
+/// is a REAL error and is never swallowed.
 fn is_benign_schema_conflict(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("duplicate column name") || m.contains("already exists")

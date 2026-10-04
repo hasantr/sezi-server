@@ -1,4 +1,4 @@
-//! Profile/group avatar blob upload + download (Profile Photo epic §2.3).
+//! Profile/group avatar blob upload + download.
 //!
 //! The server is BLIND: blob contents are E2E-encrypted (XChaCha20 STREAM, the key never
 //! leaves the E2E channel) and the worker holds only opaque bytes. Two things set this
@@ -24,8 +24,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 use worker::*;
 
-/// Ceiling for an encrypted avatar (plan §6: 512px WebP q80 targets ~60-120KB, so the
-/// encrypted ceiling is ≤400KB).
+/// Ceiling for an encrypted avatar: 512px WebP q80 targets ~60-120KB, so ≤400KB encrypted.
 const MAX_AVATAR_SIZE: u64 = 400 * 1024;
 
 // ── SQL contracts (unit-tested with rusqlite — the invite_attribution pattern) ───
@@ -75,20 +74,18 @@ pub async fn upload(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Err(resp) => return Ok(resp),
     };
 
-    // Lite install (R2 is OPTIONAL): with no store the path is off — a clean 503 after auth
-    // and before D1, symmetric with media/handlers.rs upload. The client treats it as
-    // nonretryable.
+    // R2 is OPTIONAL: with no store the path is off — a clean 503 after auth and before D1,
+    // symmetric with media/handlers.rs upload. The client treats it as nonretryable.
     let router = StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
     }
 
-    // Per-user upload rate-limit: `avatar:up:{user}` at 10 per 86400s (plan §6). The avatar
-    // is single-slot — every upload replaces the previous one — so 10/day sits far above the
-    // legitimate "set/change my profile photo" cadence while cutting off automated abuse.
-    // The KV binding is OPTIONAL (template diet): with none, or on a KV get/put error, we
-    // FAIL OPEN and allow — see ratelimit::check_rate_limit_env (lesson of 2026-06-28: the
-    // rate-limiter must never wedge messaging, so the limit loosens temporarily instead).
+    // Per-user upload rate-limit: `avatar:up:{user}` at 10 per 86400s. The avatar is
+    // single-slot — every upload replaces the previous one — so 10/day sits far above the
+    // legitimate "set/change my profile photo" cadence while cutting off automated abuse. The
+    // KV binding is OPTIONAL: with none, or on a KV get/put error, `check_rate_limit_env`
+    // FAILS OPEN, because a rate-limiter must never wedge messaging.
     if !check_rate_limit_env(&ctx.env, &format!("avatar:up:{user_id}"), 10, 86400).await {
         return json_err(429, "rate_limited");
     }
@@ -145,10 +142,9 @@ pub async fn upload(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     let now = now_secs() as i64;
 
     // Single slot: read the current avatar object (so the old one can be orphaned), then point
-    // at the new ref. The upsert on the user_id PK guarantees exactly one row. NOTE: the old
-    // blob is orphaned only AFTER the upsert succeeds. The order matters — the pointer moves
-    // to the new blob first, then the old one is dropped. The reverse order would delete a
-    // live avatar whenever the upsert failed.
+    // at the new ref. The upsert on the user_id PK guarantees exactly one row. The old blob is
+    // orphaned only AFTER the upsert succeeds — the pointer moves to the new blob first. The
+    // reverse order would delete a live avatar whenever the upsert failed.
     let existing: Option<ExistingAvatar> = db
         .prepare(SELECT_EXISTING_AVATAR_SQL)
         .bind(&[d1_text(&user_id)])?
@@ -191,7 +187,7 @@ pub async fn download(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Ok(auth) => auth.user_id,
         Err(resp) => return Ok(resp),
     };
-    // Lite install: with no store download is off too — a 503 symmetric with upload.
+    // With no store download is off too — a 503 symmetric with upload.
     let router = StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
@@ -239,14 +235,14 @@ mod tests {
 
     const MIGRATION: &str = include_str!("../../migrations/0035_avatar_objects.sql");
 
-    /// Load the avatar_objects + storage_orphans schema (0035 plus a minimal orphan table).
+    /// Load the avatar_objects schema plus a minimal storage_orphans table.
     fn db_with_schema() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE users (id TEXT PRIMARY KEY);
              INSERT INTO users(id) VALUES ('u1'), ('u2');
-             -- storage_orphans (migration 0028 ile bit-aynı sözleşme; tek-slot testi için).
+             -- storage_orphans (bit-identical contract to migration 0028; for the single-slot test).
              CREATE TABLE storage_orphans (
                store_id    TEXT NOT NULL,
                key         TEXT NOT NULL,

@@ -1,9 +1,9 @@
--- P0: davet redeem -> verify arasindaki kimlik/attribution bagini kalici tut.
+-- Keep the identity/attribution link between an invite redeem and its verify durable.
 --
--- GUVENLIK: bearer invite token bir yetkilendirme sirridir; kalici audit/grant
--- tablosunda ASLA ham saklanmaz. Rust redeem akisi SHA-256(token) hesaplar.
--- Ham token yalniz mevcut TTL'li invite_tokens satirinda ve verify tamamlaninca
--- silinen verification_codes legacy koprusunde kalir.
+-- SECURITY: a bearer invite token is an authorization secret; it is NEVER stored raw in a
+-- durable audit/grant table. The Rust redeem path computes SHA-256(token). The raw token
+-- survives only in the existing TTL-bounded invite_tokens row and in the legacy
+-- verification_codes bridge, which is deleted once verify completes.
 ALTER TABLE invite_tokens ADD COLUMN token_hash TEXT;
 ALTER TABLE verification_codes ADD COLUMN invite_token_hash TEXT;
 
@@ -27,7 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_invite_attr_inviter
 CREATE INDEX IF NOT EXISTS idx_invite_attr_used_by
   ON invite_attributions(used_by, redeemed_at DESC);
 
--- SQL katmaninda SHA-256 primitive'i garanti degil; bu nedenle eski ham token'lar
--- migration dosyasinda ledger'a kopyalanmaz. Rust verify yolu in-flight kodu,
--- maintenance yolu da henuz mevcut kullanilmis davetleri hashleyip guvenli sekilde
--- backfill eder. Boylece migration hicbir kalici tabloya bearer sirri yazmaz.
+-- A SHA-256 primitive is not guaranteed at the SQL layer, so old raw tokens are not copied
+-- into the ledger from this migration file. The Rust verify path handles the in-flight codes,
+-- and the maintenance path hashes the already-used invites and backfills them safely. That
+-- way the migration writes no bearer secret into any durable table.

@@ -86,8 +86,8 @@ mod auth_gate_guard {
         );
         assert!(
             !head.contains("require_admin("),
-            "update_settings must NOT gate on require_admin: that accepts any admin, and `join_mode` \
-             alone lets one change who may join the server"
+            "update_settings must NOT gate on require_admin: that accepts any admin, and \
+             `dm_policy` alone lets one change who may contact whom on the server"
         );
     }
 

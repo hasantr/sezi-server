@@ -1,14 +1,14 @@
--- Sezgi: çoklu-cihaz adresleme S2.3 (WIRE-CUT — per-device OTK havuzu temiz-kesik).
+-- Sezgi: multi-device addressing, the WIRE CUT — a clean break to a per-device OTK pool.
 --
--- M2-S2.3 wire-cut: tekil `envelope_b64` sökülür, OTK claim artık
--- (user_id, device_id) düzeyinde tüketilir (keys/handlers.rs bundle v2).
+-- The wire cut: the single `envelope_b64` is removed and an OTK claim is now consumed at
+-- (user_id, device_id) level (keys/handlers.rs bundle v2).
 --
--- ESKİ NULL-device OTK havuzunu SİL (temiz-kesik): S1 boyunca cihaz device_id
--- göndermeden replenish edenler `device_id IS NULL` satır bıraktı. S2.3 claim'i
--- `WHERE device_id = ?` ile çalıştığından bu legacy NULL havuzu artık ASLA
--- claim edilemez = ölü stok. Client (primary cihaz) deploy sonrası device_id ile
--- yeniden replenish eder → havuz somut-device satırlarıyla dolar. Eski NULL
--- satırları temizlemek D1'i şişmekten korur + "neden OTK bitmiyor" karışıklığını
--- önler. (signed_prekeys NULL device_id DOKUNULMAZ — bundle SPK'yı device-filtresiz
--- en-yeni seçer; primary SPK rotate edilince zaten device_id'li satır gelir.)
+-- DELETE the OLD NULL-device OTK pool (that is the clean break): devices that replenished
+-- without sending a device_id left `device_id IS NULL` rows behind. The claim now runs with
+-- `WHERE device_id = ?`, so that legacy NULL pool can NEVER be claimed again = dead stock.
+-- After the deploy the client (the primary device) replenishes again with its device_id →
+-- the pool fills with concrete-device rows. Clearing the old NULL rows keeps D1 from bloating
+-- and avoids the "why do the OTKs never run out" confusion. (signed_prekeys NULL device_id is
+-- LEFT ALONE — the bundle picks the newest SPK without a device filter, and once the primary
+-- rotates its SPK a row carrying a device_id arrives anyway.)
 DELETE FROM one_time_prekeys WHERE device_id IS NULL;

@@ -1,32 +1,27 @@
 //! `PUT /devices/list` + `GET /devices/list/:user_id` — the M1 device list.
 //!
 //! ## The JWS byte-signature model (CRITICAL)
-//! `doc_json` is a JSON STRING field in the outer body whose value is EXACTLY the inner JSON
-//! text the client signed. Once serde has parsed the outer body, `body.doc_json` holds that
-//! text's verbatim UTF-8 bytes, so the signature is verified over `body.doc_json.as_bytes()`.
-//! We NEVER re-serialize the inner document: no canonicalization is required, and the whole
-//! class of serialization-difference bugs simply cannot occur. The inner parse exists ONLY to
-//! read the fields verification needs (user_id, rev, the primary's ed_pub/x_pub).
+//! `doc_json` is a JSON STRING field whose value is EXACTLY the inner JSON text the client
+//! signed, so the signature is verified over `body.doc_json.as_bytes()` — verbatim. The inner
+//! document is NEVER re-serialized: no canonicalization, and no serialization-difference bugs.
+//! The inner parse exists only to read the fields verification needs.
 //!
-//! ## The identity binding chain (the relogin.rs pattern — CRITICAL)
-//! The list is signed with the primary device's **Ed25519** key. We cannot validate that Ed
-//! key DIRECTLY against `users.identity_pubkey`, because that blob is a Curve25519/DH key —
-//! register sends `id.diffie_pubkey()` — and NOT an Ed25519 signing key. So we apply the
-//! binding pattern from relogin.rs:
-//!   1) Build a `VerifyingKey` from the primary's `ed_pub_b64` in the doc (malformed → 400).
-//!   2) **Binding:** fetch the user's NEWEST `signed_prekeys` row. The SPK public key was
-//!      signed at registration time by the real identity via `account.sign(spk_pub)`, so if
-//!      the claimed Ed key can verify that signature it is CRYPTOGRAPHICALLY bound to the
-//!      registered identity (missing row or failed verification → 403).
-//!   3) **List signature:** the same Ed key verifies the verbatim bytes of doc_json.
+//! ## The identity binding chain (CRITICAL)
+//! The list is signed with the primary's **Ed25519** key, which cannot be checked directly
+//! against `users.identity_pubkey` — that blob is the Curve25519/DH key register sends, not a
+//! signing key. So, the same binding relogin.rs uses:
+//!   1) Build a `VerifyingKey` from the doc's primary `ed_pub_b64` (malformed → 400).
+//!   2) **Binding:** the user's NEWEST `signed_prekeys` row was signed at registration by the
+//!      real identity (`account.sign(spk_pub)`), so an Ed key that verifies it is
+//!      cryptographically bound to the registered identity (missing or failing → 403).
+//!   3) **List signature:** that same Ed key over the verbatim doc_json bytes.
 //!   4) **Consistency:** the decoded primary `x_pub_b64` == `users.identity_pubkey`.
 //!
-//! ## Shared validate-and-store path (M2-S3.2 B6)
-//! `put_list` and `link-approve` (see `link.rs`) both go through the SAME
-//! `validate_and_store_signed_list`, so there is a single source of verification. The
-//! `device_lists` write is **atomically rev-conditional** (`WHERE excluded.rev >
-//! device_lists.rev` plus RETURNING): two concurrent writers (link-approve and put_list)
-//! cannot fall into a read-then-write race, and the loser gets a 409.
+//! ## One validate-and-store path
+//! `put_list` and `link-approve` (`link.rs`) share `validate_and_store_signed_list`, so
+//! verification has a single source. That write is atomically rev-conditional (`WHERE
+//! excluded.rev > device_lists.rev` plus RETURNING), so concurrent writers cannot race
+//! read-then-write and the loser gets a 409.
 
 use crate::auth::middleware::{device_revoked, require_active_auth, require_existing_account_auth};
 use crate::d1util::{d1_blob, d1_int, d1_opt_text, d1_text};
@@ -40,10 +35,9 @@ const MAX_DEVICES: usize = 5; // 1 primary + ≤4 linked
 const MAX_DOC_BYTES: usize = 16 * 1024; // ceiling on the signed document (DoS guard)
 
 /// device_id derivation — at PARITY with core's `devices::device_id_from_ed25519_b64`:
-/// `hex(blake3(ed_pub_bytes)[..8])`, i.e. 16 lowercase hex chars. `ed_pub_32` must be 32
-/// bytes; the caller checks that. Item 2: on every list write the worker re-derives this for
-/// each device, so an entry with a forged device_id cannot leak into the routing state —
-/// the ids are self-certifying.
+/// `hex(blake3(ed_pub_bytes)[..8])`, 16 lowercase hex chars (`ed_pub_32` is checked by the
+/// caller). Re-derived for every entry on every list write, which is what makes the ids
+/// self-certifying: a forged device_id cannot reach the routing state.
 fn derive_device_id(ed_pub_32: &[u8]) -> String {
     let hash = blake3::hash(ed_pub_32);
     hex::encode(&hash.as_bytes()[..8])
@@ -62,9 +56,8 @@ pub(crate) struct DeviceListDoc {
     pub(crate) user_id: String,
     pub(crate) rev: i64,
     pub(crate) devices: Vec<DeviceEntry>,
-    /// Model-B Layer-1: signed tombstones for removed devices. Older docs do not carry the
-    /// field, hence the serde default (empty). Because the signature covers the whole doc,
-    /// the server cannot add entries here.
+    /// Signed tombstones for removed devices; older docs omit the field, hence the default.
+    /// The signature covers the whole doc, so the server cannot add entries here.
     #[serde(default)]
     pub(crate) removed_devices: Vec<DeviceEntry>,
 }
@@ -83,9 +76,8 @@ pub(crate) struct DeviceEntry {
 #[derive(Deserialize)]
 struct UserRow {
     identity_pubkey: Vec<u8>,
-    /// Model-B Layer-1 BLOCKER fix: the device-list rev HIGH-WATER mark. Even if the
-    /// `device_lists` row is lost to D1 churn, this one on `users` SURVIVES, so a stale
-    /// re-PUT (rev < high_water) is rejected and a revoked device cannot be resurrected.
+    /// The device-list rev HIGH-WATER mark. It lives on `users` so it survives the loss of the
+    /// `device_lists` row, which is what stops a stale re-PUT resurrecting a revoked device.
     #[serde(default)]
     device_list_rev: i64,
 }
@@ -106,24 +98,17 @@ fn list_read_requires_active_device(caller: &str, target: &str) -> bool {
 /// `PUT /devices/list` — upload the primary-signed device list.
 /// A thin wrapper: auth + rate-limit + body → `validate_and_store_signed_list`.
 pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // This is the endpoint that DECIDES which devices exist and which are revoked, and it used
-    // to gate on the bare stateless JWT alone — neither account existence nor device revocation.
-    // Its siblings (`messages::handlers::send`, `plugin_blob::gate`, `push::register`) all check
-    // both, and here the gap mattered most: a revoked device's access token stays valid for its
-    // 15-minute TTL, and this is the one call that could publish a list reinstating it.
+    // This endpoint DECIDES which devices exist and which are revoked, and a revoked device's
+    // access token stays valid for its 15-minute TTL — so the bare stateless JWT is not enough
+    // here: this is the one call that could publish a list reinstating that device.
     //
-    // It deliberately does NOT use `require_active_auth`. A fresh registration must publish
-    // rev=1 BEFORE any `devices` row exists — registration writes `users`, `signed_prekeys` and
-    // the OTK pool, but the first `devices` rows are created by THIS handler — so demanding an
-    // active-device proof would deadlock the bootstrap in exactly the way described for the
-    // self-read in `get_list` below. The two halves are therefore taken separately:
-    //   * `require_existing_account_auth` — the account must still exist (so a kicked user's
-    //     15-minute token cannot rewrite a device list), which is the same narrow exception
-    //     `get_list` already relies on at bootstrap.
-    //   * `device_revoked` — fail-closed for a device explicitly carrying `revoked_at`, and
-    //     false for a device with no row yet (the bootstrap). That is precisely the shape the
-    //     bootstrap needs: a device that has never been listed cannot have been revoked from a
-    //     list.
+    // It deliberately does NOT use `require_active_auth`, which would deadlock the bootstrap: a
+    // fresh registration must publish rev=1 before any `devices` row exists, and THIS handler is
+    // what creates the first ones. So the two halves are taken separately —
+    //   * `require_existing_account_auth`: the account must still exist, so a kicked user's
+    //     15-minute token cannot rewrite a device list.
+    //   * `device_revoked`: fail-closed on an explicit `revoked_at`, false for a device with no
+    //     row yet — a device that was never listed cannot have been revoked from a list.
     let auth = match require_existing_account_auth(&req, &ctx.env).await {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
@@ -133,9 +118,8 @@ pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         return json_err(401, "device_revoked");
     }
 
-    // Rate-limit: a rarely called endpoint, so this is cheap protection built on the existing
-    // KV sliding window. The KV binding is OPTIONAL (template diet): with none we continue
-    // unlimited — see ratelimit::check_rate_limit_env.
+    // A rarely called endpoint, so the KV sliding window is cheap protection. The KV binding is
+    // OPTIONAL: with none, `check_rate_limit_env` continues unlimited.
     if !crate::ratelimit::check_rate_limit_env(
         &ctx.env,
         &format!("devices:list:{auth_user}"),
@@ -170,21 +154,16 @@ pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
 /// `link-approve`, so verification lives in exactly one place. Every check is fail-closed.
 /// Success → `Ok(rev)`; rejection → `Err(Response)`, which the caller returns as `Ok(resp)`.
 ///
-/// Error codes (machine-readable): 400 bad_doc / doc_too_large / unsupported_version /
+/// Error codes (machine-readable, and EXHAUSTIVE — a client may switch on them, so every
+/// `reject!` below must appear here): 400 bad_doc / doc_too_large / unsupported_version /
 ///   user_mismatch / no_primary / multiple_primary / primary_key_mismatch /
 ///   bad_pubkey / too_many_devices / bad_signature / device_id_mismatch /
 ///   tombstone_device_id_mismatch / device_active_and_removed · 401 user_not_found ·
 ///   403 identity_mismatch / sig_invalid · 409 rev_conflict · 500 bad_spk_sig.
 ///
-/// The last three 400s were missing from this list, which matters more than a normal doc gap: a list
-/// that presents itself as MACHINE-READABLE invites a client to switch on it exhaustively, and a client
-/// that did would have treated three real rejections as unknown. Every `reject!` in this function is
-/// accounted for above — checked by enumerating them, not by reading.
-///
-/// **B6 atomicity:** the `device_lists` write is `ON CONFLICT DO UPDATE ... WHERE
-/// excluded.rev > device_lists.rev RETURNING rev`, so among concurrent writers only the one
-/// advancing rev wins; the loser sees an empty RETURNING and gets a 409. No read-then-write
-/// race exists.
+/// **Atomicity:** the write is `ON CONFLICT DO UPDATE … WHERE excluded.rev > device_lists.rev
+/// RETURNING rev`, so only the writer advancing rev wins; the loser sees an empty RETURNING and
+/// gets a 409.
 pub(crate) async fn validate_and_store_signed_list(
     db: &D1Database,
     auth_user: &str,
@@ -256,14 +235,10 @@ pub(crate) async fn validate_and_store_signed_list(
         prekey_pub: Vec<u8>,
         signature: Vec<u8>,
     }
-    // M2-S3.2 (review HIGH): scope the SPK selection by the PRIMARY device's device_id.
-    // When a linked device onboards it appends its OWN SPK, so a device-id-agnostic "newest
-    // row" selection would check the primary's list-signature binding against the LINKED
-    // device's SPK → identity_mismatch → the primary could no longer publish lists or remove
-    // devices, breaking S3.5 revoke. Prefer the row matching the primary entry's device_id.
-    // EXACTLY the primary's slot: the `device_id IS NULL OR device_id = ''` widening is gone with
-    // the device-less write that filled it, so the primary can no longer be verified against a
-    // key that landed in an unscoped slot.
+    // EXACTLY the primary's slot. A device-id-agnostic "newest row" would check the primary's
+    // binding against a LINKED device's SPK once that device onboards → identity_mismatch → the
+    // primary can no longer publish lists or revoke anyone. No `device_id IS NULL OR = ''`
+    // widening either: the primary must not be verifiable against a key from an unscoped slot.
     let primary_dev = primary.device_id.as_str();
     let spk: Option<SpkRow> = db
         .prepare(
@@ -313,14 +288,12 @@ pub(crate) async fn validate_and_store_signed_list(
         reject!(409, "rev_conflict");
     }
 
-    // Model-B Layer-1 BLOCKER fix (revoke resurrection): the rev HIGH-WATER gate. If the
-    // `device_lists` row was lost to D1 churn, an old doc — from before the removal, with no
-    // tombstone — was accepted as a fresh insert, and the active-device upsert with
-    // revoked_at=NULL RESURRECTED the removed device. `users.device_list_rev` is INDEPENDENT
-    // of device_lists and survives that row loss, so rev < high_water means stale and is
-    // rejected. An EQUAL rev (== high_water) is allowed so a RESTORE can work: the signature
-    // has already been verified, making it a genuine, current primary doc. The winning writer
-    // advances high_water with MAX inside the batch.
+    // The rev HIGH-WATER gate against revoke resurrection: with the `device_lists` row lost to D1
+    // churn, an old pre-removal doc looks like a fresh insert and the upsert's `revoked_at=NULL`
+    // brings the removed device back. `users.device_list_rev` survives that loss independently,
+    // so rev < high_water is stale. EQUAL is allowed so a restore works — the signature is
+    // already verified, so it is a genuine current doc. The winner advances high_water with MAX
+    // inside the batch.
     if doc.rev < user.device_list_rev {
         reject!(409, "rev_conflict");
     }
@@ -345,11 +318,9 @@ pub(crate) async fn validate_and_store_signed_list(
             Ok(b) => b,
             Err(_) => reject!(400, "bad_pubkey"),
         };
-        // Item 2 (Codex): EVERY device's device_id must equal the value derived from its
-        // ed_pub (parity with core verify §5). The worker used to check only the primary
-        // binding, so a linked entry with a forged device_id could leak into the `devices`
-        // routing state — core rejected it while the worker accepted it, an asymmetry. This
-        // gate makes the ids self-certifying.
+        // EVERY device_id must equal the value derived from its ed_pub, at parity with core's
+        // verify. Checking only the primary lets a forged linked entry into the `devices`
+        // routing state that core would reject — the two sides must not disagree.
         if derive_device_id(&ed) != d.device_id {
             reject!(400, "device_id_mismatch");
         }
@@ -363,12 +334,10 @@ pub(crate) async fn validate_and_store_signed_list(
         });
     }
 
-    // Item 1w (Model-B tombstones): validate removed_devices — every tombstone must be
-    // self-consistent (device_id derived from ed_pub) and DISJOINT from the active devices,
-    // because a device cannot be active and tombstoned at once (parity with core verify
-    // §6/§7). Remove-wins is ENFORCED implicitly: a tombstoned device is absent from the
-    // active `devices` array, so the omission-revoke below already sets `revoked_at=now`,
-    // and a stale re-PUT cannot resurrect it.
+    // Every tombstone must be self-consistent (device_id derived from ed_pub) and DISJOINT from
+    // the active devices — a device cannot be both at once. Remove-wins needs no extra step: a
+    // tombstoned device is absent from `devices`, so the omission-revoke below already sets
+    // `revoked_at=now`.
     for r in &doc.removed_devices {
         let red = match b64_decode(&r.ed_pub_b64) {
             Ok(b) if b.len() == 32 => b,
@@ -382,19 +351,16 @@ pub(crate) async fn validate_and_store_signed_list(
         }
     }
 
-    // ---- Success: ONE ATOMIC D1 BATCH (Item 4 — revoke safety). ----
-    // How it used to be: the device_lists rev bump, then the devices sync and the token
-    // delete, as SEPARATE queries. A failure in between meant rev had advanced but the tokens
-    // had not been deleted, so a removed device KEPT its token while the retry also got a 409
-    // — a revoked device could retain access. That was a serious revoke-security hole.
-    // Now everything runs in ONE transaction (`db.batch`, all-or-nothing).
+    // ---- Success: ONE ATOMIC D1 BATCH — this is revoke safety. ----
+    // Split into separate queries, a failure between the rev bump and the token delete leaves rev
+    // advanced while a removed device KEEPS its token, and the retry 409s: a revoked device with
+    // retained access.
     //
-    // Concurrent-writer race: the device_lists bump is CONDITIONAL (`excluded.rev > rev`), so
-    // the loser's bump is a no-op. Every derived mutation (devices upsert, omission-revoke,
-    // token delete) is gated on `device_lists.doc_json == MY doc`, so the LOSER mutates
-    // nothing: a stale list can neither resurrect a device nor revoke the wrong one. The bump
-    // statement comes FIRST, so later statements in the same transaction observe the
-    // post-bump doc_json.
+    // Concurrent writers: the bump is conditional (`excluded.rev > rev`), so the loser's is a
+    // no-op, and every derived mutation (devices upsert, omission-revoke, token delete) is gated
+    // on `device_lists.doc_json == MY doc` — so the loser mutates nothing and a stale list can
+    // neither resurrect a device nor revoke the wrong one. The bump comes FIRST so the rest of
+    // the transaction sees the post-bump doc_json.
     let now_s = now_secs() as i64;
     let now_ms_v = now_ms() as i64;
     let placeholders: String = (0..decoded.len())
@@ -467,11 +433,10 @@ pub(crate) async fn validate_and_store_signed_list(
     revoke_binds.push(d1_text(doc_json));
     stmts.push(db.prepare(&revoke_sql).bind(&revoke_binds)?);
 
-    // 4) M2-S3.5 B4 (device removal): DELETE the refresh tokens of every real device_id ABSENT
-    //    from the new list, so a removed device cannot renew its token — its session dies once
-    //    the 15-minute access-token TTL expires — and relogin rejects it as revoked. The
-    //    `device_id IS NOT NULL AND device_id != ''` carve-out that preserved rows belonging to
-    //    no device is gone: every refresh row names a device now, so it exempted nothing.
+    // 4) DELETE the refresh tokens of every device_id ABSENT from the new list: a removed device
+    //    cannot renew, so its session dies with the 15-minute access-token TTL and relogin
+    //    rejects it as revoked. No `device_id IS NOT NULL` carve-out — every refresh row names a
+    //    device, so it would exempt nothing.
     let del_sql = format!(
         "DELETE FROM refresh_tokens
          WHERE user_id = ? AND device_id NOT IN ({placeholders})
@@ -486,14 +451,11 @@ pub(crate) async fn validate_and_store_signed_list(
     del_binds.push(d1_text(doc_json));
     stmts.push(db.prepare(&del_sql).bind(&del_binds)?);
 
-    // 4b) A removed device's UNCONSUMED one-time keys are dead the moment it goes: nothing will
-    //     ever hold their private halves again, and only that device's own replenish would have
-    //     replaced them — which will never run. Measured 2026-07-27 on the live server: a device
-    //     revoked the day before still had 46 published OTKs waiting to be handed out. They are
-    //     device-scoped so the bundle handler does not serve them for the live device, which is
-    //     why this was a hygiene leak rather than a fault; it still means public keys for a dead
-    //     account sitting in the pool indefinitely. consumed=1 rows STAY: they are the record
-    //     that stops a key ever being issued twice.
+    // 4b) A removed device's UNCONSUMED one-time keys are dead the moment it goes: nobody holds
+    //     their private halves any more, and only that device's own replenish would replace them.
+    //     Hygiene rather than a fault — they are device-scoped, so the bundle handler never
+    //     serves them for a live device. consumed=1 rows STAY: they are the record that stops a
+    //     key being issued twice.
     let del_otk_sql = format!(
         "DELETE FROM one_time_prekeys
          WHERE user_id = ? AND consumed = 0
@@ -509,10 +471,9 @@ pub(crate) async fn validate_and_store_signed_list(
     del_otk_binds.push(d1_text(doc_json));
     stmts.push(db.prepare(&del_otk_sql).bind(&del_otk_binds)?);
 
-    // 5) Model-B Layer-1 BLOCKER fix: advance the rev HIGH-WATER mark. MAX keeps it monotonic
-    //    so it can never go backwards. Even if the device_lists row is lost later, this value
-    //    stays on `users`, so a stale re-PUT is rejected by the pre-check above. Only the
-    //    WINNING writer advances it (doc_json gate), so the loser cannot corrupt high_water.
+    // 5) Advance the rev HIGH-WATER mark. MAX keeps it monotonic; it lives on `users` so it
+    //    outlives the device_lists row; and the doc_json gate means only the WINNING writer
+    //    advances it.
     stmts.push(
         db.prepare(
             "UPDATE users SET device_list_rev = MAX(device_list_rev, ?)
@@ -546,23 +507,20 @@ pub(crate) async fn validate_and_store_signed_list(
     }
 }
 
-/// `GET /devices/list/:user_id` — a user's current signed list.
-/// 200 `{doc_json, sig_b64, rev}` | 404 not_found.
-/// `GET /devices/activity` — when the server last saw each of MY devices.
+/// `GET /devices/activity` (auth) → `{devices: [{device_id, last_seen_at}]}` — when the server
+/// last saw each of MY devices.
 ///
-/// Deliberately a separate route from `GET /devices/list`, which returns a document the PRIMARY
-/// signed. This is the server's own observation and it cannot go inside that blob: the signature
-/// would break, and the primary does not know the answer in the first place. Two sources, two
-/// trust levels, two fields — the client shows this as server-asserted.
+/// A separate route from `GET /devices/list` on purpose: that returns a document the PRIMARY
+/// signed, and the server's own observation cannot go inside it — the signature would break, and
+/// the primary does not know the answer. Two sources, two trust levels, two fields.
 ///
-/// SELF ONLY. When a device last connected is presence, and presence about another person is not
-/// something this endpoint has any business answering — the device list is readable by a direct
-/// contact (they need the keys), the activity is not.
+/// SELF ONLY: when a device last connected is presence, and the device list is readable by a
+/// direct contact (they need the keys) while the activity is not.
 ///
-/// `last_seen_at` is null for a device that has not made an authenticated request since the column
-/// existed. That covers both a device linked before this shipped and a genuine ghost — one whose
-/// first history sync timed out, leaving a row in the signed list and nothing behind it — and the
-/// client must not tell those two apart, because the server cannot.
+/// `last_seen_at` is null for a device that has made no authenticated request since the column
+/// existed. That covers both an old linked device and a genuine ghost — one whose first history
+/// sync timed out, leaving a row in the signed list and nothing behind it — and the client must
+/// not tell them apart, because the server cannot.
 pub async fn get_activity(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let auth = match require_active_auth(&req, &ctx.env).await {
         Ok(a) => a,
@@ -595,6 +553,7 @@ pub async fn get_activity(req: Request, ctx: RouteContext<()>) -> Result<Respons
     }))
 }
 
+/// `GET /devices/list/:user_id` → 200 `{doc_json, sig_b64, rev}` | 404 not_found.
 pub async fn get_list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let target = match ctx.param("user_id") {
         Some(s) => s.clone(),
@@ -606,14 +565,11 @@ pub async fn get_list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Err(resp) => return Ok(resp),
     };
 
-    // Fresh-registration bootstrap is intentionally GET-first: the client reads
-    // its own signed list and, on 404, publishes rev=1 with PUT /devices/list.
-    // At that point `devices` is still empty, so requiring an active device for
-    // the self-read creates a permanent deadlock (GET 401 => PUT never runs).
-    // A signed device list is public key material and PUT still verifies the
-    // primary signature/high-water; therefore a valid account token may read
-    // only its OWN list before activation. Reading another user's list keeps
-    // the active-device and direct-contact gates below.
+    // Bootstrap is GET-first: the client reads its own list and, on 404, publishes rev=1. With
+    // `devices` still empty, requiring an active device for the SELF-read deadlocks it forever
+    // (GET 401 → the PUT never runs). A signed list is public key material and the PUT still
+    // verifies signature and high-water, so an account token may read its OWN list before
+    // activation; another user's list keeps both gates below.
     let peer_read = list_read_requires_active_device(&caller, &target);
     if peer_read {
         let active = match require_active_auth(&req, &ctx.env).await {
@@ -647,6 +603,48 @@ pub async fn get_list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::list_read_requires_active_device;
+
+    /// `include_str!` binds at compile time and resolves relative to THIS file — the
+    /// `groups_tests.rs` trick. Needles are split with `concat!` because this module is INLINE, so
+    /// `SRC` contains the test source too and a literal needle would match itself.
+    const SRC: &str = include_str!("handlers.rs");
+
+    /// One handler's source, from its `pub async fn` line to the next one. "The file mentions it
+    /// somewhere" is exactly the assertion that keeps passing after the call is deleted from the
+    /// handler that needed it.
+    fn handler_body<'a>(name: &str) -> &'a str {
+        let needle = format!("\npub async fn {name}(");
+        let start = SRC
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no handler named {name} — re-point this guard"));
+        let rest = &SRC[start + 1..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// A signed device list names every device an account owns, so serving it to any authenticated
+    /// stranger is a roster of who has how many devices, account by account. Gated exactly like
+    /// `GET /keys/:user_id/bundle` — `contacts::require_direct` — which a legitimate sender
+    /// already passes, since the send path makes the same decision.
+    ///
+    /// A SOURCE guard because the property is about which middleware the handler calls, and no
+    /// behavioural test over one endpoint can see that its neighbour chose differently.
+    /// `/devices/activity` needs none: it reads `auth.user_id` and can only return the caller's.
+    #[test]
+    fn reading_another_users_device_list_needs_a_direct_relationship() {
+        let body = handler_body("get_list");
+        assert!(
+            body.contains(concat!("contacts::require_", "direct(&db, &caller, &target)")),
+            "GET /devices/list/:user_id serves a signed device list to anyone with a token"
+        );
+        let gate = body
+            .find(concat!("require_", "direct"))
+            .expect("the contact gate is gone");
+        let read = body
+            .find("FROM device_lists WHERE user_id = ?")
+            .expect("the device-list read moved — re-point this guard");
+        assert!(gate < read, "the gate must precede the read it protects");
+    }
 
     #[test]
     fn fresh_registration_can_read_own_missing_list_before_device_activation() {

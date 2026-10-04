@@ -1,38 +1,23 @@
-//! CF GraphQL Analytics — BILLING-ACCURATE usage numbers (quota epic **phase 3**).
-//! Alongside the self-reported counters in `/admin/stats` (phase 1c) this adds
-//! Cloudflare's own measurements: request count (workersInvocationsAdaptive) and R2
-//! storage (r2StorageAdaptiveGroups), giving stats its "authoritative" dual logic.
+//! CF GraphQL Analytics — BILLING-ACCURATE usage numbers. Alongside the self-reported
+//! counters in `/admin/stats` this adds Cloudflare's own measurements: request count
+//! (workersInvocationsAdaptive) and R2 storage (r2StorageAdaptiveGroups), giving stats its
+//! "authoritative" dual logic.
 //!
-//! ⚠️ FAIL-OPEN IS ABSOLUTE (this module was written without any LIVE testing — there
-//! was no CF_API_TOKEN yet): EVERY error path returns `None` → stats falls back to the
-//! self-reported numbers, the endpoint NEVER 500s, and existing fields are NEVER
-//! disturbed. The chain:
-//!   0. Config resolution is per key: **env secret/var FIRST, D1 `server_settings`
-//!      second** (0024; the owner enters it from the app via `PATCH /admin/cf-config`).
-//!      env wins, so a mixed setup works — account id in env, token entered in the UI
-//!      and stored in D1. The D1 read is FAIL-OPEN: a missing table/column (before the
-//!      migration) or any D1 error simply drops that source (env-only, today's
-//!      behavior). If both env keys are set, D1 is NEVER queried.
-//!   1. Token or account missing/empty in EVERY source → early None, without ever
-//!      touching the CF network (a VPS/standalone deployment, or CF without a token,
-//!      behaves EXACTLY as it does today).
-//!   2. fetch/network error → `console_warn` + None for that query.
-//!   3. HTTP status != 200 → `console_warn` (status + body) + None for that query.
-//!   4. Body fails to parse as JSON → `console_warn` (raw body, truncated) + None.
-//!   5. Non-empty GraphQL `errors` → `console_warn` with CF's message (visible in
-//!      `wrangler tail` once a token exists), then STILL attempt to parse data —
-//!      partial success is possible.
-//!   6. Per-field DEFENSIVE parsing: each metric is its own `.get(..).and_then(..)`
-//!      chain, so missing/null/schema-changed only nulls that one metric.
-//!   7. The request-count and R2 queries are SEPARATE POSTs: if the R2 subquery turns
-//!      out to be schema-incompatible (a validation error would sink the WHOLE query),
-//!      the primary metric — request counts — is UNAFFECTED.
-//!   8. ALL metrics None → None (no CF data at all means we are NOT authoritative).
+//! ⚠️ FAIL-OPEN IS ABSOLUTE — every error path returns `None`: stats falls back to the
+//! self-reported numbers, the endpoint NEVER 500s, and existing fields are never disturbed.
+//! Config resolves per key, **env secret/var FIRST, D1 `server_settings` second** (the owner
+//! enters it via `PATCH /admin/cf-config`), so a mixed setup works; the D1 read is itself
+//! fail-open, and with both env keys set D1 is never queried. Missing token or account → an
+//! early None that never touches the CF network. Beyond that: network error, non-200, unparsable
+//! body → `console_warn` + None for that query; non-empty GraphQL `errors` → warn but STILL
+//! parse the data, since partial success is possible; each metric is its own
+//! `.get(..).and_then(..)` chain, so a schema change nulls only that metric; and the request-count
+//! and R2 queries are SEPARATE POSTs, so an incompatible R2 subquery cannot sink the primary
+//! metric. All metrics None → None, because no CF data means we are not authoritative.
 //!
-//! Setup: CF dashboard → API token (Account Analytics: Read) → either the owner enters
-//! it in the Sezi app (Server usage → CF Analytics; stored in D1, WRITE-ONLY — no
-//! endpoint hands it back) or via CLI with `wrangler secret put CF_API_TOKEN` plus
-//! `CF_ACCOUNT_ID` (either a var or a secret).
+//! Setup: CF dashboard → API token (Account Analytics: Read) → either the owner enters it in the
+//! app (stored in D1, WRITE-ONLY — no endpoint hands it back) or `wrangler secret put
+//! CF_API_TOKEN` plus `CF_ACCOUNT_ID`.
 
 use worker::*;
 
@@ -132,11 +117,10 @@ fn normalize(raw: String) -> Option<String> {
     }
 }
 
-/// The cf columns of D1 `server_settings` (0024) — the config the owner entered from
-/// the app via `PATCH /admin/cf-config`. FAIL-OPEN IS ABSOLUTE: no D1 binding, missing
-/// table/column (before the migration), missing row or a query error all yield
-/// (None, None), i.e. the source is ignored (env-only, today's behavior; stats NEVER
-/// 500s).
+/// The cf columns of D1 `server_settings` — the config the owner entered from the app via
+/// `PATCH /admin/cf-config`. FAIL-OPEN IS ABSOLUTE: no D1 binding, a missing table/column,
+/// a missing row or a query error all yield (None, None), i.e. the source is ignored and
+/// stats NEVER 500s.
 async fn read_db_cfg(env: &Env) -> (Option<String>, Option<String>) {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -154,9 +138,8 @@ async fn read_db_cfg(env: &Env) -> (Option<String>, Option<String>) {
     {
         Ok(r) => r,
         Err(e) => {
-            // The expected case is a pre-migration "no such column" — it should not
-            // vanish silently, but it must not break the endpoint either
-            // (fail-open, with a trace).
+            // The expected case is a pre-migration "no such column" — it should not vanish
+            // silently, but it must not break the endpoint either: fail-open, with a trace.
             console_warn!("cf_analytics: could not read the D1 config (fail-open): {e:?}");
             return (None, None);
         }
@@ -170,10 +153,9 @@ async fn read_db_cfg(env: &Env) -> (Option<String>, Option<String>) {
     }
 }
 
-/// The effective config — per key, **env FIRST, D1 second** (env wins, so a mixed
-/// setup works: account id in env, token entered in the UI and stored in D1). If both
-/// env keys are set, D1 is NEVER queried — the env-configured fast path is
-/// bit-identical to today's behavior.
+/// The effective config — per key, **env FIRST, D1 second** (env wins, so a mixed setup
+/// works: account id in env, token entered in the UI and stored in D1). If both env keys
+/// are set, D1 is NEVER queried.
 async fn resolve_cfg(env: &Env) -> (Option<String>, Option<String>) {
     let env_token = read_cfg(env, "CF_API_TOKEN");
     let env_account = read_cfg(env, "CF_ACCOUNT_ID");
@@ -225,10 +207,9 @@ fn month_start_utc() -> String {
 }
 
 /// One GraphQL POST → the `data.viewer.accounts[0]` node. Every failure layer does
-/// `console_warn` + None (fail-open; `tag` tells the log which query it was). Follows
-/// fcm.rs's Fetch/RequestInit pattern. The body is taken as TEXT so that on a parse
-/// failure the raw body can be logged (evidence for live tuning) — and per the OTK
-/// wedge lesson, text + serde_json is the house pattern instead of resp.json.
+/// `console_warn` + None (fail-open; `tag` tells the log which query it was). The body is
+/// taken as TEXT rather than through `resp.json` so that on a parse failure the raw body
+/// can be logged — the house pattern.
 async fn graphql_account(token: &str, body: String, tag: &str) -> Option<serde_json::Value> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
@@ -333,9 +314,9 @@ fn extract_r2_bytes(account: &serde_json::Value) -> Option<i64> {
 /// the caller (admin/stats) falls back to the self-reported counters — the fallback arm
 /// of the dual logic. The detailed fail-open chain is in the module header.
 pub async fn fetch(env: &Env) -> Option<CfUsage> {
-    // (0)+(1) Config resolution, env-first with a D1 fallback (`resolve_cfg`). If the
-    // token or the account is missing from EVERY source, return None without ever
-    // touching the CF network (not configured = self-report, today's behavior).
+    // (0)+(1) Config resolution, env-first with a D1 fallback (`resolve_cfg`). If the token
+    // or the account is missing from EVERY source, return None without ever touching the CF
+    // network: not configured means self-report.
     let (token, account_tag) = match resolve_cfg(env).await {
         (Some(t), Some(a)) => (t, a),
         _ => return None,

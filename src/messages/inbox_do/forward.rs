@@ -1,12 +1,11 @@
 use super::*;
 
-/// M1 (narrowing repeated Olm WIPE triggers): a FRESH-reconnect force-replay hands
-/// out only the last 48 hours of forwards. Older orphan rows (e.g. a `delivery_failed`
-/// the client never `forward_ack`ed) used to be replayed unconditionally on every
-/// reconnect, re-triggering `delete_all_olm_blobs` (Olm WIPE) on the receiver. 48h is
-/// a generous delivery window (cleanup retention deletes anything older anyway; this
-/// constant shrinks the replay surface without waiting for retention). Milliseconds,
-/// matching `created_at`.
+/// A FRESH-reconnect force-replay hands out only the last 48 hours of forwards. Replaying
+/// older orphan rows (e.g. a `delivery_failed` the client never `forward_ack`ed) re-triggers
+/// `delete_all_olm_blobs` — an Olm WIPE — on the receiver, on every reconnect. 48h is a
+/// generous delivery window; cleanup retention deletes anything older anyway, and this
+/// constant shrinks the replay surface without waiting for it. Milliseconds, matching
+/// `created_at`.
 const FORCE_REPLAY_WINDOW_MS: i64 = 48 * 3600 * 1000;
 
 impl UserInbox {
@@ -20,16 +19,14 @@ impl UserInbox {
         if ids.is_empty() {
             return;
         }
-        // Sprint 8.5a: persistent forward_queue + WS push, guarded against double
-        // delivery.
-        // - Sender sends twice (R1 bypass + OpHub race) → a 10s dedup window skips the
-        //   INSERT for the same (kind, from, recipient_device, ids).
+        // Persistent forward_queue + WS push, guarded against double delivery:
+        // - Sender sends twice → a 10s dedup window skips the INSERT for the same
+        //   (kind, from, recipient_device, ids).
         // - flush_forwards (replay) skips a row for 10s after it was pushed → no race
         //   between the forward_signal push and the alarm-driven flush_forwards.
-        // M2-S2.2 (D3 verdict 2): recipient_device_id is now a persisted column and part
-        // of the dedup key → a receipt queued while the WS was down carries its device
-        // through replay (otherwise N:1 MISS). With recipient_device None (N=1 / pre-S2.3)
-        // the key is NULL, i.e. identical to the previous behaviour.
+        // recipient_device_id is a persisted column and part of the dedup key, so a receipt
+        // queued while the WS was down carries its device through replay; without it a
+        // multi-device account misses. A None recipient_device stores NULL.
         let ids_json = match serde_json::to_string(ids) {
             Ok(s) => s,
             Err(_) => return,
@@ -42,9 +39,9 @@ impl UserInbox {
         };
 
         // Dedup: is the same receipt already queued within the last 10s and not yet
-        // deleted? (forward_ack DELETEs, so a missing row means the client already
-        // acked and a fresh INSERT is legitimate.) M2-S2.2: recipient_device_id is
-        // part of the key — compared with `IS` because `= ?` never matches NULL.
+        // deleted? (forward_ack DELETEs, so a missing row means the client already acked
+        // and a fresh INSERT is legitimate.) recipient_device_id is part of the key —
+        // compared with `IS` because `= ?` never matches NULL.
         let dedup_window = now - 10_000;
         let recent: Option<i64> = match storage.sql().exec_raw(
             "SELECT id FROM forward_queue
@@ -105,13 +102,12 @@ impl UserInbox {
         .to_string();
         let mut any_pushed = false;
         for ws in self.state.get_websockets() {
-            // W9 ("read receipt arrives late" — same zombie-socket root cause as W1):
-            // send_with_str returns Ok on a half-open socket, yet the client never RECEIVES
-            // the receipt; stamping pushed_at anyway makes flush_forwards skip this row for
-            // 10s, so the receipt stalls until the next 90s alarm. We still write to EVERY
-            // socket (it may be hibernating but alive), but mark "pushed" ONLY for a
-            // genuinely live socket (fresh last_seen) → on a zombie pushed_at stays NULL and
-            // the next flush / force-reconnect replays it.
+            // The zombie-socket rule: `send_with_str` returns Ok on a half-open socket even
+            // though the client never RECEIVES the receipt, and stamping pushed_at anyway
+            // would make flush_forwards skip this row for 10s, stalling the receipt until the
+            // next 90s alarm. So write to EVERY socket (one may be hibernating but alive),
+            // and mark "pushed" ONLY for a genuinely live socket (fresh last_seen) → on a
+            // zombie pushed_at stays NULL and the next flush / force-reconnect replays it.
             if ws.send_with_str(payload.as_str()).is_ok() && super::message::ws_is_fresh(&ws, now) {
                 any_pushed = true;
             }
@@ -128,27 +124,25 @@ impl UserInbox {
         }
     }
 
-    /// Sprint 8.5a: replay the forwards piled up in the queue, on WS reconnect or from the
-    /// alarm. `force=false` (alarm): SKIP rows forward_signal just pushed (pushed_at within
-    /// the last 10s) — otherwise the "INSERT+push" and "alarm flush" race would deliver
-    /// twice to a LIVE socket.
+    /// Replay the forwards piled up in the queue, on WS reconnect or from the alarm.
+    /// `force=false` (alarm): SKIP rows forward_signal just pushed (pushed_at within the last
+    /// 10s) — otherwise the "INSERT+push" and "alarm flush" race would deliver twice to a
+    /// LIVE socket.
     ///
     /// `force=true` (FRESH reconnect, `ws_upgrade`): IGNORE `pushed_at` → hand over EVERY
-    /// forward in the queue. Rationale (field report 2026-06-02, "read receipt hugely
-    /// delayed"): forward_signal stamped pushed_at whenever `send_with_str` returned Ok on a
-    /// dead/zombie socket; once the client reconnected WITHOUT having received it, the 10s
-    /// skip also hid the receipt from the NEW socket, so it stalled until the next alarm
-    /// (90s!) or the next receipt (the "delivered+read arrive together" symptom). A new
-    /// socket by definition received none of the earlier pushes → give it everything. Safe
-    /// because the client dedups on `forward_id` (a repeat is idempotent).
+    /// forward in the queue. A new socket by definition received none of the earlier pushes,
+    /// and honouring pushed_at hides from it exactly the receipts a zombie socket swallowed —
+    /// they then stall until the next alarm (90s) or the next receipt, which is the
+    /// "delivered and read arrive together" symptom. Safe because the client dedups on
+    /// `forward_id`.
     pub(crate) fn flush_forwards_to(&self, ws: &WebSocket, force: bool) {
         let storage = self.state.storage();
         let now = (now_secs() * 1000) as i64;
         let stale_cutoff = now - 10_000;
         let cursor = if force {
-            // M1: NARROW force-replay to the last 48 hours (unconditional replay of old
-            // orphan rows re-triggered an Olm WIPE on the receiver). pushed_at is still
-            // IGNORED (force semantics preserved), but a created_at window now applies.
+            // Force-replay is NARROWED to the last 48 hours: an unconditional replay of old
+            // orphan rows re-triggers an Olm WIPE on the receiver. pushed_at is still
+            // IGNORED (force semantics), but the created_at window applies.
             let replay_cutoff = now - FORCE_REPLAY_WINDOW_MS;
             storage.sql().exec_raw(
                 "SELECT id, kind, from_user, ids_json, recipient_device_id
@@ -158,15 +152,12 @@ impl UserInbox {
                 Some(vec![JsValue::from_f64(replay_cutoff as f64)]),
             )
         } else {
-            // M1/FIX-4 (CONCERN M1 — the steady-replay Olm WIPE window): the created_at window
-            // added to the 48h force path was MISSING from the steady ~90s alarm path, so an
-            // old un-forward_acked orphan `delivery_failed` row was re-pushed every 90s →
-            // UNCONDITIONAL Olm WIPE on the receiver → a re-WIPE roughly every 90s for up to
-            // 30 days. Apply the SAME created_at window (FORCE_REPLAY_WINDOW_MS) here too, so
-            // old orphans are never re-pushed (the M1 forward_queue retention DELETE clears
-            // them out). The pushed_at skip (fresh-INSERT vs. alarm race guard) is PRESERVED.
-            // NOTE: this only narrows the worker-side surface; the real root cause (making the
-            // receiver's WIPE idempotent) lives in CORE and is out of scope here.
+            // The SAME created_at window applies to the steady ~90s alarm path. Without it an
+            // old un-forward_acked orphan `delivery_failed` row is re-pushed every 90s, each
+            // time an unconditional Olm WIPE on the receiver, for as long as retention keeps
+            // the row — up to 30 days. The pushed_at skip (fresh-INSERT vs. alarm race guard)
+            // is PRESERVED. This only narrows the worker-side surface; making the receiver's
+            // WIPE idempotent is CORE's side of it.
             let replay_cutoff = now - FORCE_REPLAY_WINDOW_MS;
             storage.sql().exec_raw(
                 "SELECT id, kind, from_user, ids_json, recipient_device_id
@@ -202,11 +193,10 @@ impl UserInbox {
                 "forward_id": row.id,
             })
             .to_string();
-            // W9-b (Codex MED): the replay path obeys the same zombie-socket test as
-            // forward_signal. Only delivery to a genuinely live socket counts as "pushed" →
-            // on a zombie pushed_at stays NULL and the next flush/force replays it. With
-            // force=true (fresh reconnect) the socket was stamped at accept time, so it is
-            // always fresh → no regression.
+            // The replay path obeys the same zombie-socket test as forward_signal: only
+            // delivery to a genuinely live socket counts as "pushed", so on a zombie
+            // pushed_at stays NULL and the next flush/force replays it. With force=true
+            // (fresh reconnect) the socket was stamped at accept time and is always fresh.
             if ws.send_with_str(payload.as_str()).is_ok() && super::message::ws_is_fresh(ws, now) {
                 pushed_ids.push(row.id);
             }
@@ -226,8 +216,8 @@ impl UserInbox {
         }
     }
 
-    /// Sprint 8: called when the sender sends a `forward_ack` frame; deletes the
-    /// acknowledged forward_ids from the queue.
+    /// Called when the sender sends a `forward_ack` frame; deletes the acknowledged
+    /// forward_ids from the queue.
     pub(crate) fn forward_ack(&self, ids: &[i64]) {
         if ids.is_empty() {
             return;
