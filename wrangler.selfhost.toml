@@ -34,12 +34,13 @@ migrations_dir = "./migrations"
 binding = "RATE_LIMIT"
 id = "00000000000000000000000000000000"
 
-# R2 (medya) — self-host'ta lokal-disk simülasyonu BEDAVA (CF aboneliği/kart gerekmez).
-# AÇMAK istersen aşağıyı yorumdan çıkar → medya --persist-to <state>/v3/r2'de tutulur.
-# (Kapalıyken mesajlaşma/grup/arama TAM çalışır; foto/dosya kapalı görünür.)
-# [[r2_buckets]]
-# binding = "MEDIA"
-# bucket_name = "sezi-media"
+# R2 (media, files, the group library) — ON by default. Self-hosted under `wrangler dev`, this is
+# a local-disk store under --persist-to <state>/v3/r2: free, no Cloudflare account or card needed.
+# Without it messaging, groups and calls still work, but files, attachments and the library do
+# not (the server answers media_not_configured).
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "sezi-media"
 
 # Durable Objects — kullanıcı-başına gelen-kutusu + oda-başına eklenti-log'u.
 [[durable_objects.bindings]]
