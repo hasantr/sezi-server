@@ -7,6 +7,11 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# The notify fan-out bench only (`bench/notify-fanout`): member and hop failures injected from
+# BENCH_FAIL_* vars, so the retry, enqueue and drain paths run for real. Never in a deployed build.
+bench-faults = []
+
 [dependencies]
 worker = { version = "0.8", features = ["d1", "http"] }
 worker-macros = "0.8"
@@ -34,12 +39,20 @@ hex = "0.4"
 uuid = { version = "1", features = ["v4", "js"] }
 getrandom = { version = "0.2", features = ["js"] }
 
+# Bounded concurrency for the group fan-out (`buffer_unordered`). Already in the tree through
+# `worker`; named here so the fan-out can use it directly.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
 # Wasm interop (D1 BLOB binding)
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
+# The router's own matcher (the `worker` crate's, pinned to the version in Cargo.lock), so
+# `invite_page/route_tests.rs` can insert the real routing table and prove `/:invite` shadows
+# nothing.
+matchit = "=0.7.3"
 
 [profile.release]
 opt-level = "s"

@@ -10,9 +10,12 @@ mod contact_qr;
 mod contacts;
 mod d1util;
 mod devices;
+mod door_bucket;
+mod door_cors;
 mod email;
 mod groups;
 mod instrument_pack;
+mod invite_page;
 mod keys;
 mod maintenance;
 mod media;
@@ -55,34 +58,11 @@ fn start() {
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // Boot guard: the cron can cold-start an isolate BEFORE any fetch does, and the drain touches
     // tables a fresh fork has not created, so migrations and key provisioning must be guaranteed
-    // here too. Memoized → a no-op on a warm isolate, and on an already-provisioned deployment.
-    self_provision::ensure_ready(&env).await;
-    // Drain the durable retry queue on EVERY scheduled invocation: matching on the cron string is
-    // brittle, so both the frequent trigger and the daily one drain.
-    crate::messages::handlers::drain_fanout_retry(&env).await;
-    membership::drain_purge_outbox(&env).await;
-    // With a live cron the drain stamp is always fresh, so the fetch-path lazy drain never wakes.
-    maintenance::stamp_drain(&env).await;
-    // Draining-backend move tick (≤4 blobs per run; exits after one cheap SELECT when no backend
-    // is draining). Like the fanout drain it runs on EVERY invocation, and its stamp likewise keeps
-    // the lazy storage-move asleep.
-    if let Err(e) = storage::drain::run_storage_move(&env).await {
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("storage move error: {}", truncated);
-    }
-    maintenance::stamp_move(&env).await;
-    // Bail out early on the frequent cron (no cleanup/GC). The test is written this way round so
-    // that the daily trigger AND any unexpected cron string FALL THROUGH to cleanup: cleanup is
-    // idempotent, so an extra run is harmless, while the opposite direction would silently stall
-    // media-GC and TTL-GC on a surprise. The drain above already ran unconditionally.
-    if event.cron() == "*/2 * * * *" {
-        return;
-    }
-    // Daily set (cleanup + fanout TTL-GC + quota reconcile) — the same body the lazy path runs,
-    // plus the daily stamp that puts lazy daily-GC to sleep.
-    maintenance::run_daily(&env).await;
-    maintenance::stamp_daily(&env).await;
+    // here too. Memoized → a no-op on a warm isolate. What it spent is charged to the drain.
+    let provision = self_provision::ensure_ready(&env).await;
+    // The order and the drain's purse live in `maintenance::cron_with`, where the budget tests run
+    // them against a counted fake.
+    maintenance::run_cron(&env, provision, &event.cron()).await;
 }
 
 #[event(fetch)]
@@ -108,9 +88,25 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // CORS preflight. A browser sends this before any request that carries `Authorization`, and
     // it never reaches the router — there is no `OPTIONS` route and adding sixty of them would
     // be the wrong shape. See `cors_headers` for why the policy is what it is.
+    // The door (redeem, the invite page) answers only the web client's origins, not `*` — see
+    // `door_cors` for why. Read before the router consumes the request.
+    let door = door_cors::is_door_path(&path).then(|| {
+        let origin = req.headers().get("origin").ok().flatten();
+        let extra = crate::utils::var_or(&env, "SEZI_WEB_ORIGINS", "");
+        (origin, extra)
+    });
     if req.method() == Method::Options {
         let mut resp = Response::empty()?.with_status(204);
-        apply_cors(resp.headers_mut())?;
+        match &door {
+            // A preflight from any other origin is refused, so its POST is never sent.
+            Some((origin, extra)) => {
+                if !origin.as_deref().is_some_and(|o| door_cors::origin_allowed(o, extra)) {
+                    return Ok(Response::empty()?.with_status(403));
+                }
+                door_cors::apply(resp.headers_mut(), origin.as_deref(), extra)?;
+            }
+            None => apply_cors(resp.headers_mut())?,
+        }
         return Ok(resp);
     }
 
@@ -119,6 +115,13 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // ready" plus copy-the-address instructions instead of an alarming 404).
         // The API surface is untouched.
         .get_async("/", welcome::welcome)
+        // The projector URL `<base>/<CODE>`: a page for a browser, JSON for the app, one rate
+        // limit for both (`invite_page`). One segment deep, so every static one-segment route
+        // here still wins — `invite_page/route_tests.rs` inserts this whole table to prove it.
+        .get_async("/:invite", invite_page::invite_page)
+        // The app's form of the same question, for an invite it holds as a bearer token: the
+        // token goes in the body, never in a URL.
+        .post_async("/invites/describe", invite_page::describe_post)
         .get("/healthz", |_, _| {
             Response::from_json(&serde_json::json!({"ok": true}))
         })
@@ -235,6 +238,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         )
         .post_async("/groups/:id/join-requests/:user/deny", groups::deny_join_request)
         .get_async("/join-requests/mine", groups::my_join_requests)
+        // Someone already on the server presenting a class invite asks to join its group.
+        .post_async("/join-requests/by-invite", groups::request_join_by_invite)
         .delete_async("/groups/:id", groups::delete_group)
         // Multi-device: store and serve the signed device list.
         .put_async("/devices/list", devices::handlers::put_list)
@@ -306,7 +311,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/turn/credentials", turn::credentials)
         .run(req, env)
         .await?;
-    apply_cors(resp.headers_mut())?;
+    match &door {
+        Some((origin, extra)) => door_cors::apply(resp.headers_mut(), origin.as_deref(), extra)?,
+        None => apply_cors(resp.headers_mut())?,
+    }
     Ok(resp)
 }
 

@@ -135,7 +135,8 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // the owner installed their own FCM credentials. WRITE-ONLY, as with cf_configured:
     // the values are returned nowhere, only this bool. Presence check only, no call to
     // Google; fails open to false.
-    let fcm_mode = crate::push::fcm::mode(&ctx.env).await;
+    let push = crate::push::config::status(&ctx.env).await;
+    let fcm_mode = push.mode;
     // Whether a TURN credential can be issued at all — the owner screen needs it to say
     // whether calls between DIFFERENT networks will connect. Write-only: the bool only.
     let turn_configured = crate::turn::is_configured(&ctx.env).await;
@@ -288,6 +289,11 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // something they set up: a server with zero FCM keys still reports
         // fcm_configured=true, because the relay default is on.
         "fcm_mode": fcm_mode.as_str(),
+        // K8: Google refused the owner's own Firebase project for these phones
+        // (SENDER_ID_MISMATCH), so the server sends through the shared relay instead
+        // (`fcm_mode` says "relay", or "off" with the relay off). A typed flag, never a
+        // sentence: the app words it. Absent on an older server → false.
+        "fcm_own_project_mismatch": push.own_rejected,
         "turn_configured": turn_configured,
         // Shipped under the SAME `version` as the storage badge — a client cannot gate on
         // the version number for it, only on the key's presence. Absent on an older server

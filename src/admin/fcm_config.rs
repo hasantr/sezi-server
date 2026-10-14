@@ -7,12 +7,15 @@
 //!   carries a private key, so only the server's owner may set or change it.
 //! - **WRITE-ONLY**: the values are only ever written here; no endpoint — this
 //!   one included — returns them. The response and `/admin/stats` carry only
-//!   `fcm_configured: bool`, so the leak surface is zero.
+//!   states — `fcm_configured`, `fcm_mode`, `fcm_own_project_mismatch` — so the leak surface
+//!   is zero.
+//! - A save or a clear forgets what the wake measured about the old project (K8,
+//!   `push/config.rs`): the next wake tests the new one.
 //! - Storage: D1 `server_config` (key-value; encrypted at rest by CF). The worker must read it
 //!   in plaintext to sign the Google OAuth assertion, so it cannot be encrypted with a key we
 //!   do not hold. It is the owner's OWN Firebase project and it is not E2E content — push is a
 //!   contentless wake, so leaking the key still reveals no message content.
-//! - Read chain lives in push/fcm.rs: per key, **env FIRST, D1 second**; with neither, a
+//! - Read chain lives in push/config.rs: per key, **env FIRST, D1 second**; with neither, a
 //!   direct FCM send is a silent no-op (FAIL-OPEN "not configured") and delivery falls back to
 //!   the shared push relay.
 
@@ -89,16 +92,22 @@ pub async fn set_fcm_config(mut req: Request, ctx: RouteContext<()>) -> Result<R
     let db = ctx.env.d1("DB")?;
     apply(&db, "fcm_project_id", body.fcm_project_id).await?;
     apply(&db, "fcm_service_account", body.fcm_service_account).await?;
+    // K8: whatever the wake measured about the old project (Google refused it for these phones,
+    // or it reached one) was measured against what the owner just replaced or removed. Forget it;
+    // the next wake tests the project again. The credentials themselves are only ever changed
+    // here, by the owner.
+    crate::push::config::clear_project_verdicts(&db).await?;
 
     // WRITE-ONLY response: the values are NEVER returned, only whether this server can push at
     // all. `fcm_configured` is true for own credentials OR a resolving push relay — and the
     // relay falls back to a built-in default unless explicitly `off` — so it does NOT mean the
     // owner's own FCM credentials are installed. `fcm_mode` answers that separate question:
     // own credentials, the shared relay, or nothing.
-    let mode = crate::push::fcm::mode(&ctx.env).await;
+    let push = crate::push::config::status(&ctx.env).await;
     Response::from_json(&serde_json::json!({
-        "fcm_configured": mode.can_push(),
-        "fcm_mode": mode.as_str(),
+        "fcm_configured": push.mode.can_push(),
+        "fcm_mode": push.mode.as_str(),
+        "fcm_own_project_mismatch": push.own_rejected,
     }))
 }
 
@@ -131,6 +140,20 @@ async fn apply(db: &D1Database, key: &str, new: Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K8: every save or clear forgets the wake's verdicts about the old project, AFTER the
+    /// credentials are written (a verdict cleared before a failed write would be lost for
+    /// nothing). What the statement deletes is tested against the schema in
+    /// `push/config_tests.rs`.
+    #[test]
+    fn a_save_or_clear_forgets_the_project_verdicts() {
+        const SRC: &str = include_str!("fcm_config.rs");
+        let handler = SRC.split("pub async fn set_fcm_config").nth(1).unwrap();
+        let handler = handler.split("\nasync fn apply").next().unwrap();
+        let last_apply = handler.rfind("apply(&db, \"fcm_service_account\"").unwrap();
+        let clear = handler.find("clear_project_verdicts(&db).await?").expect("not cleared");
+        assert!(clear > last_apply);
+    }
 
     #[test]
     fn project_id_validation() {

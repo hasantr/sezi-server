@@ -102,6 +102,31 @@ pub(crate) const MINE_SQL: &str =
       ORDER BY r.requested_at DESC
       LIMIT ?2";
 
+/// The landing group of a LIVE class invite (not revoked, not expired), by its token: what
+/// someone already on the server asks to join when they present the invite again
+/// ([`request_join_by_invite`]). A personal invite is a one-use key to an account and lands nobody
+/// who already has one. Binds: `?1` token, `?2` now.
+pub(crate) const CLASS_LANDING_OF_TOKEN_SQL: &str =
+    "SELECT it.landing_room_id AS room_id, it.token_hash AS invite_hash,
+            it.email_hint AS label, g.name AS name
+       FROM invite_tokens it JOIN groups g ON g.id = it.landing_room_id
+      WHERE it.token = ?1 AND it.kind = 'class' AND it.revoked_at IS NULL AND it.expires_at > ?2";
+
+/// A request from someone already on the server: a new one, or a fresh one in place of an
+/// approval that no longer holds — they were let in, and have since left or been removed (the
+/// handler has checked they hold no membership row). A request still waiting is left as it is,
+/// and a denied one stays denied: the admins have answered, and asking again must not undo it.
+/// RETURNING says whether a request was opened. Binds: `?1` group, `?2` user, `?3` invite_hash,
+/// `?4` invite_label, `?5` now.
+pub(crate) const REQUEST_AGAIN_SQL: &str = "INSERT INTO group_join_requests
+       (group_id, user_id, invite_hash, invite_label, state, requested_at)
+     VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
+     ON CONFLICT(group_id, user_id) DO UPDATE SET
+       state = 'pending', requested_at = excluded.requested_at, decided_at = NULL,
+       decided_by = NULL, invite_hash = excluded.invite_hash, invite_label = excluded.invite_label
+     WHERE group_join_requests.state = 'approved'
+     RETURNING state";
+
 /// The group's admins, who are the ones a new request concerns. Binds: group, limit.
 const ADMINS_SQL: &str = "SELECT user_id FROM group_members
       WHERE group_id = ? AND status = 'active' AND role IN ('owner', 'admin')
@@ -415,6 +440,98 @@ pub async fn my_join_requests(req: Request, ctx: RouteContext<()>) -> Result<Res
         })
         .collect();
     Response::from_json(&serde_json::json!({ "requests": requests }))
+}
+
+/// POST /join-requests/by-invite `{"invite": "<token or typed code>"}` — someone ALREADY on this
+/// server presents a class invite: they ask to join its landing group, on the same list the
+/// admins decide every class joiner from. 200 `{"room_id","name","state"}`, where `state` is
+/// `requested` (waiting for an admin, now or already), `member` (they are in it, or invited to
+/// it), or `denied` (an admin said no). 404 `no_invite`: no live class invite by that token.
+///
+/// Before this the door said "you are already on this server" and the invite did nothing, so a
+/// student who had been removed from the course (lab, 2026-10-05) had no way back short of an
+/// admin who knew their account. No seat is taken — a seat is an account, and this one exists —
+/// and nobody is admitted on the invite's word: even an invite without approval leaves an
+/// existing account's request to the admins, the safe direction.
+pub async fn request_join_by_invite(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let user_id = match require_live_device_auth(&req, &ctx.env).await {
+        Ok(uid) => uid,
+        Err(resp) => return Ok(resp),
+    };
+    #[derive(Deserialize)]
+    struct Body {
+        invite: String,
+    }
+    let body: Body = match req.json().await {
+        Ok(b) => b,
+        Err(_) => return json_err(400, "bad_request"),
+    };
+    let db = ctx.env.d1("DB")?;
+    // A typed code stands for its invite's token, exactly as at redeem.
+    let token = match crate::auth::invite_code::normalize(&body.invite) {
+        Some(code) => match crate::auth::invite::token_for_code(&db, &code).await? {
+            Some(token) => token,
+            None => return json_err(404, "no_invite"),
+        },
+        None => body.invite.trim().to_string(),
+    };
+    #[derive(Deserialize)]
+    struct Landing {
+        room_id: String,
+        invite_hash: Option<String>,
+        label: Option<String>,
+        name: String,
+    }
+    let now = now_secs() as i64;
+    let Some(landing) = db
+        .prepare(CLASS_LANDING_OF_TOKEN_SQL)
+        .bind(&[d1_text(&token), d1_int(now)])?
+        .first::<Landing>(None)
+        .await?
+    else {
+        return json_err(404, "no_invite");
+    };
+    let answer = |state: &str| {
+        Response::from_json(&serde_json::json!({
+            "room_id": landing.room_id,
+            "name": landing.name,
+            "state": state,
+        }))
+    };
+    if super::membership_status(&db, &landing.room_id, &user_id).await?.is_some() {
+        return answer("member");
+    }
+    let opt = |v: &Option<String>| v.as_deref().map(d1_text).unwrap_or_else(d1_null);
+    let opened: Vec<UserStateRow> = db
+        .prepare(REQUEST_AGAIN_SQL)
+        .bind(&[
+            d1_text(&landing.room_id),
+            d1_text(&user_id),
+            opt(&landing.invite_hash),
+            opt(&landing.label),
+            d1_int(now),
+        ])?
+        .all()
+        .await?
+        .results()?;
+    if !opened.is_empty() {
+        nudge_landing(&ctx.env, &db, &landing.room_id, &user_id, true).await;
+        return answer("requested");
+    }
+    let standing: Option<UserStateRow> = db
+        .prepare("SELECT state FROM group_join_requests WHERE group_id = ? AND user_id = ? LIMIT 1")
+        .bind(&[d1_text(&landing.room_id), d1_text(&user_id)])?
+        .first(None)
+        .await?;
+    answer(match standing.map(|r| r.state).as_deref() {
+        Some("denied") => "denied",
+        _ => "requested",
+    })
+}
+
+#[derive(Deserialize)]
+struct UserStateRow {
+    state: String,
 }
 
 #[cfg(test)]

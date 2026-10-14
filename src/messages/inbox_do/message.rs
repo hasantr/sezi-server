@@ -98,10 +98,12 @@ impl UserInbox {
         envelope_b64: &str,
         group_id: Option<&str>,
         silent: bool,
-    ) -> Result<(i64, bool)> {
-        // Returns (pending_id, delivered_live). `delivered_live` answers "did the push reach at
-        // least one matching, genuinely-live (W1) socket?" — false means the recipient is offline
-        // and the caller must send an FCM wake.
+    ) -> Result<(i64, bool, bool)> {
+        // Returns (pending_id, delivered_live, deduped). `delivered_live` answers "did the push
+        // reach at least one matching, genuinely-live (W1) socket?" — false means the recipient is
+        // offline and the caller must send an FCM wake. `deduped` = this envelope was already here
+        // (the in-memory 60 s cache or a pending row): nothing was stored or pushed this time, and
+        // the call that stored it decided the wake — `/notify-member` uses it to wake once (F4).
         let now = now_secs() as i64;
 
         // W1 backstop: persist the RECIPIENT user_id once (the alarm needs it to FCM-wake stuck
@@ -139,7 +141,7 @@ impl UserInbox {
             // `true`: on an in-request retry the first attempt's cross-DO response may be lost, so
             // the caller never saw that decision, and answering `true` would silently suppress the
             // FCM wake for an offline recipient.
-            return Ok((cached_id, cached_live));
+            return Ok((cached_id, cached_live, true));
         }
 
         let storage = self.state.storage();
@@ -204,7 +206,7 @@ impl UserInbox {
                     // Populate the in-memory dedup too, so a later retry within the same DO
                     // lifetime returns fast.
                     self.dedup_insert(sender_id.to_string(), envelope_hash, e.id, now, false);
-                    return Ok((e.id, false));
+                    return Ok((e.id, false, true));
                 }
                 // Unexpected (a conflict but no row — a race or a purge in between) → fail-safe:
                 // signal "not delivered" to the caller instead of attempting a fresh INSERT; the
@@ -300,7 +302,7 @@ impl UserInbox {
         // is no await between them and the DO is single-threaded, so a retry finds the envelope
         // with the correct liveness.
         self.dedup_insert(sender_id.to_string(), envelope_hash, row.id, now, delivered_live);
-        Ok((row.id, delivered_live))
+        Ok((row.id, delivered_live, false))
     }
 
     /// Is there an existing msg_id in the dedup cache for (sender, envelope_hash)?

@@ -70,15 +70,112 @@ A ready hardening kit (an EXACT wrangler pin, localhost binding, a WS shim, atom
 |---|---|---|
 | Your own signing key | `wrangler secret put JWT_SIGNING_KEY` (Ed25519 PKCS8 PEM) | Generated automatically on first boot (stored in D1) |
 | TURN relay for voice and video | CF Realtime → TURN key → `TURN_KEY_ID` + `TURN_API_TOKEN` secrets | Calls work over LAN/STUN (enough on most networks) |
-| Android push | A Firebase project → `FCM_PROJECT_ID` var + `FCM_SERVICE_ACCOUNT` secret | Delivered while the app is open (WS); it waits while closed |
+| Android push | Nothing — it works out of the box through the shared push relay. Read [Push notifications](#push-notifications-android-what-you-can-and-cannot-do) before changing it | — |
 | Usage report matching the bill | From the app: Server → Usage → CF Analytics → enter a token | The server reports its own counters |
+| Your own address for the Sezi web app | The variable `SEZI_WEB_ORIGINS` = the page's origin, e.g. `https://chat.example.org` (comma-separated for several) | Joining through a browser works from the official web app (`https://sezi-web.pages.dev`) and from a page on the server's own machine only; the invite door answers no other site |
+
+## Push notifications (Android): what you can and cannot do
+
+A push from your server is only a **doorbell**: a contentless `{"type":"wake"}` that tells a
+sleeping phone to connect and fetch what is waiting. Messages never travel inside it, so no
+choice below exposes message content to anyone.
+
+**How it works, and why the choices are narrow.** Firebase Cloud Messaging ties every device's
+push token to ONE Firebase project — the one the app was built with. The Sezi app you install
+from us is built with our project (`sezi-481e9`). Only a sender holding that project's
+service-account key can wake those phones, and that key cannot be handed out (Google revokes a
+published key). So the key lives in one small worker of ours, the **shared push relay**, and
+your server asks it to ring the doorbell: it sends the relay the device's opaque push token,
+nothing else.
+
+**What you can do:**
+
+- **Leave it as it is (the default).** Your server uses the shared relay with no setup. The relay
+  sees a push token, the time, and your server's address — never who is messaging whom, and no
+  content. In the app's server settings this shows as "Using the shared relay".
+- **Turn push off.** Set the variable `PUSH_RELAY_URL` to `off` (Cloudflare dashboard → your
+  Worker → Settings → Variables, or `[vars]` in `wrangler.toml`). Nothing leaves your server for
+  push; messages arrive whenever the app is open or connected, and a phone left asleep catches up
+  when it next opens the app. Each member can still choose the app's always-on connection (its
+  settings, background delivery): the phone stays connected without push, at the cost of an
+  ongoing notification and some battery. It is also what a phone without Google services uses
+  anyway.
+- **Use your own Firebase project — only with your own build of the app.** If you build and hand
+  out your own Sezi app, with your project's `google-services.json`, to EVERY member, then set
+  your project's id and service-account key on the server (in the app: Server → Settings →
+  Notifications, or `FCM_PROJECT_ID` plus the secret `FCM_SERVICE_ACCOUNT`). Your server then
+  talks to Google directly; the shared relay sees only a wake Google refuses for a phone running
+  our app (below).
+
+**What you cannot do:**
+
+- **Use your own Firebase project with the app from us.** Google refuses every wake to a device
+  whose token belongs to another project (`SENDER_ID_MISMATCH`). If you enter one in the app's
+  Notifications settings while your members use our app, the server notices on the first refused
+  wake: it resends that wake through the shared relay, remembers that your project cannot reach
+  these phones, and from then on sends every wake through the shared relay — your project and key
+  stay stored, unused. The Notifications settings then say "Not usable with the published app"
+  instead of "Set up". Press **Clear** there to remove the values; saving new ones (or clearing)
+  makes the server try your project again on the next wake. If you have also switched the relay
+  `off`, there is nothing to fall back to and sleeping phones are not woken; the settings say so.
+- A project that has woken at least one device is taken to be your own build's, and is never
+  switched away: a member who installed our app instead gets their wakes through the shared relay
+  one at a time, at the cost of one refused attempt to Google per wake.
+- **Run your own copy of the push relay** for our app: it would need our project's key, which is
+  never distributed.
+- **Rely on mixing the two**: a server with your own project sends through it first. A member on
+  our app is still woken (through the shared relay, as above) only once your project has woken one
+  of your own build's devices; before that, the first refused wake switches the whole server to the
+  shared relay, which cannot wake your own build. Saving your project again starts the test over.
+- **iOS:** there is no iOS app yet, so nothing here applies to iPhones.
 
 ## Updating
 
-1. On your fork in GitHub, use **Sync fork → Update branch**.
-2. On a Cloudflare-connected install this usually triggers a redeploy on its own. **If it does not**, trigger it by hand from the Cloudflare dashboard → Workers & Pages → your server → the **Deployments/Builds** tab → "Retry/Deploy"; or with one command on your computer, inside the fork's directory: `npx wrangler deploy`.
+The **Deploy to Cloudflare** button does not fork this repository: it makes a **copy** in your
+GitHub account — a new repository with one "Initial commit" and no history in common with this
+one. GitHub therefore shows no **Sync fork** button for it, and a plain `git pull` from here
+refuses ("unrelated histories"). Your copy also holds a few values this repository does not —
+chosen or created when you deployed, and written into its `wrangler.toml`: the Worker's `name`,
+your D1 database's `database_name` and `database_id`, and your KV store's `id`. An update must
+keep exactly those and take **everything else** from here, `wrangler.toml` included: new
+bindings, variables, Durable Object migrations and the compatibility date arrive that way, and
+a server left on its old `wrangler.toml` breaks on the first update that needs one of them.
 
-The database schema updates itself (self-migration) — no data is lost.
+`scripts/update-from-upstream.sh` does that. You need a computer with `git` and `bash` (Linux,
+macOS, or Git Bash on Windows), signed in to GitHub. Replace `<you>/<your-copy>` with your
+copy's address (GitHub → your repositories; it is usually called `sezi-server`):
+
+```bash
+git clone https://github.com/<you>/<your-copy>.git sezi-update && cd sezi-update
+git remote add upstream https://github.com/hasantr/sezi-server.git
+git fetch upstream
+git show upstream/main:scripts/update-from-upstream.sh | bash
+git push
+```
+
+The script merges this repository into your copy (the first time it joins the two histories),
+rebuilds `wrangler.toml` as this repository's file with your four values put back, checks that
+nothing else differs, and commits; it changes nothing if the merge conflicts anywhere else. It
+prints the values it kept — read them before you push. A file this repository deleted before
+your first update stays in your copy; it is unused and harmless. For every later update run the
+same lines again (in the same folder, skip the `clone` and `remote add`).
+
+If your copy is old enough to have no `RATE_LIMIT` KV store, the script says so: create one
+(dashboard → Storage & Databases → KV → Create), put its id on the `id = ` line under
+`[[kv_namespaces]]` in `wrangler.toml`, commit, then push.
+
+**The push redeploys your server** (Cloudflare Workers Builds builds every push to your copy's
+main branch); watch it under Workers & Pages → your server → **Deployments**. If no deployment
+starts, press **Retry/Deploy** there, or run `npx wrangler deploy` inside the folder above. In the
+Sezi app, the server's update section says "Up to date" once the new version is live.
+
+The database schema updates itself (self-migration) — no data is lost, and nobody has to join
+again.
+
+**Installed with `git clone` instead** (the command-line or own-machine paths below): your folder
+already shares this repository's history, so `git pull` inside it is the whole update; then
+`npx wrangler deploy`, or restart the service on your own machine
+(`sudo systemctl restart sezi-relay`).
 
 ## More than one server in the same account
 

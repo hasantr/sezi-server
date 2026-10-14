@@ -95,3 +95,26 @@ fn a_configured_proxy_header_is_trusted_and_nothing_else_is() {
     let junk = headers(&[("x-real-ip", "auth:redeem:ip:evil")]);
     assert_eq!(pick_client_ip(Some("x-real-ip"), junk), "local");
 }
+
+/// A relay that answers clients directly with no proxy in front (the app's "this network" install,
+/// `wrangler dev --ip 0.0.0.0`) has NO header a client cannot set: measured 2026-10-14 against
+/// wrangler 4.125 and 4.135, `wrangler dev` fills `cf-connecting-ip` with the socket's peer only
+/// when the request carries none, and passes a client's own value through untouched — so every
+/// request could name a fresh address and get a fresh miss budget. `none` keys every caller
+/// alike, whatever headers they send, including one literally named `none`.
+#[test]
+fn a_relay_told_to_trust_no_header_keys_every_caller_alike() {
+    let forged = headers(&[
+        ("cf-connecting-ip", "6.6.6.6"),
+        ("x-forwarded-for", "7.7.7.7"),
+        ("x-real-ip", "8.8.8.8"),
+        ("none", "9.9.9.9"),
+    ]);
+    for spelling in ["none", "NONE", " None "] {
+        assert_eq!(
+            pick_client_ip(Some(spelling), &forged),
+            "local",
+            "{spelling:?}"
+        );
+    }
+}

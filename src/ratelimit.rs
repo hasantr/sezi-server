@@ -48,8 +48,15 @@ pub(crate) const DOOR_WINDOW_SECS: u64 = 5 * 60;
 pub(crate) const DOOR_IP_CEILING: usize = 300;
 /// Refused redeems (an unknown code or token, a spent invite) one address may collect per window
 /// before redeem stops answering it. This is what bounds guessing a 39-bit code
-/// (`auth::invite_code`).
+/// (`auth::invite_code`). Counted in D1, not KV, by `door_bucket` — reserved before the lookup.
 pub(crate) const DOOR_MISS_LIMIT: usize = 30;
+
+/// The miss counter's key for one address. ONE bucket for every door that can tell a live invite
+/// from a dead one — redeem, and the invite page (`invite_page`) — so a second door adds no
+/// guesses: an address gets [`DOOR_MISS_LIMIT`] misses per window across both together.
+pub(crate) fn door_miss_key(ip: &str) -> String {
+    format!("auth:redeem:miss:{ip}")
+}
 
 /// Redeems or verifies one invite may see per window: a personal invite is one person (today's
 /// five), a class invite scales with its seats — two calls a seat plus slack — so the whole class
@@ -69,6 +76,10 @@ pub(crate) fn per_invite_limit(seats: i64) -> usize {
 ///   front of us appended; earlier entries are whatever the client sent. A missing or malformed
 ///   value falls into the shared `"local"` bucket rather than to `cf-connecting-ip`, which a client
 ///   can simply send to a relay that is not behind Cloudflare.
+/// - `none`: no header can be trusted — a relay clients reach DIRECTLY, with no proxy in front (the
+///   app's "this network" install). `wrangler dev` fills `cf-connecting-ip` from the socket only
+///   when the client sent none and passes a client's own value through (measured 2026-10-14), so
+///   every caller shares `"local"`: one budget for the network, never a fresh one per request.
 /// - Unset: `cf-connecting-ip`, which Cloudflare sets on every request, else `"local"` — today's
 ///   behaviour, and the reason self-hosted installs need the variable.
 pub(crate) fn pick_client_ip(
@@ -83,6 +94,8 @@ pub(crate) fn pick_client_ip(
                 .all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b':')
     };
     match trusted_header.map(str::trim).filter(|h| !h.is_empty()) {
+        // No header is trustworthy (a relay with no proxy in front): one bucket for everyone.
+        Some(name) if name.eq_ignore_ascii_case("none") => SHARED.into(),
         Some(name) => {
             let raw = header(name).unwrap_or_default();
             let value = if name.eq_ignore_ascii_case("x-forwarded-for") {
@@ -109,32 +122,6 @@ pub(crate) fn client_ip(req: &worker::Request, env: &Env) -> String {
     pick_client_ip(Some(configured.as_str()), |name| {
         req.headers().get(name).ok().flatten()
     })
-}
-
-/// Would one more hit fit? Reads the window and writes NOTHING — for a bucket that is charged only
-/// when something goes wrong (the miss counter), so a caller over it is turned away before the
-/// lookup it would otherwise get for free. Fails open like everything here.
-pub async fn peek_env(env: &Env, key: &str, max_hits: usize, window_sec: u64) -> Admission {
-    let Ok(kv) = env.kv("RATE_LIMIT") else {
-        return Admission::Allowed;
-    };
-    let raw = match kv.get(key).text().await {
-        Ok(v) => v,
-        Err(_) => return Admission::Allowed,
-    };
-    let now = now_secs();
-    let mut hits: Vec<u64> = raw
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-    hits.retain(|&t| t > now.saturating_sub(window_sec));
-    if hits.len() < max_hits {
-        Admission::Allowed
-    } else {
-        Admission::Refused {
-            retry_after_s: retry_after_s(&hits, max_hits, 1, window_sec, now),
-        }
-    }
 }
 
 /// [check_rate_limit_env] for an endpoint that tells a refused caller when to come back. Fails

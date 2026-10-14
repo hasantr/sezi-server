@@ -1,6 +1,5 @@
 use crate::auth::middleware::require_active_auth;
-use crate::d1util::{d1_int, d1_opt_text, d1_text};
-use sha2::{Digest, Sha256};
+use crate::d1util::d1_text;
 
 /// Durable-retry constants for a partially failed group fan-out.
 const W4B_INITIAL_BACKOFF_SECS: i64 = 30; // delay from enqueue to the first drain attempt
@@ -11,7 +10,6 @@ const W4B_INITIAL_BACKOFF_SECS: i64 = 30; // delay from enqueue to the first dra
 const W4B_LEASE_SECS: i64 = 600;
 const W4B_BACKOFF_BASE_SECS: i64 = 120; // 120→240→…→cap
 const W4B_MAX_BACKOFF_SECS: i64 = 3600; // a long outage retries hourly and is NEVER deleted
-const W4B_DRAIN_BATCH: usize = 50; // per cron; bounded by D1 response size + sequential DO fetches
 use crate::respond::{json_err, no_content, passthrough};
 use crate::utils::now_secs;
 use serde::Deserialize;
@@ -101,8 +99,8 @@ struct NotifyResult {
     delivered_live: bool,
 }
 
-/// The recipient DO's `/notify` body. `notify_recipient` and the retry drain both build it here
-/// so the shape has one source of truth.
+/// The recipient DO's `/notify` body (the 1:1 path; a group goes through `/notify-member`, see
+/// `group_fanout`).
 fn build_notify_payload(
     recipient_id: &str,
     sender_id: &str,
@@ -129,8 +127,7 @@ fn build_notify_payload(
 
 /// A SINGLE DO `/notify` attempt (store + WS push). Ok → (pending_id, delivered_live); Err on
 /// id_from_name/stub failure, a failed fetch, a non-200 status or an unparseable body.
-/// `notify_recipient` calls this at most twice; the drain calls it once per row, because that
-/// row's own next_at backoff is the retry.
+/// `notify_recipient` calls this at most twice.
 async fn notify_once(
     namespace: &ObjectNamespace,
     recipient_id: &str,
@@ -220,7 +217,9 @@ async fn notify_recipient(
 // already calls — the shape `keys/handlers.rs` uses for `bundle_slot`.
 #[path = "fanout_retry.rs"]
 mod fanout_retry;
-pub(crate) use fanout_retry::{drain_fanout_retry, gc_fanout_retry};
+pub(crate) use fanout_retry::{drain_fanout_retry, gc_fanout_retry, D1RetryStore};
+#[cfg(test)]
+pub(crate) use fanout_retry::{drain_with, RetryQueue, RetryRow, RowWrite};
 
 pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let (sender_id, token_device) = match require_active_auth(&req, &ctx.env).await {
@@ -279,221 +278,21 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     };
     let namespace = ctx.env.durable_object("USER_INBOX")?;
 
-    // ---- GROUP path: /notify every member except the sender ----
+    // ---- GROUP path: one call per member, the wake sent by the member's inbox (D8) ----
     if let Some(group_id) = body.group_id.as_deref() {
-        // The send gate is MEMBERSHIP ALONE, by design: the server never sees the content and
-        // distributes purely from the membership table (blocking is not a moderation layer here).
-        if crate::groups::group_role(&db, group_id, &sender_id)
-            .await?
-            .is_none()
-        {
-            return json_err(403, "not_member");
-        }
         // A group carries a single Megolm envelope, so exactly one EnvItem with no device_id:
         // the fan-out is derived inside the worker.
         if body.envelopes.len() != 1 || body.envelopes[0].device_id.is_some() {
             return json_err(400, "bad_request");
         }
-        let envelope_b64 = body.envelopes[0].envelope_b64.as_str();
-        #[derive(Deserialize)]
-        struct MemberDevice {
-            user_id: String,
-            // NULL for an active member who never published a device list — see the LEFT JOIN
-            // below.
-            device_id: Option<String>,
-        }
-        // Active members crossed with their active devices (`revoked_at IS NULL`), one (member,
-        // device) pair per insert of the single Megolm envelope; the DO's dedup keys on
-        // recipient_device, so a second device of the same member is not swallowed.
-        //
-        // The join MUST stay LEFT. An active member who never published a device list has no row
-        // in `devices`, and an INNER JOIN dropped them from the fan-out, losing their group
-        // message permanently. LEFT gives `device_id = NULL`, the loop below queues a device-blind
-        // pending row, and the NULL-tolerant flush delivers it once that member publishes and
-        // connects.
-        let pairs: Vec<MemberDevice> = db
-            .prepare(
-                "SELECT gm.user_id AS user_id, d.device_id AS device_id
-                 FROM group_members gm
-                 LEFT JOIN devices d
-                   ON d.user_id = gm.user_id AND d.revoked_at IS NULL
-                 WHERE gm.group_id = ? AND gm.user_id != ?
-                   AND gm.status = 'active'",
-            )
-            .bind(&[d1_text(group_id), d1_text(&sender_id)])?
-            .all()
-            .await?
-            .results()?;
-        // A second guard, weighted by fan-out WIDTH: one group send is `pairs.len()` DO writes,
-        // which the single-hit `msg:send` bucket counts as one event, so a large group would allow
-        // ~300xN writes per minute. 6000 units/60s permits ~23 sends/min into a full 256-member
-        // group and far more into small ones, and MAX_GROUP_MEMBERS bounds a single send's cost.
-        if !pairs.is_empty()
-            && !crate::ratelimit::check_rate_limit_weighted_env(
-                &ctx.env,
-                &format!("msg:grp_fanout:{sender_id}"),
-                6000,
-                60,
-                pairs.len(),
-            )
-            .await
-        {
-            return json_err(429, "rate_limited");
-        }
-        // Fan out sequentially — the worker's WASM runtime is single-threaded. One device's DO
-        // failure skips that device and lets the others through; idempotency lives in the DO's
-        // dedup. A group has no single canonical id, so the response reports the first successful
-        // pair's id, or a timestamp if none succeeded (the sender's local "Sent" tracking only;
-        // group receipts are a separate axis).
-        //
-        // THE SUBREQUEST BUDGET (full reasoning in `messages::budget`): every pair costs at least
-        // one DO call, plus a push worth several more for an offline recipient, against a Workers
-        // ceiling of ~50 per request. A room past roughly two dozen used to run out MID-LOOP, so
-        // every remaining pair failed for want of subrequests rather than for any delivery reason
-        // and fell into `fanout_retry`, whose drain hit the same wall. Pairs this request cannot
-        // pay for are now recognised BEFORE they are attempted and go straight to the queue.
-        let mut budget = crate::messages::budget::SubrequestBudget::new(
-            crate::messages::budget::resolve_budget(&ctx.env),
-            // +1 held back for the single `fanout_retry` batch that closes this handler.
-            crate::messages::budget::GROUP_SEND_PRELUDE + 1,
-        );
-        let mut first_id: Option<i64> = None;
-        let mut delivered_count: usize = 0;
-        let mut attempted: usize = 0;
-        let mut failed_pairs = Vec::new();
-        let mut deferred_pairs = Vec::new();
-        for p in &pairs {
-            if !budget.can_afford(crate::messages::budget::COST_PAIR_WORST_CASE) {
-                deferred_pairs.push(p);
-                continue;
-            }
-            attempted += 1;
-            budget.spend(crate::messages::budget::COST_NOTIFY);
-            match notify_recipient(
-                &namespace,
-                &p.user_id,
-                &sender_id,
-                &body.sender_device_id,
-                p.device_id.as_deref(),
-                envelope_b64,
-                Some(group_id),
-                body.silent,
-            )
-            .await
-            {
-                Ok((id, delivered_live)) => {
-                    if first_id.is_none() {
-                        first_id = Some(id);
-                    }
-                    delivered_count += 1;
-                    // An offline member device gets a content-less FCM wake, unless the sender
-                    // marked the message silent. BOTH outcomes are logged: with only the sends
-                    // logged, a control message that still wakes a phone looks identical to one
-                    // correctly silenced, which is how a waking group path stayed invisible next
-                    // to an already-quiet 1:1 path.
-                    if !delivered_live && body.silent {
-                        console_log!(
-                            "[push] skipped (silent) group={group_id} user={} dev={:?}",
-                            p.user_id, p.device_id
-                        );
-                    }
-                    if !delivered_live && !body.silent {
-                        console_log!(
-                            "[push] waking group={group_id} user={}",
-                            p.user_id
-                        );
-                        budget.spend(crate::messages::budget::COST_PUSH_WAKE);
-                        crate::push::fcm::maybe_push_wake(
-                            &ctx.env, &db, &p.user_id, p.device_id.as_deref(),
-                        )
-                        .await;
-                    }
-                }
-                Err(_) => {
-                    // The in-request retry spent a second DO call before giving up.
-                    budget.spend(crate::messages::budget::COST_NOTIFY);
-                    failed_pairs.push(p); // every attempt failed → durable retry
-                }
-            }
-        }
-        // TOTAL failure → a retryable 502 and NO enqueue: the sender retries the whole thing, and
-        // the DO's dedup makes that safe. Returning 200 with a synthetic id here would have the
-        // sender believe it succeeded and lose the message permanently. `attempted` rather than
-        // `pairs.is_empty()` because a pair the budget DEFERRED was never tried and is no evidence
-        // that delivery is broken.
-        if attempted > 0 && delivered_count == 0 {
-            return json_err(502, "fanout_failed");
-        }
-        // PARTIAL failure → the failed (member, device) pairs go into the durable queue so the
-        // cron drain re-notifies them and that member does not miss the message. The
-        // sha256(recipient|device|group|envelope) retry_key with INSERT OR IGNORE makes the
-        // enqueue idempotent, so a sender retry cannot write the same row twice. Best-effort: a
-        // failed INSERT does not break the send and stays visible as `failed: n` in the response.
-        let failed_n = failed_pairs.len();
-        let deferred_n = deferred_pairs.len();
-        if failed_n + deferred_n > 0 {
-            let now = now_secs() as i64;
-            // ONE BATCH, not one INSERT per pair: a separate statement is a separate subrequest,
-            // so the enqueue for a wide fan-out was paid for out of the same purse the fan-out had
-            // just exhausted. A D1 batch is one subrequest whatever its length.
-            let mut stmts = Vec::with_capacity(failed_n + deferred_n);
-            for p in failed_pairs.iter().chain(deferred_pairs.iter()) {
-                let device = p.device_id.as_deref().unwrap_or("");
-                let mut hasher = Sha256::new();
-                hasher.update(p.user_id.as_bytes());
-                hasher.update(b"|");
-                hasher.update(device.as_bytes());
-                hasher.update(b"|");
-                hasher.update(group_id.as_bytes());
-                hasher.update(b"|");
-                hasher.update(envelope_b64.as_bytes());
-                let retry_key: String =
-                    hasher.finalize()[..16].iter().map(|b| format!("{:02x}", b)).collect();
-                if let Ok(stmt) = db
-                    .prepare(
-                        "INSERT OR IGNORE INTO fanout_retry
-                         (retry_key, recipient_id, recipient_device, sender_id, sender_device,
-                          envelope_b64, group_id, attempts, next_at, created_at, silent)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
-                    )
-                    .bind(&[
-                        d1_text(&retry_key),
-                        d1_text(&p.user_id),
-                        d1_opt_text(p.device_id.as_deref()),
-                        d1_text(&sender_id),
-                        d1_text(&body.sender_device_id),
-                        d1_text(envelope_b64),
-                        d1_text(group_id),
-                        d1_int(now + W4B_INITIAL_BACKOFF_SECS),
-                        d1_int(now),
-                        d1_int(i64::from(body.silent)),
-                    ])
-                {
-                    stmts.push(stmt);
-                }
-            }
-            if !stmts.is_empty() {
-                let _ = db.batch(stmts).await;
-            }
-            console_log!(
-                "[deliv] W4-b enqueue: {failed_n} failed + {deferred_n} over-budget of {} pairs to durable-retry (group={group_id})",
-                pairs.len()
-            );
-        }
-        let id = first_id.unwrap_or_else(|| now_secs() as i64);
-        // The response MUST carry `acks`: the client's `send_group_message` reads
-        // `res.acks.first()`, and an {id, ts} body without it dropped the group message after all
-        // its retries. A group has one canonical id, hence a single element. `id` stays for
-        // backwards compatibility with older clients.
-        return Response::from_json(&serde_json::json!({
-            "id": id,
-            "ts": now_secs(),
-            "acks": [{ "id": id }],
-            // Pairs that fell back to durable retry — failed plus budget-deferred, since from the
-            // sender's side both mean "queued, not yet delivered". 0 = fully delivered. Telemetry
-            // today; the hook for future partial-delivery visibility.
-            "failed": failed_n + deferred_n,
-        }));
+        let msg = crate::messages::group_fanout::GroupMessage {
+            sender_id: sender_id.clone(),
+            sender_device_id: body.sender_device_id.clone(),
+            envelope_b64: body.envelopes[0].envelope_b64.clone(),
+            group_id: group_id.to_string(),
+            silent: body.silent,
+        };
+        return crate::messages::group_fanout::send_group(&ctx.env, &db, &namespace, msg).await;
     }
 
     // ---- 1:1 path (batched device fan-out) ----
@@ -609,7 +408,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 }
                 if !delivered_live && !body.silent {
                     console_log!("[push] waking 1:1 user={recipient_id} dev={:?}", e.device_id);
-                    crate::push::fcm::maybe_push_wake(
+                    crate::push::wake::maybe_push_wake(
                         &ctx.env, &db, recipient_id, e.device_id.as_deref(),
                     )
                     .await;

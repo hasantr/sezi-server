@@ -17,7 +17,7 @@
 //! protects the operator's wallet and is a real bound; the KV one protects members from each
 //! other and is a brake, because its KV binding is optional. See the note at the check itself.
 //!
-//! **Where the credentials come from (the fcm.rs chain, verbatim):** per key, env FIRST and D1
+//! **Where the credentials come from (the push/config.rs chain, verbatim):** per key, env FIRST and D1
 //! `server_config` second, so an env-set value keeps the production path unchanged while an owner
 //! with no shell can paste the pair into the Sezi app instead (`PATCH /admin/turn-config`).
 //! Requiring `wrangler secret put` would put calls behind SSH access to a box, which an ordinary
@@ -78,7 +78,7 @@ fn normalize(v: String) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// One `server_config` row, or None. Mirrors `push/fcm.rs`'s reader; kept local rather than shared
+/// One `server_config` row, or None. Mirrors `push/config.rs`'s reader; kept local rather than shared
 /// so neither module's read chain can be changed from under the other.
 async fn read_db_config(db: &D1Database, key: &str) -> Option<String> {
     #[derive(Deserialize)]

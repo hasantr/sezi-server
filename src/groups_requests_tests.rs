@@ -176,6 +176,90 @@ fn the_sweep_keeps_pending_requests() {
     assert_eq!(state_of(&db, "s2").as_deref(), Some("pending"));
 }
 
+/// A class invite as `invite_tokens` holds it, landing in `g`.
+fn class_invite(db: &Connection, token: &str, expires_at: i64, revoked: bool) {
+    db.execute(
+        "INSERT INTO invite_tokens (token, token_hash, owner_user_id, email_hint, created_at,
+                                    expires_at, kind, max_uses, introduce, landing_room_id,
+                                    landing_needs_approval, revoked_at)
+         VALUES (?1, 'h-' || ?1, 'adm', 'BIL203', 1, ?2, 'class', 100, 0, 'g', 1, ?3)",
+        params![token, expires_at, if revoked { Some(5) } else { None }],
+    )
+    .unwrap();
+}
+
+fn landing_of(db: &Connection, token: &str) -> Option<(String, String, Option<String>, String)> {
+    db.query_row(CLASS_LANDING_OF_TOKEN_SQL, params![token, NOW], |r| {
+        Ok((r.get("room_id")?, r.get("invite_hash")?, r.get("label")?, r.get("name")?))
+    })
+    .optional()
+    .unwrap()
+}
+
+/// `true` when the call opened (or re-opened) a request.
+fn request_again(db: &Connection, user: &str) -> bool {
+    db.query_row(REQUEST_AGAIN_SQL, params!["g", user, "h-cls", "BIL203", NOW], |_| Ok(()))
+        .optional()
+        .unwrap()
+        .is_some()
+}
+
+/// Lab, 2026-10-05: Cem joined through the class invite, was let in, then removed. Using the
+/// invite again from his existing account said "you are already on this server" and asked
+/// nobody: there was no way back but an admin who happened to know his id. Someone already on
+/// the server who presents a live class invite now asks to join its landing group — through the
+/// same approval list.
+#[test]
+fn an_existing_member_presenting_a_class_invite_is_told_its_landing_group() {
+    let db = db();
+    class_invite(&db, "tok-live", NOW + 100, false);
+    class_invite(&db, "tok-old", NOW - 1, false);
+    class_invite(&db, "tok-revoked", NOW + 100, true);
+    assert_eq!(
+        landing_of(&db, "tok-live"),
+        Some(("g".into(), "h-tok-live".into(), Some("BIL203".into()), "Data Structures".into()))
+    );
+    assert_eq!(landing_of(&db, "tok-old"), None, "expired");
+    assert_eq!(landing_of(&db, "tok-revoked"), None, "revoked");
+    assert_eq!(landing_of(&db, "nothing"), None);
+}
+
+#[test]
+fn a_removed_student_asks_again_and_waits_for_the_admins() {
+    let db = db();
+    // s1 was let in, then removed: the approval is spent and no membership row is left.
+    approve(&db, Some("s1"), 256);
+    assert_eq!(state_of(&db, "s1").as_deref(), Some("approved"));
+    db.execute("DELETE FROM group_members WHERE group_id='g' AND user_id='s1'", []).unwrap();
+
+    assert!(request_again(&db, "s1"), "the old approval no longer holds: asked again");
+    assert_eq!(state_of(&db, "s1").as_deref(), Some("pending"));
+    assert_eq!(page(&db, None, 10).first().map(String::as_str), Some("s1"), "newest on top");
+    // An admin approves it the ordinary way.
+    assert_eq!(approve(&db, Some("s1"), 256), ["s1"]);
+
+    // Someone new to the group (not s1..s5) asks for the first time.
+    db.execute(
+        "INSERT INTO users (id, email, identity_pubkey, display_name, created_at)
+         VALUES ('cem', 'c@x', x'00', 'Cem', 1)",
+        [],
+    )
+    .unwrap();
+    assert!(request_again(&db, "cem"));
+    assert_eq!(state_of(&db, "cem").as_deref(), Some("pending"));
+}
+
+#[test]
+fn a_waiting_or_refused_request_is_not_reopened() {
+    let db = db();
+    assert!(!request_again(&db, "s2"), "already waiting: nothing new");
+    assert_eq!(state_of(&db, "s2").as_deref(), Some("pending"));
+    db.query_row(DENY_SQL, params!["g", "s3", NOW, "adm"], |r| r.get::<_, String>(0))
+        .unwrap();
+    assert!(!request_again(&db, "s3"), "the admins said no; asking again does not undo it");
+    assert_eq!(state_of(&db, "s3").as_deref(), Some("denied"));
+}
+
 /// The same guard `groups_tests.rs` keeps over `groups.rs`: every handler here goes through the
 /// revocation-aware gate, either directly or through `admin_gate`, which calls it.
 #[test]

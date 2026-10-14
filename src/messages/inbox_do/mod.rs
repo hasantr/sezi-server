@@ -6,6 +6,7 @@ use worker::*;
 mod alarm_ops;
 mod alarm_policy;
 mod forward;
+mod member_notify;
 mod message;
 mod receipt;
 mod self_read;
@@ -257,6 +258,10 @@ impl DurableObject for UserInbox {
             }
             return Response::empty().map(|r| r.with_status(204));
         }
+        if method == Method::Post && path == "/upkeep" { // lazy upkeep, own invocation (maintenance.rs)
+            crate::maintenance::run_upkeep(&self.env).await;
+            return Response::empty().map(|r| r.with_status(204));
+        }
         self.ensure_init().await?;
 
         // WS upgrade (the worker proxies /sync here).
@@ -273,9 +278,12 @@ impl DurableObject for UserInbox {
         }
 
         match (method, path.as_str()) {
+            // A group message: one call per member, and a hop for a large room (D8).
+            (Method::Post, "/notify-member") => self.notify_member(req).await,
+            (Method::Post, "/fanout") => self.fanout_hop(req).await,
             (Method::Post, "/notify") => {
                 let body: NotifyBody = req.json().await?;
-                let (id, delivered_live) = self
+                let (id, delivered_live, _) = self
                     .notify_inner(
                         &body.sender_id,
                         body.sender_device_id.as_deref(),

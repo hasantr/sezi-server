@@ -3,7 +3,7 @@ use crate::auth::invite_attribution::CLAIM_INVITE_SQL;
 use crate::d1util::{d1_int, d1_opt_text, d1_text};
 use crate::email::mailer::send_verification_code;
 use crate::ratelimit::{
-    admit_env, client_ip, peek_env, per_invite_limit, Admission, DOOR_IP_CEILING, DOOR_MISS_LIMIT,
+    admit_env, client_ip, door_miss_key, per_invite_limit, Admission, DOOR_IP_CEILING,
     DOOR_WINDOW_SECS,
 };
 use crate::respond::{json_err, rate_limited};
@@ -24,12 +24,13 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // fall back to dev behaviour, so the rate limit stays on and dev_code does not
     // leak). Deployments that do set ENV behave bit-identically.
     let limited = crate::utils::var_or(&ctx.env, "ENV", "prod") == "prod";
-    // Keyed per address only as a CEILING and a MISS counter; the limit a lecture hall actually
-    // meets is the per-invite one below (`ratelimit`, "The door"). The KV binding is OPTIONAL
-    // (slim template): without it, everything here continues unlimited. Every refusal carries
-    // `Retry-After`: the person at the door is told when, not "later".
+    // Keyed per address as a soft CEILING (KV) and a MISS budget (`door_bucket`, D1, a real bound);
+    // the limit a lecture hall actually meets is the per-invite one below (`ratelimit`, "The
+    // door"). The KV binding is OPTIONAL (slim template): without it the ceiling is off; the miss
+    // budget needs only D1 and fails closed. Every refusal carries `Retry-After`: the person at the
+    // door is told when, not "later".
     let ip = client_ip(&req, &ctx.env);
-    let miss_key = format!("auth:redeem:miss:{ip}");
+    let miss_key = door_miss_key(&ip);
     if limited {
         let key = format!("auth:redeem:ip:{ip}");
         if let Admission::Refused { retry_after_s } =
@@ -37,23 +38,9 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         {
             return rate_limited(retry_after_s);
         }
-        if let Admission::Refused { retry_after_s } =
-            peek_env(&ctx.env, &miss_key, DOOR_MISS_LIMIT, DOOR_WINDOW_SECS).await
-        {
-            return rate_limited(retry_after_s);
-        }
     }
-    // A refused redeem is charged to the address's miss counter, then answered as it always was.
-    let refuse = |code: &'static str| {
-        let env = ctx.env.clone();
-        let key = miss_key.clone();
-        async move {
-            if limited {
-                let _ = admit_env(&env, &key, DOOR_MISS_LIMIT, DOOR_WINDOW_SECS).await;
-            }
-            json_err(403, code)
-        }
-    };
+    // A refused redeem keeps the miss it reserved below, and is answered as it always was.
+    let refuse = |code: &'static str| async move { json_err(403, code) };
 
     let body: RedeemBody = match req.json().await {
         Ok(b) => b,
@@ -79,6 +66,27 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Some(t) => t.clone(),
         None => return json_err(403, "invite_required"),
     };
+    // From here on the request is a GUESS until it proves otherwise: one miss is reserved from the
+    // address's budget BEFORE anything is looked up (`door_bucket`), so concurrent requests cannot
+    // outrun it, and it is given back once the invite turns out to be real.
+    let reservation = if limited {
+        match crate::door_bucket::reserve(&db, &miss_key, now as i64).await {
+            crate::door_bucket::Reserved::Taken(r) => Some(r),
+            crate::door_bucket::Reserved::Refused { retry_after_s } => {
+                return rate_limited(retry_after_s)
+            }
+        }
+    } else {
+        None
+    };
+    let refund = || {
+        let (db, reservation) = (&db, reservation.as_ref());
+        async move {
+            if let Some(r) = reservation {
+                crate::door_bucket::refund(db, r).await;
+            }
+        }
+    };
     // A typed code (`K7QM-4827`) stands for its invite's token; everything after this line sees
     // only tokens. Tried FIRST, because the grammars cannot overlap: a code is at most 16
     // characters before normalising and a bearer token is 24 (`auth::invite_code`).
@@ -99,6 +107,8 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         if let Admission::Refused { retry_after_s } =
             admit_env(&ctx.env, &key, per_invite_limit(*seats), DOOR_WINDOW_SECS).await
         {
+            // A real invite, refused for its own crowd: not a guess.
+            refund().await;
             return rate_limited(retry_after_s);
         }
     }
@@ -125,6 +135,8 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             false => return refuse("invalid_invite").await,
         }
     };
+    // The claim was won: the invite was real, so this was no guess.
+    refund().await;
 
     let code = generate_code();
     let code_hash = hash_code(&code);
@@ -177,7 +189,7 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
 pub(crate) const TOKEN_FOR_CODE_SQL: &str =
     "SELECT token FROM invite_tokens WHERE code_hash = ? LIMIT 1";
 
-async fn token_for_code(db: &D1Database, canonical: &str) -> Result<Option<String>> {
+pub(crate) async fn token_for_code(db: &D1Database, canonical: &str) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct TokenRow {
         token: String,

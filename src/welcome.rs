@@ -22,8 +22,10 @@
 //! and no external resources — self-contained, in keeping with the closed-server
 //! philosophy.
 //!
-//! LANGUAGE: the copy here is a PRODUCT SURFACE, not source language, and is the ONE place in the
-//! Rust tree exempt from the English-source rule (K6). Everywhere else, Turkish in Rust was a
+//! LANGUAGE: the copy here is a PRODUCT SURFACE, not source language, and — with its sibling, the
+//! invite page's `invite_page/html.rs` — the place in the Rust tree exempt from the
+//! English-source rule (K6 here is the source-language sweep, not the campus gap of the same
+//! name). Everywhere else, Turkish in Rust was a
 //! problem because the text had to cross into the app and could no longer be translated once it
 //! had. This page never crosses anything: it is rendered here and served straight to a browser —
 //! the same category as an ARB value, which K6 explicitly does not touch. Do not sweep these
@@ -75,17 +77,23 @@ pub async fn welcome(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .as_ref()
         .map(|u| u.origin().ascii_serialization())
         .unwrap_or_default();
-    // An explicit `?lang=` beats the header: it makes the page linkable in a chosen language
-    // (support threads, docs) and gives a visitor whose browser is set to a third language a
-    // way out. Anything unrecognised falls through to the header.
-    let forced = url
-        .as_ref()
+    let lang = negotiate_lang(&req);
+    Response::from_html(render_welcome(lang, owner, &origin, genesis))
+}
+
+/// The language a browser page is served in — this one and the invite page (`invite_page`).
+/// An explicit `?lang=` beats the header: it makes the page linkable in a chosen language
+/// (support threads, docs) and gives a visitor whose browser is set to a third language a way
+/// out. Anything unrecognised falls through to the header.
+pub(crate) fn negotiate_lang(req: &Request) -> Lang {
+    let forced = req
+        .url()
+        .ok()
         .and_then(|u| u.query_pairs().find(|(k, _)| k == "lang").map(|(_, v)| v.into_owned()))
         .and_then(|v| Lang::from_tag(&v));
-    let lang = forced.unwrap_or_else(|| {
+    forced.unwrap_or_else(|| {
         Lang::from_accept_language(req.headers().get("accept-language").ok().flatten().as_deref())
-    });
-    Response::from_html(render_welcome(lang, owner, &origin, genesis))
+    })
 }
 
 /// What the fresh-install page says about the genesis code. Only the no-owner branch reads it.
@@ -111,7 +119,7 @@ pub(crate) enum Lang {
 impl Lang {
     /// A single language tag → `Lang`, matching on the PRIMARY subtag so `tr-TR`, `tr_TR` and
     /// `TR` all land on Turkish. Unknown → `None` (the caller decides what that means).
-    fn from_tag(tag: &str) -> Option<Lang> {
+    pub(crate) fn from_tag(tag: &str) -> Option<Lang> {
         let primary = tag
             .trim()
             .split(['-', '_'])
@@ -132,7 +140,7 @@ impl Lang {
     /// Deliberately hand-rolled rather than strict RFC 4647: this decides which of two texts to
     /// show a browser, so a malformed q or an exotic tag must degrade to a readable page, never
     /// to an error.
-    fn from_accept_language(header: Option<&str>) -> Lang {
+    pub(crate) fn from_accept_language(header: Option<&str>) -> Lang {
         let Some(header) = header else {
             return Lang::En;
         };
@@ -261,7 +269,7 @@ pub(crate) async fn owner_exists(env: &Env) -> Option<bool> {
 /// HTML-escaped. `__LANG__` and `__FOOT__` come from the negotiated [`Copy`] — `lang` on
 /// `<html>` is what tells a screen reader and a browser translator which language they are
 /// looking at, so it has to move with the copy.
-const PAGE: &str = r#"<!doctype html>
+pub(crate) const PAGE: &str = r#"<!doctype html>
 <html lang="__LANG__">
 <head>
 <meta charset="utf-8">
@@ -387,7 +395,7 @@ fn render_welcome(lang: Lang, owner: Option<bool>, origin: &str, genesis: Genesi
 /// Minimal HTML escaping. The origin is escaped defensively: it resolves to an ASCII
 /// scheme://host[:port], but it ultimately derives from the Host header, so it is
 /// never embedded blindly.
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

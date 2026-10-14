@@ -25,7 +25,7 @@ mod requests;
 pub(crate) use requests::nudge_landing;
 pub use requests::{
     approve_all_join_requests, approve_join_request, deny_join_request, list_join_requests,
-    my_join_requests,
+    my_join_requests, request_join_by_invite,
 };
 #[path = "groups_transfer.rs"]
 mod transfer;

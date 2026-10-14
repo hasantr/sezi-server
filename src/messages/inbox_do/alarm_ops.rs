@@ -141,7 +141,7 @@ impl UserInbox {
             uid
         );
         for r in &rows {
-            crate::push::fcm::maybe_push_wake(&self.env, &db, &uid, r.device_id.as_deref()).await;
+            crate::push::wake::maybe_push_wake(&self.env, &db, &uid, r.device_id.as_deref()).await;
         }
         // Stamp the rows so the next alarm does not re-push them (best-effort; if the error is
         // swallowed the worst case is another wake on the next alarm = a harmless extra push).

@@ -1,64 +1,64 @@
-# Sezi Server — VPS / kendi-cihaz sertleştirme paketi
+# Sezi Server — hardening kit for a VPS or your own device
 
-Bu klasör, Sezi relay'ini **VPS'te ya da kendi cihazında (Raspberry Pi / mini-PC)**
-7/24 **üretim-güvenli** çalıştırmak için hazır dosyalar içerir. "Deploy to Cloudflare"
-butonuyla kuruyorsan buna GEREK YOK — bu paket **self-managed** (kendi işletim
-sistemin üstünde) kurulum içindir.
+This folder holds ready files for running the Sezi relay **production-safe, around the clock, on a
+VPS or on your own device (Raspberry Pi / mini-PC)**. If you installed with the "Deploy to
+Cloudflare" button you do NOT need any of this — the kit is for a **self-managed** install, on an
+operating system you run yourself.
 
-> ⚠️ **En kritik kural — BIND:** relay **yalnız `127.0.0.1`** dinler. Dış erişim
-> SADECE (a) cloudflared tüneli veya (b) caddy/nginx TLS reverse-proxy önünden olur.
-> `--ip 0.0.0.0` relay'i **düz-HTTP + imza-anahtarıyla doğrudan internete açar** =
-> gerçek güvenlik açığı. Aşağıdaki reçetelerin hepsi bu kurala uyar.
+> ⚠️ **The most critical rule — BIND:** the relay listens on **`127.0.0.1` only**. Outside access
+> comes ONLY through (a) a cloudflared tunnel or (b) a caddy/nginx TLS reverse proxy in front of it.
+> `--ip 0.0.0.0` puts the relay **on the internet as plain HTTP, signing key and all** — a real
+> security hole. Every recipe below keeps to this rule.
 
-Ağ şeması (her iki yol da relay'i localhost'ta tutar):
+Network layout (both paths keep the relay on localhost):
 
 ```
-  [Telefon]──TLS──►  cloudflared-edge  ──tünel──►  nginx :8787 ──► wrangler 127.0.0.1:8788
-        (A) Cloudflare yolu                         (WS-shim)          (sezi-relay)
+  [Phone]──TLS──►  cloudflared edge  ──tunnel──►  nginx :8787 ──► wrangler 127.0.0.1:8788
+        (A) the Cloudflare path                    (WS shim)         (sezi-relay)
 
-  [Telefon]──TLS──►  caddy :443 (Let's Encrypt) ─────────────────► wrangler 127.0.0.1:8788
-        (B) CF'siz tam-bağımsız yol                                 (sezi-relay)
+  [Phone]──TLS──►  caddy :443 (Let's Encrypt) ───────────────────► wrangler 127.0.0.1:8788
+        (B) the fully independent path, no CF                      (sezi-relay)
 ```
 
 ---
 
-## 0. Ön-koşullar
+## 0. Prerequisites
 
-- Debian 12/13 veya Ubuntu 22.04+ (x86_64 ya da ARM64). **glibc ≥ 2.35** gerekir
-  (workerd kapısı) → Ubuntu 20.04 / RHEL 9 / Alpine-musl **DESTEKLENMEZ**.
+- Debian 12/13 or Ubuntu 22.04+ (x86_64 or ARM64). **glibc ≥ 2.35** is required (workerd's
+  floor), so Ubuntu 20.04 / RHEL 9 / Alpine (musl) are **NOT SUPPORTED**.
 - Node.js 20+ (`node -v`).
-- ~2 GB RAM öner (Node + workerd ~200–400 MB; 1 GB sınırda).
+- ~2 GB RAM recommended (Node + workerd take ~200–400 MB; 1 GB is tight).
 
 ---
 
-## 1. wrangler'ı SABİT sürümden kur (sürüm-drift kilidi)
+## 1. Install wrangler at a PINNED version (no version drift)
 
-`npx wrangler@4` her seferinde "latest 4.x" çeker → miniflare state-formatı/workerd
-davranışı habersiz değişebilir. Bunun yerine `package.json` **tam sürüme** pinler ve
-`npm ci` **lockfile'dan bit-aynı** kurar.
+`npx wrangler@4` fetches "the latest 4.x" every time, so miniflare's state format and workerd's
+behaviour can change without notice. Instead, `package.json` pins an **exact version** and
+`npm ci` installs **bit-identically from the lockfile**.
 
 ```bash
 cd /opt/sezi-server
-npm ci --omit=dev          # package-lock.json'dan reprodüksiyon-kilitli kurulum
+npm ci --omit=dev          # a reproducible install from package-lock.json
 ```
 
-> **package-lock.json commit'li OLMALI.** Repo'da yoksa bir kez `npm install`
-> çalıştırıp `package.json` + `package-lock.json`'u birlikte commit'le. `npm ci`
-> lockfile OLMADAN çalışmaz (bilinçli — reprodüksiyon garantisi).
+> **package-lock.json MUST be committed.** If the repository has none, run `npm install` once and
+> commit `package.json` and `package-lock.json` together. `npm ci` refuses to run WITHOUT a
+> lockfile (deliberately — that is the reproducibility guarantee).
 >
-> **Güncelleme = bilinçli commit:** `package.json`'daki `wrangler` sürümünü elle
-> yükselt → `npm install` (lockfile tazelenir) → prebuilt-WASM ile smoke-test →
-> commit. Otomatik-drift YOK.
+> **An update is a deliberate commit:** raise the `wrangler` version in `package.json` by hand →
+> `npm install` (refreshes the lockfile) → smoke-test with the prebuilt WASM → commit. Nothing
+> drifts on its own.
 
 ---
 
-## 2. Relay servisini kur (systemd, sadece-localhost)
+## 2. Install the relay service (systemd, localhost only)
 
 ```bash
 sudo useradd --system --home /var/lib/sezi --shell /usr/sbin/nologin sezi || true
 sudo mkdir -p /var/lib/sezi/state /var/lib/sezi/backups
 sudo chown -R sezi:sezi /opt/sezi-server /var/lib/sezi
-sudo chmod +x /opt/sezi-server/deploy/*.sh    # Windows'ta klonlandıysa exec-bit taşınmaz
+sudo chmod +x /opt/sezi-server/deploy/*.sh    # a clone made on Windows does not carry the exec bit
 
 sudo cp deploy/sezi-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -66,15 +66,15 @@ sudo systemctl enable --now sezi-relay
 curl -s http://127.0.0.1:8788/healthz    # {"ok":true}
 ```
 
-`sezi-relay.service` `--ip 127.0.0.1 --port 8788 --persist-to /var/lib/sezi/state`
-kullanır (bkz. dosya içi yorumlar). `Restart=always`.
+`sezi-relay.service` runs with `--ip 127.0.0.1 --port 8788 --persist-to /var/lib/sezi/state` (see
+the comments in the file). `Restart=always`.
 
 ---
 
-## 3. Dış erişim — YOL A: cloudflared tüneli (mevcut, CF'e bağlı)
+## 3. Outside access — PATH A: a cloudflared tunnel (tied to CF)
 
-WebSocket (canlı /sync) için **nginx WS-shim ZORUNLU** — cloudflared → wrangler-dev
-Node-proxy zincirinde 101-upgrade takılır (bkz. `sezi-ws-shim.conf` içi açıklama).
+For the WebSocket (live /sync) the **nginx WS shim is REQUIRED**: in the chain cloudflared →
+wrangler dev's Node proxy the 101 upgrade stalls (see the comment inside `sezi-ws-shim.conf`).
 
 ```bash
 sudo apt install -y nginx
@@ -83,24 +83,41 @@ sudo nginx -t && sudo systemctl reload nginx
 # cloudflared Public Hostname → Service: http://127.0.0.1:8787
 ```
 
-Güvenlik duvarı (cloudflared yalnız OUTBOUND bağlanır → inbound port GEREKMEZ):
+> **Installed the shim before it set `client_max_body_size`?** Then nginx's 1 MB default refuses
+> every upload above 1 MB (a group-library recording's 4 MiB parts, photos, voice notes) with a
+> 413 before the relay sees it. Run this once — it adds the size limit and streams bodies to the
+> relay instead of first writing them to nginx's disk, only if the lines are missing, then tests
+> and reloads nginx:
+>
+> ```bash
+> grep -q proxy_request_buffering /etc/nginx/conf.d/sezi-ws-shim.conf || { sudo sed -i '/listen 127.0.0.1:8787;/a\    client_max_body_size 210m;\n    proxy_request_buffering off;' /etc/nginx/conf.d/sezi-ws-shim.conf && sudo nginx -t && sudo systemctl reload nginx; }
+> ```
+
+> **Cloudflare's own 100 MB cap applies on this path.** Every request through the tunnel passes
+> Cloudflare's edge, which refuses a request body over 100 MB (Free and Pro plans) whatever nginx
+> allows. Photos, videos and voice notes (50 MiB at most) and library parts (4 MiB) are well under
+> it. The one upload that can be bigger is the **instrument pack** (up to 200 MiB): on a tunnel
+> relay, use a pack under ~95 MB, or reach the relay by the caddy path (B) below, which has no
+> such cap.
+
+Firewall (cloudflared connects OUTBOUND only, so no inbound port is needed):
 
 ```bash
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-sudo ufw allow 22/tcp          # SSH — kendini kilitleme!
+sudo ufw allow 22/tcp          # SSH — do not lock yourself out!
 sudo ufw enable
 ```
 
-## 3. Dış erişim — YOL B: caddy + Let's Encrypt (CF'siz tam-bağımsız)
+## 3. Outside access — PATH B: caddy + Let's Encrypt (fully independent of CF)
 
-Kendi domain'in + kendi TLS'in; Cloudflare'e sıfır bağımlılık. caddy WebSocket'i
-doğal proxy'ler → **ayrı WS-shim gerekmez**.
+Your own domain and your own TLS; zero dependency on Cloudflare. caddy proxies WebSockets as
+they are, so **no separate WS shim is needed**, and it sets no request-body limit of its own.
 
 ```bash
-# caddy kur: https://caddyserver.com/docs/install
+# install caddy: https://caddyserver.com/docs/install
 sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
-sudo sed -i 's/sezi.example.com/senin.domainin/' /etc/caddy/Caddyfile
+sudo sed -i 's/sezi.example.com/your.domain/' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 
 sudo ufw default deny incoming
@@ -111,44 +128,45 @@ sudo ufw allow 443/tcp         # HTTPS + WSS
 sudo ufw enable
 ```
 
-> **Neden `header_up cf-connecting-ip {remote_host}`?** Worker per-IP hız-limitleri
-> (bootstrap/verify/redeem) yalnız `cf-connecting-ip` başlığını okur. CF-yolunda CF
-> bunu koyar; caddy-yolunda caddy koyar (gerçek istemci IP'siyle, spoof-korumalı).
-> Koymazsan tüm istekler tek "local" kovaya düşer = per-IP limit çöker.
+> **Why `header_up cf-connecting-ip {remote_host}`?** The worker's per-IP rate limits (bootstrap,
+> verify, redeem, the invite page) read only the `cf-connecting-ip` header. On the CF path
+> Cloudflare sets it; on the caddy path caddy does (with the real client address, not
+> spoofable). Without it every request falls into one shared "local" bucket and the per-IP limits
+> collapse.
 
 ---
 
-## 4. Hız-limitini AÇ (self-host profili)
+## 4. Turn the rate limits ON (the self-host profile)
 
-`sezi-relay.service` zaten `--config wrangler.selfhost.toml` kullanır. Bu profil kök
-`wrangler.toml`'dan (buton-deploy) **ayrıdır** ve `[[kv_namespaces]] RATE_LIMIT`
-içerir → lokal miniflare-KV **bedava**, CF-günlük-limiti yok → hız-limitleri
-(bootstrap enumerasyon-yavaşlatma, auth/verify, per-user mesaj/medya tavanları)
-**gerçekten çalışır**. Ekstra adım gerekmez; sadece self-host config'iyle çalıştır.
+`sezi-relay.service` already runs with `--config wrangler.selfhost.toml`. That profile is
+**separate** from the root `wrangler.toml` (the button deploy) and declares
+`[[kv_namespaces]] RATE_LIMIT`, so the local miniflare KV is **free**, has no CF daily limit, and
+the rate limits (bootstrap enumeration slow-down, auth/verify, per-user message and media
+ceilings) **really work**. No extra step: just run with the self-host config.
 
 ---
 
-## 5. Atomik yedek + gece-restart (timer)
+## 5. Atomic backup + nightly restart (timer)
 
-Canlı `cp .wrangler/state` = bozuk-WAL riski (D1+DO+R2 üç ayrı SQLite). `backup.sh`
-relay'i durdurur → rsync → başlatır (tutarlı snapshot) + eski yedekleri budar. Gece
-penceresi aynı zamanda wrangler-dev'i tazeler (uzun-ömür sigortası).
+A live `cp .wrangler/state` risks a torn WAL (D1, DO and R2 are three separate SQLite files).
+`backup.sh` stops the relay → rsyncs → starts it again (a consistent snapshot) and prunes old
+backups. The nightly window also refreshes wrangler dev (insurance for a long-lived process).
 
 ```bash
 sudo cp deploy/sezi-backup.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sezi-backup.timer
-# Elle test: sudo systemctl start sezi-backup.service ; ls /var/lib/sezi/backups
+# By hand: sudo systemctl start sezi-backup.service ; ls /var/lib/sezi/backups
 ```
 
-**Geri-yükleme:** `sudo systemctl stop sezi-relay && sudo rsync -a --delete \
-/var/lib/sezi/backups/state-<damga>/ /var/lib/sezi/state/ && sudo systemctl start sezi-relay`
+**Restore:** `sudo systemctl stop sezi-relay && sudo rsync -a --delete \
+/var/lib/sezi/backups/state-<stamp>/ /var/lib/sezi/state/ && sudo systemctl start sezi-relay`
 
 ---
 
-## 6. Canlılık bekçisi (healthz watchdog)
+## 6. Liveness watchdog (healthz)
 
-`Restart=always` süreç ölürse toparlar; watchdog "asılı ama canlı" durumunu yakalar
+`Restart=always` recovers a process that died; the watchdog catches one that is "hung but alive"
 (/healthz != 200 → restart).
 
 ```bash
@@ -159,9 +177,9 @@ sudo systemctl enable --now sezi-healthz.timer
 
 ---
 
-## Bilinen sınır (dürüstlük notu)
+## Known limit (an honest note)
 
-Bu paket kurulumu **"aile-pilotu → küçük-üretim"** sınıfına taşır. wrangler-dev bir
-geliştirme-sunucusudur; kalıcı native çözüm **Faz-3 `sezi-serverd` (axum)** —
-D1→rusqlite, R2→FS/S3, DO→tokio-actor, KV→bellek, cron→interval. O gelince WS-shim
-ve gece-restart sigortaları gereksizleşir. Bkz. `SEZI_SERVER_PLATFORM_PLAN.md`.
+This kit takes an install from "family pilot" to "small production". wrangler dev is a
+development server; the lasting answer is a native relay (D1 → SQLite, R2 → files/S3, DO → actors,
+KV → memory, cron → an interval). When that arrives, the WS shim and the nightly-restart insurance
+are no longer needed.

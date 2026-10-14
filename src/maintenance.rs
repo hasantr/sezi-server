@@ -9,8 +9,9 @@
 //!
 //! MECHANISM — three timestamps in `server_config` (epoch seconds): `maint_drain_at`,
 //! `maint_daily_at`, `maint_storage_move_at`. `scheduled()` refreshes its own stamp on
-//! every run; without a cron the stamp ages and the first eligible request runs
-//! maintenance in the background via `ctx.wait_until`, so no response is delayed.
+//! every run; without a cron the stamp ages and the first eligible request kicks the upkeep
+//! DO (`UPKEEP_DO`) from `ctx.wait_until`, so no response is delayed and the work runs in an
+//! invocation — and a subrequest budget — of its own.
 //!
 //! COST: no extra D1 read per request. An isolate-local `thread_local` last-checked
 //! timestamp limits D1 lookups to roughly one per 60s, and even that happens inside
@@ -68,12 +69,27 @@ thread_local! {
     static LAST_CHECK: Cell<u64> = const { Cell::new(0) };
 }
 
+/// The cron strings `wrangler.toml` sets. Anything else falls through to BOTH the drain and the
+/// daily set, so a renamed trigger cannot silently stall either (the daily set may then find the
+/// purse spent; a misconfiguration, logged by the daily set's own errors).
+pub(crate) const FREQUENT_CRON: &str = "*/2 * * * *";
+pub(crate) const DAILY_CRON: &str = "0 4 * * *";
+
+/// The UserInbox instance that runs lazy upkeep in its OWN invocation (the D8 review's F2). Not
+/// a user id: no account is ever named this.
+pub(crate) const UPKEEP_DO: &str = "__sezi_upkeep__";
+
 // ── fetch-path entry point ──────────────────────────────────────────────────
 
-/// Called from the `#[event(fetch)]` entry point, right after ensure_ready. Its cost on
-/// the request critical path is `Date.now()` plus a thread_local comparison — no D1, no
-/// await; the stamp check and any resulting work run in `ctx.wait_until`. Best-effort:
-/// every error is logged and swallowed, and the request is never affected.
+/// Called from the `#[event(fetch)]` entry point, right after ensure_ready. Its cost on the
+/// request critical path is `Date.now()` plus a thread_local comparison — no D1, no await.
+///
+/// **What it may spend in the request's invocation is `budget::LAZY_KICK`, no more:** one stamp
+/// read and, when something is due, one call to the upkeep DO, which does the work in a fresh
+/// invocation. The work used to run right here in `ctx.wait_until`, concurrently with the handler
+/// and out of the same purse of 50 — so a drain of 48 rows could cut off a group send's closing
+/// batch, and its own close was cut off in turn (#53 of 50). Best-effort: errors are logged and
+/// swallowed, and the request is never affected.
 pub fn maybe_run_lazy(env: &Env, ctx: &Context) {
     let now = now_secs();
     let due = LAST_CHECK.with(|c| {
@@ -90,58 +106,151 @@ pub fn maybe_run_lazy(env: &Env, ctx: &Context) {
         return;
     }
     let env = env.clone();
-    ctx.wait_until(async move { check_and_run(env).await });
+    ctx.wait_until(async move { kick(env).await });
 }
 
-/// Read the stamps → try the winner pattern for each stale task → run whatever we won.
-/// Order: drain first (frequent/cheap), then the storage-move tick, then the daily GC
-/// (rare/heavy).
-async fn check_and_run(env: Env) {
+/// The stamp read, then — only if a task is due — one call to the upkeep DO.
+async fn kick(env: Env) {
     let Ok(db) = env.d1("DB") else { return };
     let now = now_secs() as i64;
-    let (drain_at, daily_at, move_at) = match read_stamps(&db).await {
-        Ok(v) => v,
-        // Transient D1 error → try again in the next throttle window.
-        Err(_) => return,
-    };
-    if is_due(now, drain_at, DRAIN_LAZY_AFTER_SECS)
-        && claim(&db, KEY_DRAIN, now, now - DRAIN_LAZY_AFTER_SECS).await
+    // Transient D1 error → try again in the next throttle window.
+    let Ok((drain_at, daily_at, move_at)) = read_stamps(&db).await else { return };
+    if !(is_due(now, drain_at, DRAIN_LAZY_AFTER_SECS)
+        || is_due(now, daily_at, DAILY_LAZY_AFTER_SECS)
+        || is_due(now, move_at, MOVE_LAZY_AFTER_SECS))
     {
-        console_log!(
+        return;
+    }
+    let Ok(ns) = env.durable_object("USER_INBOX") else { return };
+    let Ok(stub) = ns.id_from_name(UPKEEP_DO).and_then(|id| id.get_stub()) else { return };
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let Ok(req) = Request::new_with_init("https://do.sezgi/upkeep", &init) else { return };
+    if let Err(e) = stub.fetch_with_request(req).await {
+        console_log!("maintenance: upkeep kick failed: {e:?}");
+    }
+}
+
+/// The upkeep DO's `/upkeep`: the lazy work, in an invocation of its own.
+pub(crate) async fn run_upkeep(env: &Env) {
+    let Ok(db) = env.d1("DB") else { return };
+    let port = LivePort { env, db };
+    upkeep_with(&port, crate::messages::budget::resolve_budget(env), now_secs() as i64).await;
+}
+
+/// The cron's work after provisioning. `provision` is what `ensure_ready` spent in this
+/// invocation, charged against the drain's purse.
+pub(crate) async fn run_cron(env: &Env, provision: usize, cron: &str) {
+    let Ok(db) = env.d1("DB") else { return };
+    let port = LivePort { env, db };
+    cron_with(&port, crate::messages::budget::resolve_budget(env), provision, cron).await;
+}
+
+/// The upkeep tasks, behind a seam so `messages/spend_tests.rs` runs `upkeep_with` and
+/// `cron_with` against a counted fake under the free-plan ceiling.
+pub(crate) trait UpkeepPort {
+    async fn read_stamps(&self) -> Option<(i64, i64, i64)>;
+    async fn claim(&self, key: &'static str, now: i64, stale_cutoff: i64) -> bool;
+    async fn stamp(&self, key: &'static str);
+    /// The fan-out retry drain with `purse` subrequests, claim and close included.
+    async fn drain(&self, purse: usize);
+    async fn purge_outbox(&self);
+    async fn storage_move(&self);
+    async fn daily(&self);
+    /// A log line (the console is a JS import, absent from the host tests).
+    fn log(&self, line: String);
+}
+
+/// Lazy upkeep, in the upkeep DO's invocation. The daily set is heavy and has no bound of its
+/// own, so when it is due it gets the invocation to itself and the drain waits for the next kick
+/// (a minute later at most, while there is traffic). Otherwise the drain is sized from what the
+/// head and the tail leave (`budget::upkeep_drain_purse`), so its close always fits.
+pub(crate) async fn upkeep_with<P: UpkeepPort>(p: &P, budget: usize, now: i64) {
+    let Some((drain_at, daily_at, move_at)) = p.read_stamps().await else { return };
+    if is_due(now, daily_at, DAILY_LAZY_AFTER_SECS)
+        && p.claim(KEY_DAILY, now, now - DAILY_LAZY_AFTER_SECS).await
+    {
+        p.log(format!("maintenance: lazy daily GC (stamp is {}s old)", now - daily_at));
+        p.daily().await;
+        return;
+    }
+    if is_due(now, drain_at, DRAIN_LAZY_AFTER_SECS)
+        && p.claim(KEY_DRAIN, now, now - DRAIN_LAZY_AFTER_SECS).await
+    {
+        p.log(format!(
             "maintenance: lazy drain (stamp is {}s old — a cron-less install, or the cron ran late)",
             now - drain_at
-        );
-        crate::messages::handlers::drain_fanout_retry(&env).await;
-        // On a Pi/workerd `wrangler dev` deployment the scheduled event may never fire, so
-        // the account-purge outbox converges off this same lazy drain stamp when the first
-        // UserInbox purge call hit a transient error.
-        crate::membership::drain_purge_outbox(&env).await;
+        ));
+        p.drain(crate::messages::budget::upkeep_drain_purse(budget)).await;
+        // On a cron-less deployment the account-purge outbox converges off this same stamp.
+        p.purge_outbox().await;
     }
-    // Draining-backend move tick (≤4 blobs per run). With no draining backend,
-    // run_storage_move returns quietly after one cheap SELECT.
     if is_due(now, move_at, MOVE_LAZY_AFTER_SECS)
-        && claim(&db, KEY_MOVE, now, now - MOVE_LAZY_AFTER_SECS).await
+        && p.claim(KEY_MOVE, now, now - MOVE_LAZY_AFTER_SECS).await
     {
-        console_log!(
-            "maintenance: lazy storage move (stamp is {}s old)",
-            now - move_at
-        );
-        if let Err(e) = crate::storage::drain::run_storage_move(&env).await {
+        p.log(format!("maintenance: lazy storage move (stamp is {}s old)", now - move_at));
+        p.storage_move().await;
+    }
+}
+
+/// The cron, after provisioning. The drain stamp goes FIRST, so a starved invocation cannot leave
+/// the lazy path believing the cron is dead; the drain gets the purse the head and tail leave
+/// (`budget::cron_drain_purse`). The daily cron does not drain — the frequent one does, every
+/// two minutes — so the heavy daily set has its invocation to itself.
+pub(crate) async fn cron_with<P: UpkeepPort>(p: &P, budget: usize, provision: usize, cron: &str) {
+    if cron != DAILY_CRON {
+        p.stamp(KEY_DRAIN).await;
+        p.drain(crate::messages::budget::cron_drain_purse(budget, provision)).await;
+        p.purge_outbox().await;
+    }
+    // Draining-backend move tick (≤4 blobs per run; one cheap SELECT when no backend drains).
+    // Its stamp keeps the lazy storage-move asleep.
+    p.storage_move().await;
+    p.stamp(KEY_MOVE).await;
+    // The daily trigger AND any unexpected cron string fall through to cleanup: cleanup is
+    // idempotent, so an extra run is harmless, while the opposite would silently stall GC.
+    if cron != FREQUENT_CRON {
+        p.daily().await;
+        p.stamp(KEY_DAILY).await;
+    }
+}
+
+struct LivePort<'a> {
+    env: &'a Env,
+    db: D1Database,
+}
+
+impl UpkeepPort for LivePort<'_> {
+    async fn read_stamps(&self) -> Option<(i64, i64, i64)> {
+        read_stamps(&self.db).await.ok()
+    }
+    async fn claim(&self, key: &'static str, now: i64, stale_cutoff: i64) -> bool {
+        claim(&self.db, key, now, stale_cutoff).await
+    }
+    async fn stamp(&self, key: &'static str) {
+        stamp(&self.db, key).await;
+    }
+    async fn drain(&self, purse: usize) {
+        crate::messages::handlers::drain_fanout_retry(self.env, purse).await;
+    }
+    async fn purge_outbox(&self) {
+        crate::membership::drain_purge_outbox(self.env).await;
+    }
+    async fn storage_move(&self) {
+        if let Err(e) = crate::storage::drain::run_storage_move(self.env).await {
             let msg = e.to_string();
             let truncated: String = msg.chars().take(80).collect();
             console_log!("storage move error: {}", truncated);
         }
     }
-    if is_due(now, daily_at, DAILY_LAZY_AFTER_SECS)
-        && claim(&db, KEY_DAILY, now, now - DAILY_LAZY_AFTER_SECS).await
-    {
-        console_log!(
-            "maintenance: lazy daily GC (stamp is {}s old)",
-            now - daily_at
-        );
-        run_daily(&env).await;
+    async fn daily(&self) {
+        run_daily(self.env).await;
+    }
+    fn log(&self, line: String) {
+        console_log!("{line}");
     }
 }
+
 
 // ── stamp reads / winner pattern ────────────────────────────────────────────
 
@@ -216,29 +325,6 @@ async fn claim(db: &D1Database, key: &str, now: i64, stale_cutoff: i64) -> bool 
 
 // ── cron-path stamping ──────────────────────────────────────────────────────
 
-/// Called by `scheduled()` on every run (after the drain), so the lazy drain never wakes
-/// on a cron-enabled deployment. Best-effort.
-pub(crate) async fn stamp_drain(env: &Env) {
-    if let Ok(db) = env.d1("DB") {
-        stamp(&db, KEY_DRAIN).await;
-    }
-}
-
-/// Called at the end of `scheduled()`'s daily branch, so the lazy daily GC sleeps.
-/// Best-effort.
-pub(crate) async fn stamp_daily(env: &Env) {
-    if let Ok(db) = env.d1("DB") {
-        stamp(&db, KEY_DAILY).await;
-    }
-}
-
-/// The twin of stamp_drain, called after every move tick. Best-effort.
-pub(crate) async fn stamp_move(env: &Env) {
-    if let Ok(db) = env.d1("DB") {
-        stamp(&db, KEY_MOVE).await;
-    }
-}
-
 /// Called by the drain endpoint: pulling the move stamp to 0 is the "run now" signal, so
 /// the first eligible request claims it instead of waiting out the threshold. Harmless on
 /// a cron-enabled deployment too, since claim deduplicates. Best-effort.
@@ -278,6 +364,10 @@ pub(crate) async fn run_daily(env: &Env) {
         console_log!("cleanup error: {}", truncated);
     }
     crate::messages::handlers::gc_fanout_retry(env).await;
+    // The door's miss counter keeps one row per address; finished windows carry nothing.
+    if let Ok(db) = env.d1("DB") {
+        let _ = crate::door_bucket::sweep(&db, now_secs() as i64).await;
+    }
     // Every leg below logs and continues, so one failure does not skip the rest.
     //
     // The group library's retention sweep (≤100 expired parts per run). Before the reconcile, so

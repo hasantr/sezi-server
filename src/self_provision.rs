@@ -207,6 +207,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0044_group_join_requests",
         include_str!("../migrations/0044_group_join_requests.sql"),
     ),
+    (
+        "0045_fanout_retry_members",
+        include_str!("../migrations/0045_fanout_retry_members.sql"),
+    ),
+    (
+        "0046_push_tokens_of_revoked_devices",
+        include_str!("../migrations/0046_push_tokens_of_revoked_devices.sql"),
+    ),
+    ("0047_door_misses", include_str!("../migrations/0047_door_misses.sql")),
 ];
 
 thread_local! {
@@ -219,13 +228,34 @@ thread_local! {
     static JWT_PEM: RefCell<Option<String>> = const { RefCell::new(None) };
     /// The admin-invite key resolved from or generated for D1 (32 bytes, b64url).
     static ADMIN_INVITE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Every D1 call provisioning has made in this isolate (`spent`).
+    static SPENT: Cell<usize> = const { Cell::new(0) };
+    /// (when, how many) of the last `ensure_ready` that spent anything: see `recent_spend`.
+    static RECENT: Cell<(u64, usize)> = const { Cell::new((0, 0)) };
+}
+
+/// Count one D1 call made by provisioning. EVERY D1 call in this file goes through it (a source
+/// guard in `messages/spend_tests.rs` counts call sites against calls of this function).
+fn spent() {
+    SPENT.with(|c| c.set(c.get() + 1));
+}
+
+/// What provisioning spent in this isolate within 30 s of `now_ms` (0 on a warm isolate) — the D8
+/// review's F1: a cold isolate's first request pays for migrations (3 D1 calls; ≈4 more for keys
+/// on a secretless fork) out of the SAME purse as its handler. The request that provisioned
+/// reaches its fan-out within milliseconds; the margin only makes a concurrent request cautious.
+pub fn recent_spend(now_ms: u64) -> usize {
+    let (at, n) = RECENT.with(|c| c.get());
+    if now_ms.saturating_sub(at) <= 30_000 { n } else { 0 }
 }
 
 /// Boot guard — called at the top of `#[event(fetch)]` and `#[event(scheduled)]`.
 /// Memoized per isolate: the first call does the work, the rest are no-ops. On an
 /// env-secret + wrangler-migrated deployment (our prod) it degenerates to a COMPLETE
-/// no-op.
-pub async fn ensure_ready(env: &Env) {
+/// no-op. Returns the D1 calls it made, which the caller's budget is charged with; concurrent
+/// cold requests may count each other's calls, which only errs on the safe side.
+pub async fn ensure_ready(env: &Env) -> usize {
+    let before = SPENT.with(|c| c.get());
     // KEYS FIRST, MIGRATIONS SECOND. A free CF account's per-request subrequest budget is tight,
     // and with the key path competing against the migration batch in the SAME request the keys
     // starve: the tables get created (so bootstrap/welcome work) while jwks/verify 500s for want
@@ -233,6 +263,11 @@ pub async fn ensure_ready(env: &Env) {
     // finishes in a handful of subrequests and the key is in place whatever the batch does.
     ensure_keys(env).await;
     ensure_migrations(env).await;
+    let n = SPENT.with(|c| c.get()).saturating_sub(before);
+    if n > 0 {
+        RECENT.with(|c| c.set((crate::utils::now_ms(), n)));
+    }
+    n
 }
 
 /// The key leg on its own — needed by the UserInbox DO (`ws_upgrade` token validation):
@@ -322,6 +357,7 @@ async fn resolve_from_db(
     let db = env.d1("DB")?;
     // The key path creates `server_config` ITSELF, so `ensure_keys` can run BEFORE the migrations
     // (ordering rationale in `ensure_ready`). IF NOT EXISTS makes the later migration a no-op.
+    spent();
     db.prepare(
         "CREATE TABLE IF NOT EXISTS server_config \
          (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL)",
@@ -346,6 +382,7 @@ async fn resolve_from_db(
                 "self_provision: {db_key} generated value failed validation (generator/validator mismatch?)"
             )));
         }
+        spent();
         db.prepare(
             "INSERT OR REPLACE INTO server_config (key, value, created_at) VALUES (?, ?, ?)",
         )
@@ -376,6 +413,7 @@ async fn resolve_from_db(
             "self_provision: {db_key} generated value failed validation (generator/validator mismatch?)"
         )));
     }
+    spent();
     db.prepare(
         "INSERT INTO server_config (key, value, created_at) VALUES (?, ?, ?)
          ON CONFLICT(key) DO NOTHING",
@@ -425,6 +463,7 @@ async fn read_config(db: &D1Database, key: &str) -> Result<Option<String>> {
     struct Row {
         value: String,
     }
+    spent();
     let row: Option<Row> = db
         .prepare("SELECT value FROM server_config WHERE key = ? LIMIT 1")
         .bind(&[d1_text(key)])?
@@ -487,6 +526,7 @@ async fn ensure_migrations(env: &Env) {
 async fn run_migrations(db: &D1Database) -> Result<()> {
     // Tracking table — DELIBERATELY named apart from wrangler's `d1_migrations`: wrangler
     // owns its own table and may change its schema, so we stay out of it.
+    spent();
     db.prepare(
         "CREATE TABLE IF NOT EXISTS _sezi_migrations \
          (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)",
@@ -499,6 +539,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
         name: String,
     }
 
+    spent();
     let mut applied: HashSet<String> = db
         .prepare("SELECT name FROM _sezi_migrations")
         .all()
@@ -512,6 +553,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
     // "0001_init.sql". Counting those as applied is what makes the first self-migration on a
     // CLI-migrated DB a no-op. FAIL-OPEN when the table is absent (a fork whose DB never met
     // wrangler). Re-merged on every isolate boot, so a later CLI apply is seen too.
+    spent();
     if let Ok(res) = db.prepare("SELECT name FROM d1_migrations").all().await {
         if let Ok(rows) = res.results::<NameRow>() {
             for r in rows {
@@ -547,6 +589,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
             ),
         }
     }
+    spent();
     match db.batch(stmts).await {
         Ok(_) => {
             console_log!(
@@ -593,6 +636,7 @@ async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
         return record_applied(db, name).await;
     }
     let stmts: Vec<D1PreparedStatement> = statements.iter().map(|s| db.prepare(s)).collect();
+    spent();
     match db.batch(stmts).await {
         Ok(_) => {
             record_applied(db, name).await?;
@@ -623,6 +667,7 @@ async fn apply_one(db: &D1Database, name: &str, sql: &str) -> Result<()> {
 }
 
 async fn record_applied(db: &D1Database, name: &str) -> Result<()> {
+    spent();
     db.prepare("INSERT OR IGNORE INTO _sezi_migrations (name, applied_at) VALUES (?, ?)")
         .bind(&[d1_text(name), d1_int(now_secs() as i64)])?
         .run()

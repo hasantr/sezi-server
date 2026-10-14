@@ -485,7 +485,7 @@ impl UserInbox {
                         // FCM wake.
                         if !live {
                             if let Some(db) = &push_db {
-                                crate::push::fcm::maybe_push_wake(
+                                crate::push::wake::maybe_push_wake(
                                     &self.env, db, recipient_id, dev.as_deref(),
                                 )
                                 .await;

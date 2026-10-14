@@ -31,7 +31,7 @@ use ed25519_dalek::{Verifier, VerifyingKey};
 use serde::Deserialize;
 use worker::*;
 
-const MAX_DEVICES: usize = 5; // 1 primary + ≤4 linked
+pub(crate) const MAX_DEVICES: usize = 5; // 1 primary + ≤4 linked
 const MAX_DOC_BYTES: usize = 16 * 1024; // ceiling on the signed document (DoS guard)
 
 /// device_id derivation — at PARITY with core's `devices::device_id_from_ed25519_b64`:
@@ -471,6 +471,15 @@ pub(crate) async fn validate_and_store_signed_list(
     del_otk_binds.push(d1_text(doc_json));
     stmts.push(db.prepare(&del_otk_sql).bind(&del_otk_binds)?);
 
+    // 4c) A removed device's push token goes with it. It used to stay forever, and a device-blind
+    //     wake woke the revoked phone (the D8 review's F6).
+    let del_push_sql = format!(
+        "DELETE FROM push_tokens
+         WHERE user_id = ? AND device_id NOT IN ({placeholders})
+           AND (SELECT doc_json FROM device_lists WHERE user_id = ?) = ?"
+    );
+    stmts.push(db.prepare(&del_push_sql).bind(&del_binds)?);
+
     // 5) Advance the rev HIGH-WATER mark. MAX keeps it monotonic; it lives on `users` so it
     //    outlives the device_lists row; and the doc_json gate means only the WINNING writer
     //    advances it.
@@ -657,5 +666,17 @@ mod tests {
     #[test]
     fn peer_device_list_reads_still_require_an_active_device() {
         assert!(list_read_requires_active_device("alice", "bob"));
+    }
+
+    /// Revoking a device (omitting it from the published list) must end its push tokens with it,
+    /// in the same batch: a revoked device's token used to stay forever, and a device-blind wake
+    /// woke it (the D8 review's F6).
+    #[test]
+    fn revoking_a_device_deletes_its_push_tokens() {
+        let body = handler_body("put_list");
+        assert!(
+            body.contains(concat!("DELETE FROM ", "push_tokens")),
+            "PUT /devices/list revokes devices but keeps their push tokens"
+        );
     }
 }
