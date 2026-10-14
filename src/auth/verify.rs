@@ -109,7 +109,10 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // applied below once the e-mail names the redemption (`ratelimit`, "The door").
     let limited = crate::utils::var_or(&ctx.env, "ENV", "prod") == "prod";
     if limited {
-        let key = format!("auth:verify:ip:{}", client_ip(&req, &ctx.env));
+        let key = format!(
+            "auth:verify:ip:{}",
+            crate::ratelimit::door_address(&client_ip(&req, &ctx.env))
+        );
         if let Admission::Refused { retry_after_s } =
             admit_env(&ctx.env, &key, DOOR_IP_CEILING, DOOR_WINDOW_SECS).await
         {

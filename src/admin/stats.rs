@@ -289,11 +289,15 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // something they set up: a server with zero FCM keys still reports
         // fcm_configured=true, because the relay default is on.
         "fcm_mode": fcm_mode.as_str(),
-        // K8: Google refused the owner's own Firebase project for these phones
-        // (SENDER_ID_MISMATCH), so the server sends through the shared relay instead
-        // (`fcm_mode` says "relay", or "off" with the relay off). A typed flag, never a
-        // sentence: the app words it. Absent on an older server → false.
+        // K8: Google refused the owner's own Firebase project for every device tried
+        // (SENDER_ID_MISMATCH) and reached none, so the shared relay wakes them (`fcm_mode`
+        // says "relay", or "off" with the relay off). A typed flag, never a sentence: the app
+        // words it. Absent on an older server → false.
         "fcm_own_project_mismatch": push.own_rejected,
+        // K8: how many devices run the published app on an own-project server and are woken
+        // through the shared relay, each token decided on its own (`push/wake.rs`). 0 without
+        // an own project. Absent on an older server → 0.
+        "fcm_relay_routed_devices": push.relay_routed,
         "turn_configured": turn_configured,
         // Shipped under the SAME `version` as the storage badge — a client cannot gate on
         // the version number for it, only on the key's presence. Absent on an older server

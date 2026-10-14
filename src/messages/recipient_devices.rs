@@ -62,7 +62,73 @@ impl RecipientDevices {
     pub(crate) fn from_rows(rows: Vec<(String, bool)>) -> Self {
         Self { rows }
     }
+
+    /// The batch's targets, when EVERY one of them is a revoked device — nothing in it can be
+    /// delivered, and only a fresh device list on the sender's side changes that. `None` when at
+    /// least one target is deliverable (an active device, or a device-blind envelope), or when the
+    /// batch names none. Unknown ids are the caller's to refuse first ([`UNKNOWN_DEVICE_CODE`]).
+    ///
+    /// Until the lab run of 2026-10-14 such a batch fell through the per-device skip with nothing
+    /// acked and was answered `502 do_notify_failed`, which the sender treats as transient: the op
+    /// walked its backoff ladder on the conversation's lane, every retry refused the same way.
+    pub(crate) fn all_revoked<'a>(
+        &self,
+        targets: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> Option<Vec<String>> {
+        let mut stale = Vec::new();
+        for target in targets {
+            let device = target?;
+            if self.verdict(device) != DeviceVerdict::Revoked {
+                return None;
+            }
+            stale.push(device.to_string());
+        }
+        (!stale.is_empty()).then_some(stale)
+    }
+
+    /// The relay's refusal of a batch whose every target is revoked ([`Self::all_revoked`]), or
+    /// `None` when the batch goes ahead. Both transports answer through it, so the exact status,
+    /// body and frame are what the host tests below read.
+    pub(crate) fn stale_refusal<'a>(
+        &self,
+        targets: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> Option<StaleRefusal> {
+        self.all_revoked(targets).map(|stale_devices| StaleRefusal { stale_devices })
+    }
 }
+
+/// What a 1:1 batch naming only revoked devices is answered ([`DEVICES_STALE_CODE`]).
+#[derive(Debug)]
+pub(crate) struct StaleRefusal {
+    stale_devices: Vec<String>,
+}
+
+impl StaleRefusal {
+    /// Not transient (no 5xx): the sender refetches the device list instead of backing off.
+    pub(crate) const HTTP_STATUS: u16 = 409;
+
+    /// `handlers::send`'s body.
+    pub(crate) fn http_body(&self) -> serde_json::Value {
+        serde_json::json!({ "error": DEVICES_STALE_CODE, "stale_devices": self.stale_devices })
+    }
+
+    /// The socket send arm's `send_err` frame for the send `reff`.
+    pub(crate) fn ws_frame(&self, reff: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "send_err",
+            "ref": reff,
+            "code": DEVICES_STALE_CODE,
+            "stale_devices": self.stale_devices,
+        })
+    }
+}
+
+/// The stable wire code both transports answer with when every device a 1:1 batch names was
+/// revoked ([`RecipientDevices::all_revoked`]): HTTP `409 {"error":"devices_stale",
+/// "stale_devices":[…]}`, and the WS send arm a `send_err` frame with `code: "devices_stale"` and
+/// the same `stale_devices`. Non-transient: the sender refetches the recipient's device list and
+/// retries at once. A batch with any deliverable target is unchanged — revoked ones are skipped.
+pub(crate) const DEVICES_STALE_CODE: &str = "devices_stale";
 
 /// Every `devices` row for one account, revoked ones included — the revoked half is exactly what
 /// tells an invented id apart from a stale one.
@@ -138,6 +204,65 @@ mod tests {
     #[test]
     fn a_revoked_device_stays_a_skip_and_does_not_fail_the_request() {
         assert_eq!(fixture().verdict("gone"), DeviceVerdict::Revoked);
+    }
+
+    /// A batch naming only revoked devices is the typed `devices_stale`, listing them; one with
+    /// anything deliverable is not, and neither is an empty or a device-blind one.
+    #[test]
+    fn a_batch_of_revoked_devices_only_is_stale() {
+        let devs = RecipientDevices::from_rows(vec![
+            ("live-1".into(), false),
+            ("gone".into(), true),
+            ("gone-2".into(), true),
+        ]);
+        assert_eq!(
+            devs.all_revoked([Some("gone"), Some("gone-2")]),
+            Some(vec!["gone".to_string(), "gone-2".to_string()])
+        );
+        assert_eq!(devs.all_revoked([Some("gone"), Some("live-1")]), None);
+        assert_eq!(devs.all_revoked([Some("gone"), None]), None);
+        assert_eq!(devs.all_revoked(std::iter::empty()), None);
+    }
+
+    /// What both transports answer a batch of revoked devices, as the client reads it: HTTP 409
+    /// with the code and the devices, and on the socket a `send_err` frame carrying the same.
+    ///
+    /// The handlers themselves cannot run on the host — `handlers::send` takes a `worker::Request`,
+    /// a `RouteContext` and a D1 binding, and `inbox_do/ws.rs` a live `WebSocket`, all of which
+    /// exist only inside the Workers runtime — so the answer is built here, by the one function
+    /// both call, and the source check below pins that they do and build nothing of their own.
+    #[test]
+    fn a_batch_of_revoked_devices_is_answered_409_devices_stale_on_both_transports() {
+        let devs = fixture();
+        let refusal = devs.stale_refusal([Some("gone")]).expect("refused");
+        assert_eq!(StaleRefusal::HTTP_STATUS, 409);
+        assert_eq!(
+            refusal.http_body(),
+            serde_json::json!({ "error": "devices_stale", "stale_devices": ["gone"] })
+        );
+        assert_eq!(
+            refusal.ws_frame("op-1"),
+            serde_json::json!({
+                "type": "send_err",
+                "ref": "op-1",
+                "code": "devices_stale",
+                "stale_devices": ["gone"],
+            })
+        );
+        assert!(devs.stale_refusal([Some("gone"), Some("live-1")]).is_none(), "a mixed batch goes ahead");
+        for (name, src) in [
+            ("messages/handlers.rs", HTTP_SEND_SRC),
+            ("messages/inbox_do/ws.rs", WS_SEND_SRC),
+        ] {
+            assert!(
+                src.contains(concat!("stale_", "refusal(")),
+                "{name} no longer answers a batch of revoked devices through stale_refusal"
+            );
+            assert!(
+                !src.contains(concat!("DEVICES_STALE", "_CODE")),
+                "{name} builds its own devices_stale answer instead of the tested one"
+            );
+        }
     }
 
     #[test]

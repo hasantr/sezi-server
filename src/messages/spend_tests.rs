@@ -475,30 +475,27 @@ fn every_provisioning_d1_call_is_counted() {
 /// which the compile-time check in `budget.rs` holds under half the ceiling.
 #[test]
 fn a_members_wake_with_the_relay_fallback_fits_its_bound() {
-    use crate::push::config::ProjectVerdict;
-    use crate::push::fcm::DirectSend;
-    use crate::push::wake::tests::{mismatch, relay_ok, relay_stale, sent, FakeWake};
+    use crate::push::wake::tests::{first_own_build, mismatch, relay_ok, relay_stale, sent, FakeWake};
     let n = crate::devices::handlers::MAX_DEVICES;
     let bound = budget::MEMBER_WAKE_FIXED + n * budget::MEMBER_WAKE_PER_DEVICE;
-    fn first_ok(token: &str) -> DirectSend {
-        if token == "t0" { DirectSend::Sent } else { DirectSend::SenderMismatch }
-    }
-    let reached = |f: &FakeWake| {
-        f.cfg.borrow_mut().reached = Some(ProjectVerdict { at: 1, project: "owner-proj".into() });
+    let relay_off = |f: FakeWake| {
+        f.cfg.borrow_mut().relay_url = None;
+        f
     };
     let cases: Vec<(&str, FakeWake)> = vec![
         ("every device sent", FakeWake::own(n, sent, relay_ok)),
-        ("refused, then relayed", FakeWake::own(n, mismatch, relay_ok)),
+        ("refused, relayed and marked", FakeWake::own(n, mismatch, relay_ok)),
         ("refused, relay says stale", FakeWake::own(n, mismatch, relay_stale)),
-        ("one reached, the rest refused and stale", FakeWake::own(n, first_ok, relay_stale)),
-        ("a reached project, every device refused and stale", {
-            let f = FakeWake::own(n, mismatch, relay_stale);
-            reached(&f);
-            f
-        }),
+        ("one reached, the rest refused, relayed and marked", FakeWake::own(n, first_own_build, relay_ok)),
+        ("one reached, the rest refused and stale", FakeWake::own(n, first_own_build, relay_stale)),
+        ("one reached, the rest refused, relay off", relay_off(FakeWake::own(n, first_own_build, relay_ok))),
     ];
     for (what, f) in cases {
-        f.wake();
-        assert!(f.spent.get() <= bound, "{what}: spent {} > {bound}", f.spent.get());
+        // The first wake (direct, relay, mark) and the next (straight to the relay).
+        for wake in ["first", "second"] {
+            f.spent.set(0);
+            f.wake();
+            assert!(f.spent.get() <= bound, "{what}, {wake} wake: spent {} > {bound}", f.spent.get());
+        }
     }
 }

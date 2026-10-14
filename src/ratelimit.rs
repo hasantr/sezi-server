@@ -51,11 +51,62 @@ pub(crate) const DOOR_IP_CEILING: usize = 300;
 /// (`auth::invite_code`). Counted in D1, not KV, by `door_bucket` — reserved before the lookup.
 pub(crate) const DOOR_MISS_LIMIT: usize = 30;
 
-/// The miss counter's key for one address. ONE bucket for every door that can tell a live invite
-/// from a dead one — redeem, and the invite page (`invite_page`) — so a second door adds no
-/// guesses: an address gets [`DOOR_MISS_LIMIT`] misses per window across both together.
+/// Refused redeems one IPv6 /48 may collect per window, across all its /64s — see
+/// [`door_miss_buckets`].
+pub(crate) const DOOR_PREFIX_MISS_LIMIT: usize = 4 * DOOR_MISS_LIMIT;
+
+/// The address a door's miss budget belongs to: an IPv4 address as it is, an IPv6 address as its
+/// /64 (adversarial review 2026-10-14, F6). One IPv6 host is handed a whole /64 — SLAAC, privacy
+/// addresses, a VPS's routed prefix — and can send from any of its 2^64 addresses, so a budget per
+/// full IPv6 address was no budget at all. An IPv4-mapped IPv6 address is its IPv4 address.
+/// Anything that is not an address (`"local"`) is kept as it is.
+pub(crate) fn door_address(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Err(_) => ip.to_string(),
+    }
+}
+
+/// The miss counter's key for one address ([`door_address`]). ONE bucket for every door that can
+/// tell a live invite from a dead one — redeem, and the invite page (`invite_page`) — so a second
+/// door adds no guesses: an address gets [`DOOR_MISS_LIMIT`] misses per window across both
+/// together.
 pub(crate) fn door_miss_key(ip: &str) -> String {
-    format!("auth:redeem:miss:{ip}")
+    format!("auth:redeem:miss:{}", door_address(ip))
+}
+
+/// Every miss bucket a request reserves from, with its limit, most specific first: the address's
+/// own ([`door_miss_key`]), and for an IPv6 address also its /48 at [`DOOR_PREFIX_MISS_LIMIT`].
+///
+/// Why the /48 too: a /48 is one site's allocation (a home, a company, a free tunnel-broker
+/// account) and holds 65,536 /64s, so the /64 bucket alone still lets one person holding a /48
+/// guess 65,536 times as fast. The /48 bucket bounds that at four /64s' worth, while one /64 can
+/// still spend only its own 30 of it.
+///
+/// Why no server-wide ceiling: whatever bounds the whole server is a lever that lets one attacker
+/// lock every joiner out for as long as they keep pulling it, and the people a server most needs
+/// to admit — a class at the start of term — are exactly who would be locked out. The bound per
+/// /64 and per /48 makes guessing cost addresses; a code's expiry and the per-invite limits do the
+/// rest. Each guess costs the server one D1 write (template README, "The door").
+pub(crate) fn door_miss_buckets(ip: &str) -> Vec<(String, usize)> {
+    let mut buckets = vec![(door_miss_key(ip), DOOR_MISS_LIMIT)];
+    if let Ok(std::net::IpAddr::V6(v6)) = ip.parse::<std::net::IpAddr>() {
+        if v6.to_ipv4_mapped().is_none() {
+            let s = v6.segments();
+            buckets.push((
+                format!("auth:redeem:miss48:{:x}:{:x}:{:x}::/48", s[0], s[1], s[2]),
+                DOOR_PREFIX_MISS_LIMIT,
+            ));
+        }
+    }
+    buckets
 }
 
 /// Redeems or verifies one invite may see per window: a personal invite is one person (today's
@@ -76,10 +127,14 @@ pub(crate) fn per_invite_limit(seats: i64) -> usize {
 ///   front of us appended; earlier entries are whatever the client sent. A missing or malformed
 ///   value falls into the shared `"local"` bucket rather than to `cf-connecting-ip`, which a client
 ///   can simply send to a relay that is not behind Cloudflare.
-/// - `none`: no header can be trusted — a relay clients reach DIRECTLY, with no proxy in front (the
-///   app's "this network" install). `wrangler dev` fills `cf-connecting-ip` from the socket only
-///   when the client sent none and passes a client's own value through (measured 2026-10-14), so
-///   every caller shares `"local"`: one budget for the network, never a fresh one per request.
+/// - `none`: no header can be trusted — a relay clients reach DIRECTLY, with nothing in front.
+///   `wrangler dev` fills `cf-connecting-ip` from the socket only when the client sent none and
+///   passes a client's own value through (measured 2026-10-14), so every caller shares `"local"`:
+///   one budget for the network, never a fresh one per request. Since the review of 2026-10-14
+///   (F7) only a FALLBACK: the app's "this network" install runs behind the LAN front
+///   (`template/deploy/sezi-lan-front.mjs`), which sets `x-real-ip` from the socket, and trusts
+///   that (`SEZI_TRUSTED_PROXY_HEADER=x-real-ip`). `none` is left for a relay whose folder the
+///   front could not be written to, where one shared budget beats a forgeable one.
 /// - Unset: `cf-connecting-ip`, which Cloudflare sets on every request, else `"local"` — today's
 ///   behaviour, and the reason self-hosted installs need the variable.
 pub(crate) fn pick_client_ip(

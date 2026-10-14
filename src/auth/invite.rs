@@ -3,7 +3,7 @@ use crate::auth::invite_attribution::CLAIM_INVITE_SQL;
 use crate::d1util::{d1_int, d1_opt_text, d1_text};
 use crate::email::mailer::send_verification_code;
 use crate::ratelimit::{
-    admit_env, client_ip, door_miss_key, per_invite_limit, Admission, DOOR_IP_CEILING,
+    admit_env, client_ip, door_address, per_invite_limit, Admission, DOOR_IP_CEILING,
     DOOR_WINDOW_SECS,
 };
 use crate::respond::{json_err, rate_limited};
@@ -20,6 +20,11 @@ struct RedeemBody {
 const CODE_TTL_SEC: u64 = 10 * 60;
 
 pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    // A body not declared JSON, or a browser's cross-site request from a page not allowed, is
+    // refused before it costs or looks up anything (`door_cors::post_refusal`).
+    if let Some(refused) = crate::door_cors::refuse_post(&req, &ctx.env)? {
+        return Ok(refused);
+    }
     // Slim template: if the ENV var is missing, assume "prod" (FAIL-SECURE — never
     // fall back to dev behaviour, so the rate limit stays on and dev_code does not
     // leak). Deployments that do set ENV behave bit-identically.
@@ -30,9 +35,8 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // budget needs only D1 and fails closed. Every refusal carries `Retry-After`: the person at the
     // door is told when, not "later".
     let ip = client_ip(&req, &ctx.env);
-    let miss_key = door_miss_key(&ip);
     if limited {
-        let key = format!("auth:redeem:ip:{ip}");
+        let key = format!("auth:redeem:ip:{}", door_address(&ip));
         if let Admission::Refused { retry_after_s } =
             admit_env(&ctx.env, &key, DOOR_IP_CEILING, DOOR_WINDOW_SECS).await
         {
@@ -69,23 +73,19 @@ pub async fn redeem(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // From here on the request is a GUESS until it proves otherwise: one miss is reserved from the
     // address's budget BEFORE anything is looked up (`door_bucket`), so concurrent requests cannot
     // outrun it, and it is given back once the invite turns out to be real.
+    // Every bucket of the address (`ratelimit::door_miss_buckets` — its own, and an IPv6
+    // address's /48), all or nothing.
     let reservation = if limited {
-        match crate::door_bucket::reserve(&db, &miss_key, now as i64).await {
-            crate::door_bucket::Reserved::Taken(r) => Some(r),
-            crate::door_bucket::Reserved::Refused { retry_after_s } => {
-                return rate_limited(retry_after_s)
-            }
+        match crate::door_bucket::reserve_door(&db, &ip, now as i64).await {
+            Ok(taken) => taken,
+            Err(retry_after_s) => return rate_limited(retry_after_s),
         }
     } else {
-        None
+        Vec::new()
     };
     let refund = || {
-        let (db, reservation) = (&db, reservation.as_ref());
-        async move {
-            if let Some(r) = reservation {
-                crate::door_bucket::refund(db, r).await;
-            }
-        }
+        let (db, reservation) = (&db, &reservation);
+        async move { crate::door_bucket::refund_door(db, reservation).await }
     };
     // A typed code (`K7QM-4827`) stands for its invite's token; everything after this line sees
     // only tokens. Tried FIRST, because the grammars cannot overlap: a code is at most 16

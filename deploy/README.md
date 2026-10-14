@@ -134,6 +134,23 @@ sudo ufw enable
 > spoofable). Without it every request falls into one shared "local" bucket and the per-IP limits
 > collapse.
 
+> **A relay only your local network reaches (no tunnel, no caddy).** `wrangler dev --ip 0.0.0.0`
+> must NOT face the network itself: it passes a client's own `cf-connecting-ip`, `x-real-ip` and
+> `x-forwarded-for` through untouched, so any client could name a fresh address on every request.
+> Put [`sezi-lan-front.mjs`](sezi-lan-front.mjs) in front instead — it needs only Node, listens on
+> the LAN port, starts wrangler on loopback behind it and sets `x-real-ip` from the socket:
+>
+> ```bash
+> node deploy/sezi-lan-front.mjs --ip 0.0.0.0 --port 8787 --inner-port 18787 -- \
+>   node node_modules/wrangler/bin/wrangler.js dev --config wrangler.selfhost.toml \
+>   --ip 127.0.0.1 --port 18787 --var SEZI_TRUSTED_PROXY_HEADER:x-real-ip \
+>   --persist-to /var/lib/sezi/state
+> ```
+>
+> The Sezi app's "this network" install writes exactly this into its unit. Without a front, set
+> `SEZI_TRUSTED_PROXY_HEADER=none` instead: then the whole network shares ONE rate-limit budget,
+> and one person's mistyped invite codes lock everyone out of joining for five minutes.
+
 ---
 
 ## 4. Turn the rate limits ON (the self-host profile)

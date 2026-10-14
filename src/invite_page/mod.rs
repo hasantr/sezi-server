@@ -76,9 +76,9 @@ struct LivePort<'a> {
 }
 
 impl DoorPort for LivePort<'_> {
-    async fn reserve_miss(&self, bucket: &str, now: i64) -> Reserved {
+    async fn reserve_miss(&self, bucket: &str, limit: usize, now: i64) -> Reserved {
         match self.env.d1("DB") {
-            Ok(db) => crate::door_bucket::reserve(&db, bucket, now).await,
+            Ok(db) => crate::door_bucket::reserve(&db, bucket, limit, now).await,
             // Fails closed, as the counter does.
             Err(_) => Reserved::Refused { retry_after_s: 60 },
         }
@@ -113,18 +113,19 @@ pub async fn invite_page(req: Request, ctx: RouteContext<()>) -> Result<Response
     let now = now_secs() as i64;
     let answer = answer_with(&LivePort { env: &ctx.env }, &ip, &key, limited, now).await?;
 
+    let status = page_status(&answer);
     let resp = match (answer, json) {
         (Answer::Refused { retry_after_s }, true) => crate::respond::rate_limited(retry_after_s)?,
         (Answer::Refused { retry_after_s }, false) => {
             let mut r = Response::from_html(html::render_rate_limited(lang, retry_after_s))?
-                .with_status(429);
+                .with_status(status);
             r.headers_mut()
                 .set("Retry-After", &retry_after_s.to_string())?;
             r
         }
         (Answer::Unavailable, true) => crate::respond::json_err(404, "invite_unavailable")?,
         (Answer::Unavailable, false) => {
-            Response::from_html(html::render_unavailable(lang))?.with_status(404)
+            Response::from_html(html::render_unavailable(lang))?.with_status(status)
         }
         (Answer::Usable(view), true) => Response::from_json(&view)?,
         (Answer::Usable(view), false) => {
@@ -145,6 +146,19 @@ pub async fn invite_page(req: Request, ctx: RouteContext<()>) -> Result<Response
     private(resp, json)
 }
 
+/// The HTML page's status. A usable invite and an unusable one are BOTH 200 — only the body
+/// differs — because a page any site can embed (`<script src>`, `<object data>`) without reading
+/// it still learns its status from the element's load and error events, and 200 against 404 was
+/// a free oracle for guessing codes through visitors' browsers (adversarial review 2026-10-14,
+/// F5). A refusal stays 429: it says something about the visitor's budget, nothing about the
+/// code. The JSON answer keeps its 404: CORS decides who may read that one.
+pub(crate) fn page_status(answer: &Answer) -> u16 {
+    match answer {
+        Answer::Refused { .. } => 429,
+        Answer::Unavailable | Answer::Usable(_) => 200,
+    }
+}
+
 /// The app's question, `POST /invites/describe` with `{"invite": "<code or token>"}`: the same
 /// gate, lookup and JSON as `GET /<CODE>`, for an invite the app holds as a bearer token (a
 /// personal envelope carries no code), which must not be put in a URL. Text that is neither a
@@ -153,6 +167,11 @@ pub async fn describe_post(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     #[derive(serde::Deserialize)]
     struct Body {
         invite: String,
+    }
+    // As redeem: not JSON, or cross-site from a page not allowed, costs nothing and looks nothing
+    // up (`door_cors::post_refusal`).
+    if let Some(refused) = crate::door_cors::refuse_post(&req, &ctx.env)? {
+        return private(refused, true);
     }
     let key = match req.json::<Body>().await {
         Ok(b) if b.invite.len() <= 128 => LookupKey::parse(b.invite.trim(), true),

@@ -216,6 +216,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0046_push_tokens_of_revoked_devices.sql"),
     ),
     ("0047_door_misses", include_str!("../migrations/0047_door_misses.sql")),
+    ("0048_push_token_routes", include_str!("../migrations/0048_push_token_routes.sql")),
 ];
 
 thread_local! {

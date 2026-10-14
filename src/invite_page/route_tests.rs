@@ -191,10 +191,10 @@ impl FakePort {
 }
 
 impl DoorPort for FakePort {
-    async fn reserve_miss(&self, bucket: &str, now: i64) -> Reserved {
+    async fn reserve_miss(&self, bucket: &str, limit: usize, now: i64) -> Reserved {
         let mut misses = self.misses.borrow_mut();
         let n = misses.entry(bucket.to_string()).or_default();
-        if *n >= DOOR_MISS_LIMIT {
+        if *n >= limit {
             return Reserved::Refused {
                 retry_after_s: crate::door_bucket::retry_after(NOW, now),
             };
@@ -323,7 +323,9 @@ fn a_relay_that_is_not_prod_runs_unlimited_and_counts_nothing() {
 #[test]
 fn redeem_counts_its_misses_through_the_same_key() {
     let redeem = include_str!("../auth/invite.rs");
-    assert!(redeem.contains(concat!("let miss_key = door_miss", "_key(&ip);")));
+    assert!(redeem.contains(concat!("door_bucket::reserve_door(&db, ", "&ip,")));
+    let bucket = include_str!("../door_bucket.rs");
+    assert!(bucket.contains(concat!("crate::ratelimit::door_miss_", "buckets(ip)")));
 }
 
 /// Redeem reserves its miss before it looks anything up, as the page does — else concurrent
@@ -336,7 +338,7 @@ fn redeem_reserves_its_miss_before_any_lookup() {
             .find(needle)
             .unwrap_or_else(|| panic!("{needle} moved — re-point this guard"))
     };
-    let reserve = at(concat!("crate::door_bucket::", "reserve(&db, &miss_key"));
+    let reserve = at(concat!("crate::door_bucket::", "reserve_door(&db, &ip"));
     assert!(reserve < at(concat!("token_for_", "code(&db, &code)")));
     assert!(reserve < at(concat!("class_invite::kind_", "of(&db, &token)")));
     assert!(
@@ -368,8 +370,8 @@ impl Future for Gate<'_> {
 }
 
 impl DoorPort for SlowPort {
-    async fn reserve_miss(&self, bucket: &str, now: i64) -> Reserved {
-        self.inner.reserve_miss(bucket, now).await
+    async fn reserve_miss(&self, bucket: &str, limit: usize, now: i64) -> Reserved {
+        self.inner.reserve_miss(bucket, limit, now).await
     }
     async fn refund_miss(&self, reservation: &Reservation) {
         self.inner.refund_miss(reservation).await
@@ -429,4 +431,74 @@ fn concurrent_guesses_from_one_address_are_bounded_by_the_miss_limit() {
         port.inner.lookups.get(),
         DOOR_MISS_LIMIT
     );
+}
+
+/// The page answers a usable and an unusable invite with the same status, so an embedding page
+/// learns nothing from load and error events (adversarial review 2026-10-14, F5); a refusal is
+/// still 429.
+#[test]
+fn the_html_page_status_is_the_same_for_a_hit_and_a_miss() {
+    assert_eq!(super::page_status(&Answer::Unavailable), 200);
+    assert_eq!(super::page_status(&Answer::Refused { retry_after_s: 5 }), 429);
+    let src = include_str!("mod.rs");
+    let handler = src.split("pub async fn invite_page").nth(1).unwrap();
+    let handler = handler.split("pub(crate) fn page_status").next().unwrap();
+    assert!(!handler.contains("with_status(404)"), "no HTML answer of a code-shaped path is a 404");
+    assert!(src.contains("Answer::Unavailable | Answer::Usable(_) => 200"));
+}
+
+// ---- IPv6 (adversarial review 2026-10-14, F6) ----
+
+/// One host owns a whole /64: every address in it spends the same budget, so rotating through
+/// them gains nothing.
+#[test]
+fn every_address_of_one_ipv6_64_spends_one_budget() {
+    let port = FakePort::default();
+    let key = LookupKey::Code("K7QM4827".into());
+    for i in 0..DOOR_MISS_LIMIT {
+        let ip = format!("2001:db8:1:2::{:x}", i + 1);
+        assert_eq!(block_on(answer_with(&port, &ip, &key, true, NOW)).unwrap(), Answer::Unavailable);
+    }
+    let fresh = "2001:db8:1:2:dead:beef:0:1";
+    assert!(matches!(
+        block_on(answer_with(&port, fresh, &key, true, NOW)).unwrap(),
+        Answer::Refused { .. }
+    ));
+    assert_eq!(port.lookups.get(), DOOR_MISS_LIMIT);
+}
+
+/// One /48 holds 65,536 /64s: it gets four /64s' worth of misses in all, and a /64 that was
+/// refused for its /48 is given its own miss back.
+#[test]
+fn an_ipv6_48_is_bounded_across_its_64s() {
+    let port = FakePort::default();
+    let key = LookupKey::Code("K7QM4827".into());
+    let mut answered = 0;
+    for net in 0..16u32 {
+        for host in 0..DOOR_MISS_LIMIT {
+            let ip = format!("2001:db8:7:{net:x}::{:x}", host + 1);
+            if block_on(answer_with(&port, &ip, &key, true, NOW)).unwrap() == Answer::Unavailable {
+                answered += 1;
+            }
+        }
+    }
+    assert_eq!(answered, crate::ratelimit::DOOR_PREFIX_MISS_LIMIT);
+    // The fifth /64 was refused by the /48 alone: its own bucket holds nothing.
+    assert_eq!(port.missed(&door_miss_key("2001:db8:7:4::1")), 0);
+    // Another /48 is untouched.
+    assert_eq!(
+        block_on(answer_with(&port, "2001:db8:8::1", &key, true, NOW)).unwrap(),
+        Answer::Unavailable
+    );
+}
+
+#[test]
+fn the_door_address_is_the_64_for_ipv6_and_the_address_for_ipv4() {
+    use crate::ratelimit::door_address;
+    assert_eq!(door_address("203.0.113.7"), "203.0.113.7");
+    assert_eq!(door_address("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::/64");
+    assert_eq!(door_address("2001:DB8:1:2::1"), "2001:db8:1:2::/64");
+    assert_eq!(door_address("::ffff:203.0.113.7"), "203.0.113.7");
+    assert_eq!(door_address("local"), "local");
+    assert_eq!(crate::ratelimit::door_miss_buckets("203.0.113.7").len(), 1, "IPv4: no prefix tier");
 }

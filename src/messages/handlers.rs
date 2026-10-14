@@ -366,6 +366,17 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             crate::messages::recipient_devices::UNKNOWN_DEVICE_CODE,
         );
     }
+    // Every target revoked: nothing here can be delivered until the sender's device list is
+    // fresh, so say that — typed and non-transient — instead of falling through to the
+    // "no device took it" 502 below, which the sender retries on its backoff ladder.
+    if let Some(refusal) =
+        recipient_devices.stale_refusal(body.envelopes.iter().map(|e| e.device_id.as_deref()))
+    {
+        return crate::respond::json_status(
+            crate::messages::recipient_devices::StaleRefusal::HTTP_STATUS,
+            &refusal.http_body(),
+        );
+    }
     // Batched 1:1 fan-out: each EnvItem gets its own /notify(recipient_device). Per-device
     // outcomes are visible to the client — successful devices join `acks`, failed ones drop out.
     let mut acks: Vec<serde_json::Value> = Vec::with_capacity(body.envelopes.len());

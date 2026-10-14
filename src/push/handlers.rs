@@ -5,6 +5,20 @@ use crate::utils::now_secs;
 use serde::Deserialize;
 use worker::*;
 
+/// A device's token, registered or refreshed. A NEW token loses the relay mark of the old one
+/// (K8, `wake.rs`): it may be another app's — the device moved between the published app and an
+/// own build — and the next wake asks Google about it. The same token keeps its mark: Google's
+/// answer about it does not change while the project does not.
+pub(crate) const REGISTER_SQL: &str =
+    "INSERT INTO push_tokens (user_id, device_id, fcm_token, platform, created_at, last_seen_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, device_id) DO UPDATE SET
+        relay_project = CASE WHEN push_tokens.fcm_token = excluded.fcm_token
+                             THEN push_tokens.relay_project ELSE NULL END,
+        fcm_token = excluded.fcm_token,
+        platform = excluded.platform,
+        last_seen_at = excluded.last_seen_at";
+
 #[derive(Deserialize)]
 struct RegisterBody {
     fcm_token: String,
@@ -57,14 +71,7 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     }
     let now = now_secs();
     let db = ctx.env.d1("DB")?;
-    db.prepare(
-        "INSERT INTO push_tokens (user_id, device_id, fcm_token, platform, created_at, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(user_id, device_id) DO UPDATE SET
-            fcm_token = excluded.fcm_token,
-            platform = excluded.platform,
-            last_seen_at = excluded.last_seen_at",
-    )
+    db.prepare(REGISTER_SQL)
     .bind(&[
         d1_text(&user_id),
         d1_text(&body.device_id),

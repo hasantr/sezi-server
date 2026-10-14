@@ -7,7 +7,7 @@
 use serde::Deserialize;
 use worker::*;
 
-use super::config::{self, ProjectVerdict, PushConfig, SendMode, KEY_OWN_REACHED, KEY_OWN_REJECTED};
+use super::config::{self, ProjectVerdict, PushConfig, SendMode, KEY_OWN_REACHED};
 use super::fcm::{send_wake, send_wake_relay, DirectSend};
 use crate::d1util::d1_text;
 use crate::utils::now_secs;
@@ -29,25 +29,35 @@ pub async fn maybe_push_wake(
 }
 
 /// One device's push token.
-const DEVICE_TOKEN_SQL: &str =
-    "SELECT device_id, fcm_token FROM push_tokens WHERE user_id = ? AND device_id = ?";
+const DEVICE_TOKEN_SQL: &str = "SELECT device_id, fcm_token, relay_project FROM push_tokens
+     WHERE user_id = ? AND device_id = ?";
 
 /// The push tokens of a user — what a device-blind wake, and a member with several asleep devices,
 /// read. Never a REVOKED device's (its token used to outlive it: the D8 review's F6), and at most
 /// `MAX_DEVICES`, newest first, so a pile of tokens from before device addressing cannot turn one
 /// wake into a dozen fetches. Rows with no device row at all are such pre-addressing tokens.
-const USER_TOKENS_SQL: &str = "SELECT pt.device_id, pt.fcm_token FROM push_tokens pt
+const USER_TOKENS_SQL: &str = "SELECT pt.device_id, pt.fcm_token, pt.relay_project FROM push_tokens pt
      WHERE pt.user_id = ?
        AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.user_id = pt.user_id
                          AND d.device_id = pt.device_id AND d.revoked_at IS NOT NULL)
      ORDER BY pt.last_seen_at DESC
      LIMIT 5";
 
+/// Mark one token as the published app's: Google refused `?1`, the owner's project, for it, so
+/// its wakes go through the shared relay. Bound to the token itself, so a token the device
+/// re-registered in the meantime is not marked for what was measured about the old one.
+pub(crate) const ROUTE_VIA_RELAY_SQL: &str = "UPDATE push_tokens SET relay_project = ?1
+     WHERE user_id = ?2 AND device_id = ?3 AND fcm_token = ?4";
+
 /// One registered device's token.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct TokenRow {
     pub(crate) device_id: String,
     pub(crate) fcm_token: String,
+    /// The own project Google refused this token for (K8): its wakes go through the shared relay
+    /// while that project is the server's. None = direct.
+    #[serde(default)]
+    pub(crate) relay_project: Option<String>,
 }
 
 /// Every subrequest a wake makes, behind one seam.
@@ -61,8 +71,10 @@ pub(crate) trait WakePort {
     /// A send through the shared relay: Ok(true) sent, Ok(false) stale, Err failed.
     async fn relay(&self, url: &str, token: &str) -> Result<bool>;
     async fn delete_token(&self, device_id: &str);
-    /// Write a verdict about the owner's own project (`config::KEY_OWN_*`).
-    async fn record(&self, key: &'static str, verdict: ProjectVerdict);
+    /// Record that the owner's own project has reached a device (`config::KEY_OWN_REACHED`).
+    async fn record_reached(&self, verdict: ProjectVerdict);
+    /// Mark one token as relayed from now on ([`ROUTE_VIA_RELAY_SQL`]).
+    async fn route_via_relay(&self, row: &TokenRow, project_id: &str);
     fn now(&self) -> i64;
     /// A log line (the console is a JS import, absent from the host tests).
     fn log(&self, line: String);
@@ -75,10 +87,11 @@ pub(crate) struct WakeTally {
     pub(crate) ok: usize,
     pub(crate) stale: usize,
     pub(crate) failed: usize,
-    /// Wakes Google refused for the own project and the relay then carried (or tried to).
+    /// Wakes of an own-project server that went through the shared relay (a token marked
+    /// before, or refused in this wake) — or tried to.
     pub(crate) relayed: usize,
-    /// This wake recorded that Google refuses the own project for these phones.
-    pub(crate) rejected: bool,
+    /// Tokens this wake found refused for the own project and marked for the relay.
+    pub(crate) routed: usize,
 }
 
 /// One member's offline devices → a contentless wake to each. The send mode is resolved ONCE and
@@ -160,12 +173,12 @@ pub(crate) async fn wake_with<P: WakePort>(
                 (project_id, service_account, fallback.as_deref())
             }
         };
-        // Refused earlier in this wake: the rest goes the way the next wake will.
-        if t.rejected {
-            if let Some(url) = fallback {
-                via_relay(p, user, url, row, &mut t).await;
-                continue;
-            }
+        // A token Google refused for THIS project before: the published app's. Straight to the
+        // relay, never direct again until the device registers another token (`handlers.rs`).
+        // Every decision here is about one token: no wake moves any other device's route.
+        if row.relay_project.as_deref() == Some(project_id.as_str()) {
+            relay_refused(p, user, fallback, row, &mut t).await;
+            continue;
         }
         match p.direct(project_id, service_account, &row.fcm_token).await {
             DirectSend::Sent => {
@@ -173,37 +186,23 @@ pub(crate) async fn wake_with<P: WakePort>(
                 if !reached {
                     reached = true;
                     let v = ProjectVerdict { at: p.now(), project: project_id.clone() };
-                    p.record(KEY_OWN_REACHED, v).await;
+                    p.record_reached(v).await;
                 }
             }
             DirectSend::Stale => stale(p, user, row, &mut t).await,
             // K8: this token was minted by another Firebase project — the published app's, which
-            // the shared relay serves. Resend this wake there so it is not lost. A project that
-            // has never reached a device is recorded as refused, and from then on (this wake's
-            // rest included) the server sends through the relay; one that has is the owner's
-            // own build's, and this is a stray published-app phone on it, relayed wake by wake.
+            // the shared relay serves. This wake is resent there so it is not lost, and the token
+            // is marked so the next one goes there first. Marked after the relay's answer: a token
+            // the relay calls stale is deleted, and a mark on it would be a write for nothing.
             DirectSend::SenderMismatch => {
-                if !reached && !t.rejected {
-                    t.rejected = true;
-                    let v = ProjectVerdict { at: p.now(), project: project_id.clone() };
-                    p.record(KEY_OWN_REJECTED, v).await;
-                    p.log(format!(
-                        "[push] user={user} project={project_id} REFUSED by FCM (SENDER_ID_MISMATCH): \
-                         these phones belong to another Firebase project -> the shared relay from now on"
-                    ));
-                }
-                match fallback {
-                    Some(url) => {
-                        t.relayed += 1;
-                        via_relay(p, user, url, row, &mut t).await;
-                    }
-                    None => {
-                        t.failed += 1;
-                        p.log(format!(
-                            "[push] user={user} device={} send FAILED: SENDER_ID_MISMATCH and the relay is off",
-                            row.device_id
-                        ));
-                    }
+                p.log(format!(
+                    "[push] user={user} device={} project={project_id} REFUSED by FCM \
+                     (SENDER_ID_MISMATCH): the published app's token -> the shared relay from now on",
+                    row.device_id
+                ));
+                t.routed += 1;
+                if relay_refused(p, user, fallback, row, &mut t).await {
+                    p.route_via_relay(row, project_id).await;
                 }
             }
             DirectSend::Failed(e) => {
@@ -213,22 +212,47 @@ pub(crate) async fn wake_with<P: WakePort>(
         }
     }
     p.log(format!(
-        "[push] user={user} mode={mode_name} token={} ok={} stale={} failed={} relayed={} rejected={}",
-        t.tokens, t.ok, t.stale, t.failed, t.relayed, t.rejected
+        "[push] user={user} mode={mode_name} token={} ok={} stale={} failed={} relayed={} routed={}",
+        t.tokens, t.ok, t.stale, t.failed, t.relayed, t.routed
     ));
     t
 }
 
-/// One token through the shared relay.
-async fn via_relay<P: WakePort>(p: &P, user: &str, url: &str, row: &TokenRow, t: &mut WakeTally) {
+/// A token the own project cannot reach, through the shared relay — or nowhere with the relay off.
+/// Answers whether the token is still registered (the relay did not call it stale).
+async fn relay_refused<P: WakePort>(
+    p: &P,
+    user: &str,
+    fallback: Option<&str>,
+    row: &TokenRow,
+    t: &mut WakeTally,
+) -> bool {
+    let Some(url) = fallback else {
+        t.failed += 1;
+        p.log(format!(
+            "[push] user={user} device={} send FAILED: the published app's token and the relay is off",
+            row.device_id
+        ));
+        return true;
+    };
+    t.relayed += 1;
+    via_relay(p, user, url, row, t).await
+}
+
+/// One token through the shared relay. Answers whether the token is still registered.
+async fn via_relay<P: WakePort>(p: &P, user: &str, url: &str, row: &TokenRow, t: &mut WakeTally) -> bool {
     match p.relay(url, &row.fcm_token).await {
         Ok(true) => t.ok += 1,
-        Ok(false) => stale(p, user, row, t).await,
+        Ok(false) => {
+            stale(p, user, row, t).await;
+            return false;
+        }
         Err(e) => {
             t.failed += 1;
             p.log(format!("[push] user={user} device={} send FAILED: {e:?}", row.device_id));
         }
     }
+    true
 }
 
 /// Stale token → drop it, so later messages do not retry it for nothing. Logged per device on
@@ -282,8 +306,20 @@ impl WakePort for D1Wake<'_> {
         }
     }
 
-    async fn record(&self, key: &'static str, verdict: ProjectVerdict) {
-        config::record(self.db, key, &verdict).await;
+    async fn record_reached(&self, verdict: ProjectVerdict) {
+        config::record(self.db, KEY_OWN_REACHED, &verdict).await;
+    }
+
+    async fn route_via_relay(&self, row: &TokenRow, project_id: &str) {
+        // Best effort: a lost mark only means the next wake asks Google once more.
+        if let Ok(stmt) = self.db.prepare(ROUTE_VIA_RELAY_SQL).bind(&[
+            d1_text(project_id),
+            d1_text(self.user),
+            d1_text(&row.device_id),
+            d1_text(&row.fcm_token),
+        ]) {
+            let _ = stmt.run().await;
+        }
     }
 
     fn now(&self) -> i64 {
@@ -292,7 +328,7 @@ impl WakePort for D1Wake<'_> {
 
     fn log(&self, line: String) {
         // A refusal or a failure is a warning, everything else a plain line, as before.
-        if line.contains("FAIL") || line.contains("STALE") || line.contains("REFUSED") {
+        if line.contains("FAIL") || line.contains("STALE") {
             console_warn!("{line}");
         } else {
             console_log!("{line}");

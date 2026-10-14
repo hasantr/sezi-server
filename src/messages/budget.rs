@@ -90,9 +90,10 @@ pub(crate) const DRAIN_BATCH_CEILING: usize = 50;
 /// What one member's WAKE can cost inside its own inbox DO, worst case: the push config (1 D1
 /// query, every key at once), the token query (1), the shared OAuth token (KV get), and when it
 /// must be minted Google (1 fetch) and the KV put (the service account comes with the config),
-/// and at most one verdict write about the owner's own project (K8) — then per device a push, its
-/// resend through the shared relay when Google refuses the project for that token (K8), and a
-/// stale-token delete. Run, not just summed: `spend_tests.rs`
+/// and at most one "reached" write about the owner's own project (K8) — then per device a push,
+/// its resend through the shared relay when Google refuses the project for that token (K8), and
+/// EITHER that token's relay mark OR a stale-token delete (a token the relay calls stale is
+/// deleted, never marked). Run, not just summed: `spend_tests.rs`
 /// (`a_members_wake_with_the_relay_fallback_fits_its_bound`).
 pub(crate) const MEMBER_WAKE_FIXED: usize = 6;
 pub(crate) const MEMBER_WAKE_PER_DEVICE: usize = 3;

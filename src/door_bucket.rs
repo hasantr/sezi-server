@@ -3,7 +3,7 @@
 //!
 //! **Reserve before, refund on a hit.** A request that is about to look an invite up first takes a
 //! miss from its address's budget in ONE statement ([`RESERVE_SQL`]): the row is created, reset if
-//! its window has passed, or incremented only while under [`DOOR_MISS_LIMIT`] — and `RETURNING`
+//! its window has passed, or incremented only while under its limit ([`crate::ratelimit::door_miss_buckets`]) — and `RETURNING`
 //! says whether it was. Only then does the lookup run. A lookup that finds a usable invite gives
 //! the miss back ([`REFUND_SQL`]). So however many requests one address has in flight, at most
 //! `DOOR_MISS_LIMIT` of them get past the reservation in a window, and every one that did not find
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use worker::*;
 
 use crate::d1util::{d1_int, d1_text};
-pub(crate) use crate::ratelimit::{DOOR_MISS_LIMIT, DOOR_WINDOW_SECS};
+pub(crate) use crate::ratelimit::DOOR_WINDOW_SECS;
 
 /// Take one miss. Binds: `?1` bucket, `?2` now, `?3` window length, `?4` limit. Returns the row's
 /// `window_start` when the miss was taken, nothing when the budget is spent.
@@ -72,8 +72,32 @@ pub(crate) fn retry_after(window_start: i64, now: i64) -> u64 {
     (window_start + DOOR_WINDOW_SECS as i64 - now).max(1) as u64
 }
 
-/// Take one miss from `bucket`'s budget.
-pub(crate) async fn reserve(db: &D1Database, bucket: &str, now: i64) -> Reserved {
+/// Take one miss from every bucket of `ip` ([`crate::ratelimit::door_miss_buckets`]: the address,
+/// and an IPv6 address's /48 too), most specific first. All or nothing: a bucket that refuses
+/// gives the ones already taken back. `Err` is the refusal's `Retry-After`.
+pub(crate) async fn reserve_door(db: &D1Database, ip: &str, now: i64) -> std::result::Result<Vec<Reservation>, u64> {
+    let mut taken = Vec::new();
+    for (bucket, limit) in crate::ratelimit::door_miss_buckets(ip) {
+        match reserve(db, &bucket, limit, now).await {
+            Reserved::Taken(r) => taken.push(r),
+            Reserved::Refused { retry_after_s } => {
+                refund_door(db, &taken).await;
+                return Err(retry_after_s);
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// Give back what [`reserve_door`] took.
+pub(crate) async fn refund_door(db: &D1Database, taken: &[Reservation]) {
+    for r in taken {
+        refund(db, r).await;
+    }
+}
+
+/// Take one miss from `bucket`'s budget of `limit`.
+pub(crate) async fn reserve(db: &D1Database, bucket: &str, limit: usize, now: i64) -> Reserved {
     #[derive(Deserialize)]
     struct Row {
         window_start: i64,
@@ -85,7 +109,7 @@ pub(crate) async fn reserve(db: &D1Database, bucket: &str, now: i64) -> Reserved
         d1_text(bucket),
         d1_int(now),
         d1_int(DOOR_WINDOW_SECS as i64),
-        d1_int(DOOR_MISS_LIMIT as i64),
+        d1_int(limit as i64),
     ]) {
         Ok(stmt) => match stmt.first(None).await {
             Ok(row) => row,

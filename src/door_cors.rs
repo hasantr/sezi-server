@@ -66,6 +66,76 @@ pub(crate) fn origin_allowed(origin: &str, extra: &str) -> bool {
         .any(|o| !o.is_empty() && o != "*" && o.eq_ignore_ascii_case(origin))
 }
 
+/// Why a door POST (redeem, `POST /invites/describe`) is refused before it costs anything, if it
+/// is (adversarial review 2026-10-14, F5). CORS alone did not hold the door: a page may send a
+/// "simple" cross-origin POST — `Content-Type: text/plain`, no preflight — and both handlers
+/// parsed the body as JSON whatever its type, so any site could spend its visitors' miss budgets
+/// blind and, on a lucky guess, claim an invite's seat. So:
+///
+/// - The body must be declared JSON ([`PostRefusal::NotJson`], 415). A browser cannot send that
+///   cross-origin without a preflight, and the preflight is refused to any origin not allowed.
+/// - A browser that says the request is `cross-site` (`Sec-Fetch-Site`) is refused unless its
+///   origin is allowed ([`PostRefusal::CrossSite`], 403) — the same rule, said by the browser
+///   itself, for a browser that skipped the preflight for any reason.
+///
+/// The native app sends JSON and no `Sec-Fetch-*` header at all. Checked before the miss budget,
+/// so a refused request is charged nothing and looks nothing up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostRefusal {
+    NotJson,
+    CrossSite,
+}
+
+impl PostRefusal {
+    pub(crate) fn status(self) -> u16 {
+        match self {
+            PostRefusal::NotJson => 415,
+            PostRefusal::CrossSite => 403,
+        }
+    }
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            PostRefusal::NotJson => "unsupported_media_type",
+            PostRefusal::CrossSite => "cross_site",
+        }
+    }
+}
+
+/// The check behind [`PostRefusal`]. `extra` is `SEZI_WEB_ORIGINS`.
+pub(crate) fn post_refusal(
+    content_type: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    origin: Option<&str>,
+    extra: &str,
+) -> Option<PostRefusal> {
+    let json = content_type
+        .and_then(|ct| ct.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+    if !json {
+        return Some(PostRefusal::NotJson);
+    }
+    let cross_site = sec_fetch_site.is_some_and(|s| s.trim().eq_ignore_ascii_case("cross-site"));
+    if cross_site && !origin.is_some_and(|o| origin_allowed(o, extra)) {
+        return Some(PostRefusal::CrossSite);
+    }
+    None
+}
+
+/// [`post_refusal`] for a live request: the refusal to send, or None to go on.
+pub(crate) fn refuse_post(req: &worker::Request, env: &worker::Env) -> worker::Result<Option<worker::Response>> {
+    let header = |name: &str| req.headers().get(name).ok().flatten();
+    let extra = crate::utils::var_or(env, "SEZI_WEB_ORIGINS", "");
+    match post_refusal(
+        header("content-type").as_deref(),
+        header("sec-fetch-site").as_deref(),
+        header("origin").as_deref(),
+        &extra,
+    ) {
+        Some(why) => crate::respond::json_err(why.status(), why.code()).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// The door's CORS headers for a request from `origin`: the origin echoed when allowed, nothing
 /// otherwise. `Vary: Origin` either way, so no cache serves one origin's answer to another.
 pub(crate) fn apply(

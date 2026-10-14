@@ -74,6 +74,27 @@ A ready hardening kit (an EXACT wrangler pin, localhost binding, a WS shim, atom
 | Usage report matching the bill | From the app: Server → Usage → CF Analytics → enter a token | The server reports its own counters |
 | Your own address for the Sezi web app | The variable `SEZI_WEB_ORIGINS` = the page's origin, e.g. `https://chat.example.org` (comma-separated for several) | Joining through a browser works from the official web app (`https://sezi-web.pages.dev`) and from a page on the server's own machine only; the invite door answers no other site |
 
+## The door: what guessing an invite code costs
+
+An invite code is short enough to read off a projector (39 bits), so the server bounds guessing
+rather than relying on the code alone. Every request that asks about an invite — joining
+(`POST /auth/redeem`), the invite page (`GET /<CODE>`) and the app's `POST /invites/describe` —
+first takes one "miss" from its sender's budget, and a real invite gives it back:
+
+- **30 misses per 5 minutes per sender**: an IPv4 address, or an IPv6 /64 (one device owns a
+  whole /64, so a budget per IPv6 address would be none at all).
+- **120 misses per 5 minutes per IPv6 /48** on top, across all its /64s.
+- **No server-wide limit**, on purpose: it would let one person lock every joiner out.
+- **Cost:** each guess is **one D1 row write** (the counter), plus one more on a hit. On the
+  Workers free plan's 100,000 writes a day, a determined guesser spends your write budget before
+  they find a code; watch Usage if joining suddenly slows. Finished windows are swept daily.
+- The counter lives in D1 and **fails closed**: if D1 cannot be written, joining pauses for a
+  minute.
+- The door answers browsers only from the web app's origins (`SEZI_WEB_ORIGINS` above): its
+  `POST`s must be sent as JSON (415 otherwise) and a browser's cross-site request from any other
+  page is refused (403). The invite page answers a used or unknown code with the same status
+  (200) as a good one, so another site cannot test codes through its visitors' browsers.
+
 ## Push notifications (Android): what you can and cannot do
 
 A push from your server is only a **doorbell**: a contentless `{"type":"wake"}` that tells a
@@ -104,29 +125,26 @@ nothing else.
   out your own Sezi app, with your project's `google-services.json`, to EVERY member, then set
   your project's id and service-account key on the server (in the app: Server → Settings →
   Notifications, or `FCM_PROJECT_ID` plus the secret `FCM_SERVICE_ACCOUNT`). Your server then
-  talks to Google directly; the shared relay sees only a wake Google refuses for a phone running
-  our app (below).
+  talks to Google directly; the shared relay sees only the tokens of phones running our app
+  (below), never your own build's.
+- **Mix the two.** With your own project set, the server decides PER DEVICE. A device whose token
+  Google refuses for your project (`SENDER_ID_MISMATCH` — it runs our app) gets that wake resent
+  through the shared relay, and from then on all its wakes go there, until the device registers a
+  different token. Every other device keeps going to Google directly through your project, in
+  whatever order the wakes happen. The Notifications settings count the devices the shared relay
+  wakes ("2 devices run the published app…").
 
 **What you cannot do:**
 
-- **Use your own Firebase project with the app from us.** Google refuses every wake to a device
-  whose token belongs to another project (`SENDER_ID_MISMATCH`). If you enter one in the app's
-  Notifications settings while your members use our app, the server notices on the first refused
-  wake: it resends that wake through the shared relay, remembers that your project cannot reach
-  these phones, and from then on sends every wake through the shared relay — your project and key
-  stay stored, unused. The Notifications settings then say "Not usable with the published app"
-  instead of "Set up". Press **Clear** there to remove the values; saving new ones (or clearing)
-  makes the server try your project again on the next wake. If you have also switched the relay
-  `off`, there is nothing to fall back to and sleeping phones are not woken; the settings say so.
-- A project that has woken at least one device is taken to be your own build's, and is never
-  switched away: a member who installed our app instead gets their wakes through the shared relay
-  one at a time, at the cost of one refused attempt to Google per wake.
+- **Use your own Firebase project with the app from us alone.** Google refuses every wake to a
+  device whose token belongs to another project. If you enter one while all your members use our
+  app, every device ends up woken through the shared relay (as above) and your project serves
+  nobody: the Notifications settings then say "Not usable with the published app" instead of "Set
+  up". Press **Clear** there to remove the values. Saving new values (or clearing) makes the server
+  ask Google about every device again on its next wake. If you have also switched the relay `off`,
+  there is nothing to fall back to and our app's phones are not woken while asleep.
 - **Run your own copy of the push relay** for our app: it would need our project's key, which is
   never distributed.
-- **Rely on mixing the two**: a server with your own project sends through it first. A member on
-  our app is still woken (through the shared relay, as above) only once your project has woken one
-  of your own build's devices; before that, the first refused wake switches the whole server to the
-  shared relay, which cannot wake your own build. Saving your project again starts the test over.
 - **iOS:** there is no iOS app yet, so nothing here applies to iPhones.
 
 ## Updating

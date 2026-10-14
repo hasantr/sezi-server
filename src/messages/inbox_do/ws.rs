@@ -421,6 +421,14 @@ impl UserInbox {
                     );
                     return Ok(());
                 }
+                // Every target revoked → the typed `devices_stale`, at parity with
+                // `handlers::send` (not the "no device took it" `do_notify_failed` below).
+                if let Some(refusal) =
+                    recipient_devices.stale_refusal(env_items.iter().map(|(d, _)| d.as_deref()))
+                {
+                    let _ = ws.send_with_str(refusal.ws_frame(&reff).to_string().as_str());
+                    return Ok(());
+                }
                 // Per-device /notify to the recipient's DO (parity with handlers::send).
                 let namespace = self.env.durable_object("USER_INBOX")?;
                 let stub = namespace.id_from_name(recipient_id)?.get_stub()?;

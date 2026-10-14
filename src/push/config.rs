@@ -6,16 +6,21 @@
 //! worker). With the relay `off`, push is a silent no-op: FAIL-OPEN, because FCM is optional and
 //! the worker runs fine without it. See `PushConfig::send_mode`.
 //!
-//! **An own project that cannot reach these phones (K8, 2026-10-14).** The published app's
+//! **An own project that cannot reach some of these phones (K8, 2026-10-14).** The published app's
 //! devices hold tokens minted by OUR Firebase project, so a server owner who enters their own
-//! project in the app's Notifications settings gets a 403 `SENDER_ID_MISMATCH` for every wake,
-//! and every phone on the server stopped waking while the settings read "Set up". The wake now
-//! records that verdict here (`KEY_OWN_REJECTED`, bound to the project it was measured against),
-//! and while it stands the server sends through the shared relay as if no own project were set.
-//! Saving or clearing the credentials deletes it, and the next wake tests the project again. The
-//! owner's credentials are never deleted by the server. A project that has reached a device
-//! (`KEY_OWN_REACHED`) is the owner's own build's: a stray published-app token on such a server
-//! is relayed one wake at a time and never switches the whole server away from its project.
+//! project gets a 403 `SENDER_ID_MISMATCH` for each such token. Until the K8 fix every phone on
+//! the server then stopped waking while the settings read "Set up". The decision is made PER
+//! TOKEN (`wake.rs`): a token Google refused for the owner's project is marked in `push_tokens`
+//! (`relay_project`), resent through the shared relay, and from then on always relayed, until the
+//! device registers a different token. Every other token keeps going direct, so a mixed fleet
+//! (the owner's own build beside the published app) works whatever order its wakes run in, and an
+//! own-build token is never handed to the shared relay. The first answer was a server-wide
+//! verdict; two wakes racing on a fresh server could then switch an own-build server to a relay
+//! that cannot reach it (adversarial review, 2026-10-14). What is left at server level is a
+//! SUMMARY for the owner's settings ([`status`]): how many devices are relayed, and whether the
+//! project has ever reached one (`KEY_OWN_REACHED`). Saving or clearing the credentials resets
+//! both, and the next wake tests each token again. The owner's credentials are never deleted by
+//! the server.
 
 use serde::{Deserialize, Serialize};
 use worker::*;
@@ -36,11 +41,12 @@ use crate::d1util::{d1_int, d1_text};
 // E2E content — push is a contentless wake, so a leaked key forges wakes, it does not open
 // messages. No endpoint returns the value, and an owner can move it to an env secret, which wins.
 
-/// The `server_config` key of "Google refused this project for a device's token"
-/// (`SENDER_ID_MISMATCH`). Its value is a `ProjectVerdict`.
-pub(crate) const KEY_OWN_REJECTED: &str = "push_own_project_mismatch";
+/// The server-wide "Google refused this project" verdict of the first K8 build. It routes
+/// nothing any more; the clear below and migration 0048 delete what a server wrote under it.
+#[cfg(test)]
+pub(crate) const LEGACY_KEY_OWN_REJECTED: &str = "push_own_project_mismatch";
 /// The `server_config` key of "this project has reached a device". Its value is a
-/// `ProjectVerdict`.
+/// `ProjectVerdict`. A summary for the owner's settings; it routes nothing.
 pub(crate) const KEY_OWN_REACHED: &str = "push_own_project_reached";
 
 const KEY_PROJECT_ID: &str = "fcm_project_id";
@@ -48,12 +54,24 @@ const KEY_SERVICE_ACCOUNT: &str = "fcm_service_account";
 const KEY_RELAY_URL: &str = "push_relay_url";
 
 /// Every push key in one query: what a wake and the admin status read.
-const READ_SQL: &str = "SELECT key, value FROM server_config WHERE key IN (?, ?, ?, ?, ?)";
+const READ_SQL: &str = "SELECT key, value FROM server_config WHERE key IN (?, ?, ?, ?)";
 
-/// Both verdicts go when the owner saves or clears the credentials: whatever was measured was
-/// measured against what they just replaced, and the next wake measures again.
+/// What was measured goes when the owner saves or clears the credentials — it was measured against
+/// what they just replaced: the server's "reached" (and the legacy verdict), and every token's
+/// relay mark ([`CLEAR_TOKEN_ROUTES_SQL`]). The next wake tests each token again.
 pub(crate) const CLEAR_VERDICTS_SQL: &str = "DELETE FROM server_config
      WHERE key IN ('push_own_project_mismatch', 'push_own_project_reached')";
+
+/// Every token's relay mark goes with the verdicts.
+pub(crate) const CLEAR_TOKEN_ROUTES_SQL: &str =
+    "UPDATE push_tokens SET relay_project = NULL WHERE relay_project IS NOT NULL";
+
+/// How many live devices' tokens are relayed because Google refused `?1` (the own project) for
+/// them — the owner's summary. A revoked device's row is not counted (the wake skips it too).
+pub(crate) const RELAY_ROUTED_COUNT_SQL: &str = "SELECT COUNT(*) AS n FROM push_tokens pt
+     WHERE pt.relay_project = ?1
+       AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.user_id = pt.user_id
+                         AND d.device_id = pt.device_id AND d.revoked_at IS NOT NULL)";
 
 /// One verdict's write. `created_at` stays the first write's stamp, as everywhere in this table;
 /// the verdict's own time is in its value.
@@ -112,7 +130,6 @@ pub(crate) struct PushConfig {
     pub(crate) service_account: Option<String>,
     /// Already resolved: the default applied, `off` → None.
     pub(crate) relay_url: Option<String>,
-    pub(crate) rejected: Option<ProjectVerdict>,
     pub(crate) reached: Option<ProjectVerdict>,
 }
 
@@ -133,7 +150,6 @@ impl PushConfig {
             project_id: env.project_id.or_else(|| row(KEY_PROJECT_ID)),
             service_account: env.service_account.or_else(|| row(KEY_SERVICE_ACCOUNT)),
             relay_url,
-            rejected: verdict(KEY_OWN_REJECTED),
             reached: verdict(KEY_OWN_REACHED),
         }
     }
@@ -148,34 +164,26 @@ impl PushConfig {
         matches!((self.own(), v), (Some((p, _)), Some(v)) if v.project == p)
     }
 
-    /// Google refused the owner's own project for a device's token, and nothing has been saved
-    /// since. What the owner's Notifications settings are told (`fcm_own_project_mismatch`).
-    pub(crate) fn own_rejected(&self) -> bool {
-        self.about_own(&self.rejected)
-    }
-
     /// The owner's own project has reached a device.
     pub(crate) fn own_reached(&self) -> bool {
         self.about_own(&self.reached)
     }
 
-    /// The way a wake goes: the owner's own project, unless Google has refused it for these
-    /// phones; otherwise the shared relay; with that `off`, nothing.
+    /// The way a wake goes: the owner's own project — each token direct unless it is marked for
+    /// the relay (`wake.rs`) — otherwise the shared relay; with that `off`, nothing.
     pub(crate) fn send_mode(&self) -> Option<SendMode> {
         if let Some((project_id, service_account)) = self.own() {
-            if !self.own_rejected() {
-                return Some(SendMode::Direct {
-                    project_id: project_id.to_string(),
-                    service_account: service_account.to_string(),
-                    fallback: self.relay_url.clone(),
-                    reached: self.own_reached(),
-                });
-            }
+            return Some(SendMode::Direct {
+                project_id: project_id.to_string(),
+                service_account: service_account.to_string(),
+                fallback: self.relay_url.clone(),
+                reached: self.own_reached(),
+            });
         }
         self.relay_url.clone().map(|url| SendMode::Relay { url })
     }
 
-    /// Which of the three ways this server stands on push — what the wake will actually do.
+    /// Which way the server is configured to push.
     pub(crate) fn mode(&self) -> PushMode {
         match self.send_mode() {
             Some(SendMode::Direct { .. }) => PushMode::Own,
@@ -199,7 +207,6 @@ pub(crate) async fn read(env: &Env, db: &D1Database) -> Option<PushConfig> {
             d1_text(KEY_PROJECT_ID),
             d1_text(KEY_SERVICE_ACCOUNT),
             d1_text(KEY_RELAY_URL),
-            d1_text(KEY_OWN_REJECTED),
             d1_text(KEY_OWN_REACHED),
         ])
         .ok()?
@@ -223,14 +230,47 @@ pub(crate) async fn record(db: &D1Database, key: &str, verdict: &ProjectVerdict)
     }
 }
 
-/// Forget both verdicts — the owner saved or cleared the credentials.
+/// Forget what was measured — the owner saved or cleared the credentials: the verdicts and every
+/// token's relay mark, in one batch.
 pub(crate) async fn clear_project_verdicts(db: &D1Database) -> Result<()> {
-    db.prepare(CLEAR_VERDICTS_SQL).run().await?;
+    db.batch(vec![db.prepare(CLEAR_VERDICTS_SQL), db.prepare(CLEAR_TOKEN_ROUTES_SQL)])
+        .await?;
     Ok(())
 }
 
-/// What the owner's screens are told about push: the mode, and whether Google refused their own
-/// project for these phones (in which case the mode is the relay, or off with the relay off).
+/// The owner's summary from the config and the count of relayed devices. Pure, so the wording
+/// rules are tested without D1.
+///
+/// - `relay_routed`: live devices whose token Google refused for the own project (the published
+///   app's), woken through the shared relay.
+/// - `own_rejected`: devices were refused and NONE was ever reached directly — the owner's project
+///   serves nobody here. The mode then reports what the wake does for those devices: the relay,
+///   or nothing with the relay off.
+pub(crate) fn summarize(cfg: &PushConfig, relay_routed: u32) -> PushStatus {
+    let own_rejected = cfg.own().is_some() && relay_routed > 0 && !cfg.own_reached();
+    let mode = match (cfg.mode(), own_rejected) {
+        (PushMode::Own, true) if cfg.relay_url.is_some() => PushMode::Relay,
+        (PushMode::Own, true) => PushMode::Off,
+        (m, _) => m,
+    };
+    PushStatus { mode, own_rejected, relay_routed: if cfg.own().is_some() { relay_routed } else { 0 } }
+}
+
+/// How many live devices are relay-routed under `project` (one D1 query). 0 when unreadable.
+async fn relay_routed(db: &D1Database, project: &str) -> u32 {
+    #[derive(Deserialize)]
+    struct N {
+        n: u32,
+    }
+    let Ok(stmt) = db.prepare(RELAY_ROUTED_COUNT_SQL).bind(&[d1_text(project)]) else {
+        return 0;
+    };
+    stmt.first::<N>(None).await.ok().flatten().map_or(0, |r| r.n)
+}
+
+/// What the owner's screens are told about push ([`summarize`]): the mode, how many devices the
+/// shared relay wakes because Google refused the owner's project for their tokens, and whether
+/// that is every device that was tried.
 ///
 /// `PushMode::can_push()` on top of it answers "will a push go out at all" — the right question
 /// for a health indicator (`fcm_configured` on `/admin/stats` and on the fcm-config response), and
@@ -238,17 +278,18 @@ pub(crate) async fn clear_project_verdicts(db: &D1Database) -> Result<()> {
 /// unless explicitly `off`, so a FRESH server with zero FCM keys reports true, and a bare
 /// "configured ✓" would read as "I set this up". That screen asks for the mode itself.
 ///
-/// The read face of a WRITE-ONLY contract: states, never a value. Cheap by design — one D1 query,
-/// no call to Google or the relay — and it fails safe to `Off`, because stats must NEVER 500.
+/// The read face of a WRITE-ONLY contract: states, never a value. Cheap by design — two D1
+/// queries, no call to Google or the relay — and it fails safe to `Off`, because stats must NEVER
+/// 500.
 pub async fn status(env: &Env) -> PushStatus {
-    let cfg = match env.d1("DB") {
-        Ok(db) => read(env, &db).await,
-        Err(_) => None,
+    let off = PushStatus { mode: PushMode::Off, own_rejected: false, relay_routed: 0 };
+    let Ok(db) = env.d1("DB") else { return off };
+    let Some(cfg) = read(env, &db).await else { return off };
+    let routed = match cfg.own() {
+        Some((project, _)) => relay_routed(&db, project).await,
+        None => 0,
     };
-    match cfg {
-        Some(c) => PushStatus { mode: c.mode(), own_rejected: c.own_rejected() },
-        None => PushStatus { mode: PushMode::Off, own_rejected: false },
-    }
+    summarize(&cfg, routed)
 }
 
 /// See `status`.
@@ -256,12 +297,14 @@ pub async fn status(env: &Env) -> PushStatus {
 pub struct PushStatus {
     pub mode: PushMode,
     pub own_rejected: bool,
+    pub relay_routed: u32,
 }
 
-/// How a server sends push wakes. `Own` = the owner's own FCM project and service account;
-/// `Relay` = the shared push relay (the default, and NOT something the owner configured — or the
-/// owner's project was refused for these phones); `Off` = neither, so an offline recipient gets
-/// no wake at all.
+/// How a server sends push wakes. `Own` = the owner's own FCM project and service account (a
+/// token Google refused for it goes through the relay); `Relay` = the shared push relay (the
+/// default, and NOT something the owner configured — or, in the owner's summary, every device
+/// tried was refused for the owner's project); `Off` = neither, so an offline recipient gets no
+/// wake at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushMode {
     Own,

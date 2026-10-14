@@ -7,10 +7,10 @@
 //!   carries a private key, so only the server's owner may set or change it.
 //! - **WRITE-ONLY**: the values are only ever written here; no endpoint — this
 //!   one included — returns them. The response and `/admin/stats` carry only
-//!   states — `fcm_configured`, `fcm_mode`, `fcm_own_project_mismatch` — so the leak surface
-//!   is zero.
+//!   states — `fcm_configured`, `fcm_mode`, `fcm_own_project_mismatch`,
+//!   `fcm_relay_routed_devices` — so the leak surface is zero.
 //! - A save or a clear forgets what the wake measured about the old project (K8,
-//!   `push/config.rs`): the next wake tests the new one.
+//!   `push/config.rs`), each token's relay mark included: the next wake tests the new one.
 //! - Storage: D1 `server_config` (key-value; encrypted at rest by CF). The worker must read it
 //!   in plaintext to sign the Google OAuth assertion, so it cannot be encrypted with a key we
 //!   do not hold. It is the owner's OWN Firebase project and it is not E2E content — push is a
@@ -92,10 +92,10 @@ pub async fn set_fcm_config(mut req: Request, ctx: RouteContext<()>) -> Result<R
     let db = ctx.env.d1("DB")?;
     apply(&db, "fcm_project_id", body.fcm_project_id).await?;
     apply(&db, "fcm_service_account", body.fcm_service_account).await?;
-    // K8: whatever the wake measured about the old project (Google refused it for these phones,
-    // or it reached one) was measured against what the owner just replaced or removed. Forget it;
-    // the next wake tests the project again. The credentials themselves are only ever changed
-    // here, by the owner.
+    // K8: whatever the wake measured about the old project (the tokens Google refused for it,
+    // whether it reached a device) was measured against what the owner just replaced or removed.
+    // Forget it — every token's relay mark included; the next wake tests each token again. The
+    // credentials themselves are only ever changed here, by the owner.
     crate::push::config::clear_project_verdicts(&db).await?;
 
     // WRITE-ONLY response: the values are NEVER returned, only whether this server can push at
@@ -108,6 +108,7 @@ pub async fn set_fcm_config(mut req: Request, ctx: RouteContext<()>) -> Result<R
         "fcm_configured": push.mode.can_push(),
         "fcm_mode": push.mode.as_str(),
         "fcm_own_project_mismatch": push.own_rejected,
+        "fcm_relay_routed_devices": push.relay_routed,
     }))
 }
 
