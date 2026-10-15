@@ -113,12 +113,9 @@ pub(crate) struct EnvPush {
 impl EnvPush {
     fn read(env: &Env) -> Self {
         Self {
-            project_id: env.var("FCM_PROJECT_ID").ok().and_then(|v| normalize(&v.to_string())),
-            service_account: env
-                .secret("FCM_SERVICE_ACCOUNT")
-                .ok()
-                .and_then(|s| normalize(&s.to_string())),
-            relay_url: env.var("PUSH_RELAY_URL").ok().and_then(|v| normalize(&v.to_string())),
+            project_id: crate::utils::env_text(env, "FCM_PROJECT_ID").and_then(|v| normalize(&v)),
+            service_account: crate::utils::env_text(env, "FCM_SERVICE_ACCOUNT").and_then(|s| normalize(&s)),
+            relay_url: crate::utils::env_text(env, "PUSH_RELAY_URL").and_then(|v| normalize(&v)),
         }
     }
 }

@@ -171,9 +171,48 @@ pub(crate) fn pick_client_ip(
     }
 }
 
+/// The address part of a socket peer as workerd reports it in `request.cf.clientIp`: `ip:port`,
+/// `[v6]:port`, or a bare address. `None` for anything that is not an address.
+pub(crate) fn peer_address_ip(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let ip = if let Some(rest) = raw.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if raw.matches(':').count() == 1 {
+        raw.split(':').next().unwrap_or("")
+    } else {
+        raw
+    };
+    let valid = !ip.is_empty()
+        && ip.len() <= 64
+        && ip.bytes().all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b':');
+    valid.then(|| ip.to_string())
+}
+
+/// The TCP peer workerd hands a worker (`request.cf.clientIp`). Absent on Cloudflare, which has no
+/// such field; there the caller comes from `cf-connecting-ip`.
+fn socket_peer(req: &worker::Request) -> Option<String> {
+    let cf = js_sys::Reflect::get(req.inner(), &wasm_bindgen::JsValue::from_str("cf")).ok()?;
+    if cf.is_null() || cf.is_undefined() {
+        return None;
+    }
+    js_sys::Reflect::get(&cf, &wasm_bindgen::JsValue::from_str("clientIp"))
+        .ok()?
+        .as_string()
+}
+
 /// [pick_client_ip] for a live request.
+///
+/// `socket` (a relay on bare workerd that clients reach directly, the app's "this network"
+/// install since 2026-10-15): the TCP peer itself, so no header is trusted at all and no LAN front
+/// is needed — the front existed because `wrangler dev` gave the worker no peer address. A peer
+/// that cannot be read shares the `"local"` bucket, the same fail-closed answer as a bad header.
 pub(crate) fn client_ip(req: &worker::Request, env: &Env) -> String {
     let configured = crate::utils::var_or(env, "SEZI_TRUSTED_PROXY_HEADER", "");
+    if configured.trim().eq_ignore_ascii_case("socket") {
+        return socket_peer(req)
+            .and_then(|raw| peer_address_ip(&raw))
+            .unwrap_or_else(|| "local".into());
+    }
     pick_client_ip(Some(configured.as_str()), |name| {
         req.headers().get(name).ok().flatten()
     })

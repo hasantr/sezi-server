@@ -15,7 +15,7 @@ use super::UserInbox;
 
 impl UserInbox {
     pub(crate) async fn bench_member_fault(&self, recipient_id: &str) -> bool {
-        let Some(spec) = self.env.var("BENCH_FAIL_MEMBERS").ok().map(|v| v.to_string()) else {
+        let Some(spec) = crate::utils::env_text(&self.env, "BENCH_FAIL_MEMBERS") else {
             return false;
         };
         let Some((prefix, n)) = spec.split_once(':') else { return false };
@@ -24,7 +24,7 @@ impl UserInbox {
     }
 
     pub(crate) async fn bench_hop_fault(&self) -> bool {
-        let Some(n) = self.env.var("BENCH_FAIL_HOPS").ok().and_then(|v| v.to_string().parse::<u32>().ok())
+        let Some(n) = crate::utils::env_text(&self.env, "BENCH_FAIL_HOPS").and_then(|v| v.parse::<u32>().ok())
         else {
             return false;
         };

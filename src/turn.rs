@@ -98,7 +98,7 @@ async fn read_db_config(db: &D1Database, key: &str) -> Option<String> {
 /// The CF TURN key id: env secret FIRST (the existing production path), then the D1 row the owner
 /// entered from the app.
 async fn resolve_key_id(env: &Env, db: &D1Database) -> Option<String> {
-    if let Some(v) = env.secret("TURN_KEY_ID").ok().and_then(|v| normalize(v.to_string())) {
+    if let Some(v) = crate::utils::env_text(env, "TURN_KEY_ID").and_then(normalize) {
         return Some(v);
     }
     read_db_config(db, "turn_key_id").await
@@ -107,11 +107,7 @@ async fn resolve_key_id(env: &Env, db: &D1Database) -> Option<String> {
 /// The CF TURN API token: env secret FIRST, then D1. This is the strong half of the pair — it can
 /// mint credentials — which is why writing it is owner-only and no endpoint ever returns it.
 async fn resolve_api_token(env: &Env, db: &D1Database) -> Option<String> {
-    if let Some(v) = env
-        .secret("TURN_API_TOKEN")
-        .ok()
-        .and_then(|v| normalize(v.to_string()))
-    {
+    if let Some(v) = crate::utils::env_text(env, "TURN_API_TOKEN").and_then(normalize) {
         return Some(v);
     }
     read_db_config(db, "turn_api_token").await
@@ -266,9 +262,8 @@ pub async fn credentials(req: Request, ctx: RouteContext<()>) -> Result<Response
 /// (`credentials` above) and the /admin/stats report read the SAME ceiling — what is
 /// advertised matches what is enforced, as with retention.
 pub(crate) fn monthly_cap(env: &Env) -> i64 {
-    env.var("TURN_MONTHLY_CAP")
-        .ok()
-        .and_then(|v| v.to_string().parse::<i64>().ok())
+    crate::utils::env_text(env, "TURN_MONTHLY_CAP")
+        .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(DEFAULT_MONTHLY_CAP)
 }
 
@@ -278,10 +273,8 @@ pub(crate) fn monthly_cap(env: &Env) -> i64 {
 /// not have to remember to lower this one too. `0` (or a negative value) disables the per-user
 /// guard, which is the escape hatch for an operator who wants only the server-wide bound.
 fn user_monthly_cap(env: &Env) -> i64 {
-    let configured = env
-        .var("TURN_USER_MONTHLY_CAP")
-        .ok()
-        .and_then(|v| v.to_string().parse::<i64>().ok())
+    let configured = crate::utils::env_text(env, "TURN_USER_MONTHLY_CAP")
+        .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(DEFAULT_USER_MONTHLY_CAP);
     if configured <= 0 {
         return 0;

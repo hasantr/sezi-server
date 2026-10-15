@@ -13,68 +13,79 @@ operating system you run yourself.
 Network layout (both paths keep the relay on localhost):
 
 ```
-  [Phone]──TLS──►  cloudflared edge  ──tunnel──►  nginx :8787 ──► wrangler 127.0.0.1:8788
+  [Phone]──TLS──►  cloudflared edge  ──tunnel──►  nginx :8787 ──► workerd 127.0.0.1:8788
         (A) the Cloudflare path                    (WS shim)         (sezi-relay)
 
-  [Phone]──TLS──►  caddy :443 (Let's Encrypt) ───────────────────► wrangler 127.0.0.1:8788
+  [Phone]──TLS──►  caddy :443 (Let's Encrypt) ───────────────────► workerd 127.0.0.1:8788
         (B) the fully independent path, no CF                      (sezi-relay)
 ```
+
+The relay runs on **bare workerd** — the same runtime Cloudflare runs it on, as one process. No
+Node, no wrangler, no npm at run time: the repository carries the prebuilt WASM and the workerd
+config generated from it (`workerd/config.capnp`), and `workerd/WORKERD.lock` names the exact
+workerd build that config was tested with, with its sha512 for each architecture.
 
 ---
 
 ## 0. Prerequisites
 
-- Debian 12/13 or Ubuntu 22.04+ (x86_64 or ARM64). **glibc ≥ 2.35** is required (workerd's
-  floor), so Ubuntu 20.04 / RHEL 9 / Alpine (musl) are **NOT SUPPORTED**.
-- Node.js 20+ (`node -v`).
-- ~2 GB RAM recommended (Node + workerd take ~200–400 MB; 1 GB is tight).
+- 64-bit Linux (x86_64 or ARM64) with **glibc ≥ 2.35** (workerd's floor): Debian 12/13, Ubuntu
+  22.04+, Raspberry Pi OS 64-bit (bookworm). Ubuntu 20.04, RHEL 9, Alpine (musl) and 32-bit Pi
+  OS are **NOT SUPPORTED** — workerd is not built for them.
+- `git`, `curl`, `tar`, `sha512sum`. **No Node.js.**
+- ~35 MB to download once; the relay takes ~110–150 MB of memory, so 1 GB of RAM is plenty.
 
 ---
 
-## 1. Install wrangler at a PINNED version (no version drift)
-
-`npx wrangler@4` fetches "the latest 4.x" every time, so miniflare's state format and workerd's
-behaviour can change without notice. Instead, `package.json` pins an **exact version** and
-`npm ci` installs **bit-identically from the lockfile**.
+## 1. Fetch workerd at the PINNED version (no version drift)
 
 ```bash
-cd /opt/sezi-server
-npm ci --omit=dev          # a reproducible install from package-lock.json
+sudo useradd --system --home /var/lib/sezi --shell /usr/sbin/nologin sezi || true
+sudo mkdir -p /var/lib/sezi/state /var/lib/sezi/backups
+sudo git clone https://github.com/hasantr/sezi-server /opt/sezi-server   # or your fork
+sudo chown -R sezi:sezi /opt/sezi-server /var/lib/sezi
+sudo -u sezi -H sh /opt/sezi-server/deploy/fetch-workerd.sh
 ```
 
-> **package-lock.json MUST be committed.** If the repository has none, run `npm install` once and
-> commit `package.json` and `package-lock.json` together. `npm ci` refuses to run WITHOUT a
-> lockfile (deliberately — that is the reproducibility guarantee).
->
-> **An update is a deliberate commit:** raise the `wrangler` version in `package.json` by hand →
-> `npm install` (refreshes the lockfile) → smoke-test with the prebuilt WASM → commit. Nothing
-> drifts on its own.
+`fetch-workerd.sh` downloads the workerd build `workerd/WORKERD.lock` names from the npm registry,
+checks the tarball's sha512 against the lock **before** unpacking it, and installs it into
+`/var/lib/sezi/.local/sezi-workerd/<version>/`, with `current` pointing at it. A download that
+does not match is not installed. Nothing system-wide is touched.
+
+> **An update is a `git pull`.** When the pull changes `workerd/WORKERD.lock`, run
+> `fetch-workerd.sh` again and restart the relay; the old version stays beside the new one, so
+> going back is moving `current`.
 
 ---
 
 ## 2. Install the relay service (systemd, localhost only)
 
 ```bash
-sudo useradd --system --home /var/lib/sezi --shell /usr/sbin/nologin sezi || true
-sudo mkdir -p /var/lib/sezi/state /var/lib/sezi/backups
-sudo chown -R sezi:sezi /opt/sezi-server /var/lib/sezi
-sudo chmod +x /opt/sezi-server/deploy/*.sh    # a clone made on Windows does not carry the exec bit
-
-sudo cp deploy/sezi-relay.service /etc/systemd/system/
+sudo cp /opt/sezi-server/deploy/sezi-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sezi-relay
 curl -s http://127.0.0.1:8788/healthz    # {"ok":true}
 ```
 
-`sezi-relay.service` runs with `--ip 127.0.0.1 --port 8788 --persist-to /var/lib/sezi/state` (see
-the comments in the file). `Restart=always`.
+`sezi-relay.service` runs `workerd serve` on `workerd/config.capnp`, listening on
+`127.0.0.1:8788`, with its stores in `/var/lib/sezi/state/v3/` (see the comments in the file).
+`Restart=always`.
+
+**Settings** (all optional) go in `/opt/sezi-server/.dev.vars` as `KEY=value` lines, owned by
+`sezi` and `chmod 600`; the unit reads them as its environment. The names the relay accepts:
+`SEZI_CLAIM_SECRET`, `SEZI_TRUSTED_PROXY_HEADER`, `SEZI_WEB_ORIGINS`, `TURN_KEY_ID`,
+`TURN_API_TOKEN`, `TURN_MONTHLY_CAP`, `TURN_USER_MONTHLY_CAP`, `FCM_PROJECT_ID`,
+`FCM_SERVICE_ACCOUNT`, `PUSH_RELAY_URL`, `RESET_PASSWORD`. Nothing else is read from the
+environment — the signing key is generated on first start and kept in the database.
 
 ---
 
 ## 3. Outside access — PATH A: a cloudflared tunnel (tied to CF)
 
-For the WebSocket (live /sync) the **nginx WS shim is REQUIRED**: in the chain cloudflared →
-wrangler dev's Node proxy the 101 upgrade stalls (see the comment inside `sezi-ws-shim.conf`).
+The **nginx WS shim** sits between cloudflared and the relay. It was made REQUIRED by the older
+wrangler-based install, whose Node proxy stalled the WebSocket's 101 upgrade (see the comment
+inside `sezi-ws-shim.conf`); bare workerd has no Node proxy, but the tunnel path has not been
+measured without the shim yet, so keep it.
 
 ```bash
 sudo apt install -y nginx
@@ -134,40 +145,34 @@ sudo ufw enable
 > spoofable). Without it every request falls into one shared "local" bucket and the per-IP limits
 > collapse.
 
-> **A relay only your local network reaches (no tunnel, no caddy).** `wrangler dev --ip 0.0.0.0`
-> must NOT face the network itself: it passes a client's own `cf-connecting-ip`, `x-real-ip` and
-> `x-forwarded-for` through untouched, so any client could name a fresh address on every request.
-> Put [`sezi-lan-front.mjs`](sezi-lan-front.mjs) in front instead — it needs only Node, listens on
-> the LAN port, starts wrangler on loopback behind it and sets `x-real-ip` from the socket:
+> **A relay only your local network reaches (no tunnel, no caddy).** Here the relay faces the
+> network itself, so it must not believe any header a client sends about its own address. Set
+> `SEZI_TRUSTED_PROXY_HEADER=socket` in `.dev.vars` and change the unit's
+> `--socket-addr=http=127.0.0.1:8788` to `--socket-addr=http=0.0.0.0:8787`: workerd hands the
+> relay the TCP peer, and the rate limits are keyed on that alone. No front process is needed.
+> The Sezi app's "This network" install writes exactly this into its unit. Plain HTTP on a
+> network you trust only — sign-ins cross it in the clear.
 >
-> ```bash
-> node deploy/sezi-lan-front.mjs --ip 0.0.0.0 --port 8787 --inner-port 18787 -- \
->   node node_modules/wrangler/bin/wrangler.js dev --config wrangler.selfhost.toml \
->   --ip 127.0.0.1 --port 18787 --var SEZI_TRUSTED_PROXY_HEADER:x-real-ip \
->   --persist-to /var/lib/sezi/state
-> ```
->
-> The Sezi app's "this network" install writes exactly this into its unit. Without a front, set
-> `SEZI_TRUSTED_PROXY_HEADER=none` instead: then the whole network shares ONE rate-limit budget,
-> and one person's mistyped invite codes lock everyone out of joining for five minutes.
+> (`sezi-lan-front.mjs` is the older wrangler-based install's answer to the same problem, kept
+> for relays still running that way.)
 
 ---
 
 ## 4. Turn the rate limits ON (the self-host profile)
 
-`sezi-relay.service` already runs with `--config wrangler.selfhost.toml`. That profile is
-**separate** from the root `wrangler.toml` (the button deploy) and declares
-`[[kv_namespaces]] RATE_LIMIT`, so the local miniflare KV is **free**, has no CF daily limit, and
-the rate limits (bootstrap enumeration slow-down, auth/verify, per-user message and media
-ceilings) **really work**. No extra step: just run with the self-host config.
+`workerd/config.capnp` is generated from `wrangler.selfhost.toml`, the self-host profile —
+**separate** from the root `wrangler.toml` (the button deploy). It declares
+`[[kv_namespaces]] RATE_LIMIT`, so the local KV is **free**, has no CF daily limit, and the rate
+limits (bootstrap enumeration slow-down, auth/verify, per-user message and media ceilings)
+**really work**. No extra step.
 
 ---
 
 ## 5. Atomic backup + nightly restart (timer)
 
-A live `cp .wrangler/state` risks a torn WAL (D1, DO and R2 are three separate SQLite files).
+A live copy of `/var/lib/sezi/state` risks a torn WAL (D1, DO and R2 are three separate SQLite files).
 `backup.sh` stops the relay → rsyncs → starts it again (a consistent snapshot) and prunes old
-backups. The nightly window also refreshes wrangler dev (insurance for a long-lived process).
+backups.
 
 ```bash
 sudo cp deploy/sezi-backup.{service,timer} /etc/systemd/system/
@@ -196,7 +201,8 @@ sudo systemctl enable --now sezi-healthz.timer
 
 ## Known limit (an honest note)
 
-This kit takes an install from "family pilot" to "small production". wrangler dev is a
-development server; the lasting answer is a native relay (D1 → SQLite, R2 → files/S3, DO → actors,
-KV → memory, cron → an interval). When that arrives, the WS shim and the nightly-restart insurance
-are no longer needed.
+The relay runs on the runtime Cloudflare itself uses, with its development services (the
+binding proxy, the storage browser) removed from the generated config. Its stores are workerd's
+local SQLite files, one machine's worth: there is no replication, so the nightly backup above is
+the whole of your disaster recovery. A native relay (D1 → SQLite, R2 → files/S3, DO → actors) is
+planned; it changes nothing the app sees.

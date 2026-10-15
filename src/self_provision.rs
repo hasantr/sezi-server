@@ -307,8 +307,8 @@ pub fn cached_jwt_pem() -> Option<String> {
 /// deletes an owner row and reopens genesis. Generated on a fresh fork, so an installation that
 /// never set the secret still has one. `None` means neither source had a key: fail CLOSED.
 pub fn resolve_admin_invite_key(env: &Env) -> Option<String> {
-    if let Ok(s) = env.secret("ADMIN_INVITE_KEY") {
-        return Some(s.to_string());
+    if let Some(s) = crate::utils::env_text(env, "ADMIN_INVITE_KEY") {
+        return Some(s);
     }
     ADMIN_INVITE.with(|c| c.borrow().clone())
 }
@@ -326,8 +326,7 @@ async fn ensure_one_key(
     // An env secret counts ONLY if non-empty AND it validates — `is_ok()` alone is not enough:
     // on the button-deploy runtime an UNSET secret comes back as `Ok("")`, which would take the
     // env-first branch, bypass self-heal, and 500 every jwks/verify with "PEM type label invalid".
-    if let Ok(s) = env.secret(env_name) {
-        let v = s.to_string();
+    if let Some(v) = crate::utils::env_text(env, env_name) {
         if !v.trim().is_empty() && validate(&v) {
             return;
         }

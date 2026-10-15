@@ -39,8 +39,7 @@ fn load_signing_key(env: &Env) -> Result<SigningKey> {
     // string and 500'd with "PEM label invalid" without ever reaching
     // self-provision. Now an empty or unparseable env secret is ignored and the valid
     // self-provisioned key is used.
-    if let Ok(s) = env.secret("JWT_SIGNING_KEY") {
-        let raw = s.to_string();
+    if let Some(raw) = crate::utils::env_text(env, "JWT_SIGNING_KEY") {
         if !raw.trim().is_empty() {
             if let Ok(k) = parse_signing_pem(&raw) {
                 return Ok(k);

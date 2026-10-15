@@ -99,12 +99,7 @@ query SezgiR2($accountTag: string, $todayStart: string) {
 /// configured. This is the ENV layer only — the D1 fallback lives in `resolve_cfg`,
 /// where env wins.
 fn read_cfg(env: &Env, key: &str) -> Option<String> {
-    let raw = env
-        .secret(key)
-        .map(|s| s.to_string())
-        .or_else(|_| env.var(key).map(|v| v.to_string()))
-        .ok()?;
-    normalize(raw)
+    normalize(crate::utils::env_text(env, key)?)
 }
 
 /// Trim, and map empty to None — env and D1 values are normalized with the SAME rule.

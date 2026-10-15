@@ -1,0 +1,7 @@
+# The workerd this config was generated and smoke-tested with (worker-rs/scripts/workerd-config.sh).
+# An install downloads https://registry.npmjs.org/@cloudflare/workerd-<arch>/-/workerd-<arch>-<version>.tgz
+# and runs package/bin/workerd only when the tarball's sha512 matches the line for its arch.
+# Each line: <arch> <npm integrity> <the same sha512 in hex, for sha512sum>.
+version 1.20260426.1
+linux-64 sha512-C8LlC8uSYzg49y51n++75esxZmMp+Uz1OKHHA/4lkv6rjOTbcHQJuEwSLppjybVIXpv7A8MBhbu9iyCTvyv1mw== 0bc2e50bcb92633838f72e759fefbbe5eb31666329f94cf538a1c703fe2592feab8ce4db707409b84c122e9a63c9b5485e9bfb03c30185bbbd8b2093bf2bf59b
+linux-arm64 sha512-ESVp/OIFMAqjQsa8BOP2BQQz5Vpfv6ncN6lNnIuNeOgsISQBdYk+LA60bwQHMud9tvmnSYtONp1zkZ8OQz+x6w== 112569fce205300aa342c6bc04e3f6050433e55a5fbfa9dc37a94d9c8b8d78e82c21240175893e2c0eb46f040732e77db6f9a7498b4e369d73919f0e433fb1eb

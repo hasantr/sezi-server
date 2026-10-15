@@ -1,27 +1,32 @@
 # /etc/systemd/system/sezi-relay.service
 #
-# Sezi self-host relay (wrangler dev / lokal-workerd). 7/24 kalıcı servis.
+# The Sezi relay on bare workerd — Cloudflare's own runtime, one process, no Node, no wrangler.
+# The hand-installed kit's unit (deploy/README.md); the app's "On my own computer" install writes
+# its own unit of the same shape into the user's home instead.
 #
-# YERLEŞİM VARSAYIMI (kendi yoluna göre uyarla):
-#   Kod       : /opt/sezi-server        (fork'un klonu; `git pull` ile güncellenir)
-#   Kalıcı veri: /var/lib/sezi/state     (D1/DO/KV/R2 lokal SQLite — YEDEKLENECEK yer)
-#   Kullanıcı : sezi (sistem kullanıcısı; `useradd --system --home /var/lib/sezi sezi`)
+# LAYOUT (adapt the paths to yours):
+#   Code         : /opt/sezi-server          (a clone of this repository; updated with `git pull`)
+#   Data         : /var/lib/sezi/state       (D1 / Durable Objects / KV / R2 as local SQLite — BACK THIS UP)
+#   User         : sezi                      (a system user, home /var/lib/sezi)
+#   workerd      : /var/lib/sezi/.local/sezi-workerd/current/workerd   (deploy/fetch-workerd.sh)
+#   Settings     : /opt/sezi-server/.dev.vars  (KEY=value lines; optional — see deploy/README.md)
 #
-# KURULUM (bir kez):
+# INSTALL (once):
 #   sudo useradd --system --home /var/lib/sezi --shell /usr/sbin/nologin sezi || true
-#   sudo mkdir -p /opt/sezi-server /var/lib/sezi/state /var/lib/sezi/backups
-#   sudo git clone https://github.com/hasantr/sezi-server /opt/sezi-server   # veya kendi fork'un
-#   cd /opt/sezi-server && sudo -u sezi npm ci --omit=dev     # wrangler'ı LOCKFILE'dan bit-aynı kur
+#   sudo mkdir -p /var/lib/sezi/state /var/lib/sezi/backups
+#   sudo git clone https://github.com/hasantr/sezi-server /opt/sezi-server   # or your fork
 #   sudo chown -R sezi:sezi /opt/sezi-server /var/lib/sezi
-#   sudo cp deploy/sezi-relay.service /etc/systemd/system/
+#   sudo -u sezi -H sh /opt/sezi-server/deploy/fetch-workerd.sh   # checked against workerd/WORKERD.lock
+#   sudo cp /opt/sezi-server/deploy/sezi-relay.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now sezi-relay
 #
-# NOT: `npm ci` KURULUM adımıdır, ExecStart'ta DEĞİL — restart'lar (watchdog dahil)
-# npm-registry erişimine BAĞLI olmamalı (offline-restart güvenli). Sürüm yükseltmek =
-# bilinçli: `git pull` sonrası tekrar `npm ci` çalıştır.
+# Fetching workerd is an INSTALL step, never part of ExecStart: a restart (the watchdog's
+# included) must not depend on reaching the npm registry. After a `git pull` that changes
+# workerd/WORKERD.lock, run fetch-workerd.sh again — the new version goes beside the old one and
+# `current` moves to it.
 
 [Unit]
-Description=Sezi self-host relay (wrangler dev / workerd)
+Description=Sezi self-host relay (workerd)
 After=network-online.target
 Wants=network-online.target
 
@@ -30,30 +35,37 @@ Type=simple
 User=sezi
 Group=sezi
 WorkingDirectory=/opt/sezi-server
-# HOME yazılabilir olmalı (wrangler cache/config buraya yazar).
-Environment=HOME=/var/lib/sezi
-Environment=WRANGLER_SEND_METRICS=false
-Environment=NODE_ENV=production
+# The relay's settings (FCM, TURN, SEZI_WEB_ORIGINS, the claim secret …). The leading `-` makes a
+# missing file no error.
+EnvironmentFile=-/opt/sezi-server/.dev.vars
 
-# ── GÜVENLİK-KRİTİK: BIND SADECE 127.0.0.1 ──────────────────────────────────
-# --ip 127.0.0.1 = relay yalnız localhost dinler. Dış dünya SADECE cloudflared
-# tüneli VEYA caddy/nginx TLS-reverse-proxy ÖNÜNDEN erişir. ASLA `--ip 0.0.0.0`:
-# o, düz-HTTP + JWT'yi (self-provision imza anahtarı) doğrudan internete açar =
-# GERÇEK AÇIK. Port 8788 = iç port (WS-shim/caddy buraya proxy'ler).
-ExecStart=/opt/sezi-server/node_modules/.bin/wrangler dev \
-  --config wrangler.selfhost.toml \
-  --ip 127.0.0.1 --port 8788 \
-  --persist-to /var/lib/sezi/state
+# workerd will not start when a store folder is missing; this makes them on every start, so a
+# cleared state directory comes back empty instead of keeping the relay down.
+ExecStartPre=/bin/mkdir -p /var/lib/sezi/state/v3/cache /var/lib/sezi/state/v3/d1 /var/lib/sezi/state/v3/do /var/lib/sezi/state/v3/kv /var/lib/sezi/state/v3/r2
+
+# ── SECURITY-CRITICAL: BIND TO 127.0.0.1 ONLY ───────────────────────────────────────────────
+# The relay listens on localhost only. The outside reaches it ONLY through a cloudflared tunnel
+# or a caddy/nginx TLS reverse proxy in front of it, which sets `cf-connecting-ip` (the header the
+# rate limits read by default). Never `0.0.0.0` here: that is plain HTTP — sign-ins included — on
+# the internet. Port 8788 is the inner port the shim or caddy proxies to.
+ExecStart=/var/lib/sezi/.local/sezi-workerd/current/workerd serve --experimental \
+  /opt/sezi-server/workerd/config.capnp \
+  --socket-addr=http=127.0.0.1:8788 \
+  -dcache:storage=/var/lib/sezi/state/v3/cache \
+  -dd1:storage=/var/lib/sezi/state/v3/d1 \
+  -ddo:storage=/var/lib/sezi/state/v3/do \
+  -dkv:storage=/var/lib/sezi/state/v3/kv \
+  -dr2:storage=/var/lib/sezi/state/v3/r2
 
 Restart=always
 RestartSec=5
 
-# ── systemd sertleştirme ─────────────────────────────────────────────────────
+# ── systemd hardening ───────────────────────────────────────────────────────────────────────
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/opt/sezi-server /var/lib/sezi
+ReadWritePaths=/var/lib/sezi
 
 [Install]
 WantedBy=multi-user.target

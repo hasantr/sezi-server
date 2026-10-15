@@ -59,9 +59,8 @@ struct ValueRow {
 /// checklist can say "you cannot reset this server yet" instead of the owner finding out at the
 /// moment they try. Presence only — the value is never returned anywhere.
 pub async fn reset_key_configured(env: &Env) -> bool {
-    if env
-        .secret("RESET_PASSWORD")
-        .map(|s| !s.to_string().is_empty())
+    if crate::utils::env_text(env, "RESET_PASSWORD")
+        .map(|s| !s.is_empty())
         .unwrap_or(false)
     {
         return true;
@@ -220,11 +219,7 @@ pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
     //
     // FAIL-CLOSED with NEITHER: a server holding no destruction kit cannot be wiped over the
     // network at all. An owner-token compromise alone must never be enough to erase a server.
-    let env_secret = ctx
-        .env
-        .secret("RESET_PASSWORD")
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    let env_secret = crate::utils::env_text(&ctx.env, "RESET_PASSWORD").unwrap_or_default();
     let authorized = if !env_secret.is_empty() {
         secret_eq(&body.password, &env_secret)
     } else {

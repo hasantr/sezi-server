@@ -42,9 +42,8 @@ pub(crate) const CLAIM_HEADER: &str = "x-sezi-claim";
 /// secret that was never set (see `self_provision::ensure_one_key`), and an empty secret must not
 /// become a gate that an empty header opens.
 pub(crate) fn configured_secret(env: &Env) -> Option<String> {
-    env.secret(CLAIM_SECRET_BINDING)
-        .ok()
-        .map(|s| s.to_string().trim().to_string())
+    crate::utils::env_text(env, CLAIM_SECRET_BINDING)
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 

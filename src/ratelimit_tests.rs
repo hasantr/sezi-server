@@ -2,7 +2,7 @@
 //! namespace; the arithmetic that decides the header does not, and it is the half a client counts
 //! down from.
 
-use super::{per_invite_limit, pick_client_ip, retry_after_s, DOOR_IP_CEILING};
+use super::{peer_address_ip, per_invite_limit, pick_client_ip, retry_after_s, DOOR_IP_CEILING};
 
 /// Five hits in a five-minute window — a personal invite's redeem and verify limit.
 const MAX: usize = 5;
@@ -117,4 +117,19 @@ fn a_relay_told_to_trust_no_header_keys_every_caller_alike() {
             "{spelling:?}"
         );
     }
+}
+
+/// `SEZI_TRUSTED_PROXY_HEADER=socket` (bare workerd, 2026-10-15): the caller is the TCP peer, which
+/// workerd hands the worker as `request.cf.clientIp` ("ip:port"; measured "192.168.1.21:39902"),
+/// so no header — forged or not — decides the bucket and no LAN front is needed. The address is
+/// taken without its port; anything that is not an address is no address.
+#[test]
+fn the_socket_peer_is_read_without_its_port() {
+    assert_eq!(peer_address_ip("192.168.1.21:39902").as_deref(), Some("192.168.1.21"));
+    assert_eq!(peer_address_ip("[2001:db8::1]:443").as_deref(), Some("2001:db8::1"));
+    assert_eq!(peer_address_ip("2001:db8::1").as_deref(), Some("2001:db8::1"));
+    assert_eq!(peer_address_ip("10.0.0.5").as_deref(), Some("10.0.0.5"));
+    assert_eq!(peer_address_ip(""), None);
+    assert_eq!(peer_address_ip("evil\nheader:1"), None);
+    assert_eq!(peer_address_ip("[::1]"), Some("::1".to_string()));
 }
