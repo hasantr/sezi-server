@@ -6,6 +6,12 @@
 //! (base64/ed25519/hmac/sha2) come from the parent through `use super::*`.
 use super::*;
 
+/// How far apart two clocks may be and still agree on an offer. An offer and a claim are stamped
+/// by PHONES and judged here by the relay's clock (and the claim against the offer, by two phones'
+/// clocks): a phone one second ahead of the relay made every fresh offer "not yet valid" — found
+/// 2026-10-22 on a Pi relay with NTP on both sides. The offer's own short lifetime still bounds it.
+pub(super) const CLOCK_SKEW_MS: i64 = 120_000;
+
 pub(super) fn verify_offer_json(
     offer_json: &str,
     expected_server: &str,
@@ -22,7 +28,7 @@ pub(super) fn verify_offer_json(
     if offer.server_instance != expected_server {
         return failure(VerifyErrorKind::WrongServer, "wrong server");
     }
-    if now_ms_value < offer.issued_at_ms {
+    if now_ms_value < offer.issued_at_ms - CLOCK_SKEW_MS {
         return failure(VerifyErrorKind::NotYetValid, "offer not yet valid");
     }
     if now_ms_value >= offer.expires_at_ms {
@@ -54,12 +60,12 @@ pub(super) fn verify_claim_json(
     {
         return failure(VerifyErrorKind::OfferMismatch, "offer binding mismatch");
     }
-    if claim.claimed_at_ms < verified_offer.offer.issued_at_ms
-        || claim.claimed_at_ms >= verified_offer.offer.expires_at_ms
+    if claim.claimed_at_ms < verified_offer.offer.issued_at_ms - CLOCK_SKEW_MS
+        || claim.claimed_at_ms >= verified_offer.offer.expires_at_ms + CLOCK_SKEW_MS
     {
         return failure(VerifyErrorKind::Expired, "claim outside offer window");
     }
-    if claim.claimed_at_ms > now_ms_value {
+    if claim.claimed_at_ms > now_ms_value + CLOCK_SKEW_MS {
         return failure(VerifyErrorKind::NotYetValid, "claim from future");
     }
     if claim.claimant.user_id == verified_offer.offer.issuer.user_id

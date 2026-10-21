@@ -85,6 +85,21 @@ fn signed_offer_and_claim_verify_end_to_end() {
     assert_eq!(verified.claim_id_hex.len(), HASH_BYTES * 2);
 }
 
+/// The relay's clock and a phone's are never the same: an offer stamped a moment "ahead" of the
+/// relay is fresh, not refused (found 2026-10-22 with a phone one second ahead of a Pi relay).
+#[test]
+fn a_phone_slightly_ahead_of_the_relay_is_not_from_the_future() {
+    let (offer, claim) = signed_fixture();
+    assert!(verify_offer_json(&offer, SERVER, ISSUED - 1_500).is_ok());
+    assert_eq!(
+        verify_offer_json(&offer, SERVER, ISSUED - CLOCK_SKEW_MS - 1)
+            .unwrap_err()
+            .kind,
+        VerifyErrorKind::NotYetValid
+    );
+    assert!(verify_claim_json(&offer, &claim, SERVER, ISSUED - 1_000).is_ok());
+}
+
 #[test]
 fn server_expiry_and_grant_escalation_fail_closed() {
     let (offer, claim) = signed_fixture();
