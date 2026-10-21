@@ -32,6 +32,7 @@ mod realtime;
 mod respond;
 mod room_library;
 mod self_provision;
+mod sfu;
 mod server;
 mod sigv4;
 mod storage;
@@ -181,6 +182,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // FCM push config — owner ONLY and WRITE-ONLY, same contract as cf-config.
         .patch_async("/admin/fcm-config", admin::fcm_config::set_fcm_config)
         .patch_async("/admin/turn-config", admin::turn_config::set_turn_config)
+        // Group calls through CF Realtime SFU — owner ONLY, the token write-only (sfu_config.rs).
+        .patch_async("/admin/sfu-config", admin::sfu_config::set_sfu_config)
         // Self-reported usage statistics, admin/owner-gated. SHADOW MODE: reporting only, no
         // limit is enforced.
         .get_async("/admin/stats", admin::stats::stats)
@@ -309,6 +312,15 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/push/unregister", push::handlers::unregister)
         // TURN credentials for calls — relaying over the internet, budget-gated.
         .post_async("/turn/credentials", turn::credentials)
+        // Group calls through CF Realtime SFU (sfu/mod.rs): members only, their own sessions,
+        // pulls within the same call, usage counted toward the owner's cap.
+        .get_async("/calls/sfu/status", sfu::status)
+        .post_async("/calls/sfu/sessions", sfu::new_session)
+        .post_async("/calls/sfu/sessions/:sid/tracks", sfu::tracks)
+        .put_async("/calls/sfu/sessions/:sid/renegotiate", sfu::renegotiate)
+        .put_async("/calls/sfu/sessions/:sid/tracks/close", sfu::close_tracks)
+        .put_async("/calls/sfu/sessions/:sid/tracks/update", sfu::update_tracks)
+        .post_async("/calls/sfu/usage", sfu::usage)
         .run(req, env)
         .await?;
     match &door {

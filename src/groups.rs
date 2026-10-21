@@ -80,7 +80,7 @@ const MAX_SETTINGS_JSON_BYTES: usize = 2048;
 /// Revocation needs no such row-existence rule — removing a device SETS `revoked_at` rather than
 /// deleting the row — so this closes the hole without a bootstrap deadlock. Same pairing as
 /// `plugin_blob::gate`.
-async fn require_live_device_auth(
+pub(crate) async fn require_live_device_auth(
     req: &Request,
     env: &Env,
 ) -> std::result::Result<String, Response> {

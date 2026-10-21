@@ -140,6 +140,9 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // Whether a TURN credential can be issued at all — the owner screen needs it to say
     // whether calls between DIFFERENT networks will connect. Write-only: the bool only.
     let turn_configured = crate::turn::is_configured(&ctx.env).await;
+    // Group calls through the SFU: set or not (never the values), route, cap, the month's
+    // reported egress and warnings, the top groups (sfu/mod.rs). Absent on an older server.
+    let sfu = crate::sfu::stats_block(&ctx.env, &db).await;
     let fcm_configured = fcm_mode.can_push();
     // Does the server carry the means to wipe itself? The owner checklist needs this:
     // without a reset key the one irreversible action an owner may legitimately want is
@@ -299,6 +302,7 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         // an own project. Absent on an older server → 0.
         "fcm_relay_routed_devices": push.relay_routed,
         "turn_configured": turn_configured,
+        "sfu": sfu,
         // Shipped under the SAME `version` as the storage badge — a client cannot gate on
         // the version number for it, only on the key's presence. Absent on an older server
         // → the client reads it as false and shows the gap, which is the safe direction:
