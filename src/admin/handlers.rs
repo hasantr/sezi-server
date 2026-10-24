@@ -281,11 +281,13 @@ struct UserRow {
     last_seen_at: Option<i64>,
 }
 
-/// One page of members, oldest first, ties by id. Binds: `?1` cursor created_at (NULL on the first
+/// One page of members, oldest first, ties by id. Humans only: the owner sees bots under
+/// `/admin/bots` (docs/BOTS_BUILD.md §2.2). Binds: `?1` cursor created_at (NULL on the first
 /// page), `?2` cursor id, `?3` limit.
 pub(crate) const USERS_PAGE_SQL: &str = "SELECT id, email, display_name, role, created_at, last_seen_at
        FROM users
-      WHERE ?1 IS NULL OR created_at > ?1 OR (created_at = ?1 AND id > ?2)
+      WHERE kind = 'human'
+        AND (?1 IS NULL OR created_at > ?1 OR (created_at = ?1 AND id > ?2))
       ORDER BY created_at ASC, id ASC
       LIMIT ?3";
 
@@ -345,7 +347,7 @@ pub async fn list_users(req: Request, ctx: RouteContext<()>) -> Result<Response>
         n: i64,
     }
     let total = db
-        .prepare("SELECT COUNT(*) AS n FROM users")
+        .prepare("SELECT COUNT(*) AS n FROM users WHERE kind = 'human'")
         .first::<CountRow>(None)
         .await?
         .map(|r| r.n)
@@ -468,6 +470,10 @@ pub async fn remove_member(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     }
 
     let db = ctx.env.d1("DB")?;
+    // A bot is deleted as a bot (`DELETE /admin/bots/:id`), never removed as a member.
+    if crate::bots::any_bot(&db, std::slice::from_ref(&body.user_id)).await? {
+        return json_err(400, crate::bots::BOT_NOT_MEMBER);
+    }
     let target: Option<RoleOnly> = db
         .prepare("SELECT role FROM users WHERE id = ? LIMIT 1")
         .bind(&[d1_text(&body.user_id)])?

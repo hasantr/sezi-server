@@ -1,0 +1,26 @@
+# What two Sezi DEVICES agree on: the encrypted envelope and `inner`, the payload format inside it.
+# `inner` could only arrive once `FileManifest` stopped crossing the bridge (D5.4) — a single
+# bridge-visible type had pinned the whole wire format to the root crate.
+#
+# Deliberately NOT the home of `client/api`'s DTOs: those are what one device and its own
+# server agree on, which is a different contract with a different lifetime. Fifteen of them are
+# bridge-pinned anyway.
+[package]
+name = "sezi-protocol"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "The Sezi wire format."
+
+[lints]
+workspace = true
+
+[dependencies]
+sezi-error = { path = "../sezi-error" }
+serde = { workspace = true }
+vodozemac = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rand = { workspace = true }

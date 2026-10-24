@@ -130,6 +130,36 @@ fn the_invite_route_shadows_no_other_route() {
     assert!(router.at("/K7QM-4827/extra").is_err(), "one segment only");
 }
 
+/// The POST table, read the same way. The bot program's route is two segments under a static
+/// `/bot/v1` (docs/BOTS_BUILD.md §2.5): it must take every method name and shadow nothing.
+#[test]
+fn the_bot_route_takes_every_method_and_shadows_no_other_post() {
+    let src = include_str!("../lib.rs");
+    let needle = concat!(".post", "_async(\"");
+    let mut routes = Vec::new();
+    let mut rest = src;
+    while let Some(at) = rest.find(needle) {
+        rest = &rest[at + needle.len()..];
+        routes.push(rest[..rest.find('"').unwrap()].to_string());
+    }
+    assert!(routes.iter().any(|r| r == "/bot/v1/:method"), "the route is registered");
+    let mut router = matchit::Router::new();
+    for r in &routes {
+        router
+            .insert(r.as_str(), r.clone())
+            .unwrap_or_else(|e| panic!("{r} conflicts: {e}"));
+    }
+    for r in routes.iter().filter(|r| !r.contains(':')) {
+        assert_eq!(router.at(r).unwrap().value, r, "{r} is shadowed");
+    }
+    for m in ["getMe", "getUpdates", "sendMessage"] {
+        let path = format!("/bot/v1/{m}");
+        let hit = router.at(&path).unwrap();
+        assert_eq!((hit.value.as_str(), hit.params.get("method")), ("/bot/v1/:method", Some(m)));
+    }
+    assert_eq!(router.at("/admin/bots/x/token").unwrap().value, "/admin/bots/:id/token");
+}
+
 /// The other half: no static one-segment route could ever be read as a code, so a code the
 /// generator mints can never be unreachable behind a route.
 #[test]

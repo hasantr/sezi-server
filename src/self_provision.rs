@@ -218,6 +218,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0047_door_misses", include_str!("../migrations/0047_door_misses.sql")),
     ("0048_push_token_routes", include_str!("../migrations/0048_push_token_routes.sql")),
     ("0049_sfu", include_str!("../migrations/0049_sfu.sql")),
+    ("0050_bots", include_str!("../migrations/0050_bots.sql")),
+    ("0051_push_wake_style", include_str!("../migrations/0051_push_wake_style.sql")),
 ];
 
 thread_local! {

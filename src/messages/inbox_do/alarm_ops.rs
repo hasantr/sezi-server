@@ -1,11 +1,13 @@
 //! Everything the periodic alarm does, lifted out of `mod.rs` under the file-size ceiling.
 //!
-//! A pure move: arming, measuring what is still outstanding, and the W1 stuck-pending FCM
-//! backstop. The DECISION of whether to arm at all is `alarm_policy`; this is the I/O half.
+//! A pure move: the alarm body itself (`run_alarm`), arming, measuring what is still
+//! outstanding, and the W1 stuck-pending FCM backstop. The DECISION of whether to arm at all is
+//! `alarm_policy`; this is the I/O half.
 
 use super::{
-    alarm_policy::{alarm_needs_arming, AlarmWork},
-    sql_no_args, UserInbox, FLUSH_INTERVAL_MS, PUSH_BACKSTOP_GRACE_SECS, RECIPIENT_UID_KEY,
+    alarm_policy::{alarm_needs_arming, next_alarm_delay_ms, AlarmWork},
+    sql_no_args, UserInbox, CLEANUP_INTERVAL_MS, FLUSH_INTERVAL_MS, IDLE_INTERVAL_MS,
+    LAST_CLEANUP_KEY, PUSH_BACKSTOP_GRACE_SECS, RECIPIENT_UID_KEY, REMOVED_ACCOUNT_KEY,
 };
 use crate::utils::now_secs;
 use serde::Deserialize;
@@ -154,4 +156,94 @@ impl UserInbox {
         );
     }
 
+    /// The whole periodic alarm: flush, forwards, the FCM backstop, the daily retention cleanup
+    /// and the conditional re-arm. `DurableObject::alarm` in `mod.rs` is this one call.
+    pub(super) async fn run_alarm(&self) -> Result<Response> {
+        // Read BEFORE `ensure_init`, which re-creates the tables and re-arms the alarm. A purged
+        // inbox must leave here without arming anything; running init first is exactly how one
+        // kept its 90s heartbeat alive.
+        let account_removed = self
+            .state
+            .storage()
+            .get::<bool>(REMOVED_ACCOUNT_KEY)
+            .await?
+            .unwrap_or(false);
+        if account_removed {
+            return Response::empty();
+        }
+        self.ensure_init().await?;
+        if self.is_bot().await {
+            self.bot_tick().await; // opens what members sent, before anything below reads `pending`
+        }
+        self.flush_pending_to_all();
+        // If the sender misses the reconnect, the periodic alarm pushes anyway (idempotent: a
+        // repeat is removed by the client's `forward_ack` and the sender side dedups it).
+        self.flush_forwards_to_all();
+        // Ground truth for delivery: the liveness test narrows the delivered_live false-positive
+        // window but cannot close it (a socket that dies right after a ping). Still sitting in
+        // pending means unacked means undelivered → wake once the grace period is over.
+        self.backstop_push_stale_pending().await;
+        let now_ms_val = (now_secs() * 1000) as i64;
+        let last: Option<i64> = self
+            .state
+            .storage()
+            .get::<i64>(LAST_CLEANUP_KEY)
+            .await
+            .ok()
+            .flatten();
+        let last_val = last.unwrap_or(0);
+        if now_ms_val - last_val >= CLEANUP_INTERVAL_MS {
+            // Admin-configurable (D1 server_settings), one SELECT per cleanup and therefore at
+            // most once per 24h; the helper falls back to 30 days on an error or a missing row.
+            let days = crate::server::handlers::fetch_message_retention_days(&self.env).await;
+            let cutoff = (now_secs() as i64) - days * 24 * 3600;
+            let storage = self.state.storage();
+            // BEST-EFFORT, like its siblings: a bare `?` here would abort the handler and skip
+            // the `ensure_alarm` re-arm below, killing the alarm chain. The watermark advances
+            // ONLY on success, so a transient error is retried on the next alarm rather than
+            // skipping retention for 24h.
+            let purge_ok = storage
+                .sql()
+                .exec_raw(
+                    "DELETE FROM pending WHERE created_at < ?",
+                    Some(vec![JsValue::from_f64(cutoff as f64)]),
+                )
+                .is_ok();
+            // `updated_at` is in ms, hence cutoff*1000. The high-water mark (`receipt_meta`) is
+            // never purged → seq stays monotonic and cursors stay consistent.
+            let _ = storage.sql().exec_raw(
+                "DELETE FROM receipt_state WHERE updated_at < ?",
+                Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
+            );
+            // self_read_state is purged at retention parity, not exempt: it is the live
+            // incremental convergence cursor, and a row beyond retention is dead metadata. A new
+            // device gets old messages via M4 sibling sync, whose package carries `viewed_at`
+            // alongside the message, so read state flows independently of this table. As with
+            // receipt_state, the high-water mark (self_read_meta) is never purged. updated_at is ms.
+            let _ = storage.sql().exec_raw(
+                "DELETE FROM self_read_state WHERE updated_at < ?",
+                Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
+            );
+            // Orphan receipt rows — especially delivery_failed ones the client never
+            // forward_acked — otherwise accumulate forever and are replayed unconditionally on a
+            // fresh reconnect, re-triggering `delete_all_olm_blobs` on the receiver. `created_at`
+            // is in MS here, unlike pending's seconds-based cutoff.
+            let _ = storage.sql().exec_raw(
+                "DELETE FROM forward_queue WHERE created_at < ?",
+                Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
+            );
+            if purge_ok {
+                let _ = storage.put(LAST_CLEANUP_KEY, now_ms_val).await;
+            }
+        }
+        // Re-arm robustly (a blind `let _ = set_alarm` lets one transient error break the chain
+        // for the life of this DO instance), and CONDITIONALLY: an inbox with nothing queued and
+        // nobody connected stops rather than waking ~960 times a day (see `alarm_policy`). Both
+        // events that create work — `/notify` and `ws_upgrade` — call `ensure_alarm`.
+        let work = self.measure_alarm_work(account_removed);
+        if let Some(delay) = next_alarm_delay_ms(work, FLUSH_INTERVAL_MS, IDLE_INTERVAL_MS) {
+            self.arm_alarm_within(delay).await;
+        }
+        Response::empty()
+    }
 }

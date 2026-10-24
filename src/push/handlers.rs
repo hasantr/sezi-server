@@ -3,27 +3,43 @@ use crate::d1util::{d1_int, d1_text};
 use crate::respond::{json_err, no_content};
 use crate::utils::now_secs;
 use serde::Deserialize;
+use wasm_bindgen::JsValue;
 use worker::*;
+
+use super::style::WakeStyle;
 
 /// A device's token, registered or refreshed. A NEW token loses the relay mark of the old one
 /// (K8, `wake.rs`): it may be another app's — the device moved between the published app and an
 /// own build — and the next wake asks Google about it. The same token keeps its mark: Google's
 /// answer about it does not change while the project does not.
+///
+/// Every register states how the device is woken (`style.rs`), so a device whose Autostart was
+/// turned on goes back to `data` at its next register; a client that sends no `wake` registers
+/// `data`, which is what every token was before.
 pub(crate) const REGISTER_SQL: &str =
-    "INSERT INTO push_tokens (user_id, device_id, fcm_token, platform, created_at, last_seen_at)
-     VALUES (?, ?, ?, ?, ?, ?)
+    "INSERT INTO push_tokens
+        (user_id, device_id, fcm_token, platform, created_at, last_seen_at, wake, wake_lang)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id, device_id) DO UPDATE SET
         relay_project = CASE WHEN push_tokens.fcm_token = excluded.fcm_token
                              THEN push_tokens.relay_project ELSE NULL END,
         fcm_token = excluded.fcm_token,
         platform = excluded.platform,
-        last_seen_at = excluded.last_seen_at";
+        last_seen_at = excluded.last_seen_at,
+        wake = excluded.wake,
+        wake_lang = excluded.wake_lang";
 
 #[derive(Deserialize)]
 struct RegisterBody {
     fcm_token: String,
     device_id: String,
     platform: String, // "android" | "ios"
+    /// "data" (absent = data) | "visible": the device cannot be woken by a data push.
+    #[serde(default)]
+    wake: Option<String>,
+    /// The visible notification's language, "tr" | "en".
+    #[serde(default)]
+    lang: Option<String>,
 }
 
 pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -70,6 +86,7 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         Err(_) => return json_err(503, "revoke_check_unavailable"),
     }
     let now = now_secs();
+    let style = WakeStyle::parse(body.wake.as_deref(), body.lang.as_deref());
     let db = ctx.env.d1("DB")?;
     db.prepare(REGISTER_SQL)
     .bind(&[
@@ -79,6 +96,8 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         d1_text(&body.platform),
         d1_int(now as i64),
         d1_int(now as i64),
+        d1_text(style.column()),
+        style.lang_column().map(d1_text).unwrap_or(JsValue::NULL),
     ])?
     .run()
     .await?;

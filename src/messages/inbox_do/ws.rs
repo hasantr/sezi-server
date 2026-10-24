@@ -50,12 +50,6 @@ impl UserInbox {
                             .collect()
                     })
                     .unwrap_or_default();
-                let id_to_uid: std::collections::HashMap<i64, String> = ids
-                    .iter()
-                    .copied()
-                    .zip(ack_uids.iter().cloned())
-                    .filter(|(_, u)| !u.is_empty())
-                    .collect();
                 // `success` is optional, defaulting to true. False still drains the queue but
                 // sends `delivery_failed` instead of `delivered`: the client uses it to clear the
                 // queue after a decrypt failure, which is exactly when a second tick would lie.
@@ -63,61 +57,13 @@ impl UserInbox {
                     .get("success")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                // Ack isolation: SELECT+DELETE only rows belonging to THIS device, plus NULL ones
-                // — `AND (device_id = ? OR device_id IS NULL)`. A NULL pending row is legitimate:
-                // it belongs to a member who never published a device list (the group fallback's
-                // LEFT JOIN), who is therefore a SINGLE logical device that must be able to ack
-                // its own rows, or the message is never removed and redelivers forever. Safe only
-                // because the 1:1 path REQUIRES a device_id, so NULL never means ambiguity.
-                // Revisit if a multi-device user can ever own a NULL row.
+                // The socket's own device scopes the delete (ack isolation, see `ack.rs`).
                 let ack_device: Option<String> = ws
                     .deserialize_attachment::<Attachment>()
                     .ok()
                     .flatten()
                     .map(|a| a.device_id);
-                let placeholders: String =
-                    (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-                // `ack_device` is an Option only because the attachment may be missing on a socket
-                // that was never attached — not because a token can lack a device claim. The
-                // `OR device_id IS NULL` above is a different thing: it is about the pending ROW.
-                let (dev_clause, mut extra_arg): (&str, Option<JsValue>) = match &ack_device {
-                    Some(d) => (
-                        " AND (device_id = ? OR device_id IS NULL)",
-                        Some(JsValue::from_str(d)),
-                    ),
-                    None => ("", None),
-                };
-                let select_sql = format!(
-                    "SELECT id, sender_id, device_id FROM pending WHERE id IN ({}){}",
-                    placeholders, dev_clause
-                );
-                let del_sql = format!(
-                    "DELETE FROM pending WHERE id IN ({}){}",
-                    placeholders, dev_clause
-                );
-                let base_vals: Vec<JsValue> =
-                    ids.iter().map(|i| JsValue::from_f64(*i as f64)).collect();
-                let mut select_vals = base_vals.clone();
-                if let Some(a) = extra_arg.take() {
-                    select_vals.push(a);
-                }
-                let mut del_vals = base_vals;
-                if let Some(d) = &ack_device {
-                    del_vals.push(JsValue::from_str(d));
-                }
-                let storage = self.state.storage();
-                let sql = storage.sql();
-                let cursor = sql.exec_raw(&select_sql, Some(select_vals))?;
-                #[derive(Deserialize)]
-                struct AckRow {
-                    id: i64,
-                    sender_id: String,
-                    /// M2-S2.2: this row's recipient device (carried into the delivered forward).
-                    #[serde(default)]
-                    device_id: Option<String>,
-                }
-                let rows: Vec<AckRow> = cursor.to_array()?;
-                sql.exec_raw(&del_sql, Some(del_vals))?;
+                let rows = self.delete_acked_rows(&ids, ack_device.as_deref())?;
                 let _ = ws.send_with_str(
                     serde_json::json!({"type": "ack_ok", "ids": ids})
                         .to_string()
@@ -130,53 +76,15 @@ impl UserInbox {
                     .ok()
                     .flatten()
                     .map(|a| a.user_id);
-                if let Some(rid) = recipient_id {
-                    use std::collections::HashMap;
-                    // M2-S2.2: group the receipts by (sender, recipient_device) so a
-                    // delivery-failed self-heal targets the right device pair (D1 BLOCKER).
-                    // With N=1 there is a single device → a single group; when the row's
-                    // device is NULL (the backfill window) fall back to ack_device.
-                    let mut by_key: HashMap<(String, Option<String>), Vec<i64>> = HashMap::new();
-                    for r in rows {
-                        let dev = r.device_id.or_else(|| ack_device.clone());
-                        by_key.entry((r.sender_id, dev)).or_default().push(r.id);
-                    }
-                    let namespace = self.env.durable_object("USER_INBOX")?;
-                    // `success=true` → /forward-delivered (second tick for the sender).
-                    // `success=false` → /forward-delivery-failed (sender moves to
-                    //  failedDelivery → the UI shows a 1.5 tick and auto-retries).
-                    let forward_path = if success {
-                        "https://do.sezgi/forward-delivered"
-                    } else {
-                        "https://do.sezgi/forward-delivery-failed"
-                    };
-                    for ((sender_id, recipient_device), acked) in by_key {
-                        let stub = namespace.id_from_name(&sender_id)?.get_stub()?;
-                        // A1 completion: a uid array PARALLEL to `acked` (empty string when
-                        // unknown). `/forward-delivered` → apply_receipt("delivered", .., uids)
-                        // → receipt_state.msg_uid → the sibling advances its oc- row on the
-                        // next cursor sync.
-                        let uids: Vec<String> = acked
-                            .iter()
-                            .map(|id| id_to_uid.get(id).cloned().unwrap_or_default())
-                            .collect();
-                        let payload = serde_json::json!({
-                            "from": rid,
-                            "recipient_device_id": recipient_device,
-                            "ids": acked,
-                            "uids": uids,
-                        })
-                        .to_string();
-                        let mut init = RequestInit::new();
-                        init.with_method(Method::Post);
-                        init.with_body(Some(payload.into()));
-                        let headers = Headers::new();
-                        headers.set("content-type", "application/json")?;
-                        init.with_headers(headers);
-                        let do_req = Request::new_with_init(forward_path, &init)?;
-                        let _ = stub.fetch_with_request(do_req).await;
-                    }
-                }
+                self.forward_acked_rows(
+                    rows,
+                    &ids,
+                    &ack_uids,
+                    success,
+                    ack_device.as_deref(),
+                    recipient_id.as_deref(),
+                )
+                .await?;
             }
             // NO `typing` ARM, deliberately. The indicator is an E2E-encrypted
             // `InnerMessage::Typing` inside an ordinary `send`, so the server never sees it as

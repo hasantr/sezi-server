@@ -157,7 +157,7 @@ async fn notify_once(
 /// sequence id. A per-device failure surfaces as `Err` rather than being silently skipped, which
 /// is what makes it visible during fan-out.
 #[allow(clippy::too_many_arguments)]
-async fn notify_recipient(
+pub(crate) async fn notify_recipient(
     namespace: &ObjectNamespace,
     recipient_id: &str,
     sender_id: &str,

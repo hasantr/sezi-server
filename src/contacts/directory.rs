@@ -4,6 +4,25 @@
 //! pub handlers are re-exported from mod.rs.
 use super::*;
 
+/// One directory page. Humans only: a bot is every member's contact through a grant and never
+/// listed (docs/BOTS_BUILD.md §2.2). Binds, in order: caller, mode, mode, caller, caller,
+/// has_cursor, cursor_name, cursor_name, cursor_id, limit.
+pub(crate) const DIRECTORY_PAGE_SQL: &str = "SELECT u.id AS user_id, u.display_name, u.role, u.profile_revision,
+                    lower(COALESCE(u.display_name, '')) AS sort_name
+               FROM users u
+              WHERE u.id != ? AND u.kind = 'human'
+                AND ((? = 'all_members' AND u.directory_visibility != 'hidden')
+                  OR (? = 'opt_in' AND u.directory_visibility = 'visible'))
+                AND NOT EXISTS (
+                  SELECT 1 FROM contact_blocks b
+                   WHERE (b.blocker_user_id = ? AND b.blocked_user_id = u.id)
+                      OR (b.blocker_user_id = u.id AND b.blocked_user_id = ?)
+                )
+                AND (? = 0 OR lower(COALESCE(u.display_name, '')) > ?
+                  OR (lower(COALESCE(u.display_name, '')) = ? AND u.id > ?))
+              ORDER BY lower(COALESCE(u.display_name, '')) ASC, u.id ASC
+              LIMIT ?";
+
 /// GET /directory — virtual, privacy-filtered stable-cursor page.
 pub async fn directory(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let auth = match active(&req, &ctx.env).await {
@@ -29,23 +48,7 @@ pub async fn directory(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         .map(|c| (1_i64, c.name, c.id))
         .unwrap_or_else(|| (0, String::new(), String::new()));
     let rows: Vec<ProfileRow> = db
-        .prepare(
-            "SELECT u.id AS user_id, u.display_name, u.role, u.profile_revision,
-                    lower(COALESCE(u.display_name, '')) AS sort_name
-               FROM users u
-              WHERE u.id != ?
-                AND ((? = 'all_members' AND u.directory_visibility != 'hidden')
-                  OR (? = 'opt_in' AND u.directory_visibility = 'visible'))
-                AND NOT EXISTS (
-                  SELECT 1 FROM contact_blocks b
-                   WHERE (b.blocker_user_id = ? AND b.blocked_user_id = u.id)
-                      OR (b.blocker_user_id = u.id AND b.blocked_user_id = ?)
-                )
-                AND (? = 0 OR lower(COALESCE(u.display_name, '')) > ?
-                  OR (lower(COALESCE(u.display_name, '')) = ? AND u.id > ?))
-              ORDER BY lower(COALESCE(u.display_name, '')) ASC, u.id ASC
-              LIMIT ?",
-        )
+        .prepare(DIRECTORY_PAGE_SQL)
         .bind(&[
             d1_text(&auth.user_id),
             d1_text(&mode),

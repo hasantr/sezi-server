@@ -1,0 +1,38 @@
+# The first crate of the D5 split, and the one everything else waits on: `sezi-crypto` and
+# `sezi-store` cannot move until `Error` is available below them.
+#
+# Honest note on the shape: this is called a leaf and it is not one. The enum takes `#[from]` from
+# rusqlite, reqwest, tokio-tungstenite, vodozemac and serde_json, so a crate that exists to hold "the
+# error type" ends up naming every I/O backend in the system. That is a real design fault the split
+# exposed rather than caused — a per-layer error with conversions at the boundaries is the right end
+# state. Doing it now would touch 61 files for no behavioural gain, so it is recorded and deferred.
+#
+# The backend dependencies are feature-gated exactly as the root package gates them, and the root
+# forwards its own `storage`/`client` features here. If that forwarding is ever dropped, a variant
+# disappears from one side of the build and the conversions stop compiling — noisily, which is the
+# good case.
+[package]
+name = "sezi-error"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "The shared error type for the Sezi core."
+
+[features]
+storage = ["dep:rusqlite"]
+client = ["dep:reqwest", "dep:tokio-tungstenite"]
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+vodozemac = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+
+# Native only — see the `Ws` variant in lib.rs. Keeping it out of the wasm dependency graph is
+# what stops `tokio/net` (and behind it mio) reaching a browser build through the error type.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio-tungstenite = { workspace = true, optional = true }

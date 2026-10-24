@@ -220,6 +220,10 @@ pub async fn create_group(mut req: Request, ctx: RouteContext<()>) -> Result<Res
     let now = now_secs() as i64;
     let group_id = Uuid::new_v4().to_string();
     let db = ctx.env.d1("DB")?;
+    // A bot never becomes a group member (docs/BOTS_BUILD.md §2.2).
+    if crate::bots::any_bot(&db, &members).await? {
+        return json_err(400, crate::bots::BOT_NOT_MEMBER);
+    }
 
     // THE BOUND. The counting query, what it counts and why it fails closed live in
     // `groups_transfer.rs` beside the other write that can mint an owner row — a cap counted two
@@ -365,6 +369,11 @@ pub async fn add_member(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
         Some(role) if is_group_admin(&role) => {}
         Some(_) => return json_err(403, "forbidden"),
         None => return json_err(403, "not_member"),
+    }
+    // The relay's half of "no room key to a bot": a bot is never a `group_members` row, so no
+    // client ever has it among a room's members (docs/BOTS_BUILD.md §2.2).
+    if crate::bots::any_bot(&db, std::slice::from_ref(&body.user_id)).await? {
+        return json_err(400, crate::bots::BOT_NOT_MEMBER);
     }
     // The membership ceiling, counting active + pending rows: a pending row becomes active on
     // acceptance and widens the fan-out. Skipped when the target is already a member or invitee,

@@ -1,5 +1,6 @@
 //! FCM HTTP v1 — CONTENTLESS wake push (the Signal pattern). It carries NO message
-//! content, only `data:{type:"wake"}`. All Google learns is "a push happened, at this
+//! content, only `data:{type:"wake"}` — and, for a device that cannot be woken, a fixed generic
+//! notification (`style.rs`). All Google learns is "a push happened, at this
 //! time": E2E is preserved and the content is decrypted on the device. That matches the
 //! closed-to-the-outside philosophy.
 //!
@@ -22,6 +23,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 use worker::*;
 
+use super::style::{fcm_message, relay_body, WakeStyle};
 use crate::utils::{b64u_encode, now_secs};
 
 #[derive(Deserialize)]
@@ -165,8 +167,9 @@ pub(crate) async fn send_wake(
     service_account: &str,
     fcm_token: &str,
     project_id: &str,
+    style: WakeStyle,
 ) -> DirectSend {
-    match send_wake_inner(env, service_account, fcm_token, project_id).await {
+    match send_wake_inner(env, service_account, fcm_token, project_id, style).await {
         Ok(d) => d,
         Err(e) => DirectSend::Failed(format!("{e:?}")),
     }
@@ -177,20 +180,13 @@ async fn send_wake_inner(
     service_account: &str,
     fcm_token: &str,
     project_id: &str,
+    style: WakeStyle,
 ) -> Result<DirectSend> {
     let access_token = get_access_token(env, service_account).await?;
     let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
-    // data-ONLY (no `notification` block): this is what makes Android fire
-    // onBackgroundMessage even when the app is terminated, and it carries no content.
-    // priority=high wakes the device out of doze.
-    let payload = serde_json::json!({
-        "message": {
-            "token": fcm_token,
-            "data": { "type": "wake" },
-            "android": { "priority": "high" }
-        }
-    })
-    .to_string();
+    // data-only, or data plus a generic notification for a device that cannot be woken
+    // (`style.rs`). Neither carries content.
+    let payload = fcm_message(fcm_token, style).to_string();
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     init.with_body(Some(payload.into()));
@@ -306,9 +302,9 @@ fn body_signals_bad_token(body: &str) -> bool {
 /// its own service account, and the resend of a wake Google refused for the owner's own project
 /// (K8). Ok(true) = sent, Ok(false) = STALE (the caller deletes it from push_tokens; the relay forwards FCM's
 /// UNREGISTERED signal as `stale:true`), Err = transient (429 / 5xx / network).
-pub(crate) async fn send_wake_relay(relay_url: &str, fcm_token: &str) -> Result<bool> {
+pub(crate) async fn send_wake_relay(relay_url: &str, fcm_token: &str, style: WakeStyle) -> Result<bool> {
     let url = format!("{}/wake", relay_url.trim_end_matches('/'));
-    let payload = serde_json::json!({ "token": fcm_token }).to_string();
+    let payload = relay_body(fcm_token, style).to_string();
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     init.with_body(Some(payload.into()));

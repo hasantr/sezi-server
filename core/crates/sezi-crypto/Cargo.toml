@@ -1,0 +1,29 @@
+# The Olm layer: the device Account, the 1:1 session wrapper, group (Megolm) crypto, and the
+# passphrase KDF that guards the account pickle. `megolm`/`messaging` arrived in D5.5, once
+# `FileManifest` stopped crossing the bridge and released `inner`.
+[package]
+name = "sezi-crypto"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Olm identity and 1:1 session primitives."
+
+[features]
+# Forwarded from the root: `identity.rs` gates a test fixture on it, and a
+# feature that exists on only one side of a crate boundary silently drops the item.
+testkit = []
+
+[lints]
+workspace = true
+
+[dependencies]
+sezi-error = { path = "../sezi-error" }
+sezi-protocol = { path = "../sezi-protocol" }
+serde = { workspace = true }
+vodozemac = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+web-time = { workspace = true }
+serde_json = { workspace = true }
+# `kdf::derive_pickle_key`. Shared with the root crate (depot) and `sezi-store`, hence a workspace dep.
+argon2 = { workspace = true }

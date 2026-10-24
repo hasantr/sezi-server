@@ -9,6 +9,7 @@ use worker::*;
 
 use super::config::{self, ProjectVerdict, PushConfig, SendMode, KEY_OWN_REACHED};
 use super::fcm::{send_wake, send_wake_relay, DirectSend};
+use super::style::WakeStyle;
 use crate::d1util::d1_text;
 use crate::utils::now_secs;
 
@@ -29,14 +30,15 @@ pub async fn maybe_push_wake(
 }
 
 /// One device's push token.
-const DEVICE_TOKEN_SQL: &str = "SELECT device_id, fcm_token, relay_project FROM push_tokens
+const DEVICE_TOKEN_SQL: &str = "SELECT device_id, fcm_token, relay_project, wake, wake_lang FROM push_tokens
      WHERE user_id = ? AND device_id = ?";
 
 /// The push tokens of a user — what a device-blind wake, and a member with several asleep devices,
 /// read. Never a REVOKED device's (its token used to outlive it: the D8 review's F6), and at most
 /// `MAX_DEVICES`, newest first, so a pile of tokens from before device addressing cannot turn one
 /// wake into a dozen fetches. Rows with no device row at all are such pre-addressing tokens.
-const USER_TOKENS_SQL: &str = "SELECT pt.device_id, pt.fcm_token, pt.relay_project FROM push_tokens pt
+const USER_TOKENS_SQL: &str = "SELECT pt.device_id, pt.fcm_token, pt.relay_project, pt.wake, pt.wake_lang
+     FROM push_tokens pt
      WHERE pt.user_id = ?
        AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.user_id = pt.user_id
                          AND d.device_id = pt.device_id AND d.revoked_at IS NOT NULL)
@@ -58,6 +60,18 @@ pub(crate) struct TokenRow {
     /// while that project is the server's. None = direct.
     #[serde(default)]
     pub(crate) relay_project: Option<String>,
+    /// `data` | `visible` (`style.rs`): whether this device's wakes carry a generic notification.
+    #[serde(default)]
+    pub(crate) wake: Option<String>,
+    #[serde(default)]
+    pub(crate) wake_lang: Option<String>,
+}
+
+impl TokenRow {
+    /// How this token is woken. A row from before the column, or with any other value, is `data`.
+    pub(crate) fn style(&self) -> WakeStyle {
+        WakeStyle::parse(self.wake.as_deref(), self.wake_lang.as_deref())
+    }
 }
 
 /// Every subrequest a wake makes, behind one seam.
@@ -67,9 +81,10 @@ pub(crate) trait WakePort {
     /// One device's token (`devices` of one), or the user's newest tokens (one D1 query).
     async fn tokens(&self, devices: Option<&[String]>) -> Result<Vec<TokenRow>>;
     /// A send through the owner's own project (the OAuth mint, when due, rides on the first).
-    async fn direct(&self, project_id: &str, service_account: &str, token: &str) -> DirectSend;
+    async fn direct(&self, project_id: &str, service_account: &str, token: &str, style: WakeStyle)
+        -> DirectSend;
     /// A send through the shared relay: Ok(true) sent, Ok(false) stale, Err failed.
-    async fn relay(&self, url: &str, token: &str) -> Result<bool>;
+    async fn relay(&self, url: &str, token: &str, style: WakeStyle) -> Result<bool>;
     async fn delete_token(&self, device_id: &str);
     /// Record that the owner's own project has reached a device (`config::KEY_OWN_REACHED`).
     async fn record_reached(&self, verdict: ProjectVerdict);
@@ -180,7 +195,7 @@ pub(crate) async fn wake_with<P: WakePort>(
             relay_refused(p, user, fallback, row, &mut t).await;
             continue;
         }
-        match p.direct(project_id, service_account, &row.fcm_token).await {
+        match p.direct(project_id, service_account, &row.fcm_token, row.style()).await {
             DirectSend::Sent => {
                 t.ok += 1;
                 if !reached {
@@ -241,7 +256,7 @@ async fn relay_refused<P: WakePort>(
 
 /// One token through the shared relay. Answers whether the token is still registered.
 async fn via_relay<P: WakePort>(p: &P, user: &str, url: &str, row: &TokenRow, t: &mut WakeTally) -> bool {
-    match p.relay(url, &row.fcm_token).await {
+    match p.relay(url, &row.fcm_token, row.style()).await {
         Ok(true) => t.ok += 1,
         Ok(false) => {
             stale(p, user, row, t).await;
@@ -288,12 +303,18 @@ impl WakePort for D1Wake<'_> {
         stmt.all().await?.results()
     }
 
-    async fn direct(&self, project_id: &str, service_account: &str, token: &str) -> DirectSend {
-        send_wake(self.env, service_account, token, project_id).await
+    async fn direct(
+        &self,
+        project_id: &str,
+        service_account: &str,
+        token: &str,
+        style: WakeStyle,
+    ) -> DirectSend {
+        send_wake(self.env, service_account, token, project_id, style).await
     }
 
-    async fn relay(&self, url: &str, token: &str) -> Result<bool> {
-        send_wake_relay(url, token).await
+    async fn relay(&self, url: &str, token: &str, style: WakeStyle) -> Result<bool> {
+        send_wake_relay(url, token, style).await
     }
 
     async fn delete_token(&self, device_id: &str) {

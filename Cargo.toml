@@ -47,12 +47,23 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 
+# The bot's end of the encryption runs inside the relay, in the bot's own UserInbox
+# (docs/BOTS_BUILD.md §1). Path dependencies into core's workspace: cargo resolves their
+# `workspace = true` keys through `core/Cargo.toml`. The self-host template vendors these crates
+# and a generated workspace root (`scripts/sync-template.sh`), which rewrites the paths.
+sezi-bot-engine = { path = "core/crates/sezi-bot-engine" }
+sezi-protocol = { path = "core/crates/sezi-protocol" }
+
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
 # The router's own matcher (the `worker` crate's, pinned to the version in Cargo.lock), so
 # `invite_page/route_tests.rs` can insert the real routing table and prove `/:invite` shadows
 # nothing.
 matchit = "=0.7.3"
+# A member device that speaks Olm the way a kernel does, so the bot inbox's tests drive the real
+# engine through the DO store (`messages/inbox_do/bot/engine_tests.rs`).
+sezi-crypto = { path = "core/crates/sezi-crypto" }
+vodozemac = "0.10"
 
 [profile.release]
 opt-level = "s"

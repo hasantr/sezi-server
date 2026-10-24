@@ -1,0 +1,165 @@
+//! Bot mode: a bot's end of the encryption, in the bot's own `UserInbox` (docs/BOTS_BUILD.md §2.3).
+//!
+//! Every path the kernel already takes to a user — the 1:1 notify, the `delivered` and
+//! `delivery_failed` forwards, `forward-read` — reaches `USER_INBOX.id_from_name(bot)` with no
+//! routing change; in bot mode, this inbox answers them with the engine instead of a socket.
+//!
+//! | File | What |
+//! |---|---|
+//! | `store.rs` | the bot tables (created lazily, only here) and the engine's `BotStore` over them |
+//! | `ingest.rs` | the alarm's tick: open stored frames in one synchronous block, ack, queue |
+//! | `send.rs` | `sendMessage`, pair-acks (repair and reply), resends after a re-pair |
+//! | `outbox.rs` | what the tick owes the network, drained under a subrequest budget |
+//! | `updates.rs` | the update JSON and `getUpdates`' long poll |
+//!
+//! Internal routes (a DO stub is not public; only `bots/` in the Worker calls them):
+//! `/bot/init`, `/bot/updates`, `/bot/api`, `/bot/state`.
+
+use super::*;
+
+mod ingest;
+mod outbox;
+mod send;
+mod store;
+mod updates;
+
+/// DO storage key: this inbox belongs to a bot.
+const BOT_MODE_KEY: &str = "bot_mode";
+
+/// What every engine call needs, read from `bot_kv`.
+pub(super) struct BotCtx {
+    pub(super) bot_id: String,
+    pub(super) device_id: String,
+    pub(super) key: [u8; 32],
+}
+
+#[derive(Deserialize)]
+struct InitBody {
+    bot_id: String,
+    device_id: String,
+    account_pickle: String,
+    pickle_key_b64: String,
+}
+
+impl UserInbox {
+    /// Is this a bot's inbox? Memoized for the life of the instance (`/purge-account` resets it).
+    pub(super) async fn is_bot(&self) -> bool {
+        if let Some(b) = self.bot_mode.get() {
+            return b;
+        }
+        let b = self
+            .state
+            .storage()
+            .get::<bool>(BOT_MODE_KEY)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        self.bot_mode.set(Some(b));
+        b
+    }
+
+    /// The bot tables; idempotent and synchronous.
+    fn bot_tables(&self) -> Result<()> {
+        let sql = self.state.storage().sql();
+        for t in store::TABLES {
+            sql.exec_raw(t, sql_no_args())?;
+        }
+        Ok(())
+    }
+
+    fn bot_store(&self) -> store::SqlBotStore<store::DoSql> {
+        store::do_store(self.state.storage().sql())
+    }
+
+    pub(super) fn bot_ctx(&self) -> Result<BotCtx> {
+        let s = self.bot_store();
+        let missing = || Error::RustError("bot inbox not initialized".into());
+        let key_b64 = s.kv_get("pickle_key").ok_or_else(missing)?;
+        let key: [u8; 32] = crate::utils::b64_decode(&key_b64)
+            .ok()
+            .and_then(|k| k.try_into().ok())
+            .ok_or_else(missing)?;
+        Ok(BotCtx {
+            bot_id: s.kv_get("bot_id").ok_or_else(missing)?,
+            device_id: s.kv_get("device_id").ok_or_else(missing)?,
+            key,
+        })
+    }
+
+    /// The `/bot/*` routes. `/bot/init` is the one that may run before bot mode.
+    pub(super) async fn bot_fetch(&self, mut req: Request, path: &str) -> Result<Response> {
+        if path == "/bot/init" && req.method() == Method::Post {
+            let body: InitBody = req.json().await?;
+            return self.bot_init(body).await;
+        }
+        if !self.is_bot().await {
+            return Response::error("not found", 404);
+        }
+        self.bot_tables()?;
+        match (req.method(), path) {
+            (Method::Post, "/bot/updates") => {
+                let body: serde_json::Value = req.json().await?;
+                self.bot_get_updates(&body).await
+            }
+            (Method::Post, "/bot/api") => {
+                let body: serde_json::Value = req.json().await?;
+                self.bot_api(&body).await
+            }
+            (Method::Get, "/bot/state") => self.bot_state(),
+            _ => Response::error("not found", 404),
+        }
+    }
+
+    /// Bot mode on, with the identity the Worker just made. Refused once an account is here: a
+    /// bot's identity is never replaced (a new key behind the same user id reads as
+    /// `key_changed` at every member).
+    async fn bot_init(&self, body: InitBody) -> Result<Response> {
+        self.bot_tables()?;
+        let s = self.bot_store();
+        if s.kv_get("account_pickle").is_some() {
+            return Response::error("already_initialized", 409);
+        }
+        s.kv_put("bot_id", &body.bot_id);
+        s.kv_put("device_id", &body.device_id);
+        s.kv_put("pickle_key", &body.pickle_key_b64);
+        s.kv_put("account_pickle", &body.account_pickle);
+        self.state.storage().put(BOT_MODE_KEY, true).await?;
+        // notify_inner persists this on the first frame anyway; writing it now names the inbox.
+        self.state.storage().put(RECIPIENT_UID_KEY, body.bot_id.as_str()).await?;
+        self.bot_mode.set(Some(true));
+        Response::empty().map(|r| r.with_status(204))
+    }
+
+    async fn bot_api(&self, body: &serde_json::Value) -> Result<Response> {
+        let ctx = self.bot_ctx()?;
+        let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        match s("method") {
+            "sendMessage" => self.bot_send_text(&ctx, s("to"), s("text")).await,
+            _ => crate::bots::api::bot_err(404, "unknown-method"),
+        }
+    }
+
+    /// Counts, for diagnosis. No content.
+    fn bot_state(&self) -> Result<Response> {
+        let s = self.bot_store();
+        let count = |t: &str| {
+            use store::Exec;
+            s.db.int(&format!("SELECT COUNT(*) AS n FROM {t}"), &[]).unwrap_or(-1)
+        };
+        Response::from_json(&serde_json::json!({
+            "bot_id": s.kv_get("bot_id"),
+            "pending": count("pending"),
+            "updates": count("bot_updates"),
+            "outbox": count("bot_outbox"),
+            "sent": count("bot_sent"),
+        }))
+    }
+
+    /// `/notify` in bot mode: the frame is stored (by the caller, as for anyone); the bot is
+    /// "live" by definition, so no push is attempted, and the tick runs now.
+    pub(super) async fn bot_notified(&self, id: i64) -> Result<Response> {
+        self.arm_alarm_within(0).await;
+        Response::from_json(&serde_json::json!({ "id": id, "delivered_live": true }))
+    }
+}

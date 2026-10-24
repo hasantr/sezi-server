@@ -27,12 +27,30 @@ struct OtkRow {
     prekey_pub: Vec<u8>,
 }
 
+/// The newest SPK of exactly this device. Bind: user, device.
+pub(crate) const DEVICE_SPK_SQL: &str = "SELECT prekey_id, prekey_pub, signature FROM signed_prekeys
+                 WHERE user_id = ? AND device_id = ?
+                 ORDER BY created_at DESC LIMIT 1";
+
+/// The device's own identity (Curve25519) key. Bind: user, device.
+pub(crate) const DEVICE_X_PUB_SQL: &str =
+    "SELECT x_pub FROM devices WHERE user_id = ? AND device_id = ? LIMIT 1";
+
+/// The atomic per-device OTK claim. Bind: user, device.
+pub(crate) const CLAIM_DEVICE_OTK_SQL: &str = "UPDATE one_time_prekeys SET consumed = 1
+                 WHERE id = (
+                   SELECT id FROM one_time_prekeys
+                   WHERE user_id = ? AND device_id = ? AND consumed = 0
+                   ORDER BY id ASC LIMIT 1
+                 )
+                 RETURNING id, prekey_id, prekey_pub";
+
 /// M2-S2.3: build the bundle slot for one device (its own SPK plus an OTK claim). `device`
 /// None is the pre-device-list bootstrap window described at the call site, where the target
 /// provably owns one device and the unfiltered queries therefore select it. A device
 /// with no SPK is skipped by returning None, so it does not appear in the bundle; if no
 /// device has an SPK, `devices` ends up empty.
-pub(super) async fn build_device_bundle(
+pub(crate) async fn build_device_bundle(
     db: &D1Database,
     target_id: &str,
     device: Option<&str>,
@@ -45,11 +63,7 @@ pub(super) async fn build_device_bundle(
             // written under a real device now — registration's inline write included — so there
             // is nothing in that slot to borrow, and borrowing would hand a peer a key belonging
             // to a different device. A device with no SPK yet is skipped instead.
-            db.prepare(
-                "SELECT prekey_id, prekey_pub, signature FROM signed_prekeys
-                 WHERE user_id = ? AND device_id = ?
-                 ORDER BY created_at DESC LIMIT 1",
-            )
+            db.prepare(DEVICE_SPK_SQL)
             .bind(&[d1_text(target_id), d1_text(d)])?
             .first(None)
             .await?
@@ -82,7 +96,7 @@ pub(super) async fn build_device_bundle(
                 x_pub: Vec<u8>,
             }
             let row: Option<XRow> = db
-                .prepare("SELECT x_pub FROM devices WHERE user_id = ? AND device_id = ? LIMIT 1")
+                .prepare(DEVICE_X_PUB_SQL)
                 .bind(&[d1_text(target_id), d1_text(d)])?
                 .first(None)
                 .await?;
@@ -116,15 +130,7 @@ pub(super) async fn build_device_bundle(
     // fallback prekey session, and a client retry will pick up a real OTK.
     let otk: Option<OtkRow> = match device {
         Some(d) => {
-            db.prepare(
-                "UPDATE one_time_prekeys SET consumed = 1
-                 WHERE id = (
-                   SELECT id FROM one_time_prekeys
-                   WHERE user_id = ? AND device_id = ? AND consumed = 0
-                   ORDER BY id ASC LIMIT 1
-                 )
-                 RETURNING id, prekey_id, prekey_pub",
-            )
+            db.prepare(CLAIM_DEVICE_OTK_SQL)
             .bind(&[d1_text(target_id), d1_text(d)])?
             .first(None)
             .await?

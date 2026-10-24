@@ -4,6 +4,7 @@ use worker::*;
 
 mod admin;
 mod auth;
+mod bots;
 mod cf_analytics;
 mod contact_grant;
 mod contact_qr;
@@ -187,6 +188,15 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // Self-reported usage statistics, admin/owner-gated. SHADOW MODE: reporting only, no
         // limit is enforced.
         .get_async("/admin/stats", admin::stats::stats)
+        // Bots (docs/BOTS_BUILD.md §2.5): the owner's surface, then the program's one route —
+        // two segments, so it cannot shadow `/:invite`. The program's key rides in
+        // `Authorization`, never in the URL (URLs are logged below).
+        .post_async("/admin/bots", bots::admin::create)
+        .get_async("/admin/bots", bots::admin::list)
+        .patch_async("/admin/bots/:id", bots::admin::update)
+        .post_async("/admin/bots/:id/token", bots::admin::renew_token)
+        .delete_async("/admin/bots/:id", bots::admin::delete)
+        .post_async("/bot/v1/:method", bots::api::dispatch)
         // Per-group library usage (admin/owner): sizes, counts and dates — never content, which
         // the server does not have. Paged, largest first.
         .get_async("/admin/library", admin::library::usage)

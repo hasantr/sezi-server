@@ -65,7 +65,7 @@ pub async fn stats(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     // elevated role INCLUDING owner (an owner can do every admin action —
     // consistent with the middleware).
     let members: i64 = db
-        .prepare("SELECT COUNT(*) AS n FROM users")
+        .prepare("SELECT COUNT(*) AS n FROM users WHERE kind = 'human'")
         .first::<CountRow>(None)
         .await?
         .map(|r| r.n)

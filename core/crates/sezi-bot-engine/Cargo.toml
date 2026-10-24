@@ -1,0 +1,25 @@
+# The bot's end of the encryption, pure: state and inbound frames in, outbound frames and bot
+# updates out. No I/O, no clock, no async — the relay's bot inbox (worker-rs) supplies storage
+# and HTTP around it, and the wire scenarios drive a real kernel against it. docs/BOTS_BUILD.md.
+[package]
+name = "sezi-bot-engine"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "A bot account's Olm/Megolm state machine, I/O-free and wasm-compatible."
+
+[lints]
+workspace = true
+
+[dependencies]
+sezi-error = { path = "../sezi-error" }
+sezi-protocol = { path = "../sezi-protocol" }
+sezi-crypto = { path = "../sezi-crypto" }
+vodozemac = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# vodozemac reaches getrandom 0.2, which refuses wasm32-unknown-unknown without "js". The relay
+# (worker-rs) turns it on anyway; this lets the crate's own wasm check stand alone (CI).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

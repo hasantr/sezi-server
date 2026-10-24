@@ -12,7 +12,11 @@ use worker::*;
 #[path = "bundle_slot.rs"]
 mod bundle_slot;
 
-use bundle_slot::build_device_bundle;
+pub(crate) use bundle_slot::build_device_bundle;
+// For the bot provisioning tests ("the bundle SQL serves the bot"). Not `cfg(test)`: this
+// file's own guards cut its source at the first `#[cfg(test)]` line.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use bundle_slot::{CLAIM_DEVICE_OTK_SQL, DEVICE_SPK_SQL, DEVICE_X_PUB_SQL};
 
 #[derive(Deserialize)]
 struct UserRow {

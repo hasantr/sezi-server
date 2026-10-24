@@ -3,16 +3,16 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use worker::*;
 
+mod ack;
 mod alarm_ops;
 mod alarm_policy;
+mod bot;
 mod forward;
 mod member_notify;
 mod message;
 mod receipt;
 mod self_read;
 mod ws;
-
-use alarm_policy::next_alarm_delay_ms;
 
 const FLUSH_INTERVAL_MS: i64 = 90 * 1000;
 /// Alarm interval for a DO with nothing to deliver that still holds retention-eligible rows.
@@ -60,6 +60,8 @@ pub struct UserInbox {
     /// Has the recipient user_id been written to storage in this DO instance? Avoids a redundant
     /// write per notify; resets on a DO restart, so the first notify after one writes it again.
     pub(crate) uid_persisted: std::cell::Cell<bool>,
+    /// Is this a bot's inbox (`bot/`)? `None` until first read from storage.
+    pub(crate) bot_mode: std::cell::Cell<Option<bool>>,
 }
 
 #[derive(Clone)]
@@ -192,6 +194,7 @@ impl DurableObject for UserInbox {
             initialized: std::cell::Cell::new(false),
             dedup: std::sync::Mutex::new(Vec::new()),
             uid_persisted: std::cell::Cell::new(false),
+            bot_mode: std::cell::Cell::new(None),
         }
     }
 
@@ -218,6 +221,7 @@ impl DurableObject for UserInbox {
             storage.put(REMOVED_ACCOUNT_KEY, true).await?;
             self.initialized.set(false);
             self.uid_persisted.set(false);
+            self.bot_mode.set(None);
             if let Ok(mut dedup) = self.dedup.lock() {
                 dedup.clear();
             }
@@ -263,6 +267,9 @@ impl DurableObject for UserInbox {
             return Response::empty().map(|r| r.with_status(204));
         }
         self.ensure_init().await?;
+        if path.starts_with("/bot/") {
+            return self.bot_fetch(req, &path).await;
+        }
 
         // WS upgrade (the worker proxies /sync here).
         if req
@@ -294,6 +301,9 @@ impl DurableObject for UserInbox {
                         body.silent,
                     )
                     .await?;
+                if self.is_bot().await {
+                    return self.bot_notified(id).await;
+                }
                 // Cheap (a no-op get_alarm when already armed) and revives a chain broken by an
                 // earlier transient error, so a recipient who never reconnects over WS still
                 // gets the FCM backstop.
@@ -333,6 +343,9 @@ impl DurableObject for UserInbox {
             // fires once the session has self-healed.
             (Method::Post, "/forward-delivery-failed") => {
                 let body: ForwardIdsBody = req.json().await?;
+                if self.is_bot().await {
+                    return self.bot_delivery_failed(&body.from).await;
+                }
                 self.forward_signal(
                     "delivery_failed",
                     &body.from,
@@ -408,89 +421,7 @@ impl DurableObject for UserInbox {
     }
 
     async fn alarm(&self) -> Result<Response> {
-        // Read BEFORE `ensure_init`, which re-creates the tables and re-arms the alarm. A purged
-        // inbox must leave here without arming anything; running init first is exactly how one
-        // kept its 90s heartbeat alive.
-        let account_removed = self
-            .state
-            .storage()
-            .get::<bool>(REMOVED_ACCOUNT_KEY)
-            .await?
-            .unwrap_or(false);
-        if account_removed {
-            return Response::empty();
-        }
-        self.ensure_init().await?;
-        self.flush_pending_to_all();
-        // If the sender misses the reconnect, the periodic alarm pushes anyway (idempotent: a
-        // repeat is removed by the client's `forward_ack` and the sender side dedups it).
-        self.flush_forwards_to_all();
-        // Ground truth for delivery: the liveness test narrows the delivered_live false-positive
-        // window but cannot close it (a socket that dies right after a ping). Still sitting in
-        // pending means unacked means undelivered → wake once the grace period is over.
-        self.backstop_push_stale_pending().await;
-        let now_ms_val = (now_secs() * 1000) as i64;
-        let last: Option<i64> = self
-            .state
-            .storage()
-            .get::<i64>(LAST_CLEANUP_KEY)
-            .await
-            .ok()
-            .flatten();
-        let last_val = last.unwrap_or(0);
-        if now_ms_val - last_val >= CLEANUP_INTERVAL_MS {
-            // Admin-configurable (D1 server_settings), one SELECT per cleanup and therefore at
-            // most once per 24h; the helper falls back to 30 days on an error or a missing row.
-            let days = crate::server::handlers::fetch_message_retention_days(&self.env).await;
-            let cutoff = (now_secs() as i64) - days * 24 * 3600;
-            let storage = self.state.storage();
-            // BEST-EFFORT, like its siblings: a bare `?` here would abort the handler and skip
-            // the `ensure_alarm` re-arm below, killing the alarm chain. The watermark advances
-            // ONLY on success, so a transient error is retried on the next alarm rather than
-            // skipping retention for 24h.
-            let purge_ok = storage
-                .sql()
-                .exec_raw(
-                    "DELETE FROM pending WHERE created_at < ?",
-                    Some(vec![JsValue::from_f64(cutoff as f64)]),
-                )
-                .is_ok();
-            // `updated_at` is in ms, hence cutoff*1000. The high-water mark (`receipt_meta`) is
-            // never purged → seq stays monotonic and cursors stay consistent.
-            let _ = storage.sql().exec_raw(
-                "DELETE FROM receipt_state WHERE updated_at < ?",
-                Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
-            );
-            // self_read_state is purged at retention parity, not exempt: it is the live
-            // incremental convergence cursor, and a row beyond retention is dead metadata. A new
-            // device gets old messages via M4 sibling sync, whose package carries `viewed_at`
-            // alongside the message, so read state flows independently of this table. As with
-            // receipt_state, the high-water mark (self_read_meta) is never purged. updated_at is ms.
-            let _ = storage.sql().exec_raw(
-                "DELETE FROM self_read_state WHERE updated_at < ?",
-                Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
-            );
-            // Orphan receipt rows — especially delivery_failed ones the client never
-            // forward_acked — otherwise accumulate forever and are replayed unconditionally on a
-            // fresh reconnect, re-triggering `delete_all_olm_blobs` on the receiver. `created_at`
-            // is in MS here, unlike pending's seconds-based cutoff.
-            let _ = storage.sql().exec_raw(
-                "DELETE FROM forward_queue WHERE created_at < ?",
-                Some(vec![JsValue::from_f64((cutoff * 1000) as f64)]),
-            );
-            if purge_ok {
-                let _ = storage.put(LAST_CLEANUP_KEY, now_ms_val).await;
-            }
-        }
-        // Re-arm robustly (a blind `let _ = set_alarm` lets one transient error break the chain
-        // for the life of this DO instance), and CONDITIONALLY: an inbox with nothing queued and
-        // nobody connected stops rather than waking ~960 times a day (see `alarm_policy`). Both
-        // events that create work — `/notify` and `ws_upgrade` — call `ensure_alarm`.
-        let work = self.measure_alarm_work(account_removed);
-        if let Some(delay) = next_alarm_delay_ms(work, FLUSH_INTERVAL_MS, IDLE_INTERVAL_MS) {
-            self.arm_alarm_within(delay).await;
-        }
-        Response::empty()
+        self.run_alarm().await
     }
 }
 

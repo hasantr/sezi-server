@@ -479,6 +479,11 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             d1_text(&user_id),
             d1_int(now as i64),
         ])?,
+        // Every bot is every member's contact (docs/BOTS_BUILD.md §2.1): the joiner too.
+        db.prepare(crate::bots::provision::GRANT_BOTS_TO_JOINER_SQL)
+            .bind(&[d1_text(&user_id), d1_int(now as i64)])?,
+        db.prepare(crate::bots::provision::GRANT_REVISIONS_FOR_JOINER_SQL)
+            .bind(&[d1_text(&user_id), d1_int(now as i64)])?,
         db.prepare("DELETE FROM verification_codes WHERE email = ?")
             .bind(&[d1_text(&body.email)])?,
     ])

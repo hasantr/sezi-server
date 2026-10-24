@@ -107,6 +107,8 @@ impl FakeWake {
                         device_id: format!("d{i}"),
                         fcm_token: format!("t{i}"),
                         relay_project: None,
+                        wake: None,
+                        wake_lang: None,
                     })
                     .collect(),
             ),
@@ -142,17 +144,17 @@ impl WakePort for FakeWake {
         self.spent.set(self.spent.get() + 1);
         Ok(self.tokens.borrow().clone())
     }
-    async fn direct(&self, project_id: &str, _sa: &str, token: &str) -> DirectSend {
+    async fn direct(&self, project_id: &str, _sa: &str, token: &str, style: WakeStyle) -> DirectSend {
         assert_eq!(project_id, "owner-proj");
         if !self.minted.replace(true) {
             self.spent.set(self.spent.get() + MINT);
         }
-        self.tick(format!("direct:{token}"));
+        self.tick(format!("direct:{token}{}", style_mark(style)));
         (self.direct_answer)(token)
     }
-    async fn relay(&self, url: &str, token: &str) -> Result<bool> {
+    async fn relay(&self, url: &str, token: &str, style: WakeStyle) -> Result<bool> {
         assert_eq!(url, "https://relay");
-        self.tick(format!("relay:{token}"));
+        self.tick(format!("relay:{token}{}", style_mark(style)));
         (self.relay_answer)(token)
     }
     async fn delete_token(&self, device_id: &str) {
@@ -175,6 +177,14 @@ impl WakePort for FakeWake {
         1_700_000_000
     }
     fn log(&self, _line: String) {}
+}
+
+/// A data wake is logged as before; a visible one says so, so a test sees which style was sent.
+fn style_mark(style: WakeStyle) -> String {
+    match style {
+        WakeStyle::Data => String::new(),
+        WakeStyle::Visible(l) => format!(":visible-{}", l.code()),
+    }
 }
 
 /// FCM's answer for a token another project minted — what every published-app phone gets.
@@ -351,7 +361,7 @@ fn schema_with_token(token: &str) -> rusqlite::Connection {
         [],
     )
     .unwrap();
-    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", token, "android", 1, 1])
+    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", token, "android", 1, 1, "data", None::<String>])
         .unwrap();
     db
 }
@@ -371,10 +381,10 @@ fn a_mark_lives_with_its_token() {
     // A mark for a token the device has replaced meanwhile writes nothing.
     db.execute(ROUTE_VIA_RELAY_SQL, rusqlite::params!["other", "u", "d0", "tok-old"]).unwrap();
     assert_eq!(mark(&db).as_deref(), Some("owner-proj"));
-    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-a", "android", 2, 2])
+    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-a", "android", 2, 2, "data", None::<String>])
         .unwrap();
     assert_eq!(mark(&db).as_deref(), Some("owner-proj"), "the same token keeps its mark");
-    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-b", "android", 3, 3])
+    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-b", "android", 3, 3, "data", None::<String>])
         .unwrap();
     assert_eq!(mark(&db), None, "a new token is asked again");
     db.execute(ROUTE_VIA_RELAY_SQL, rusqlite::params!["owner-proj", "u", "d0", "tok-b"]).unwrap();
@@ -396,4 +406,70 @@ fn the_token_reads_carry_the_mark() {
         .query_row(super::super::config::RELAY_ROUTED_COUNT_SQL, ["owner-proj"], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1);
+}
+
+// ---- How a token is woken (`style.rs`) ----
+
+fn style_of(db: &rusqlite::Connection, one: bool) -> (Option<String>, Option<String>) {
+    let read = |r: &rusqlite::Row<'_>| Ok((r.get(3)?, r.get(4)?));
+    if one {
+        db.query_row(DEVICE_TOKEN_SQL, ["u", "d0"], read).unwrap()
+    } else {
+        db.query_row(USER_TOKENS_SQL, ["u"], read).unwrap()
+    }
+}
+
+/// A token registered before the column, or by a client that sends no `wake`, reads `data`; a
+/// visible register is read back with its language; the next register as `data` clears both.
+#[test]
+fn the_token_reads_carry_the_wake_style() {
+    let db = crate::test_schema::full_schema();
+    db.execute(
+        "INSERT INTO users (id, email, identity_pubkey, created_at) VALUES ('u', 'u@x', x'00', 1)",
+        [],
+    )
+    .unwrap();
+    // The shape of every row written before 0051: no wake column named.
+    db.execute(
+        "INSERT INTO push_tokens (user_id, device_id, fcm_token, platform, created_at, last_seen_at)
+         VALUES ('u', 'd0', 'tok-a', 'android', 1, 1)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(style_of(&db, true), (Some("data".into()), None));
+    let register = |wake: &str, lang: Option<&str>| {
+        db.execute(
+            super::super::handlers::REGISTER_SQL,
+            rusqlite::params!["u", "d0", "tok-a", "android", 2, 2, wake, lang],
+        )
+        .unwrap();
+    };
+    register("visible", Some("en"));
+    for one in [true, false] {
+        assert_eq!(style_of(&db, one), (Some("visible".into()), Some("en".into())));
+    }
+    register("data", None);
+    assert_eq!(style_of(&db, false), (Some("data".into()), None));
+}
+
+/// The loop sends each token in its own style, direct and through the relay alike; a data token
+/// beside a visible one is sent exactly as before.
+#[test]
+fn each_token_is_woken_in_its_own_style() {
+    let f = FakeWake::own(2, mismatch, relay_ok);
+    {
+        let mut rows = f.tokens.borrow_mut();
+        rows[1].wake = Some("visible".into());
+        rows[1].wake_lang = Some("en".into());
+    }
+    f.wake();
+    assert_eq!(
+        f.calls(),
+        ["direct:t0", "relay:t0", "route:d0", "direct:t1:visible-en", "relay:t1:visible-en", "route:d1"]
+    );
+    // A relay-only server: the same styles.
+    f.cfg.borrow_mut().project_id = None;
+    f.cfg.borrow_mut().service_account = None;
+    f.wake();
+    assert_eq!(f.calls(), ["relay:t0", "relay:t1:visible-en"]);
 }
