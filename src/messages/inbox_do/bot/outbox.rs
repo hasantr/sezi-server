@@ -34,6 +34,8 @@ pub(super) enum OutKind {
     Notify,
     ForwardDelivered,
     ForwardFailed,
+    /// The program took the member's message: their blue tick.
+    ForwardRead,
 }
 
 impl OutKind {
@@ -42,11 +44,12 @@ impl OutKind {
             OutKind::Notify => "notify",
             OutKind::ForwardDelivered => "forward_delivered",
             OutKind::ForwardFailed => "forward_failed",
+            OutKind::ForwardRead => "forward_read",
         }
     }
 
     fn parse(s: &str) -> Option<Self> {
-        [Self::Notify, Self::ForwardDelivered, Self::ForwardFailed]
+        [Self::Notify, Self::ForwardDelivered, Self::ForwardFailed, Self::ForwardRead]
             .into_iter()
             .find(|k| k.as_str() == s)
     }
@@ -200,10 +203,10 @@ impl UserInbox {
         let Ok(f) = serde_json::from_str::<ForwardBody>(body) else {
             return true;
         };
-        let path = if kind == OutKind::ForwardDelivered {
-            "/forward-delivered"
-        } else {
-            "/forward-delivery-failed"
+        let path = match kind {
+            OutKind::ForwardDelivered => "/forward-delivered",
+            OutKind::ForwardRead => "/forward-read",
+            _ => "/forward-delivery-failed",
         };
         let sent =
             crate::bots::bot_inbox(&self.env, &f.to, Method::Post, path, Some(f.payload.to_string())).await;
@@ -211,7 +214,7 @@ impl UserInbox {
     }
 
     /// Arm the alarm for whatever the bot still owes: now while frames wait, else the outbox's
-    /// earliest retry. (`arm_alarm_within` only ever pulls an alarm EARLIER.)
+    /// earliest retry, or the webhook's next attempt. (`arm_alarm_within` only ever pulls an alarm EARLIER.)
     pub(super) async fn bot_rearm(&self) {
         let now = (now_secs() * 1000) as i64;
         let store = self.bot_store();
@@ -221,7 +224,11 @@ impl UserInbox {
             self.arm_alarm_within(0).await;
             return;
         }
-        if let Some(t) = store.db.int(OUTBOX_NEXT, &[]) {
+        let next = [store.db.int(OUTBOX_NEXT, &[]), self.bot_webhook_next()]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(t) = next {
             self.arm_alarm_within((t - now).max(0)).await;
         }
     }
@@ -239,7 +246,7 @@ mod tests {
 
     #[test]
     fn every_kind_survives_its_own_name() {
-        for k in [OutKind::Notify, OutKind::ForwardDelivered, OutKind::ForwardFailed] {
+        for k in [OutKind::Notify, OutKind::ForwardDelivered, OutKind::ForwardFailed, OutKind::ForwardRead] {
             assert_eq!(OutKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(OutKind::parse("room_send"), None);

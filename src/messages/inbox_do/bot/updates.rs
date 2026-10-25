@@ -18,7 +18,8 @@ use super::*;
 pub(super) const UPDATE_TTL_MS: i64 = 24 * 3600 * 1000;
 
 /// Bind: json, created_at.
-pub(super) const UPDATE_PUSH: &str = "INSERT INTO bot_updates (json, created_at) VALUES (?, ?)";
+pub(super) const UPDATE_PUSH: &str =
+    "INSERT INTO bot_updates (json, created_at) VALUES (?, ?) RETURNING update_id";
 /// Bind: offset.
 pub(super) const UPDATE_CONFIRM: &str = "DELETE FROM bot_updates WHERE update_id < ?";
 /// Bind: offset, limit.
@@ -93,10 +94,25 @@ struct UpdateRow {
 }
 
 impl UserInbox {
-    pub(super) fn bot_push_update(&self, update: &serde_json::Value, now: i64) {
+    /// Store an update; its `update_id`, or `None` when the write failed.
+    pub(super) fn bot_push_update(&self, update: &serde_json::Value, now: i64) -> Option<i64> {
+        #[derive(Deserialize)]
+        struct Id {
+            update_id: i64,
+        }
         let args = vec![JsValue::from_str(&update.to_string()), JsValue::from_f64(now as f64)];
-        if let Err(e) = self.state.storage().sql().exec_raw(UPDATE_PUSH, Some(args)) {
-            console_log!("[bot] update write failed: {e:?}");
+        match self
+            .state
+            .storage()
+            .sql()
+            .exec_raw(UPDATE_PUSH, Some(args))
+            .and_then(|c| c.to_array::<Id>())
+        {
+            Ok(rows) => rows.first().map(|r| r.update_id),
+            Err(e) => {
+                console_log!("[bot] update write failed: {e:?}");
+                None
+            }
         }
     }
 
@@ -106,6 +122,10 @@ impl UserInbox {
     pub(super) async fn bot_get_updates(&self, body: &serde_json::Value) -> Result<Response> {
         let int = |k: &str, d: i64| body.get(k).and_then(|v| v.as_i64()).unwrap_or(d);
         let (offset, timeout, limit) = (int("offset", 0), int("timeout", 0), int("limit", 100));
+        if self.bot_store().kv_get("webhook_url").is_some() {
+            return crate::bots::api::bot_err(409, "webhook-active");
+        }
+        let ctx = self.bot_ctx()?;
         let sql = self.state.storage().sql();
         if offset > 0 {
             sql.exec_raw(UPDATE_CONFIRM, Some(vec![JsValue::from_f64(offset as f64)]))?;
@@ -128,6 +148,10 @@ impl UserInbox {
                 JsValue::from_f64(last.update_id as f64),
             ];
             let _ = sql.exec_raw(UPDATE_MARK, Some(args));
+            // The program has them: the members' blue ticks go out with the next tick.
+            let first = rows.first().map_or(last.update_id, |r| r.update_id);
+            self.bot_updates_taken(&ctx, first, last.update_id, now);
+            self.arm_alarm_within(0).await;
         }
         let updates: Vec<serde_json::Value> = rows
             .into_iter()

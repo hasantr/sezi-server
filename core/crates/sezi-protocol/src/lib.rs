@@ -1,6 +1,7 @@
 //! The Sezi wire format.
 
 pub mod activity_batch;
+pub mod bots;
 pub mod devices;
 pub mod envelope;
 pub mod inner;

@@ -11,12 +11,15 @@
 //! | `send.rs` | `sendMessage`, pair-acks (repair and reply), resends after a re-pair |
 //! | `outbox.rs` | what the tick owes the network, drained under a subrequest budget |
 //! | `updates.rs` | the update JSON and `getUpdates`' long poll |
+//! | `deliver.rs` | the webhook round, the owner's ping, and "taken" → the member's `forward-read` |
 //!
 //! Internal routes (a DO stub is not public; only `bots/` in the Worker calls them):
-//! `/bot/init`, `/bot/updates`, `/bot/api`, `/bot/state`.
+//! `/bot/init`, `/bot/updates`, `/bot/api`, `/bot/state`, `/bot/webhook`, `/bot/webhook-secret`,
+//! `/bot/ping`.
 
 use super::*;
 
+mod deliver;
 mod ingest;
 mod outbox;
 mod send;
@@ -107,6 +110,12 @@ impl UserInbox {
                 self.bot_api(&body).await
             }
             (Method::Get, "/bot/state") => self.bot_state(),
+            (Method::Post, "/bot/webhook") => self.bot_set_webhook(req.json().await?),
+            (Method::Post, "/bot/webhook-secret") => self.bot_set_webhook_secret(req.json().await?),
+            (Method::Post, "/bot/ping") => {
+                let body: serde_json::Value = req.json().await?;
+                self.bot_ping(body.get("who").cloned().unwrap_or_default()).await
+            }
             _ => Response::error("not found", 404),
         }
     }
@@ -140,19 +149,20 @@ impl UserInbox {
         }
     }
 
-    /// Counts, for diagnosis. No content.
+    /// Counts, for diagnosis and the owner's page. No content.
     fn bot_state(&self) -> Result<Response> {
+        use store::Exec;
         let s = self.bot_store();
-        let count = |t: &str| {
-            use store::Exec;
-            s.db.int(&format!("SELECT COUNT(*) AS n FROM {t}"), &[]).unwrap_or(-1)
-        };
+        let count = |t: &str| s.db.int(&format!("SELECT COUNT(*) AS n FROM {t}"), &[]).unwrap_or(-1);
+        let count_opt = |q: &str| s.db.int(q, &[]);
         Response::from_json(&serde_json::json!({
             "bot_id": s.kv_get("bot_id"),
             "pending": count("pending"),
             "updates": count("bot_updates"),
             "outbox": count("bot_outbox"),
             "sent": count("bot_sent"),
+            "waiting_since": count_opt(deliver::WAITING_SINCE),
+            "webhook": s.kv_get("webhook_url").is_some(),
         }))
     }
 

@@ -7,7 +7,7 @@ use super::*;
 /// One directory page. Humans only: a bot is every member's contact through a grant and never
 /// listed (docs/BOTS_BUILD.md §2.2). Binds, in order: caller, mode, mode, caller, caller,
 /// has_cursor, cursor_name, cursor_name, cursor_id, limit.
-pub(crate) const DIRECTORY_PAGE_SQL: &str = "SELECT u.id AS user_id, u.display_name, u.role, u.profile_revision,
+pub(crate) const DIRECTORY_PAGE_SQL: &str = "SELECT u.id AS user_id, u.display_name, u.role, u.profile_revision, u.kind,
                     lower(COALESCE(u.display_name, '')) AS sort_name
                FROM users u
               WHERE u.id != ? AND u.kind = 'human'
@@ -150,6 +150,7 @@ pub async fn directory_changes(req: Request, ctx: RouteContext<()>) -> Result<Re
                 display_name: r.display_name.clone(),
                 role: r.role.clone().unwrap_or_else(|| "member".into()),
                 profile_revision: r.profile_revision.unwrap_or(1),
+                kind: human_kind(),
                 sort_name: String::new(),
             };
             changes.push(serde_json::json!({

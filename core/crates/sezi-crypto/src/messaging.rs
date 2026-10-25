@@ -695,7 +695,10 @@ pub fn decrypt_from_peer(
         | InnerMessage::PluginEpochKeyShare { .. }
         | InnerMessage::PluginRemoved { .. }
         | InnerMessage::Typing { .. }
-        | InnerMessage::ProfileAvatar { .. } => ("control".to_string(), String::new()),
+        | InnerMessage::ProfileAvatar { .. }
+        // Bot-bound: a human never shows one; the kernel drops it before this matters.
+        | InnerMessage::BotCall { .. }
+        | InnerMessage::BotTap { .. } => ("control".to_string(), String::new()),
         // A group-library card travels over Megolm only, and the kernel projection draws it; on
         // this legacy 1:1 path it is mapped for completeness, the card as its JSON.
         InnerMessage::LibraryCard(card) => {

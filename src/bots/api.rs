@@ -5,6 +5,10 @@
 //! | `getMe` | `{}` | `{ok, bot:{bot_id, name, about}}` |
 //! | `getUpdates` | `{offset?, timeout? 0..25, limit? 1..100}` | `{ok, updates:[…]}`; below `offset` is confirmed and deleted |
 //! | `sendMessage` | `{chat:{user_id}, text ≤4000}` | `{ok, message_id}` (`b-<uuid>`) |
+//! | `setWebhook` | `{url}` (https; `""` or `null` clears) | `{ok, webhook_secret}` |
+//! | `deleteWebhook` | `{}` | `{ok}` |
+//!
+//! With a webhook set, `getUpdates` answers `bot/webhook-active` (409): one queue, one reader.
 //!
 //! Phase 1 writes 1:1 text only: a `room_id`, `reply_to` or `buttons` answers `bot/unsupported`
 //! rather than being dropped in silence. Errors are `{ok:false, error:"bot/<code>"}`.
@@ -13,8 +17,7 @@
 //! A bot may write to an active human of this server who has not blocked it, and to nobody else.
 
 use super::token::{self, BotAuth};
-use crate::d1util::{d1_int, d1_text};
-use crate::utils::now_secs;
+use crate::d1util::d1_text;
 use serde::Deserialize;
 use worker::*;
 
@@ -44,13 +47,8 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     if bot.disabled_at.is_some() {
         return bot_err(403, "disabled");
     }
-    // Best effort: "when did the program last show up" (the Phase 2 "no word from it" line).
-    if let Ok(stmt) = db
-        .prepare("UPDATE bots SET program_seen_at = ?2 WHERE bot_id = ?1")
-        .bind(&[d1_text(&bot.bot_id), d1_int(now_secs() as i64)])
-    {
-        let _ = stmt.run().await;
-    }
+    // "When did the program last show up" (the owner's "no word from it" line).
+    super::mark_program_seen(&ctx.env, &bot.bot_id).await;
     let body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
     match method.as_str() {
         "getMe" => Response::from_json(&serde_json::json!({
@@ -59,6 +57,13 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         })),
         "getUpdates" => get_updates(&ctx.env, &bot, &body).await,
         "sendMessage" => send_message(&ctx.env, &db, &bot, body).await,
+        "setWebhook" => {
+            let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            // authenticate() just read this very header.
+            let token = crate::auth::middleware::extract_bearer(&req).unwrap_or_default();
+            set_webhook(&ctx.env, &db, &bot, url, &token).await
+        }
+        "deleteWebhook" => set_webhook(&ctx.env, &db, &bot, "", "").await,
         _ => bot_err(404, "unknown-method"),
     }
 }
@@ -74,6 +79,32 @@ async fn get_updates(env: &Env, bot: &BotAuth, body: &serde_json::Value) -> Resu
     let q = serde_json::json!({ "offset": offset, "timeout": timeout, "limit": limit });
     let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/updates", Some(q.to_string())).await?;
     crate::respond::passthrough(resp).await
+}
+
+/// Set (`url` non-empty) or clear the webhook. The secret is derived from the key the program
+/// called with, so the program can compute it itself; it is also answered, once, for convenience.
+async fn set_webhook(env: &Env, db: &D1Database, bot: &BotAuth, url: &str, token: &str) -> Result<Response> {
+    let (url, secret) = if url.trim().is_empty() {
+        (None, None)
+    } else {
+        let Some(url) = super::webhook::clean_url(url) else {
+            return bot_err(400, "bad-url");
+        };
+        (Some(url), Some(super::webhook::derive_secret(token)))
+    };
+    let call = serde_json::json!({ "url": url, "secret": secret });
+    let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/webhook", Some(call.to_string())).await?;
+    if resp.status_code() != 204 {
+        return bot_err(502, "inbox-unavailable");
+    }
+    db.prepare("UPDATE bots SET webhook_url = ?2 WHERE bot_id = ?1")
+        .bind(&[d1_text(&bot.bot_id), crate::d1util::d1_opt_text(url.as_deref())])?
+        .run()
+        .await?;
+    match secret {
+        Some(s) => Response::from_json(&serde_json::json!({ "ok": true, "webhook_secret": s })),
+        None => Response::from_json(&serde_json::json!({ "ok": true })),
+    }
 }
 
 #[derive(Deserialize)]

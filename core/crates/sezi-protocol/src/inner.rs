@@ -769,6 +769,26 @@ pub enum InnerMessage {
     /// file ([`LibraryCardRef`]). Group-only, over Megolm. A build that predates it decodes it as
     /// `Unknown` below, which the chat and the list show as "Unsupported message".
     LibraryCard(LibraryCardRef),
+    /// A member's message in a room, copied 1:1 to a bot of that room that it called (named in
+    /// `ext.mentions`, or `/command`). Only a bot ever receives it; a human kernel drops one
+    /// ([`InnerMessage::is_bot_bound`], `crate::bots`). Phase 3 sends it; it is declared now so
+    /// every human build already refuses it. `docs/BOTS_BUILD.md` §2.6.
+    BotCall {
+        room_id: String,
+        msg_uid: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        utc_offset_min: Option<i32>,
+    },
+    /// A tap on a bot's button, sent to that bot alone (Phase 4). Bot-bound like `BotCall`.
+    BotTap {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room_id: Option<String>,
+        msg_uid: String,
+        action_id: String,
+    },
     /// Forward-compatibility catch-all — messages carrying an unknown `kind` tag land here.
     /// Thanks to `#[serde(other)]` the payload of any unrecognized tag is silently
     /// swallowed; the decrypt chain does not collapse.

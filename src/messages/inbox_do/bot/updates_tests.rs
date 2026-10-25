@@ -62,7 +62,7 @@ fn read(c: &Connection, offset: i64, limit: i64) -> Vec<i64> {
 fn an_offset_confirms_and_deletes_everything_below_it() {
     let c = db();
     for i in 0..5 {
-        c.execute(UPDATE_PUSH, params![format!("{{\"n\":{i}}}"), 1_000 + i]).unwrap();
+        c.query_row(UPDATE_PUSH, params![format!("{{\"n\":{i}}}"), 1_000 + i], |r| r.get::<_, i64>(0)).unwrap();
     }
     assert_eq!(read(&c, 0, 100), vec![1, 2, 3, 4, 5]);
     assert_eq!(read(&c, 0, 2), vec![1, 2], "the limit holds");
@@ -75,15 +75,15 @@ fn an_offset_confirms_and_deletes_everything_below_it() {
     assert_eq!(read(&c, 3, 100), vec![3, 4, 5], "1 and 2 are confirmed and gone");
     assert_eq!(read(&c, 0, 100), vec![3, 4, 5]);
     // A new update after a confirm keeps counting up: ids are never reused.
-    c.execute(UPDATE_PUSH, params!["{}", 2_000]).unwrap();
+    c.query_row(UPDATE_PUSH, params!["{}", 2_000], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(read(&c, 3, 100), vec![3, 4, 5, 6]);
 }
 
 #[test]
 fn updates_older_than_the_window_expire() {
     let c = db();
-    c.execute(UPDATE_PUSH, params!["{}", 1_000]).unwrap();
-    c.execute(UPDATE_PUSH, params!["{}", 1_000 + UPDATE_TTL_MS]).unwrap();
+    c.query_row(UPDATE_PUSH, params!["{}", 1_000], |r| r.get::<_, i64>(0)).unwrap();
+    c.query_row(UPDATE_PUSH, params!["{}", 1_000 + UPDATE_TTL_MS], |r| r.get::<_, i64>(0)).unwrap();
     c.execute(UPDATE_EXPIRE, [1_000 + UPDATE_TTL_MS - 1]).unwrap();
     assert_eq!(read(&c, 0, 100), vec![2]);
 }

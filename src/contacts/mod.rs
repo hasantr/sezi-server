@@ -190,10 +190,18 @@ struct ProfileRow {
     display_name: Option<String>,
     role: String,
     profile_revision: i64,
+    /// `human` or `bot` (`users.kind`), so a client can tell a bot apart. A row whose query
+    /// does not select it reads as a human.
+    #[serde(default = "human_kind")]
+    kind: String,
     /// Exact SQLite ordering key. Never recompute with Rust Unicode casing:
     /// SQLite `lower()` is ASCII-oriented and a mismatch would skip/duplicate
     /// Turkish names across stable-cursor pages.
     sort_name: String,
+}
+
+fn human_kind() -> String {
+    "human".into()
 }
 
 fn profile_json(row: &ProfileRow) -> serde_json::Value {
@@ -205,6 +213,7 @@ fn profile_json(row: &ProfileRow) -> serde_json::Value {
         "avatar_ref": serde_json::Value::Null,
         "role": row.role,
         "profile_revision": row.profile_revision,
+        "kind": row.kind,
     })
 }
 

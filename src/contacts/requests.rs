@@ -106,6 +106,8 @@ struct RequestRow {
     display_name: Option<String>,
     role: String,
     profile_revision: i64,
+    #[serde(default = "human_kind")]
+    kind: String,
 }
 
 fn request_json(row: &RequestRow, caller: &str) -> serde_json::Value {
@@ -114,6 +116,7 @@ fn request_json(row: &RequestRow, caller: &str) -> serde_json::Value {
         display_name: row.display_name.clone(),
         role: row.role.clone(),
         profile_revision: row.profile_revision,
+        kind: row.kind.clone(),
         sort_name: String::new(),
     };
     serde_json::json!({
@@ -193,7 +196,7 @@ async fn fetch_request(
                 r.server_fingerprint, r.issued_at, r.nonce_hash, r.status, r.trust,
                 r.created_at, r.expires_at, r.responded_at, r.grant_applied,
                 CASE WHEN r.source_user_id = ? THEN r.target_user_id ELSE r.source_user_id END AS peer_id,
-                u.display_name, u.role, u.profile_revision
+                u.display_name, u.role, u.profile_revision, u.kind
            FROM contact_requests r
            JOIN users u ON u.id = CASE WHEN r.source_user_id = ? THEN r.target_user_id ELSE r.source_user_id END
           WHERE r.request_id = ? AND (r.source_user_id = ? OR r.target_user_id = ?) LIMIT 1",
@@ -438,7 +441,7 @@ pub async fn list_requests(req: Request, ctx: RouteContext<()>) -> Result<Respon
                     r.server_fingerprint, r.issued_at, r.nonce_hash, r.status, r.trust,
                     r.created_at, r.expires_at, r.responded_at, r.grant_applied,
                     CASE WHEN r.source_user_id = ? THEN r.target_user_id ELSE r.source_user_id END AS peer_id,
-                    u.display_name, u.role, u.profile_revision
+                    u.display_name, u.role, u.profile_revision, u.kind
                FROM contact_requests r
                JOIN users u ON u.id = CASE WHEN r.source_user_id = ? THEN r.target_user_id ELSE r.source_user_id END
               WHERE (r.source_user_id = ? OR r.target_user_id = ?)

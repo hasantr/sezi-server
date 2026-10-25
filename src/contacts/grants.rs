@@ -14,6 +14,8 @@ struct GrantRow {
     display_name: Option<String>,
     role: String,
     profile_revision: i64,
+    #[serde(default = "human_kind")]
+    kind: String,
 }
 
 fn grant_json(r: &GrantRow) -> serde_json::Value {
@@ -22,6 +24,7 @@ fn grant_json(r: &GrantRow) -> serde_json::Value {
         display_name: r.display_name.clone(),
         role: r.role.clone(),
         profile_revision: r.profile_revision,
+        kind: r.kind.clone(),
         sort_name: String::new(),
     };
     serde_json::json!({"grant_id":r.grant_id,"peer":profile_json(&p),"source":r.source,"trust":r.trust,"created_at":r.created_at})
@@ -36,7 +39,7 @@ pub async fn list_grants(req: Request, ctx: RouteContext<()>) -> Result<Response
     let revision = contact_revision(&db, &auth.user_id).await?;
     let rows:Vec<GrantRow>=db.prepare(
         "SELECT g.grant_id, CASE WHEN g.user_low=? THEN g.user_high ELSE g.user_low END AS peer_id,
-                g.source,g.trust,g.created_at,u.display_name,u.role,u.profile_revision
+                g.source,g.trust,g.created_at,u.display_name,u.role,u.profile_revision,u.kind
            FROM contact_grants g JOIN users u ON u.id=CASE WHEN g.user_low=? THEN g.user_high ELSE g.user_low END
           WHERE (g.user_low=? OR g.user_high=?) AND g.revoked_at IS NULL
             AND NOT EXISTS (SELECT 1 FROM contact_blocks b WHERE

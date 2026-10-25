@@ -3,10 +3,17 @@
 //! | Route | What |
 //! |---|---|
 //! | `POST /admin/bots {name, about?}` | create → `{bot_id, token}`; the token is shown ONCE |
-//! | `GET /admin/bots` | every bot not deleted |
+//! | `GET /admin/bots` | every bot not deleted, with how its program is doing (below) |
 //! | `PATCH /admin/bots/:id {name?, about?, disabled?}` | change, turn off, turn back on |
 //! | `POST /admin/bots/:id/token` | a new key; the old one stops at once |
 //! | `DELETE /admin/bots/:id` | soft delete: the account and its name stay for old messages |
+//! | `POST /admin/bots/:id/test` | "Dene": a `ping` update to the program → `{ok, update_id}` |
+//!
+//! Each listed bot carries `program_seen_at` (seconds: its last API call or taken webhook),
+//! `waiting_since` (ms: the oldest update its program has not been handed), `webhook` (set or
+//! not) and `program_silent` — "Programından haber yok": an update has waited 10 minutes and
+//! the program has not been seen in that time (BOTS_BUILD §5, R9 decision 4). Otherwise the
+//! page shows "last seen".
 //!
 //! OWNER-only, through `require_active_auth` (a revoked device's access token is refused at
 //! once — the `admin/mod.rs` guard explains why `require_auth` is never enough here).
@@ -24,6 +31,18 @@ use worker::*;
 
 const MAX_NAME_CHARS: usize = 64;
 const MAX_ABOUT_CHARS: usize = 280;
+/// How long an update waits before the program counts as silent.
+const SILENT_AFTER_MS: i64 = 10 * 60 * 1000;
+
+/// "No word from the program": an update has waited `SILENT_AFTER_MS`, and the program was not
+/// seen within that window. `seen_at_s` is in seconds (`bots.program_seen_at`), the rest in ms.
+pub(crate) fn program_silent(waiting_since_ms: Option<i64>, seen_at_s: Option<i64>, now_ms: i64) -> bool {
+    let Some(since) = waiting_since_ms else {
+        return false;
+    };
+    let window_start = now_ms - SILENT_AFTER_MS;
+    since <= window_start && seen_at_s.is_none_or(|s| s * 1000 < window_start)
+}
 
 /// The owner's user id, or the refusal to send.
 async fn owner(req: &Request, env: &Env) -> std::result::Result<String, Response> {
@@ -152,7 +171,28 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .all()
         .await?
         .results()?;
-    Response::from_json(&serde_json::json!({ "bots": rows }))
+    #[derive(Deserialize, Default)]
+    struct State {
+        #[serde(default)]
+        waiting_since: Option<i64>,
+        #[serde(default)]
+        webhook: bool,
+    }
+    let now = now_ms() as i64;
+    let mut out = Vec::with_capacity(rows.len());
+    // One inbox read per bot; `provision::MAX_BOTS` bounds the count.
+    for row in rows {
+        let state: State = match super::bot_inbox(&ctx.env, &row.bot_id, Method::Get, "/bot/state", None).await {
+            Ok(mut r) if r.status_code() == 200 => r.json().await.unwrap_or_default(),
+            _ => State::default(),
+        };
+        let mut v = serde_json::to_value(&row).map_err(|e| Error::RustError(e.to_string()))?;
+        v["waiting_since"] = state.waiting_since.into();
+        v["webhook"] = state.webhook.into();
+        v["program_silent"] = program_silent(state.waiting_since, row.program_seen_at, now).into();
+        out.push(v);
+    }
+    Response::from_json(&serde_json::json!({ "bots": out }))
 }
 
 #[derive(Deserialize, Default)]
@@ -259,7 +299,46 @@ pub async fn renew_token(req: Request, ctx: RouteContext<()>) -> Result<Response
             .bind(&[d1_text(&token::hash(&secret)), d1_text(&bot_id), now])?,
     ])
     .await?;
+    // A webhook in force is signed with the NEW key's secret from now on; the old one stops
+    // verifying, as the old key stops working.
+    let push = serde_json::json!({ "secret": super::webhook::derive_secret(&secret) });
+    if let Err(e) =
+        super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/webhook-secret", Some(push.to_string())).await
+    {
+        console_warn!("bot webhook secret rotation failed bot={bot_id}: {e:?}");
+    }
     Response::from_json(&serde_json::json!({ "bot_id": bot_id, "token": secret }))
+}
+
+/// "Dene": a `ping` update, carrying the owner as `who`, that the program receives like any
+/// other — by poll or webhook. A program that answers it shows the owner the whole loop works.
+pub async fn test(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let owner_id = match owner(&req, &ctx.env).await {
+        Ok(u) => u,
+        Err(resp) => return Ok(resp),
+    };
+    let Some(bot_id) = ctx.param("id").cloned() else {
+        return json_err(400, "bad_request");
+    };
+    let db = ctx.env.d1("DB")?;
+    if !live_bot(&db, &bot_id).await? {
+        return json_err(404, "not_found");
+    }
+    #[derive(Deserialize, serde::Serialize)]
+    struct Who {
+        user_id: String,
+        #[serde(default)]
+        display_name: Option<String>,
+        server_role: String,
+    }
+    let who: Option<Who> = db
+        .prepare("SELECT id AS user_id, display_name, role AS server_role FROM users WHERE id = ?1")
+        .bind(&[d1_text(&owner_id)])?
+        .first(None)
+        .await?;
+    let call = serde_json::json!({ "who": who });
+    let resp = super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/ping", Some(call.to_string())).await?;
+    crate::respond::passthrough(resp).await
 }
 
 pub async fn delete(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -288,4 +367,24 @@ pub async fn delete(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     }
     provision::nudge_humans(&ctx.env, &db).await;
     no_content()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::program_silent;
+
+    const MIN: i64 = 60_000;
+
+    #[test]
+    fn silent_only_after_an_update_waited_ten_minutes_unseen() {
+        let now = 100 * MIN;
+        assert!(!program_silent(None, None, now), "nothing waits");
+        assert!(!program_silent(Some(now - 9 * MIN), None, now), "not ten minutes yet");
+        assert!(program_silent(Some(now - 10 * MIN), None, now), "never seen");
+        assert!(program_silent(Some(now - 30 * MIN), Some((now - 11 * MIN) / 1000), now));
+        assert!(
+            !program_silent(Some(now - 30 * MIN), Some((now - 2 * MIN) / 1000), now),
+            "seen within the window: last seen, not silent"
+        );
+    }
 }

@@ -208,6 +208,7 @@ impl UserInbox {
         let _ = sql.exec_raw(super::updates::UPDATE_EXPIRE, cutoff(super::updates::UPDATE_TTL_MS));
         let _ = sql.exec_raw("DELETE FROM bot_sent WHERE created_at < ?", cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::store::SEEN_EXPIRE, cutoff(SENT_TTL_MS));
+        let _ = sql.exec_raw(super::deliver::SRC_ORPHANS, sql_no_args());
         let store = self.bot_store();
         let checked = store.kv_get("otk_checked_at").and_then(|v| v.parse::<i64>().ok());
         if checked.is_some_and(|t| now - t < OTK_CHECK_EVERY_MS) {

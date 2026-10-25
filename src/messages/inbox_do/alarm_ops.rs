@@ -36,8 +36,13 @@ impl UserInbox {
         if !alarm_needs_arming(current, deadline) {
             return;
         }
+        // `set_alarm` reads a bare i64 as an OFFSET from now, not an epoch time: handing it
+        // `deadline` armed every inbox ~56 years out (2026-09-02 → 2026-10-25), so no alarm ever
+        // fired — no backstop push, no cleanup, and a bot's frames never opened. The offset is
+        // spelled as a `Duration` so the unit cannot be misread again.
+        let offset = std::time::Duration::from_millis(delay_ms.max(0) as u64);
         for _ in 0..3 {
-            if storage.set_alarm(deadline).await.is_ok() {
+            if storage.set_alarm(offset).await.is_ok() {
                 return;
             }
         }

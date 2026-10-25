@@ -83,6 +83,16 @@ mod tests {
     const FLUSH: i64 = 90_000;
     const IDLE: i64 = 6 * 3600 * 1000;
 
+    /// `Storage::set_alarm` takes an i64 as an offset from now. The only caller handed it an
+    /// epoch deadline for seven weeks and every inbox's alarm landed decades out; this pins the
+    /// call to the `Duration` offset it now builds.
+    #[test]
+    fn set_alarm_is_given_an_offset_never_an_epoch_time() {
+        let src = include_str!("alarm_ops.rs");
+        let calls: Vec<&str> = src.match_indices("set_alarm(").map(|(i, _)| &src[i..i + 17]).collect();
+        assert_eq!(calls, vec!["set_alarm(offset)"], "every set_alarm call must pass the Duration offset");
+    }
+
     fn idle_work() -> AlarmWork {
         AlarmWork {
             account_removed: false,

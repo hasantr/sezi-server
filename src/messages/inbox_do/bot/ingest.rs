@@ -67,6 +67,7 @@ impl UserInbox {
         for user in repairs.difference(&pair_acks) {
             self.bot_repair(&ctx, user).await;
         }
+        self.bot_deliver_webhooks(&ctx).await;
         self.bot_drain_outbox(&ctx).await;
         self.bot_housekeeping(&ctx).await;
         Ok(())
@@ -155,7 +156,9 @@ impl UserInbox {
                             continue;
                         }
                         let update = message_update(now, &from, pre.who.get(&from), msg_uid.as_deref(), &body, &ext);
-                        self.bot_push_update(&update, now);
+                        if let Some(id) = self.bot_push_update(&update, now) {
+                            self.bot_note_update_src(id, &from, env.remote_id, msg_uid.as_deref());
+                        }
                     }
                     Effect::Update(Inbound::PairAck { from }) => {
                         pair_acks.insert(from);

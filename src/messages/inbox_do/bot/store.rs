@@ -11,7 +11,7 @@ use sezi_bot_engine::BotStore;
 use wasm_bindgen::JsValue;
 use worker::SqlStorage;
 
-pub(super) const TABLES: [&str; 7] = [
+pub(super) const TABLES: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS bot_kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     // slot 0 = the current session with that device, 1..=ARCHIVE_SLOTS = older ones, newest first.
     "CREATE TABLE IF NOT EXISTS bot_olm (
@@ -42,6 +42,12 @@ pub(super) const TABLES: [&str; 7] = [
     "CREATE TABLE IF NOT EXISTS bot_seen (
         from_user TEXT NOT NULL, msg_uid TEXT NOT NULL, at INTEGER NOT NULL,
         PRIMARY KEY (from_user, msg_uid))",
+    // Which member frame an update came from, so the program taking it (a poll's answer, a
+    // webhook's 2xx/3xx) becomes a `forward-read` to that member: their blue tick means "the
+    // program has it". Gone when the update is taken, or with the update.
+    "CREATE TABLE IF NOT EXISTS bot_update_src (
+        update_id INTEGER PRIMARY KEY, from_user TEXT NOT NULL,
+        remote_id INTEGER NOT NULL, msg_uid TEXT)",
 ];
 
 /// Bind: from, msg_uid.

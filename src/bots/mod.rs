@@ -8,7 +8,9 @@
 //! | File | What |
 //! |---|---|
 //! | `admin.rs` | the owner's `/admin/bots` surface: create (key shown once), list, change, renew, delete |
-//! | `api.rs` | `/bot/v1/:method` — `getMe`, `getUpdates`, `sendMessage` |
+//! | `api.rs` | `/bot/v1/:method` — `getMe`, `getUpdates`, `sendMessage`, `setWebhook`, `deleteWebhook` |
+//! | `webhook.rs` | the webhook's derived secret, its signature and envelope, one POST |
+//! | `listing.rs` | `GET /bots` — the enabled bots, for any active member |
 //! | `token.rs` | the key's shape, its hash, the lookup |
 //! | `provision.rs` | every D1 statement a bot's account, device, keys and grants take |
 //!
@@ -17,8 +19,10 @@
 
 pub mod admin;
 pub mod api;
+pub mod listing;
 pub(crate) mod provision;
 pub(crate) mod token;
+pub(crate) mod webhook;
 
 use crate::d1util::d1_text;
 use serde::Deserialize;
@@ -47,6 +51,20 @@ pub(crate) async fn any_bot(db: &D1Database, ids: &[String]) -> Result<bool> {
         .first(None)
         .await?;
     Ok(row.is_some_and(|r| r.n > 0))
+}
+
+/// "The program showed up": an API call, or a webhook it took (`bots.program_seen_at`, seconds).
+/// Best effort — a missed stamp only makes the owner's "no word from it" line early.
+pub(crate) async fn mark_program_seen(env: &Env, bot_id: &str) {
+    let Ok(db) = env.d1("DB") else {
+        return;
+    };
+    if let Ok(stmt) = db
+        .prepare("UPDATE bots SET program_seen_at = ?2 WHERE bot_id = ?1")
+        .bind(&[d1_text(bot_id), crate::d1util::d1_int(crate::utils::now_secs() as i64)])
+    {
+        let _ = stmt.run().await;
+    }
 }
 
 /// One internal call to a bot's inbox. DO stubs are not public: only this Worker reaches them,

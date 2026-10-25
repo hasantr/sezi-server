@@ -195,6 +195,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .get_async("/admin/bots", bots::admin::list)
         .patch_async("/admin/bots/:id", bots::admin::update)
         .post_async("/admin/bots/:id/token", bots::admin::renew_token)
+        .post_async("/admin/bots/:id/test", bots::admin::test)
+        .get_async("/bots", bots::listing::list)
         .delete_async("/admin/bots/:id", bots::admin::delete)
         .post_async("/bot/v1/:method", bots::api::dispatch)
         // Per-group library usage (admin/owner): sizes, counts and dates — never content, which
