@@ -198,7 +198,9 @@ impl UserInbox {
 
     /// `/bot/wake`: the bot was turned back on; whatever waits runs now.
     pub(super) async fn bot_wake(&self) -> Result<Response> {
-        self.bot_store().db.run("DELETE FROM bot_kv WHERE k = ?", &[super::store::Arg::T(KV_HOLD_UNTIL)]);
+        for k in [KV_HOLD_UNTIL, super::deliver::KV_WEBHOOK_HOLD] {
+            self.bot_store().db.run("DELETE FROM bot_kv WHERE k = ?", &[super::store::Arg::T(k)]);
+        }
         // Its room work too: posts, key requests and chunks held while it was off.
         self.bot_room_wake((now_secs() * 1000) as i64);
         self.arm_alarm_within(0).await;

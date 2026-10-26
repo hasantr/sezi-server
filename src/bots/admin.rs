@@ -422,8 +422,8 @@ pub async fn delete(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         now_secs() as i64,
     )?)
     .await?;
-    // Its sessions, updates and outbox go with the inbox; a failure here leaves an inbox no
-    // token can reach any more, which the next delete attempt (404) cannot retry — so log it.
+    // Its sessions, updates, secrets and outbox go with the inbox. A failure here is retried by
+    // the cron's purge drain: the batch above queued it (`provision::QUEUE_PURGE_SQL`).
     if let Err(e) = crate::realtime::purge_account_inbox(&ctx.env, &bot_id).await {
         console_warn!("bot inbox purge failed bot={bot_id}: {e:?}");
     }

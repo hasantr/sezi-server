@@ -345,6 +345,14 @@ fn a_deleted_bot_leaves_every_room_and_keeps_its_rows() {
     }
     db.execute(REVOKE_GRANTS_SQL, params![BOT, NOW + 10, "alice"]).unwrap();
     db.execute(LEAVE_ROOMS_SQL, params![BOT]).unwrap();
+    db.execute(QUEUE_PURGE_SQL, params![BOT, NOW + 10]).unwrap();
+    db.execute(QUEUE_PURGE_SQL, params![BOT, NOW + 20]).unwrap(); // a retried delete batch
+    let owed: (i64, i64) = db
+        .query_row("SELECT COUNT(*), MIN(next_at) FROM account_purge_outbox WHERE user_id = ?1", [BOT], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(owed, (1, NOW + 10), "the inbox is owed one purge, due at once");
     let rooms: i64 = db
         .query_row("SELECT COUNT(*) FROM group_bots WHERE bot_id = ?1", [BOT], |r| r.get(0))
         .unwrap();
@@ -364,4 +372,5 @@ fn a_deleted_bot_leaves_every_room_and_keeps_its_rows() {
     let body = &src[src.find("pub(crate) fn deletion_statements(").unwrap()..];
     let body = &body[..body.find("\n}\n").unwrap()];
     assert!(body.contains("LEAVE_ROOMS_SQL"), "the soft delete lost its room step");
+    assert!(body.contains("QUEUE_PURGE_SQL"), "a failed inbox purge would be retried by nobody");
 }

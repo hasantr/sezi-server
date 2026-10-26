@@ -135,6 +135,14 @@ pub(crate) const REVOKE_GRANTS_SQL: &str = "UPDATE contact_grants SET revoked_at
 /// the `ON DELETE CASCADE` of `group_bots.bot_id` never fires and the rows go here. Bind: bot_id.
 pub(crate) const LEAVE_ROOMS_SQL: &str = "DELETE FROM group_bots WHERE bot_id = ?1";
 
+/// Delete, step 6: the bot's inbox is owed a purge, durably. It holds the bot's private identity,
+/// the owner's provider key and sheet secret, and an AI bot's last day of members' words; the
+/// delete purges it at once, and when that call fails the cron's purge drain
+/// (`membership::drain_purge_outbox`) tries again — before this row, a failed purge was only
+/// logged, and the next delete attempt answered 404. Bind: bot_id, now.
+pub(crate) const QUEUE_PURGE_SQL: &str = "INSERT OR IGNORE INTO account_purge_outbox
+       (user_id, reason, created_at, attempts, next_at) VALUES (?1, 'removed', ?2, 0, ?2)";
+
 /// The humans worth a live nudge: the most recently seen. Bind: limit.
 pub(crate) const NUDGE_TARGETS_SQL: &str = "SELECT id FROM users WHERE kind = 'human'
       ORDER BY COALESCE(last_seen_at, 0) DESC, id LIMIT ?1";
@@ -276,8 +284,9 @@ pub(crate) fn deletion_statements(
         db.prepare(super::token::REVOKE_TOKENS_SQL).bind(&[id.clone(), now.clone()])?,
         db.prepare(TOMBSTONE_REVISIONS_SQL).bind(&[id.clone(), now.clone()])?,
         db.prepare(TOMBSTONES_SQL).bind(&[id.clone(), now.clone()])?,
-        db.prepare(REVOKE_GRANTS_SQL).bind(&[id.clone(), now, d1_text(owner)])?,
-        db.prepare(LEAVE_ROOMS_SQL).bind(&[id])?,
+        db.prepare(REVOKE_GRANTS_SQL).bind(&[id.clone(), now.clone(), d1_text(owner)])?,
+        db.prepare(LEAVE_ROOMS_SQL).bind(std::slice::from_ref(&id))?,
+        db.prepare(QUEUE_PURGE_SQL).bind(&[id, now])?,
     ])
 }
 

@@ -45,6 +45,13 @@ pub(crate) const SQL_SET_WARNED: &str = "UPDATE sfu_usage SET warned_80 = MAX(wa
      warned_100 = MAX(warned_100, ?) WHERE month = ?";
 pub(crate) const SQL_TOUCH_REPORT: &str =
     "UPDATE sfu_sessions SET last_report_at = ? WHERE session_id = ?";
+/// Where a member's next report is counted from: their latest report — or newest session's
+/// opening — on ANY of their sessions. The clamp is a member's, not a session's: per session, a
+/// member who opened a few hundred sessions could each claim 2.25 GB every five minutes and spend
+/// the month's cap within the hour, turning the SFU off for every group call on the server.
+/// Bind: user.
+pub(crate) const SQL_USER_REPORTED_SINCE: &str =
+    "SELECT MAX(COALESCE(last_report_at, created_at)) AS t FROM sfu_sessions WHERE user_id = ?";
 pub(crate) const SQL_PRUNE_SESSIONS: &str = "DELETE FROM sfu_sessions WHERE created_at < ?";
 
 /// A session row is kept this long (a day); older rows are pruned when a new one is opened.
@@ -307,7 +314,15 @@ pub async fn usage(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
         Err(resp) => return Ok(resp),
     };
     let now = now_secs() as i64;
-    let since = row.last_report_at.unwrap_or(row.created_at);
+    #[derive(Deserialize)]
+    struct Since {
+        t: Option<i64>,
+    }
+    let member_since: Option<i64> = match db.prepare(SQL_USER_REPORTED_SINCE).bind(&[d1_text(&row.user_id)]) {
+        Ok(stmt) => stmt.first::<Since>(None).await.ok().flatten().and_then(|s| s.t),
+        Err(_) => None,
+    };
+    let since = member_since.unwrap_or(row.last_report_at.unwrap_or(row.created_at));
     let counted = policy::clamp_report(body.egress_bytes, now - since);
     // A report of nothing changes nothing — not even "last reported": that moment is what keeps
     // a call counted as going on past the month's limit (`admits_running_call`), and only media

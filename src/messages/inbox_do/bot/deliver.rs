@@ -14,13 +14,31 @@
 //! came from gets a `forward-read` (queued in the outbox), so the member's blue tick means "the
 //! program has it". A successful webhook also counts as the program being seen
 //! (`bots.program_seen_at`), as an API call does.
+//!
+//! **A bot turned off is handed nothing.** Polling answers `bot/disabled` at the Worker; the
+//! webhook round asks D1 whether the bot is on (`builtin_policy::round_gate`, the built-in
+//! runner's own gate) before it POSTs, and while it is off — or deleted, or D1 silent — it sends
+//! nothing and marks nothing read, and waits (`KV_WEBHOOK_HOLD`) until `/bot/wake` or the hold
+//! ends. Until 2026-10-26 a turned-off program bot went on receiving every member's message.
 
+use super::builtin_policy::{round_gate, Gate};
 use super::outbox::{retry_delay_ms, OutKind};
 use super::store::{Arg, Exec};
 use super::*;
 
 /// Webhook POSTs one tick may make.
 const WEBHOOK_BATCH: i64 = 10;
+/// How long one webhook POST may take before it counts as failed (and backs off on the ladder) —
+/// the sheet bot's own bound for one hop (`builtin_sheet::HOP_TIMEOUT_MS`). A program slower than
+/// that is retried, not waited on, so ten silent POSTs cannot hold a tick past five minutes.
+const WEBHOOK_TIMEOUT_MS: u64 = 30_000;
+/// `bot_kv`: until when the webhook round waits because the bot is off (ms).
+pub(super) const KV_WEBHOOK_HOLD: &str = "webhook_hold_until";
+
+/// When the webhook's queue next needs the alarm: its head, pushed back to the end of a hold.
+pub(super) fn webhook_next(head: Option<i64>, hold_until: Option<i64>) -> Option<i64> {
+    head.map(|t| t.max(hold_until.unwrap_or(0)))
+}
 
 /// Bind: update_id, from_user, remote_id, msg_uid.
 pub(super) const SRC_PUT: &str = "INSERT OR REPLACE INTO bot_update_src
@@ -185,6 +203,18 @@ impl UserInbox {
         let Some((url, secret)) = webhook_of(&store) else {
             return;
         };
+        let start = (now_secs() * 1000) as i64;
+        if self.bot_webhook_next().is_none_or(|t| t > start) {
+            return; // nothing due, or held while the bot is off: no D1 read
+        }
+        // Off, deleted or D1 silent: nothing is POSTed and nothing reads as taken.
+        match round_gate(self.builtin_bot_row().await) {
+            Gate::Run(_) => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_WEBHOOK_HOLD)]),
+            Gate::Hold(ms) => {
+                store.kv_put(KV_WEBHOOK_HOLD, &(start + ms).to_string());
+                return;
+            }
+        }
         let sql = self.state.storage().sql();
         let due: Vec<DueRow> = match sql
             .exec_raw(HOOK_DUE, Some(vec![JsValue::from_f64(WEBHOOK_BATCH as f64)]))
@@ -208,7 +238,14 @@ impl UserInbox {
             };
             update["update_id"] = row.update_id.into();
             let update_json = update.to_string();
-            let status = crate::bots::webhook::post(&url, &secret, now, &update_json).await;
+            // Bounded: the round runs inside the tick, and the bot's replies and room posts drain
+            // after it — a program that never answers must not hold them (or the next frames).
+            let status = super::builtin_ai::with_timeout(
+                crate::bots::webhook::post(&url, &secret, now, &update_json),
+                WEBHOOK_TIMEOUT_MS,
+            )
+            .await
+            .unwrap_or_else(|| Err(Error::RustError("webhook timed out".into())));
             if matches!(status, Ok(s) if crate::bots::webhook::taken(s)) {
                 self.bot_updates_taken(ctx, row.update_id, row.update_id, now);
                 let _ = sql.exec_raw(HOOK_DONE, Some(vec![JsValue::from_f64(row.update_id as f64)]));
@@ -233,7 +270,8 @@ impl UserInbox {
     pub(super) fn bot_webhook_next(&self) -> Option<i64> {
         let store = self.bot_store();
         webhook_of(&store)?;
-        store.db.int(HOOK_NEXT, &[])
+        let hold = store.kv_get(KV_WEBHOOK_HOLD).and_then(|v| v.parse::<i64>().ok());
+        webhook_next(store.db.int(HOOK_NEXT, &[]), hold)
     }
 }
 

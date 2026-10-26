@@ -92,7 +92,7 @@ async fn set_webhook(env: &Env, db: &D1Database, bot: &BotAuth, url: &str, token
     let (url, secret) = if url.trim().is_empty() {
         (None, None)
     } else {
-        let Some(url) = super::webhook::clean_url(url) else {
+        let Some(url) = super::webhook::clean_url(url, super::builtin_rules::allow_lan(env)) else {
             return bot_err(400, "bad-url");
         };
         (Some(url), Some(super::webhook::derive_secret(token)))

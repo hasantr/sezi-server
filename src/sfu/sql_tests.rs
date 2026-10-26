@@ -21,6 +21,7 @@ fn every_statement_prepares_on_the_real_schema() {
         SQL_ADD_ROOM_USAGE,
         SQL_SET_WARNED,
         SQL_TOUCH_REPORT,
+        SQL_USER_REPORTED_SINCE,
         SQL_PRUNE_SESSIONS,
         SQL_TOP_ROOMS,
     ] {
@@ -94,4 +95,34 @@ fn a_call_is_going_on_while_a_session_of_it_reported_lately() {
     assert_eq!(live("c1", 2_000), (1, Some(1_000)), "a report keeps it going; its age is the first session's");
     assert_eq!(live("c1", 2_600).0, 0, "nothing reported since");
     assert_eq!(live("c2", 0), (0, None), "another call's sessions do not count");
+}
+
+/// Opening more sessions buys a member no more report: what one report may count is measured
+/// from that member's latest report on ANY session. Per session, 300 sessions opened together
+/// could each claim five minutes at full rate — 675 GB, most of a month's 1,000 GB cap, after
+/// five minutes of waiting.
+#[test]
+fn a_members_reports_share_one_clock_however_many_sessions_they_open() {
+    let db = db();
+    let since = |user: &str| -> Option<i64> {
+        db.query_row(SQL_USER_REPORTED_SINCE, params![user], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(since("mallory"), None, "no session: the caller falls back to the session's own");
+    for i in 0..300 {
+        db.execute(SQL_INSERT_SESSION, params![format!("s{i}"), "r1", format!("c{i}"), "mallory", 1_000]).unwrap();
+    }
+    db.execute(SQL_INSERT_SESSION, params!["honest", "r1", "c0", "alice", 1_000]).unwrap();
+    let mut counted = 0;
+    for i in 0..300 {
+        // Every session reports at once, five minutes after they all opened (as `usage` does it:
+        // a report that counts nothing touches nothing).
+        let now = 1_300;
+        let got = policy::clamp_report(i64::MAX, now - since("mallory").unwrap());
+        if got > 0 {
+            db.execute(SQL_TOUCH_REPORT, params![now, format!("s{i}")]).unwrap();
+        }
+        counted += got;
+    }
+    assert_eq!(counted, policy::clamp_report(i64::MAX, 300), "300 sessions are one member's five minutes");
+    assert_eq!(since("alice"), Some(1_000), "another member's clock is their own");
 }

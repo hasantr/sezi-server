@@ -41,7 +41,8 @@ fn a_report_counts_no_more_than_the_time_could_carry() {
     assert_eq!(clamp_report(i64::MAX, 30), per_sec * 30);
     assert_eq!(clamp_report(-5, 30), 0);
     assert_eq!(clamp_report(i64::MAX, 3_600), per_sec * MAX_REPORT_GAP_SECS, "a long gap is capped");
-    assert_eq!(clamp_report(i64::MAX, 0), per_sec, "at least one second");
+    assert_eq!(clamp_report(i64::MAX, 0), 0, "no time, nothing: reports back to back add nothing");
+    assert_eq!(clamp_report(i64::MAX, -3), 0, "a clock that went back adds nothing either");
 }
 
 #[test]

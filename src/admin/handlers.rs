@@ -396,6 +396,10 @@ pub async fn set_role(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         return json_err(400, "bad_request");
     }
     let db = ctx.env.d1("DB")?;
+    // A bot holds no server role: it never signs in, and its row is not a member's.
+    if crate::bots::any_bot(&db, std::slice::from_ref(&body.user_id)).await? {
+        return json_err(400, crate::bots::BOT_NOT_MEMBER);
+    }
     let target: Option<RoleOnly> = db
         .prepare("SELECT role FROM users WHERE id = ? LIMIT 1")
         .bind(&[d1_text(&body.user_id)])?
@@ -561,6 +565,11 @@ pub async fn transfer_ownership(mut req: Request, ctx: RouteContext<()>) -> Resu
         return json_err(400, "already_owner");
     }
     let db = ctx.env.d1("DB")?;
+    // Handed to a bot, the server would have an owner nobody can ever act as: a bot gets no
+    // token, and the caller has just been demoted.
+    if crate::bots::any_bot(&db, std::slice::from_ref(&body.user_id)).await? {
+        return json_err(400, crate::bots::BOT_NOT_MEMBER);
+    }
     let target: Option<RoleOnly> = db
         .prepare("SELECT role FROM users WHERE id = ? LIMIT 1")
         .bind(&[d1_text(&body.user_id)])?
@@ -617,6 +626,23 @@ pub async fn transfer_ownership(mut req: Request, ctx: RouteContext<()>) -> Resu
 mod tests {
     use super::USERS_PAGE_SQL;
     use rusqlite::params;
+
+    /// Every owner action aimed at a person refuses a bot BEFORE it writes. `transfer_ownership`
+    /// to a bot id demoted the owner and made the bot the server's owner — an owner nobody can
+    /// ever act as, since a bot gets no token — and `set_role` gave a bot a server role.
+    #[test]
+    fn no_role_or_ownership_goes_to_a_bot() {
+        let src = include_str!("handlers.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        for name in ["set_role", "remove_member", "transfer_ownership"] {
+            let start = src.find(&format!("pub async fn {name}(")).expect(name);
+            let rest = &src[start..];
+            let body = &rest[..rest[1..].find("\npub async fn ").map_or(rest.len(), |i| i + 1)];
+            let guard = body.find("any_bot(").unwrap_or_else(|| panic!("{name} never refuses a bot"));
+            let write = body.find("db.batch(").or_else(|| body.find("delete_membership(")).expect("a write");
+            assert!(guard < write, "{name} writes before it refuses a bot");
+        }
+    }
 
     /// The keyset walks every member exactly once across a tie in `created_at` — the 200-row cap
     /// this replaced hid everyone past the two hundredth student.

@@ -65,21 +65,22 @@ pub(crate) fn taken(status: u16) -> bool {
     (200..400).contains(&status)
 }
 
-/// An `https://` URL with a host, no credentials and no fragment, at most 512 bytes; else `None`.
-/// No address check beyond that: a Worker's fetch cannot reach a private network, and the URL is
-/// the program's own, set with its own key.
-pub(crate) fn clean_url(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.len() > MAX_URL_LEN {
+/// An `https://` URL with a host, no credentials and no fragment, at most 512 bytes, whose host
+/// is not an IP literal or a private name — the built-in bots' rule (`builtin_rules::outbound_url`,
+/// with its lab escape); else `None`.
+///
+/// The host rule is not optional. A relay on Cloudflare cannot reach a private network, but a
+/// self-hosted one runs on bare workerd with miniflare's `internet` service, which allows
+/// `private` addresses: there the bot inbox's POST reaches whatever the owner's LAN and the
+/// relay's own machine have (the router's page, a NAS, a local admin port). Whoever holds a bot's
+/// key — the owner's program, a developer it was given to, someone it leaked to — would have had
+/// that reach. As with the built-in rule, a public NAME that resolves to a private address is not
+/// caught here.
+pub(crate) fn clean_url(raw: &str, allow_lan: bool) -> Option<String> {
+    if raw.trim().len() > MAX_URL_LEN {
         return None;
     }
-    let url = Url::parse(raw).ok()?;
-    let ok = url.scheme() == "https"
-        && url.host_str().is_some_and(|h| !h.is_empty())
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.fragment().is_none();
-    ok.then(|| url.to_string())
+    crate::bots::builtin_rules::outbound_url(raw, allow_lan).map(|url| url.to_string())
 }
 
 /// One attempt. `Ok(status)` for any answer, `Err` when nothing answered.

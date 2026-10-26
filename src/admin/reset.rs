@@ -27,6 +27,13 @@
 //! and registration mints a fresh `Uuid`, so new accounts get new DOs and the retention alarm
 //! collects the old. It is also why the wipe includes the OWNER — keeping their row keeps their
 //! old inbox DO while D1 insists they have no devices.
+//!
+//! **Except a bot's.** A bot's inbox is not a mailbox of ciphertext: it holds the bot's private
+//! identity, the owner's AI provider key and sheet secret, and — for an AI bot — the last day of
+//! what members wrote to it, in the clear. No alarm collects that, and after the wipe nothing
+//! could ever reach it again to delete it. So the wipe queues every bot's inbox on
+//! `account_purge_outbox` ([`QUEUE_BOT_PURGES_SQL`]) in the same batch, and the cron's purge drain
+//! empties them.
 
 use crate::auth::hashing::{hash_code, secret_eq, verify_code};
 use crate::auth::middleware::{require_active_auth, require_owner};
@@ -176,10 +183,25 @@ const WIPE_TABLES: &[&str] = &[
     "user_storage",
     "server_stats",
     "turn_usage",
+    "door_misses",
+    "sfu_sessions",
+    "sfu_room_usage",
     "account_purge_outbox",
+    // Bots: their inboxes are queued for purging just before `bots` goes (QUEUE_BOT_PURGES_SQL),
+    // which is why they come after `account_purge_outbox`. `bots` cascades from `users` too; it is
+    // named so the wipe does not depend on that.
+    "group_bots",
+    "bot_tokens",
+    "bots",
     // LAST: every table above may reference it.
     "users",
 ];
+
+/// Every bot's inbox onto the purge outbox (module doc, "Except a bot's"). Runs inside the wipe,
+/// after `account_purge_outbox` is emptied and before `bots` is. Binds: now.
+pub(crate) const QUEUE_BOT_PURGES_SQL: &str = "INSERT OR IGNORE INTO account_purge_outbox
+       (user_id, reason, created_at, attempts, next_at)
+     SELECT bot_id, 'removed', ?1, 0, ?1 FROM bots";
 
 /// Tables a reset must NOT touch — the owner's configuration and the server's own identity.
 ///
@@ -193,6 +215,11 @@ const KEEP_TABLES: &[&str] = &[
     "storage_backends",
     // Populated by the wipe itself: the blobs still have to be deleted from the store.
     "storage_orphans",
+    // The owner's uploaded SoundFont pack: configuration, and its blob stays referenced.
+    "instrument_pack",
+    // The month's SFU spend on the owner's Cloudflare app. The money is spent whatever the D1
+    // says; wiping it would hand the month's cap back in full.
+    "sfu_usage",
 ];
 
 pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -275,6 +302,9 @@ pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
     ];
     // ── 2) The wipe itself, children before parents ──────────────────────────────────────────
     for table in WIPE_TABLES {
+        if *table == "bots" {
+            stmts.push(db.prepare(QUEUE_BOT_PURGES_SQL).bind(&[d1_int(now)])?);
+        }
         stmts.push(db.prepare(format!("DELETE FROM {table}")));
     }
     db.batch(stmts).await?;
@@ -311,71 +341,74 @@ mod tests {
     /// table in NEITHER survives every reset silently, and nobody notices until its stale rows
     /// produce a bug that looks impossible on a "clean" server.
     ///
-    /// The expected set is written out rather than parsed: a test deriving it from the source it
-    /// checks would agree with itself. So a new migration means three deliberate edits — one list
-    /// here, one of the two above — instead of one silent omission.
+    /// The expected set is the MIGRATIONS' (`test_schema::full_schema`), not a list written here.
+    /// Until 2026-10-26 it was a hand-written list, and it had stopped at migration 0046: eight
+    /// tables made since — the bots' three, the SFU's three, `door_misses`, `instrument_pack` —
+    /// were in neither list and the guard passed, because it only ever checked the tables it was
+    /// told about. Reading the schema is not the test agreeing with itself: what it checks is the
+    /// two lists above, and the schema is the other side.
     #[test]
-    fn every_table_is_classified_as_wiped_or_kept() {
-        // Every CREATE TABLE in worker-rs/migrations, minus the two `*_new` rebuild scratch tables
-        // (dropped by the migration that makes them) and the migration bookkeeping.
-        const ALL: &[&str] = &[
-            "account_purge_outbox",
-            "avatar_objects",
-            "contact_blocks",
-            "contact_grants",
-            "contact_qr_claims",
-            "contact_qr_offers",
-            "contact_requests",
-            "contact_revisions",
-            "contact_tombstones",
-            "device_lists",
-            "devices",
-            "directory_revisions",
-            "directory_tombstones",
-            "fanout_retry",
-            "group_join_requests",
-            "group_members",
-            "groups",
-            "invite_attributions",
-            "invite_tokens",
-            "link_requests",
-            "media_objects",
-            "membership_delete_guard",
-            "one_time_prekeys",
-            "pending_messages",
-            "plugin_code_objects",
-            "plugin_epoch_floor",
-            "plugin_media_objects",
-            "push_tokens",
-            "push_wake_debounce",
-            "refresh_tokens",
-            "room_library_objects",
-            "server_config",
-            "server_plugin_policy",
-            "server_settings",
-            "server_stats",
-            "signed_prekeys",
-            "storage_backends",
-            "storage_orphans",
-            "turn_usage",
-            "usage_counters",
-            "user_storage",
-            "users",
-            "verification_codes",
-        ];
-        for t in ALL {
-            let wiped = WIPE_TABLES.contains(t);
-            let kept = KEEP_TABLES.contains(t);
-            assert!(
-                wiped || kept,
-                "table `{t}` is in neither WIPE_TABLES nor KEEP_TABLES — decide which, \
-                 or it survives every reset unnoticed"
-            );
-            assert!(
-                !(wiped && kept),
-                "table `{t}` is in BOTH lists — one of the two is wrong"
-            );
+    fn every_migrated_table_is_classified_as_wiped_or_kept() {
+        let db = crate::test_schema::full_schema();
+        let all: Vec<String> = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table'
+                   AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_new' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(all.len() > 40, "the schema read found only {} tables", all.len());
+        for t in &all {
+            let (wiped, kept) = (WIPE_TABLES.contains(&t.as_str()), KEEP_TABLES.contains(&t.as_str()));
+            assert!(wiped || kept, "table `{t}` is in neither WIPE_TABLES nor KEEP_TABLES");
+            assert!(!(wiped && kept), "table `{t}` is in BOTH lists");
         }
+        for t in WIPE_TABLES.iter().chain(KEEP_TABLES) {
+            assert!(all.iter().any(|a| a == t), "`{t}` is listed but no migration makes it");
+        }
+    }
+
+    /// The wipe as it ships, on the real schema: it commits (no foreign key refuses it), leaves no
+    /// bot behind in D1, and leaves every bot's inbox queued for purging — the one place its
+    /// secrets and its members' words could still be (module doc, "Except a bot's").
+    #[test]
+    fn the_wipe_commits_and_queues_every_bots_inbox_for_purging() {
+        use rusqlite::params;
+        let db = crate::test_schema::full_schema();
+        db.execute_batch(
+            "INSERT INTO users (id, email, identity_pubkey, created_at, role)
+               VALUES ('owner', 'o@x', x'00', 1, 'owner');
+             INSERT INTO users (id, email, identity_pubkey, created_at, kind)
+               VALUES ('bot-1', 'b1@bot', x'00', 1, 'bot'), ('bot-2', 'b2@bot', x'00', 1, 'bot');
+             INSERT INTO bots (bot_id, name, created_by, created_at) VALUES
+               ('bot-1', 'Katip', 'owner', 1), ('bot-2', 'Asistan', 'owner', 1);
+             INSERT INTO bot_tokens (token_hash, bot_id, created_at) VALUES ('h', 'bot-1', 1);
+             INSERT INTO groups (id, name, created_by, created_at, updated_at)
+               VALUES ('g', 'G', 'owner', 1, 1);
+             INSERT INTO group_bots (group_id, bot_id, added_by, added_at) VALUES ('g', 'bot-1', 'owner', 1);",
+        )
+        .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        for table in WIPE_TABLES {
+            if *table == "bots" {
+                tx.execute(QUEUE_BOT_PURGES_SQL, params![1_000]).unwrap();
+            }
+            tx.execute(&format!("DELETE FROM {table}"), []).unwrap_or_else(|e| panic!("{table}: {e}"));
+        }
+        tx.commit().unwrap();
+        let count = |sql: &str| -> i64 { db.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM bots") + count("SELECT COUNT(*) FROM users"), 0);
+        let queued: Vec<String> = db
+            .prepare("SELECT user_id FROM account_purge_outbox WHERE next_at <= 1000 ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(queued, ["bot-1", "bot-2"], "every bot's inbox is owed a purge, due now");
     }
 
     /// `users` last: several wiped tables have a foreign key into it and a D1 batch is one

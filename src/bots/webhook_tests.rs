@@ -43,7 +43,7 @@ fn a_redirect_counts_as_taken_and_an_error_does_not() {
 #[test]
 fn only_plain_https_urls_are_accepted() {
     assert_eq!(
-        clean_url(" https://script.google.com/macros/s/X/exec ").as_deref(),
+        clean_url(" https://script.google.com/macros/s/X/exec ", false).as_deref(),
         Some("https://script.google.com/macros/s/X/exec")
     );
     for bad in [
@@ -54,8 +54,33 @@ fn only_plain_https_urls_are_accepted() {
         "not a url",
         "",
     ] {
-        assert_eq!(clean_url(bad), None, "{bad}");
+        assert_eq!(clean_url(bad, false), None, "{bad}");
     }
     let long = format!("https://example.com/{}", "a".repeat(600));
-    assert_eq!(clean_url(&long), None);
+    assert_eq!(clean_url(&long, false), None);
+}
+
+#[test]
+fn a_webhook_may_not_point_into_the_relays_own_network() {
+    // A self-hosted relay's fetch reaches private addresses (bare workerd keeps miniflare's
+    // `internet` service, `allow = ["public", "private"]`), so a bot key must not be a way in.
+    for bad in [
+        "https://192.168.1.1/hook",
+        "https://10.0.0.5/hook",
+        "https://127.0.0.1:8787/admin/users",
+        "https://2130706433/hook",
+        "https://0x7f.1/hook",
+        "https://[::1]/hook",
+        "https://[::ffff:127.0.0.1]/hook",
+        "https://localhost/hook",
+        "https://relay.localhost/hook",
+        "https://nas.local/hook",
+        "https://router.lan/hook",
+        "https://fritz.box/hook",
+        "https://printer/hook",
+    ] {
+        assert_eq!(clean_url(bad, false), None, "{bad}");
+    }
+    // The lab's escape (`BOT_BUILTIN_ALLOW_LAN=1`) lifts it, as it does for the built-in bots.
+    assert!(clean_url("https://10.0.0.5/hook", true).is_some());
 }

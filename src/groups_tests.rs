@@ -444,3 +444,45 @@ fn the_settings_bag_is_capped_wherever_it_is_written() {
         );
     }
 }
+
+/// An invitation sent to the wrong person could not be taken back: `remove-member` resolves its
+/// target through `group_role`, which ignores 'pending', so it answered 204 and kept the row — and
+/// the invitee could accept it at any later time and be handed the room's key (2026-10-26).
+#[test]
+fn an_admin_can_withdraw_an_invitation_nobody_accepted() {
+    use super::WITHDRAW_INVITE_SQL;
+    let db = teardown_fixture();
+    db.execute_batch(
+        "INSERT INTO group_members VALUES
+           ('g','p','member',3,'pending','c'),
+           ('g','pa','admin',3,'pending','c'),
+           ('keep','p','member',3,'pending','c');",
+    )
+    .unwrap();
+    let withdraw = |user: &str, by_role: &str| -> usize {
+        db.prepare(WITHDRAW_INVITE_SQL)
+            .unwrap()
+            .query_map(params!["g", user, by_role], |r| r.get::<_, String>(0))
+            .unwrap()
+            .count()
+    };
+    let rows = |room: &str| -> Vec<String> {
+        db.prepare("SELECT user_id FROM group_members WHERE group_id = ? ORDER BY 1")
+            .unwrap()
+            .query_map(params![room], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(withdraw("m", "owner"), 0, "an ACTIVE member is removed, never 'withdrawn'");
+    assert_eq!(withdraw("pa", "admin"), 0, "an admin withdraws only a member's invitation");
+    assert_eq!(withdraw("p", "admin"), 1);
+    assert_eq!(withdraw("p", "admin"), 0, "idempotent");
+    assert_eq!(withdraw("pa", "owner"), 1, "the owner withdraws anyone's");
+    assert_eq!(rows("g"), ["c", "m"]);
+    assert_eq!(rows("keep"), ["c", "p"], "the room next door keeps its invitation");
+
+    let body = handler_body(SRC, "remove_member");
+    let arm = body.find("WITHDRAW_INVITE_SQL").expect("remove_member never withdraws an invitation");
+    assert!(body[arm..].contains("notify::nudge_room"), "a withdrawal tells the invitee's devices");
+}

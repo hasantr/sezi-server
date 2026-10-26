@@ -490,9 +490,18 @@ pub async fn decline_invite(req: Request, ctx: RouteContext<()>) -> Result<Respo
     no_content()
 }
 
+/// Withdraw an invitation nobody has accepted: the PENDING row only, never an active one, and —
+/// as for a member — an admin only a `member`'s, the owner anyone's. Binds: `?1` group, `?2`
+/// invitee, `?3` the remover's role in the group. RETURNING says whether a row went.
+pub(crate) const WITHDRAW_INVITE_SQL: &str = "DELETE FROM group_members
+      WHERE group_id = ?1 AND user_id = ?2 AND status = 'pending'
+        AND (?3 = 'owner' OR role = 'member')
+     RETURNING user_id";
+
 // POST /groups/:id/remove-member (auth required), body {user_id} → 204. Remove a member, or leave
 // the group. Authority: leaving yourself is free except for the owner; removing someone else
-// requires owner/admin; the owner cannot be removed; an admin cannot remove another admin.
+// requires owner/admin; the owner cannot be removed; an admin cannot remove another admin. Aimed
+// at someone invited who has not accepted, it WITHDRAWS the invitation (`WITHDRAW_INVITE_SQL`).
 pub async fn remove_member(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let requester = match require_live_device_auth(&req, &ctx.env).await {
         Ok(uid) => uid,
@@ -518,6 +527,22 @@ pub async fn remove_member(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     };
     let target_role = match group_role(&db, &group_id, &target).await? {
         Some(r) => r,
+        // Invited, not accepted. Until 2026-10-26 this answered 204 and kept the row, so an
+        // invitation sent to the wrong person could never be taken back: they could accept it
+        // whenever they liked, and the room's key would follow.
+        None if target != requester && is_group_admin(&req_role) => {
+            let withdrawn = db
+                .prepare(WITHDRAW_INVITE_SQL)
+                .bind(&[d1_text(&group_id), d1_text(&target), d1_text(&req_role)])?
+                .all()
+                .await?
+                .results::<serde_json::Value>()?;
+            if !withdrawn.is_empty() {
+                // Named, as a decliner is: their row no longer exists to be found.
+                notify::nudge_room(&ctx.env, &db, &group_id, &[&target]).await;
+            }
+            return no_content();
+        }
         None => return no_content(), // already not a member → idempotent
     };
 

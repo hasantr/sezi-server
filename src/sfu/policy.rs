@@ -124,9 +124,12 @@ pub fn group_is_direct(settings_json: Option<&str>) -> bool {
 
 /// How many of a reported `bytes` count: never negative, never more than
 /// [`MAX_RECEIVE_BITS_PER_SEC`] could carry in the seconds since the last report (at most
-/// [`MAX_REPORT_GAP_SECS`], at least one).
+/// [`MAX_REPORT_GAP_SECS`]). No time, nothing: until 2026-10-26 a report always counted at least
+/// one second, so a member posting reports back to back was credited 7.5 MB each, as fast as the
+/// relay answered. A report that counts nothing moves no clock (`usage`); members report every
+/// 30 s, so a real one never meets this.
 pub fn clamp_report(bytes: i64, elapsed_secs: i64) -> i64 {
-    let secs = elapsed_secs.clamp(1, MAX_REPORT_GAP_SECS);
+    let secs = elapsed_secs.clamp(0, MAX_REPORT_GAP_SECS);
     bytes.clamp(0, MAX_RECEIVE_BITS_PER_SEC / 8 * secs)
 }
 

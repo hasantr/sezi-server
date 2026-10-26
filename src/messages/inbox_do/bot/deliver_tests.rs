@@ -88,3 +88,35 @@ fn taken_frames_group_per_member_with_parallel_uids() {
         ]
     );
 }
+
+/// The body of `fn <name>` in `src`, up to its closing brace at method depth.
+fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let start = src.find(&format!("fn {name}(")).expect(name);
+    &src[start..start + src[start..].find("\n    }\n").expect("end")]
+}
+
+/// A program bot the owner turned off went on receiving every member's message by webhook — and
+/// each one read as "the program has it" — while polling answered `bot/disabled` (2026-10-26).
+/// The round asks the same gate the built-in runner does, before it POSTs or marks anything read.
+#[test]
+fn a_bot_turned_off_is_posted_nothing_and_marks_nothing_read() {
+    let src = include_str!("deliver.rs");
+    let round = fn_body(src, "bot_deliver_webhooks");
+    let gate = round.find("round_gate(").expect("the webhook round never asks whether the bot is on");
+    for step in ["webhook::post(", "bot_updates_taken("] {
+        assert!(gate < round.find(step).expect(step), "{step} before the gate");
+    }
+    // A program that never answers fails its POST after a bound instead of holding the tick (and
+    // the replies and room posts that drain after this round).
+    assert!(round.contains("with_timeout(\n                crate::bots::webhook::post("), "an unbounded webhook POST");
+    // `/bot/wake` (the owner turning it back on) ends the hold at once.
+    assert!(fn_body(include_str!("builtin.rs"), "bot_wake").contains("KV_WEBHOOK_HOLD"));
+}
+
+#[test]
+fn a_held_webhook_queue_waits_for_the_hold_and_an_empty_one_arms_nothing() {
+    assert_eq!(webhook_next(None, Some(9_000)), None, "nothing waits: no alarm, held or not");
+    assert_eq!(webhook_next(Some(0), None), Some(0), "due now");
+    assert_eq!(webhook_next(Some(0), Some(9_000)), Some(9_000), "off: not a hot loop");
+    assert_eq!(webhook_next(Some(20_000), Some(9_000)), Some(20_000), "a back-off past the hold");
+}
