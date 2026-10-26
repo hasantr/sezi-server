@@ -73,7 +73,8 @@ pub(crate) fn message_update(
         }),
         None => serde_json::json!({ "user_id": from }),
     };
-    let reply_to = ext.get("reply").and_then(|r| r.get("msg_uid")).cloned();
+    // The member's `ext.reply` is `sezi_protocol::reply`'s shape: the original's id is `uid`.
+    let reply_to = sezi_protocol::reply::read(ext).map(|r| r.uid);
     let mut update = serde_json::json!({
         "kind": "message",
         "at": at_ms,
@@ -85,6 +86,54 @@ pub(crate) fn message_update(
         update["command"] = serde_json::json!({ "name": name, "args": args });
     }
     update
+}
+
+/// Where a room call came from, as the relay's own tables say (never the caller's word).
+pub(crate) struct CallRoom<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
+    /// The caller's role in the room (`group_members.role`).
+    pub(crate) role: &'a str,
+}
+
+/// The update for a member's call in a room (Phase 3). `message.message_id` is the call's id in
+/// the room — what `sendMessage {chat:{room_id}, reply_to}` names to answer it; `lang` and
+/// `utc_offset_min` are the caller's, when their kernel sent them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_update(
+    at_ms: i64,
+    from: &str,
+    who: Option<&Who>,
+    room: &CallRoom<'_>,
+    msg_uid: &str,
+    body: &str,
+    lang: Option<&str>,
+    utc_offset_min: Option<i32>,
+) -> serde_json::Value {
+    let mut update = message_update(at_ms, from, who, Some(msg_uid), body, &serde_json::Value::Null);
+    update["kind"] = "call".into();
+    update["chat"] = serde_json::json!({ "type": "room", "room_id": room.id, "name": room.name });
+    update["who"]["room_role"] = room.role.into();
+    update["message"]["lang"] = lang.into();
+    update["message"]["utc_offset_min"] = utc_offset_min.into();
+    update
+}
+
+/// The update for the bot being added to a room or removed from it; `who` is the admin, as the
+/// Worker read them from D1.
+pub(crate) fn room_event_update(
+    kind: &str,
+    at_ms: i64,
+    room_id: &str,
+    name: &str,
+    who: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "at": at_ms,
+        "chat": { "type": "room", "room_id": room_id, "name": name },
+        "who": who.cloned().unwrap_or(serde_json::Value::Null),
+    })
 }
 
 #[derive(Deserialize)]

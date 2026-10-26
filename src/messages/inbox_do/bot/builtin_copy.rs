@@ -38,11 +38,15 @@ pub(super) enum Line {
     TestMessage,
     /// A sheet bot whose sheet is not connected yet.
     NotSetUp,
+    /// Heads a row proposed for a call in a group, sent 1:1: which group (`{room}`).
+    ProposalFromRoom,
+    /// Heads a proposal that replaced one still waiting for an answer.
+    ProposalReplaced,
 }
 
 /// Every line, for the tests.
 #[cfg(test)]
-pub(super) const ALL: [Line; 14] = [
+pub(super) const ALL: [Line; 16] = [
     Line::AiUnavailable,
     Line::TryLater,
     Line::DailyLimit,
@@ -57,6 +61,8 @@ pub(super) const ALL: [Line; 14] = [
     Line::SheetGaveUp,
     Line::TestMessage,
     Line::NotSetUp,
+    Line::ProposalFromRoom,
+    Line::ProposalReplaced,
 ];
 
 pub(super) fn line(lang: Lang, l: Line) -> &'static str {
@@ -93,6 +99,10 @@ pub(super) fn line(lang: Lang, l: Line) -> &'static str {
         (Lang::En, Line::TestMessage) => "Hello! This is a test from the bot's owner.",
         (Lang::Tr, Line::NotSetUp) => "Bu bot henüz kurulmadı; mesajın kaydedilmedi.",
         (Lang::En, Line::NotSetUp) => "This bot isn't set up yet; your message was not saved.",
+        (Lang::Tr, Line::ProposalFromRoom) => "“{room}” grubundaki mesajın için:",
+        (Lang::En, Line::ProposalFromRoom) => "For your message in the group \"{room}\":",
+        (Lang::Tr, Line::ProposalReplaced) => "Önceki öneri geçersiz; cevabın bunun için.",
+        (Lang::En, Line::ProposalReplaced) => "This replaces the earlier proposal; your answer is for this one.",
     }
 }
 

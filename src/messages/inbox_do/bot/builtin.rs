@@ -199,6 +199,8 @@ impl UserInbox {
     /// `/bot/wake`: the bot was turned back on; whatever waits runs now.
     pub(super) async fn bot_wake(&self) -> Result<Response> {
         self.bot_store().db.run("DELETE FROM bot_kv WHERE k = ?", &[super::store::Arg::T(KV_HOLD_UNTIL)]);
+        // Its room work too: posts, key requests and chunks held while it was off.
+        self.bot_room_wake((now_secs() * 1000) as i64);
         self.arm_alarm_within(0).await;
         Response::empty().map(|r| r.with_status(204))
     }
@@ -220,7 +222,7 @@ impl UserInbox {
                     None => (Err("ai/no-key"), None),
                     Some(key) => {
                         let bot_name = self.builtin_bot_name().await.unwrap_or_default();
-                        let system = builtin_ai::system_prompt(ai, &bot_name, name, cfg.writes_sheet(), now);
+                        let system = builtin_ai::system_prompt(ai, &bot_name, name, None, cfg.writes_sheet(), now);
                         let body = builtin_ai::request_body(ai, &system, &[] as &[Turn], text);
                         match builtin_ai::call(ai, &key, &body).await {
                             Ok(t) => (Ok(()), Some(builtin_ai::split_row(&t).0)),
@@ -261,7 +263,7 @@ impl UserInbox {
         match (cfg.sheet_url.as_deref(), self.builtin_sheet_secret()) {
             (None, _) => Err(NOT_CONNECTED),
             (Some(url), Some(s)) => {
-                let body = builtin_sheet::body_json(&s, true, None, now, user_id, name, text, None);
+                let body = builtin_sheet::body_json(&s, true, None, now, user_id, name, None, text, None);
                 builtin_sheet::post(url, &body, allow_lan(&self.env)).await.0
             }
             (Some(_), None) => Err("bot/sheet-secret"),

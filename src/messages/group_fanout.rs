@@ -365,7 +365,8 @@ pub(crate) async fn fan_out_and_close<C: FanoutCalls, S: RetryStore>(
     SendVerdict::Sent { first_id, queued: queued.len() }
 }
 
-/// The group branch of `POST /messages/send`, from the membership gate to the response.
+/// The group branch of `POST /messages/send`: the PUBLIC gate (an active member, or 403), then
+/// [`fan_out_group`]. The gate is unchanged by bots: they post from inside the relay.
 pub(crate) async fn send_group(
     env: &Env,
     db: &D1Database,
@@ -377,44 +378,73 @@ pub(crate) async fn send_group(
     if crate::groups::group_role(db, &msg.group_id, &msg.sender_id).await?.is_none() {
         return json_err(403, "not_member");
     }
+    fan_out_group(env, db, ns, msg).await
+}
+
+/// Active members crossed with their active devices (`revoked_at IS NULL`), the sender left out.
+/// The join MUST stay LEFT: an INNER JOIN dropped a member with no device rows from the fan-out
+/// and lost their group message permanently. Bind: group, sender.
+pub(crate) const GROUP_SEND_MEMBERS_SQL: &str = "SELECT gm.user_id AS user_id, d.device_id AS device_id
+     FROM group_members gm
+     LEFT JOIN devices d
+       ON d.user_id = gm.user_id AND d.revoked_at IS NULL
+     WHERE gm.group_id = ? AND gm.user_id != ?
+       AND gm.status = 'active'";
+
+/// Who a room message goes to: every active member but the sender, with their active devices,
+/// grouped per member. One D1 query. The bot's room send (`inbox_do/bot/room.rs`) reads its
+/// recipients through this too, so the two cannot drift.
+pub(crate) async fn group_send_members(db: &D1Database, group_id: &str, sender_id: &str) -> Result<Vec<Member>> {
     #[derive(Deserialize)]
     struct MemberDevice {
         user_id: String,
         // NULL for an active member who never published a device list — see the LEFT JOIN.
         device_id: Option<String>,
     }
-    // Active members crossed with their active devices (`revoked_at IS NULL`). The join MUST stay
-    // LEFT: an INNER JOIN dropped a member with no device rows from the fan-out and lost their
-    // group message permanently.
     let pairs: Vec<MemberDevice> = db
-        .prepare(
-            "SELECT gm.user_id AS user_id, d.device_id AS device_id
-             FROM group_members gm
-             LEFT JOIN devices d
-               ON d.user_id = gm.user_id AND d.revoked_at IS NULL
-             WHERE gm.group_id = ? AND gm.user_id != ?
-               AND gm.status = 'active'",
-        )
-        .bind(&[d1_text(&msg.group_id), d1_text(&msg.sender_id)])?
+        .prepare(GROUP_SEND_MEMBERS_SQL)
+        .bind(&[d1_text(group_id), d1_text(sender_id)])?
         .all()
         .await?
         .results()?;
+    Ok(members_from_pairs(pairs.into_iter().map(|p| (p.user_id, p.device_id)).collect()))
+}
+
+/// How many pending rows a fan-out to `members` stores: one per device, one for a device-blind
+/// member.
+pub(crate) fn fanout_width(members: &[Member]) -> usize {
+    members.iter().map(|m| m.devices.as_ref().map_or(1, Vec::len)).sum()
+}
+
+/// Everything after the public gate, for a sender that passed it: the members, the
+/// width-weighted rate limit, the fan-out and its close, the response.
+///
+/// It is NOT the bot's way into a room. A bot is never a member, so it never reaches here
+/// through `send_group`; its posts go out from its own inbox after its own `group_bots` check
+/// (`inbox_do/bot/room.rs`), in budgeted chunks through [`notify_members`].
+pub(crate) async fn fan_out_group(
+    env: &Env,
+    db: &D1Database,
+    ns: &ObjectNamespace,
+    msg: GroupMessage,
+) -> Result<Response> {
+    let members = group_send_members(db, &msg.group_id, &msg.sender_id).await?;
+    let width = fanout_width(&members);
     // A second guard, weighted by fan-out WIDTH in devices: one group send stores a pending row
     // per device, which the single-hit `msg:send` bucket counts as one event. 6000 units/60s
     // permits ~23 sends/min into a full 256-member group and far more into small ones.
-    if !pairs.is_empty()
+    if width > 0
         && !crate::ratelimit::check_rate_limit_weighted_env(
             env,
             &format!("msg:grp_fanout:{}", msg.sender_id),
             6000,
             60,
-            pairs.len(),
+            width,
         )
         .await
     {
         return json_err(429, "rate_limited");
     }
-    let members = members_from_pairs(pairs.into_iter().map(|p| (p.user_id, p.device_id)).collect());
 
     // What THIS invocation already spent provisioning a cold isolate is charged here, measured
     // where it ran (`self_provision::recent_spend`).
@@ -504,6 +534,41 @@ mod tests {
         assert_eq!(v["sender_id"], "s");
         assert_eq!(v["group_id"], "g");
         assert!(v["recipient_device_ids"].is_null());
+    }
+
+    /// The rate limit's weight: a pending row per device, one for a device-blind member.
+    #[test]
+    fn the_width_counts_devices_and_a_blind_member_once() {
+        let m = members_from_pairs(vec![pair("a", Some("a1")), pair("a", Some("a2")), pair("b", None)]);
+        assert_eq!(fanout_width(&m), 3);
+        assert_eq!(fanout_width(&[]), 0);
+    }
+
+    /// The recipients' query on the real schema: active members only, the sender left out,
+    /// revoked devices dropped, a member with no device kept (device-blind).
+    #[test]
+    fn the_members_query_takes_active_members_and_live_devices() {
+        let db = crate::test_schema::full_schema();
+        db.execute_batch(
+            "INSERT INTO users (id, email, identity_pubkey, created_at) VALUES
+               ('s','s@x',x'00',1),('a','a@x',x'00',1),('b','b@x',x'00',1),('p','p@x',x'00',1);
+             INSERT INTO groups (id, name, created_by, created_at, updated_at) VALUES ('g','G','s',1,1);
+             INSERT INTO group_members (group_id, user_id, role, joined_at, status) VALUES
+               ('g','s','owner',1,'active'),('g','a','member',1,'active'),
+               ('g','b','member',1,'active'),('g','p','member',1,'pending');
+             INSERT INTO devices (user_id, device_id, role, ed_pub, x_pub, label, added_at, revoked_at) VALUES
+               ('a','a1','primary',x'00',x'00','',1,NULL),('a','a2','linked',x'00',x'00','',1,5),
+               ('s','s1','primary',x'00',x'00','',1,NULL);",
+        )
+        .unwrap();
+        let mut st = db.prepare(GROUP_SEND_MEMBERS_SQL).unwrap();
+        let mut rows: Vec<(String, Option<String>)> = st
+            .query_map(["g", "s"], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![pair("a", Some("a1")), pair("b", None)]);
     }
 
     #[test]

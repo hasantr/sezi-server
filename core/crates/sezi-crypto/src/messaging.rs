@@ -558,6 +558,8 @@ pub fn decrypt_from_peer(
         InnerMessage::CallRecordingNotice { .. } => ("control".to_string(), String::new()),
         // So is the app-added notice: each device writes its own from the install it applied.
         InnerMessage::PluginAddedNotice { .. } => ("control".to_string(), String::new()),
+        // And the room-bot notice: each device writes its own from its own group refresh.
+        InnerMessage::RoomBotNotice { .. } => ("control".to_string(), String::new()),
         InnerMessage::P2pBlobOffer { ticket, manifest } => {
             // Ticket + manifest travel together in the body as one JSON object.
             // Dart's `_handleInbound` sees `kind == "p2p_blob_offer"` → hands the ticket to

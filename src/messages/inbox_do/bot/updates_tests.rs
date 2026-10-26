@@ -23,7 +23,7 @@ fn a_message_update_carries_the_relays_who_and_never_the_senders() {
         display_name: Some("Alice".into()),
         server_role: Some("member".into()),
     };
-    let ext = serde_json::json!({ "reply": { "msg_uid": "b-1", "author": "bot" } });
+    let ext = serde_json::json!({ "reply": { "uid": "b-1", "by": "bot", "kind": "text", "text": "earlier" } });
     let u = message_update(1_761_200_000_000, "alice", Some(&who), Some("m-9"), "/ara kitap", &ext);
     assert_eq!(
         u,
@@ -86,4 +86,26 @@ fn updates_older_than_the_window_expire() {
     c.query_row(UPDATE_PUSH, params!["{}", 1_000 + UPDATE_TTL_MS], |r| r.get::<_, i64>(0)).unwrap();
     c.execute(UPDATE_EXPIRE, [1_000 + UPDATE_TTL_MS - 1]).unwrap();
     assert_eq!(read(&c, 0, 100), vec![2]);
+}
+
+#[test]
+fn a_call_names_its_room_and_the_callers_room_role_from_the_relay() {
+    let who = Who { user_id: "alice".into(), display_name: Some("Alice".into()), server_role: Some("member".into()) };
+    let room = CallRoom { id: "g-1", name: "Hukuk", role: "admin" };
+    let u = call_update(5, "alice", Some(&who), &room, "loc-7", "yarın kaçta?", Some("tr"), Some(180));
+    assert_eq!(
+        u,
+        serde_json::json!({
+            "kind": "call",
+            "at": 5,
+            "chat": { "type": "room", "room_id": "g-1", "name": "Hukuk" },
+            "message": { "message_id": "loc-7", "text": "yarın kaçta?", "reply_to": null,
+                         "lang": "tr", "utc_offset_min": 180 },
+            "who": { "user_id": "alice", "display_name": "Alice", "server_role": "member", "room_role": "admin" },
+        })
+    );
+    let added = room_event_update("added", 6, "g-1", "Hukuk", Some(&serde_json::json!({"user_id": "bob"})));
+    assert_eq!(added["kind"], "added");
+    assert_eq!(added["chat"], serde_json::json!({ "type": "room", "room_id": "g-1", "name": "Hukuk" }));
+    assert_eq!(added["who"]["user_id"], "bob");
 }

@@ -8,7 +8,8 @@
 
 use super::super::ack::{group_acks, AckRow};
 use super::outbox::OutKind;
-use super::updates::{message_update, Who};
+use super::room::BotRooms;
+use super::updates::{call_update, message_update, CallRoom, Who};
 use super::*;
 use sezi_bot_engine::{on_envelope, Effect, Envelope, Inbound};
 use std::collections::{BTreeSet, HashMap};
@@ -24,6 +25,15 @@ struct Prefetch {
     /// (user, device) → the D1 `devices.x_pub` the engine checks a PreKey's identity against.
     x_pub: HashMap<(String, String), String>,
     who: HashMap<String, Who>,
+    /// The bot's rooms, and which senders may call it in each (Phase 3, `room.rs`).
+    rooms: BotRooms,
+}
+
+/// What the synchronous block hands the async part after it.
+#[derive(Default)]
+struct Owed {
+    repairs: BTreeSet<String>,
+    pair_acks: BTreeSet<String>,
 }
 
 impl UserInbox {
@@ -53,30 +63,31 @@ impl UserInbox {
                 Some(vec![JsValue::from_f64(TICK_BATCH as f64)]),
             )?
             .to_array()?;
-        let mut repairs = BTreeSet::new();
-        let mut pair_acks = BTreeSet::new();
+        let mut owed = Owed::default();
         if !rows.is_empty() {
-            let pre = self.bot_prefetch(&rows).await?;
-            self.bot_open_frames(&ctx, rows, &pre, &mut repairs, &mut pair_acks)?;
+            let pre = self.bot_prefetch(&ctx, &rows).await?;
+            self.bot_open_frames(&ctx, rows, &pre, &mut owed)?;
         }
         // A member's pair-ack was already answered by the engine (its Deliver is queued): only
         // what that member could not read goes again. A repair is the bot's own pair-ack first.
-        for user in &pair_acks {
+        for user in &owed.pair_acks {
             self.bot_resend_failed(&ctx, user).await;
         }
-        for user in repairs.difference(&pair_acks) {
+        for user in owed.repairs.difference(&owed.pair_acks) {
             self.bot_repair(&ctx, user).await;
         }
         self.bot_deliver_webhooks(&ctx).await;
-        // A built-in bot answers here; its replies go out with the drain below.
-        // The two share the tick's purse: the drain gets what the round left (`builtin_policy`).
+        // A built-in bot answers here; its replies go out with the drain below. Then the room
+        // round shares keys and encrypts what waits for a room. The three share the tick's purse:
+        // each gets what the one before left (`builtin_policy`, `room::room_budget`).
         let round = self.bot_builtin_round(&ctx).await;
-        self.bot_drain_outbox_within(&ctx, super::builtin_policy::drain_budget(round)).await;
+        let room = self.bot_room_round(&ctx, super::room::room_budget(round)).await;
+        self.bot_drain_outbox_within(&ctx, super::builtin_policy::drain_budget(round + room)).await;
         self.bot_housekeeping(&ctx).await;
         Ok(())
     }
 
-    async fn bot_prefetch(&self, rows: &[PendingRow]) -> Result<Prefetch> {
+    async fn bot_prefetch(&self, ctx: &BotCtx, rows: &[PendingRow]) -> Result<Prefetch> {
         let senders: BTreeSet<&str> = rows.iter().map(|r| r.sender_id.as_str()).collect();
         let list = serde_json::to_string(&senders).map_err(|e| Error::RustError(e.to_string()))?;
         let db = self.env.d1("DB")?;
@@ -104,7 +115,9 @@ impl UserInbox {
             .all()
             .await?
             .results()?;
+        let rooms = self.bot_rooms_of(&ctx.bot_id, &list).await?;
         Ok(Prefetch {
+            rooms,
             x_pub: keys
                 .into_iter()
                 .map(|k| ((k.user_id, k.device_id), crate::utils::b64_encode(&k.x_pub)))
@@ -119,8 +132,7 @@ impl UserInbox {
         ctx: &BotCtx,
         rows: Vec<PendingRow>,
         pre: &Prefetch,
-        repairs: &mut BTreeSet<String>,
-        pair_acks: &mut BTreeSet<String>,
+        owed: &mut Owed,
     ) -> Result<()> {
         let now = (now_secs() * 1000) as i64;
         let mut store = self.bot_store();
@@ -150,7 +162,7 @@ impl UserInbox {
                         self.bot_queue_deliver(&user_id, &device_id, &envelope_b64, msg_uid.as_deref(), now);
                     }
                     Effect::Repair { user_id } => {
-                        repairs.insert(user_id);
+                        owed.repairs.insert(user_id);
                     }
                     Effect::Update(Inbound::Text { from, msg_uid, body, ext, .. }) => {
                         // A kernel resends after a re-pair when its `delivered` came late: the
@@ -164,9 +176,41 @@ impl UserInbox {
                         }
                     }
                     Effect::Update(Inbound::PairAck { from }) => {
-                        pair_acks.insert(from);
+                        owed.pair_acks.insert(from);
                     }
-                    // Rooms, taps and room-key requests are Phase 3/4; `Ignored` is read and dropped.
+                    Effect::Update(Inbound::Call { from, room_id, msg_uid, body, lang, utc_offset_min }) => {
+                        // Believed only for a room of this bot, from an active member of it.
+                        let Some((name, role)) = pre.rooms.caller(&room_id, &from) else {
+                            console_log!("[bot] call refused: not a room of this bot, or not a member");
+                            continue;
+                        };
+                        if !store.first_sight(&from, &format!("{room_id}/{msg_uid}"), now) {
+                            continue;
+                        }
+                        let room = CallRoom { id: &room_id, name, role };
+                        let update = call_update(
+                            now,
+                            &from,
+                            pre.who.get(&from),
+                            &room,
+                            &msg_uid,
+                            &body,
+                            lang.as_deref(),
+                            utc_offset_min,
+                        );
+                        if let Some(id) = self.bot_push_update(&update, now) {
+                            self.bot_note_update_src(id, &from, env.remote_id, Some(&msg_uid));
+                            self.bot_note_call(&room_id, &msg_uid, &from, &body, now);
+                        }
+                    }
+                    Effect::Update(Inbound::RoomKeyRequest { from, room_id, session_id }) => {
+                        if pre.rooms.caller(&room_id, &from).is_some() {
+                            // Answered by the room round, within its budget (`room_asks.rs`).
+                            self.bot_note_key_ask(&room_id, &from, session_id.as_deref(), now);
+                        }
+                    }
+                    // Taps are Phase 4; `Ignored` is read and dropped; `DeliverRoom` never comes
+                    // out of reading a frame.
                     Effect::DeliverRoom { .. } | Effect::Update(_) => {}
                 }
             }

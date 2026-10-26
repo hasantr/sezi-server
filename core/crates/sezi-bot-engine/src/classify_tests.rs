@@ -40,7 +40,7 @@ fn rich_text_reaches_the_program_as_its_words() {
 #[test]
 fn a_room_key_request_names_its_room() {
     let p = of(InnerMessage::RoomKeyRequest { room_id: "r1".into(), session_id: None });
-    assert_eq!(classify(&p, "u", "d", false), Inbound::RoomKeyRequest { from: "u".into(), room_id: "r1".into() });
+    assert_eq!(classify(&p, "u", "d", false), Inbound::RoomKeyRequest { from: "u".into(), room_id: "r1".into(), session_id: None });
 }
 
 #[test]

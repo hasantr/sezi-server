@@ -35,6 +35,9 @@ pub(super) const ORPHAN_PLUGIN_CODE_SQL: &str =
      SELECT store_id,'plugin-code/' || room_id || '/' || blob_id,size_bytes,?,0
        FROM plugin_code_objects WHERE room_id = ?";
 
+/// The room's bots (`group_bots`). Bind: room. Also covered by the `groups` FK cascade.
+pub(super) const DELETE_ROOM_BOTS_SQL: &str = "DELETE FROM group_bots WHERE group_id = ?";
+
 /// Tear a group down. The caller has already been checked to be the sitting owner.
 ///
 /// ONE batch, and unlike the two sequential `.run()` calls this replaces, that is load-bearing in
@@ -53,7 +56,7 @@ pub(super) const ORPHAN_PLUGIN_CODE_SQL: &str =
 ///    already been erased — invisible to `list_my_groups`, and undeletable through this very
 ///    handler, which needs an owner row to authorise. `create_group` batches for exactly this
 ///    reason and says so.
-/// 3. **SUBREQUESTS.** Ten statements as one batch is one subrequest instead of ten, which is
+/// 3. **SUBREQUESTS.** Eleven statements as one batch is one subrequest instead of eleven, which is
 ///    what buys the room for the post-commit live nudges (`groups_notify.rs`).
 ///
 /// `plugin_epoch_floor` is DELETED, not bumped. The handler used to call
@@ -85,9 +88,12 @@ pub(super) async fn delete_group_rows(db: &D1Database, group_id: &str, now: i64)
         db.prepare("DELETE FROM plugin_code_objects WHERE room_id = ?")
             .bind(&[d1_text(group_id)])?,
         db.prepare(DELETE_ROOM_SQL).bind(&[d1_text(group_id)])?,
-        // `group_members` also cascades off the `groups` FK; the explicit delete is
-        // belt-and-braces, and inside a batch it costs nothing.
+        // `group_members` and `group_bots` also cascade off the `groups` FK (D1 enforces
+        // foreign keys; `groups_bots_tests.rs` proves the cascade on the real schema); the
+        // explicit deletes are belt-and-braces, and inside a batch they cost nothing.
         db.prepare("DELETE FROM group_members WHERE group_id = ?")
+            .bind(&[d1_text(group_id)])?,
+        db.prepare(DELETE_ROOM_BOTS_SQL)
             .bind(&[d1_text(group_id)])?,
         db.prepare("DELETE FROM groups WHERE id = ?")
             .bind(&[d1_text(group_id)])?,

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::store::{RoomSession, RoomShare, RoomStore};
 use crate::BotStore;
 
 /// How many sessions per device are kept behind the current one.
@@ -33,6 +34,46 @@ pub struct MemStore {
     /// (user, device) → that device's session slots.
     pub sessions: HashMap<(String, String), Slots>,
     pub repairs: HashMap<String, i64>,
+    /// room → the bot's outbound Megolm session there.
+    pub rooms: HashMap<String, RoomSession>,
+    /// (room, session id) → the devices it was shared with.
+    pub room_shares: HashMap<(String, String), Vec<RoomShare>>,
+    /// (room, user) → when their last `RoomKeyRequest` was answered.
+    pub room_requests: HashMap<(String, String), i64>,
+}
+
+impl RoomStore for MemStore {
+    fn room_session(&self, room_id: &str) -> Option<RoomSession> {
+        self.rooms.get(room_id).cloned()
+    }
+
+    fn put_room_session(&mut self, room_id: &str, session: RoomSession) {
+        self.rooms.insert(room_id.to_owned(), session);
+    }
+
+    fn room_shares(&self, room_id: &str, session_id: &str) -> Vec<RoomShare> {
+        self.room_shares.get(&key(room_id, session_id)).cloned().unwrap_or_default()
+    }
+
+    fn put_room_share(&mut self, room_id: &str, session_id: &str, share: RoomShare) {
+        let shares = self.room_shares.entry(key(room_id, session_id)).or_default();
+        shares.retain(|s| !(s.user_id == share.user_id && s.device_id == share.device_id));
+        shares.push(share);
+    }
+
+    fn forget_room(&mut self, room_id: &str) {
+        self.rooms.remove(room_id);
+        self.room_shares.retain(|(r, _), _| r != room_id);
+        self.room_requests.retain(|(r, _), _| r != room_id);
+    }
+
+    fn room_request_at(&self, room_id: &str, user_id: &str) -> Option<i64> {
+        self.room_requests.get(&key(room_id, user_id)).copied()
+    }
+
+    fn set_room_request_at(&mut self, room_id: &str, user_id: &str, at_ms: i64) {
+        self.room_requests.insert(key(room_id, user_id), at_ms);
+    }
 }
 
 fn key(user_id: &str, device_id: &str) -> (String, String) {

@@ -14,13 +14,16 @@
 //! | `deliver.rs` | the webhook round, the owner's ping, and "taken" → the member's `forward-read` |
 //! | `builtin.rs` | a built-in bot (sheet, AI): its configuration and secrets, the owner's test |
 //! | `builtin_run.rs` · `builtin_jobs.rs` | the built-in runner's round: members' updates · rows owed to the sheet |
+//! | `builtin_room.rs` | a built-in bot called in a room: answers into the room, proposals 1:1 |
 //! | `builtin_policy.rs` | the round's pure decisions: budget, a pending row, a proposal's text |
 //! | `builtin_ai.rs` · `builtin_sheet.rs` | the model call (two dialects) · the sheet's POST |
 //! | `builtin_store.rs` · `builtin_copy.rs` | the built-in tables · every line the bot says itself |
+//! | `room.rs` · `room_send.rs` · `room_asks.rs` | the bot in its rooms: calls it believes, posts and their key shares · a post's chunks · key requests |
+//! | `room_plan.rs` · `room_store.rs` | the room round's pure decisions · the room tables |
 //!
-//! Internal routes (a DO stub is not public; only `bots/` in the Worker calls them):
+//! Internal routes (a DO stub is not public; only the Worker calls them):
 //! `/bot/init`, `/bot/updates`, `/bot/api`, `/bot/state`, `/bot/webhook`, `/bot/webhook-secret`,
-//! `/bot/ping`, `/bot/builtin`, `/bot/builtin-test`, `/bot/wake`.
+//! `/bot/ping`, `/bot/builtin`, `/bot/builtin-test`, `/bot/wake`, `/bot/room-event`.
 
 use super::*;
 
@@ -29,12 +32,18 @@ mod builtin_ai;
 mod builtin_copy;
 mod builtin_jobs;
 mod builtin_policy;
+mod builtin_room;
 mod builtin_run;
 mod builtin_sheet;
 mod builtin_store;
 mod deliver;
 mod ingest;
 mod outbox;
+mod room;
+mod room_asks;
+mod room_plan;
+mod room_send;
+mod room_store;
 mod send;
 mod store;
 mod updates;
@@ -78,8 +87,18 @@ impl UserInbox {
     /// The bot tables; idempotent and synchronous.
     fn bot_tables(&self) -> Result<()> {
         let sql = self.state.storage().sql();
-        for t in store::TABLES.iter().chain(builtin_store::TABLES.iter()) {
+        for t in store::TABLES.iter().chain(builtin_store::TABLES.iter()).chain(room_store::TABLES.iter()) {
             sql.exec_raw(t, sql_no_args())?;
+        }
+        // Columns added since an older inbox made its tables: each once, its failure on a table
+        // that already has the column ignored.
+        let s = self.bot_store();
+        let ran: usize = s.kv_get("builtin_schema").and_then(|v| v.parse().ok()).unwrap_or(0);
+        if ran < builtin_store::UPGRADES.len() {
+            for u in &builtin_store::UPGRADES[ran..] {
+                let _ = sql.exec_raw(u, sql_no_args());
+            }
+            s.kv_put("builtin_schema", &builtin_store::UPGRADES.len().to_string());
         }
         Ok(())
     }
@@ -136,6 +155,7 @@ impl UserInbox {
                 self.bot_builtin_test(body.get("who").cloned().unwrap_or_default()).await
             }
             (Method::Post, "/bot/wake") => self.bot_wake().await,
+            (Method::Post, "/bot/room-event") => self.bot_room_event(req.json().await?).await,
             _ => Response::error("not found", 404),
         }
     }
@@ -165,6 +185,11 @@ impl UserInbox {
         let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
         match s("method") {
             "sendMessage" => self.bot_send_text(&ctx, s("to"), s("text")).await,
+            // The Worker checked `group_bots`; the room round checks it again before sending.
+            "sendRoom" => {
+                let reply_to = body.get("reply_to").and_then(|v| v.as_str());
+                self.bot_send_room_text(s("room_id"), s("text"), reply_to).await
+            }
             _ => crate::bots::api::bot_err(404, "unknown-method"),
         }
     }
@@ -182,6 +207,8 @@ impl UserInbox {
             "outbox": count("bot_outbox"),
             "sent": count("bot_sent"),
             "sheet_jobs": count("bot_sheet_jobs"),
+            "room_posts": count("bot_room_posts"),
+            "rooms_keyed": count("bot_megolm"),
             "waiting_since": count_opt(deliver::WAITING_SINCE),
             "webhook": s.kv_get("webhook_url").is_some(),
         });

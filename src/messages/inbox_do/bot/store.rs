@@ -292,5 +292,5 @@ pub(super) fn do_store(sql: SqlStorage) -> SqlBotStore<DoSql> {
 
 #[cfg(test)]
 #[path = "store_tests.rs"]
-mod tests;
+pub(super) mod tests;
 

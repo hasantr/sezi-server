@@ -242,6 +242,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/groups/:id/settings", groups::update_settings)
         .post_async("/groups/:id/accept", groups::accept_invite)
         .post_async("/groups/:id/decline", groups::decline_invite)
+        // A room's bots, managed by its admins (`groups_bots.rs`).
+        .get_async("/groups/:id/bots", groups::list_room_bots)
+        .post_async("/groups/:id/bots", groups::add_room_bot)
+        .delete_async("/groups/:id/bots/:bot_id", groups::remove_room_bot)
         // Join requests a class invite left in its landing group (`groups_requests.rs`): the
         // group's admins decide; the requester reads only their own.
         .get_async("/groups/:id/join-requests", groups::list_join_requests)

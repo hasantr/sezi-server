@@ -67,14 +67,38 @@ fn usage_counts_per_member_per_day() {
     assert_eq!(day_of(1_761_200_000_000), 20_384);
 }
 
+/// An inbox made before rooms gains the columns; on a fresh one the upgrade is a harmless error.
+#[test]
+fn the_room_columns_reach_old_and_new_tables() {
+    let old = Connection::open_in_memory().unwrap();
+    old.execute_batch(
+        "CREATE TABLE bot_ai_proposals (user_id TEXT PRIMARY KEY, row_json TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
+         CREATE TABLE bot_sheet_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, name TEXT NOT NULL,
+           text TEXT NOT NULL, row_json TEXT, at INTEGER NOT NULL, confirm INTEGER NOT NULL DEFAULT 0,
+           attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
+           told INTEGER NOT NULL DEFAULT 0);",
+    )
+    .unwrap();
+    for u in UPGRADES {
+        old.execute_batch(u).unwrap();
+    }
+    old.execute(JOB_PUSH, params!["a", "A", "t", Option::<String>::None, 1, 0, 1, 1, "{}"]).unwrap();
+    let fresh = db();
+    for u in UPGRADES {
+        assert!(fresh.execute_batch(u).is_err(), "already there");
+    }
+}
+
 #[test]
 fn a_proposal_is_one_per_member_and_lapses_after_ten_minutes() {
     let c = db();
-    c.execute(PROPOSAL_PUT, params!["alice", r#"{"a":"1"}"#, "first", 1_000]).unwrap();
-    c.execute(PROPOSAL_PUT, params!["alice", r#"{"a":"2"}"#, "second", 2_000]).unwrap();
+    c.execute(PROPOSAL_PUT, params!["alice", r#"{"a":"1"}"#, "first", 1_000, Option::<String>::None]).unwrap();
+    c.execute(PROPOSAL_PUT, params!["alice", r#"{"a":"2"}"#, "second", 2_000, r#"{"id":"g","name":"G","call_uid":"loc-1"}"#]).unwrap();
     let (row, text, at): (String, String, i64) =
         c.query_row(PROPOSAL_GET, ["alice"], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
     assert_eq!((row.as_str(), text.as_str(), at), (r#"{"a":"2"}"#, "second", 2_000), "the newest replaces");
+    let room: Option<String> = c.query_row(PROPOSAL_GET, ["alice"], |r| r.get(3)).unwrap();
+    assert_eq!(room.as_deref(), Some(r#"{"id":"g","name":"G","call_uid":"loc-1"}"#), "and keeps its room");
     assert!(!lapsed(at, at + PROPOSAL_WAIT_MS - 1));
     assert!(lapsed(at, at + PROPOSAL_WAIT_MS));
     c.execute(PROPOSAL_DROP, ["alice"]).unwrap();
@@ -87,7 +111,7 @@ fn sheet_jobs_go_in_order_and_the_head_holds_the_queue() {
     let push = |text: &str, at: i64| {
         c.execute(
             JOB_PUSH,
-            params!["alice", "Alice", text, Option::<String>::None, at, 0, at, at],
+            params!["alice", "Alice", text, Option::<String>::None, at, 0, at, at, Option::<String>::None],
         )
         .unwrap();
     };
@@ -113,7 +137,7 @@ fn sheet_jobs_go_in_order_and_the_head_holds_the_queue() {
 fn leaving_ai_mode_forgets_every_member() {
     let c = db();
     c.execute(TURN_PUT, params!["alice", "user", "x", 1]).unwrap();
-    c.execute(PROPOSAL_PUT, params!["alice", "{}", "x", 1]).unwrap();
+    c.execute(PROPOSAL_PUT, params!["alice", "{}", "x", 1, Option::<String>::None]).unwrap();
     c.execute(USAGE_BUMP, params!["alice", 1]).unwrap();
     for q in AI_FORGET {
         c.execute(q, []).unwrap();
@@ -159,7 +183,7 @@ fn the_alarm_comes_back_when_the_oldest_memory_is_due_to_go() {
     c.execute(TURN_PUT, params!["alice", "user", "q", 5_000]).unwrap();
     c.execute(TURN_PUT, params!["bob", "user", "q", 9_000]).unwrap();
     assert_eq!(next(), Some(5_000 + TURN_TTL_MS));
-    c.execute(PROPOSAL_PUT, params!["alice", "{}", "t", 1_000]).unwrap();
+    c.execute(PROPOSAL_PUT, params!["alice", "{}", "t", 1_000, Option::<String>::None]).unwrap();
     assert_eq!(next(), Some(1_000 + PROPOSAL_KEEP_MS), "the earliest of both");
     c.execute(PROPOSALS_FORGET, []).unwrap();
     c.execute(TURNS_EXPIRE, [5_000 + 1]).unwrap();
@@ -170,7 +194,7 @@ fn the_alarm_comes_back_when_the_oldest_memory_is_due_to_go() {
 fn authors_behind_a_failing_head_are_told_once_each() {
     let c = db();
     let push = |user: &str| {
-        c.execute(JOB_PUSH, params![user, user, "t", Option::<String>::None, 1, 0, 1, 1]).unwrap();
+        c.execute(JOB_PUSH, params![user, user, "t", Option::<String>::None, 1, 0, 1, 1, Option::<String>::None]).unwrap();
     };
     for u in ["head", "bob", "carol", "bob", "head"] {
         push(u);

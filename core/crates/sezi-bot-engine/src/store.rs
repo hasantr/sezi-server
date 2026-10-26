@@ -64,3 +64,41 @@ pub(crate) fn current(
         None => Ok(None),
     }
 }
+
+/// The bot's own outbound Megolm session in one room (Phase 3, `room.rs`), pickled with the pickle
+/// key. `sent` counts the messages encrypted on it, for rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomSession {
+    pub session_id: String,
+    pub pickle: String,
+    pub created_at_ms: i64,
+    pub sent: u32,
+}
+
+/// One member device the current session was shared with, and the key it was given: a SNAPSHOT
+/// exported at that first share, so a re-share (the member's `RoomKeyRequest`) opens exactly what
+/// the first one did — never an earlier message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomShare {
+    pub user_id: String,
+    pub device_id: String,
+    pub key_b64: String,
+}
+
+/// What the room half of the engine keeps beside the 1:1 state. A trait of its own, so a host that
+/// runs 1:1 only is not made to implement it. Synchronous, like [`BotStore`].
+///
+/// There is deliberately no method that stores a key somebody ELSE shared: a bot never imports a
+/// room key, so it cannot read a room message it was not sent.
+pub trait RoomStore: BotStore {
+    fn room_session(&self, room_id: &str) -> Option<RoomSession>;
+    fn put_room_session(&mut self, room_id: &str, session: RoomSession);
+    /// The shares of session `session_id` in this room.
+    fn room_shares(&self, room_id: &str, session_id: &str) -> Vec<RoomShare>;
+    fn put_room_share(&mut self, room_id: &str, session_id: &str, share: RoomShare);
+    /// Forget the room: its session, every share of it, every request mark.
+    fn forget_room(&mut self, room_id: &str);
+    /// When `user_id` last had a `RoomKeyRequest` answered in this room.
+    fn room_request_at(&self, room_id: &str, user_id: &str) -> Option<i64>;
+    fn set_room_request_at(&mut self, room_id: &str, user_id: &str, at_ms: i64);
+}

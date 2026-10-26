@@ -121,6 +121,19 @@ pub(super) fn confirm_text(lang: Lang, shown: &str, row: &Row, max: usize) -> Op
     Some(prose + &tail)
 }
 
+/// What heads a row proposed for a call in a group, sent to the caller 1:1 (`builtin_room.rs`):
+/// which group it is for, and — when it took the place of a proposal still waiting — that the
+/// member's next yes or no answers this one. There is ONE waiting proposal per member, so a 1:1
+/// "evet" always confirms the last row they were shown, and that row says where it came from.
+pub(super) fn room_proposal_header(lang: Lang, room_name: &str, replaced: bool) -> String {
+    let from = line(lang, Line::ProposalFromRoom).replace("{room}", room_name.trim());
+    if replaced {
+        format!("{}\n{from}", line(lang, Line::ProposalReplaced))
+    } else {
+        from
+    }
+}
+
 /// What a settled row leaves in the member's context, and what the bot says now: `None` for an
 /// ordinary message. A confirmed row is remembered as "Kaydedildi." — the line the member is
 /// shown when it lands — so the model can tell a saved row from one that was not (the system

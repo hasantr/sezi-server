@@ -24,7 +24,7 @@ struct FailedRow {
 
 impl UserInbox {
     /// A member's active devices, as the engine wants them.
-    async fn bot_member_devices(&self, user_id: &str) -> Result<Vec<DeviceKeys>> {
+    pub(super) async fn bot_member_devices(&self, user_id: &str) -> Result<Vec<DeviceKeys>> {
         #[derive(Deserialize)]
         struct Row {
             device_id: String,
@@ -53,7 +53,7 @@ impl UserInbox {
     }
 
     /// A key for each device that has no session: its one-time key, else its signed fallback.
-    async fn bot_claim_keys(&self, user_id: &str, devices: &[String]) -> Result<Vec<ClaimedKey>> {
+    pub(super) async fn bot_claim_keys(&self, user_id: &str, devices: &[String]) -> Result<Vec<ClaimedKey>> {
         let db = self.env.d1("DB")?;
         let mut out = Vec::with_capacity(devices.len());
         for d in devices {
@@ -226,6 +226,7 @@ impl UserInbox {
         let _ = sql.exec_raw(super::store::SEEN_EXPIRE, cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::deliver::SRC_ORPHANS, sql_no_args());
         self.builtin_housekeeping(now);
+        self.bot_room_housekeeping(now);
         let store = self.bot_store();
         let checked = store.kv_get("otk_checked_at").and_then(|v| v.parse::<i64>().ok());
         if checked.is_some_and(|t| now - t < OTK_CHECK_EVERY_MS) {

@@ -4,17 +4,34 @@ use super::*;
 /// tested against these exact bytes. Change them in both places or neither.
 pub(super) const VECTOR_ROW: &str = concat!(
     r#"{"v":1,"secret":"s3cr3t-sheet","test":false,"row_id":"b0000000-0000-4000-8000-000000000002-17","at":1761200000000,"#,
-    r#""who":{"user_id":"a0000000-0000-4000-8000-000000000001","name":"Ayşe"},"#,
+    r#""who":{"user_id":"a0000000-0000-4000-8000-000000000001","name":"Ayşe"},"room":null,"#,
     r#""text":"Yarın 10:00 duruşma, Ankara 3. Asliye","#,
     r#""row":{"Tarih":"2026-10-27","Saat":"10:00","Mahkeme":"Ankara 3. Asliye"}}"#,
 );
 pub(super) const VECTOR_TEST: &str = concat!(
     r#"{"v":1,"secret":"s3cr3t-sheet","test":true,"row_id":null,"at":1761200000000,"#,
-    r#""who":{"user_id":"a0000000-0000-4000-8000-000000000001","name":"Ayşe"},"#,
+    r#""who":{"user_id":"a0000000-0000-4000-8000-000000000001","name":"Ayşe"},"room":null,"#,
     r#""text":"Merhaba! Bu, bot sahibinin bir denemesi.","row":null}"#,
+);
+/// A sheet bot's row from a call in a group (Phase 3): `room` after `who`, no `row` (a plain
+/// sheet bot writes the words; an AI bot's confirmed room row carries both).
+pub(super) const VECTOR_ROOM: &str = concat!(
+    r#"{"v":1,"secret":"s3cr3t-sheet","test":false,"row_id":"b0000000-0000-4000-8000-000000000002-18","at":1761200000000,"#,
+    r#""who":{"user_id":"a0000000-0000-4000-8000-000000000001","name":"Ayşe"},"#,
+    r#""room":{"id":"c0000000-0000-4000-8000-000000000003","name":"Hukuk Bürosu"},"#,
+    r#""text":"Yarın 10:00 duruşma, Ankara 3. Asliye","row":null}"#,
 );
 
 const WHO: &str = "a0000000-0000-4000-8000-000000000001";
+
+#[test]
+fn a_call_from_a_room_names_the_room_after_who() {
+    let room = SheetRoom { id: "c0000000-0000-4000-8000-000000000003", name: "Hukuk Bürosu" };
+    let text = "Yarın 10:00 duruşma, Ankara 3. Asliye";
+    let row_id = "b0000000-0000-4000-8000-000000000002-18";
+    let body = body_json("s3cr3t-sheet", false, Some(row_id), 1_761_200_000_000, WHO, "Ayşe", Some(room), text, None);
+    assert_eq!(body, VECTOR_ROOM);
+}
 
 #[test]
 fn the_body_is_the_shared_vector_byte_for_byte() {
@@ -26,11 +43,12 @@ fn the_body_is_the_shared_vector_byte_for_byte() {
     let text = "Yarın 10:00 duruşma, Ankara 3. Asliye";
     let row_id = "b0000000-0000-4000-8000-000000000002-17";
     assert_eq!(
-        body_json("s3cr3t-sheet", false, Some(row_id), 1_761_200_000_000, WHO, "Ayşe", text, Some(&row)),
+        body_json("s3cr3t-sheet", false, Some(row_id), 1_761_200_000_000, WHO, "Ayşe", None, text, Some(&row)),
         VECTOR_ROW
     );
     let test_text = "Merhaba! Bu, bot sahibinin bir denemesi.";
-    assert_eq!(body_json("s3cr3t-sheet", true, None, 1_761_200_000_000, WHO, "Ayşe", test_text, None), VECTOR_TEST);
+    let test = body_json("s3cr3t-sheet", true, None, 1_761_200_000_000, WHO, "Ayşe", None, test_text, None);
+    assert_eq!(test, VECTOR_TEST);
 }
 
 #[test]

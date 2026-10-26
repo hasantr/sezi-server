@@ -11,9 +11,12 @@
 //! E2E: the server never sees group CONTENT. This module manages only the membership table;
 //! message crypto is Megolm on the client and distribution is the fan-out in `messages`.
 
-// Five blocks declared here rather than in `lib.rs`, so the group surface stays one module from
+// Six blocks declared here rather than in `lib.rs`, so the group surface stays one module from
 // the outside: the ownership-transfer write, the teardown batch, the live nudges, the two
-// read projections, and the join requests a class invite leaves behind.
+// read projections, the join requests a class invite leaves behind, and a room's bots.
+#[path = "groups_bots.rs"]
+pub(crate) mod bots;
+pub use bots::{add_room_bot, list_room_bots, remove_room_bot};
 #[path = "groups_delete.rs"]
 mod delete;
 #[path = "groups_notify.rs"]

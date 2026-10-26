@@ -16,7 +16,9 @@
 //! the program has not been seen in that time (BOTS_BUILD §5, R9 decision 4). Otherwise the
 //! page shows "last seen". A built-in bot (`builtin` = `sheet` / `ai`) is never silent — the relay
 //! is its program — and carries `ai_provider`, `ai_model`, `last_ok_at` (ms) and `last_error`
-//! (a typed code) instead; no secret and no instructions are listed.
+//! (a typed code) instead; no secret and no instructions are listed. Every bot also carries
+//! `rooms` (`[{room_id, name}]`), the rooms it is in — read-only here, since a room's admins
+//! decide its bots and the owner never does.
 //!
 //! OWNER-only, through `require_active_auth` (a revoked device's access token is refused at
 //! once — the `admin/mod.rs` guard explains why `require_auth` is never enough here).
@@ -205,9 +207,30 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         v["ai_model"] = state.ai_model.into();
         v["last_ok_at"] = state.last_ok_at.into();
         v["last_error"] = state.last_error.into();
+        v["rooms"] = bot_rooms(&db, &row.bot_id).await?.into();
         out.push(v);
     }
     Response::from_json(&serde_json::json!({ "bots": out }))
+}
+
+/// The rooms a bot is in, `[{room_id, name}]` — shown to the owner READ-ONLY: a room's admins
+/// add and remove its bots (`groups_bots.rs`, R9 decision 6), the owner only sees where it is.
+async fn bot_rooms(db: &D1Database, bot_id: &str) -> Result<Vec<serde_json::Value>> {
+    #[derive(Deserialize)]
+    struct Room {
+        group_id: String,
+        name: String,
+    }
+    let rooms: Vec<Room> = db
+        .prepare(crate::groups::bots::BOT_ROOMS_SQL)
+        .bind(&[d1_text(bot_id)])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rooms
+        .into_iter()
+        .map(|r| serde_json::json!({ "room_id": r.group_id, "name": r.name }))
+        .collect())
 }
 
 #[derive(Deserialize, Default)]

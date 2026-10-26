@@ -322,3 +322,46 @@ fn setting_a_built_in_kind_lists_it_with_its_provider_and_drops_the_webhook() {
         db.query_row(LIST_SQL, [], |r| Ok((r.get("builtin")?, r.get("ai_provider")?))).unwrap();
     assert_eq!(back, (None, None), "program mode again");
 }
+
+#[test]
+fn a_deleted_bot_leaves_every_room_and_keeps_its_rows() {
+    let db = setup();
+    provision(&db);
+    for (room, name) in [("g1", "Hukuk"), ("g2", "Arşiv")] {
+        db.execute(
+            "INSERT INTO groups (id, name, created_by, created_at, updated_at) VALUES (?1, ?2, 'alice', ?3, ?3)",
+            params![room, name, NOW],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO group_bots (group_id, bot_id, added_by, added_at) VALUES (?1, ?2, 'alice', ?3)",
+            params![room, BOT, NOW],
+        )
+        .unwrap();
+    }
+    // The order `deletion_statements` batches them in.
+    for sql in [MARK_DELETED_SQL, REVOKE_TOKENS_SQL, TOMBSTONE_REVISIONS_SQL, TOMBSTONES_SQL] {
+        db.execute(sql, params![BOT, NOW + 10]).unwrap();
+    }
+    db.execute(REVOKE_GRANTS_SQL, params![BOT, NOW + 10, "alice"]).unwrap();
+    db.execute(LEAVE_ROOMS_SQL, params![BOT]).unwrap();
+    let rooms: i64 = db
+        .query_row("SELECT COUNT(*) FROM group_bots WHERE bot_id = ?1", [BOT], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rooms, 0, "the soft delete keeps the bots row, so no cascade would have done this");
+    let kept: (i64, i64) = db
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM bots WHERE bot_id = ?1), (SELECT COUNT(*) FROM users WHERE id = ?1)",
+            [BOT],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(kept, (1, 1), "past messages keep their sender");
+    let groups: i64 = db.query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0)).unwrap();
+    assert_eq!(groups, 2, "the rooms themselves are untouched");
+    // `deletion_statements` must carry it: a const nobody batches deletes nothing.
+    let src = include_str!("provision.rs");
+    let body = &src[src.find("pub(crate) fn deletion_statements(").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("LEAVE_ROOMS_SQL"), "the soft delete lost its room step");
+}

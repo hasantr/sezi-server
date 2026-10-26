@@ -131,6 +131,10 @@ pub(crate) const TOMBSTONES_SQL: &str = "INSERT INTO contact_tombstones
 pub(crate) const REVOKE_GRANTS_SQL: &str = "UPDATE contact_grants SET revoked_at = ?2, revoked_by = ?3
       WHERE (user_low = ?1 OR user_high = ?1) AND revoked_at IS NULL";
 
+/// Delete, step 5: out of every room (BOTS_BUILD §2.5). The soft delete keeps the `bots` row, so
+/// the `ON DELETE CASCADE` of `group_bots.bot_id` never fires and the rows go here. Bind: bot_id.
+pub(crate) const LEAVE_ROOMS_SQL: &str = "DELETE FROM group_bots WHERE bot_id = ?1";
+
 /// The humans worth a live nudge: the most recently seen. Bind: limit.
 pub(crate) const NUDGE_TARGETS_SQL: &str = "SELECT id FROM users WHERE kind = 'human'
       ORDER BY COALESCE(last_seen_at, 0) DESC, id LIMIT ?1";
@@ -272,7 +276,8 @@ pub(crate) fn deletion_statements(
         db.prepare(super::token::REVOKE_TOKENS_SQL).bind(&[id.clone(), now.clone()])?,
         db.prepare(TOMBSTONE_REVISIONS_SQL).bind(&[id.clone(), now.clone()])?,
         db.prepare(TOMBSTONES_SQL).bind(&[id.clone(), now.clone()])?,
-        db.prepare(REVOKE_GRANTS_SQL).bind(&[id, now, d1_text(owner)])?,
+        db.prepare(REVOKE_GRANTS_SQL).bind(&[id.clone(), now, d1_text(owner)])?,
+        db.prepare(LEAVE_ROOMS_SQL).bind(&[id])?,
     ])
 }
 

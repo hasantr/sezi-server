@@ -43,9 +43,30 @@ pub(crate) fn classify(payload: &ChatPayload, from: &str, device: &str, was_prek
         InnerMessage::Text { body } => text(body),
         // A formatted message reaches the program as its plain words: the delta is a UI format.
         InnerMessage::RichText { plain_text, .. } => text(plain_text),
-        InnerMessage::RoomKeyRequest { room_id, .. } => {
-            Inbound::RoomKeyRequest { from: from.to_owned(), room_id: room_id.clone() }
-        }
+        InnerMessage::RoomKeyRequest { room_id, session_id } => Inbound::RoomKeyRequest {
+            from: from.to_owned(),
+            room_id: room_id.clone(),
+            session_id: session_id.clone(),
+        },
+        // A member's room message that called the bot, copied to it 1:1 (Phase 3). The host
+        // still checks the room is one of the bot's and `from` an active member of it.
+        InnerMessage::BotCall { room_id, msg_uid, body, lang, utc_offset_min } => Inbound::Call {
+            from: from.to_owned(),
+            room_id: room_id.clone(),
+            msg_uid: msg_uid.clone(),
+            body: body.clone(),
+            lang: lang.clone(),
+            utc_offset_min: *utc_offset_min,
+        },
+        // Something that carries a room's secret, sent to a bot: a member's kernel never does
+        // (BOTS_BUILD §2.7), so this is a bug or a forgery. Read, acked and NEVER imported — the
+        // engine has no store for another sender's key — and named so a test can see it arrive.
+        InnerMessage::RoomKeyShare { .. }
+        | InnerMessage::RoomKeyGossip { .. }
+        | InnerMessage::PluginEpochKeyShare { .. }
+        | InnerMessage::PluginRecordSnapshot { .. }
+        | InnerMessage::PluginRecord { room: Some(_), .. }
+        | InnerMessage::GroupOutboundCopy { .. } => Inbound::Ignored("room_secret"),
         InnerMessage::StateDigest { .. } => Inbound::Ignored("state_digest"),
         InnerMessage::Typing { .. } => Inbound::Ignored("typing"),
         InnerMessage::ProfileAvatar { .. } => Inbound::Ignored("avatar"),

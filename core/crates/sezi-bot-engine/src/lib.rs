@@ -10,8 +10,16 @@
 //!
 //! Where things are: `identity.rs` (made once, keys topped up), `inbound.rs` (reading a frame),
 //! `classify.rs` (what it means to a program), `heal.rs` (who re-pairs, and when), `direct.rs`
-//! (sealing a frame to a member's devices), `store.rs` (the host's storage trait), `mem.rs` (a
+//! (sealing a frame to a member's devices), `room.rs` (the bot's own Megolm session per room:
+//! share, rotate, post, answer a key request), `store.rs` (the host's storage traits), `mem.rs` (a
 //! HashMap store for tests).
+//!
+//! ## Phase 3 (rooms, 2026-10-26) — for the relay track
+//!
+//! [`RoomStore`] (a supertrait of [`BotStore`]) holds the room state; a 1:1-only host needs none of
+//! it. [`Inbound::RoomKeyRequest`] gained `session_id`, and a `BotCall` now classifies as
+//! [`Inbound::Call`]. Anything carrying a room secret that reaches the bot is
+//! `Inbound::Ignored("room_secret")`: acked, never imported.
 //!
 //! ## CONTRACT CHANGES (engine track, 2026-10-23) — for the relay track
 //!
@@ -51,6 +59,7 @@ mod heal;
 mod identity;
 mod inbound;
 pub mod mem;
+mod room;
 mod store;
 #[cfg(test)]
 mod testutil;
@@ -59,7 +68,11 @@ pub use classify::{PAIR_ACK_MARKER, SYSTEM_MARKER_PREFIX};
 pub use direct::text_payload;
 pub use heal::REPAIR_WINDOW_MS;
 pub use identity::{DEVICE_LABEL, SPK_PREKEY_ID};
-pub use store::BotStore;
+pub use room::{
+    room_encrypt, room_forget, room_key_request, room_key_request_due, room_prepare, room_share, room_text_payload, RoomPrep,
+    Rotation, ROOM_REQUEST_WINDOW_MS, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS,
+};
+pub use store::{BotStore, RoomSession, RoomShare, RoomStore};
 
 use sezi_error::Result;
 use sezi_protocol::inner::ChatPayload;
@@ -123,8 +136,9 @@ pub enum Inbound {
     },
     /// A button tap (Phase 4).
     Tap { from: String, room_id: Option<String>, msg_uid: String, action_id: String },
-    /// A member asking for the bot's room key again (Phase 3).
-    RoomKeyRequest { from: String, room_id: String },
+    /// A member asking for the bot's room key again (Phase 3): answer with [`room_key_request`]
+    /// once the host has checked `from` is an active member of a room the bot is in.
+    RoomKeyRequest { from: String, room_id: String, session_id: Option<String> },
     /// Read, acked and dropped: caps, digest, avatar, typing, receipts.
     Ignored(&'static str),
 }

@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `getMe` | `{}` | `{ok, bot:{bot_id, name, about}}` |
 //! | `getUpdates` | `{offset?, timeout? 0..25, limit? 1..100}` | `{ok, updates:[…]}`; below `offset` is confirmed and deleted |
-//! | `sendMessage` | `{chat:{user_id}, text ≤4000}` | `{ok, message_id}` (`b-<uuid>`) |
+//! | `sendMessage` | `{chat:{user_id}\|{room_id}, text ≤4000, reply_to?}` | `{ok, message_id}` (`b-<uuid>`) |
 //! | `setWebhook` | `{url}` (https; `""` or `null` clears) | `{ok, webhook_secret}` |
 //! | `deleteWebhook` | `{}` | `{ok}` |
 //!
@@ -12,8 +12,11 @@
 //! A built-in bot (`builtin.rs`) is that reader: `getUpdates` and `setWebhook` answer
 //! `bot/builtin-active` (409) until the owner returns it to program mode.
 //!
-//! Phase 1 writes 1:1 text only: a `room_id`, `reply_to` or `buttons` answers `bot/unsupported`
-//! rather than being dropped in silence. Errors are `{ok:false, error:"bot/<code>"}`.
+//! Into a room (Phase 3): only one whose admins added the bot (`group_bots`, else
+//! `bot/not-in-room`), sent by the bot's inbox under its own Megolm session. `reply_to` is the
+//! `message_id` of a call the bot was handed in that room (`bot/unknown-reply` otherwise); a 1:1
+//! `reply_to` and `buttons` answer `bot/unsupported` rather than being dropped in silence.
+//! Errors are `{ok:false, error:"bot/<code>"}`.
 //!
 //! The Worker checks the key and who the bot may write to; the bot's inbox does the encryption.
 //! A bot may write to an active human of this server who has not blocked it, and to nobody else.
@@ -137,15 +140,21 @@ async fn send_message(
     let Ok(body) = serde_json::from_value::<SendBody>(body) else {
         return bot_err(400, "bad-request");
     };
-    if body.chat.room_id.is_some() || body.reply_to.is_some() || body.buttons.is_some() {
+    if body.buttons.is_some() {
         return bot_err(400, "unsupported");
     }
-    let Some(to) = body.chat.user_id.filter(|u| u.len() == 36) else {
-        return bot_err(400, "bad-request");
-    };
     let text = body.text.trim_end();
     if text.trim().is_empty() || text.chars().count() > MAX_TEXT_CHARS {
         return bot_err(400, "bad-text");
+    }
+    let room = match (body.chat.room_id, body.chat.user_id.as_deref()) {
+        (Some(room), None) if !room.is_empty() && room.len() <= 64 => Some(room),
+        (None, Some(_)) => None,
+        _ => return bot_err(400, "bad-request"),
+    };
+    // A reply names a room call (`update.message.message_id`); 1:1 replies are not built yet.
+    if room.is_none() && body.reply_to.is_some() {
+        return bot_err(400, "unsupported");
     }
     if !crate::ratelimit::check_rate_limit_env(
         env,
@@ -157,6 +166,21 @@ async fn send_message(
     {
         return bot_err(429, "rate-limited");
     }
+    if let Some(room_id) = room {
+        // Only into a room whose admins added this bot (`group_bots`); the bot's inbox asks again
+        // before anything leaves, so a removal in between still stops the post.
+        if !crate::groups::bots::is_room_bot(db, &room_id, &bot.bot_id).await? {
+            return bot_err(403, "not-in-room");
+        }
+        let call = serde_json::json!({
+            "method": "sendRoom", "room_id": room_id, "text": text, "reply_to": body.reply_to,
+        });
+        let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/api", Some(call.to_string())).await?;
+        return crate::respond::passthrough(resp).await;
+    }
+    let Some(to) = body.chat.user_id.filter(|u| u.len() == 36) else {
+        return bot_err(400, "bad-request");
+    };
     #[derive(Deserialize)]
     struct Target {
         human: i64,

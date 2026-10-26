@@ -3,8 +3,12 @@
 //!
 //! ```json
 //! {"v": 1, "secret": "<sheet_secret>", "test": false, "row_id": "<bot>-<job>" | null, "at": 1761200000000,
-//!  "who": {"user_id": "…", "name": "…"}, "text": "…", "row": {"Tarih": "…", …} | null}
+//!  "who": {"user_id": "…", "name": "…"}, "room": {"id": "…", "name": "…"} | null,
+//!  "text": "…", "row": {"Tarih": "…", …} | null}
 //! ```
+//!
+//! `room` (Phase 3) names the group a call came from; `null` for a 1:1 message and for the owner's
+//! test. The core's script writes it to a "Grup" / "Group" column when present.
 //!
 //! The secret is in the BODY because an Apps Script web app cannot read headers. `row_id` stays
 //! the same across every re-send of one row: a POST may land and still be sent again (its GET
@@ -105,6 +109,13 @@ struct Who<'a> {
     name: &'a str,
 }
 
+/// The group a row's call came from.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct SheetRoom<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
+}
+
 /// The POST's fields, in the contract's order.
 #[derive(serde::Serialize)]
 struct Body<'a> {
@@ -114,6 +125,7 @@ struct Body<'a> {
     row_id: Option<&'a str>,
     at: i64,
     who: Who<'a>,
+    room: Option<SheetRoom<'a>>,
     text: &'a str,
     row: Option<&'a Row>,
 }
@@ -128,10 +140,11 @@ pub(crate) fn body_json(
     at: i64,
     user_id: &str,
     name: &str,
+    room: Option<SheetRoom<'_>>,
     text: &str,
     row: Option<&Row>,
 ) -> String {
-    let b = Body { v: 1, secret, test, row_id, at, who: Who { user_id, name }, text, row };
+    let b = Body { v: 1, secret, test, row_id, at, who: Who { user_id, name }, room, text, row };
     serde_json::to_string(&b).unwrap_or_default()
 }
 

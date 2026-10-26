@@ -13,6 +13,7 @@
 
 use super::builtin_copy::{line, Line};
 use super::builtin_policy as policy;
+use super::builtin_room::RoomRef;
 use super::builtin_run::Run;
 use super::builtin_sheet::{self, Row};
 use super::builtin_store as bs;
@@ -40,11 +41,18 @@ struct DueJob {
     next_at: i64,
     created_at: i64,
     told: i64,
+    /// The room call the row came from (`builtin_room::RoomRef`); its lines go to that room.
+    #[serde(default)]
+    room_json: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Author {
     user_id: String,
+    /// Their earliest waiting row's room and words, where that row came from a call.
+    #[serde(default)]
+    room_json: Option<String>,
+    text: String,
 }
 
 /// A row's id at the script, the same on every send.
@@ -71,6 +79,7 @@ impl UserInbox {
         let store = self.bot_store();
         let mut landed_said: HashSet<String> = HashSet::new();
         for job in jobs {
+            let room = RoomRef::parse(job.room_json.as_deref());
             let now = (now_secs() * 1000) as i64;
             if !self.builtin_current(run) {
                 return;
@@ -87,7 +96,7 @@ impl UserInbox {
                     return;
                 }
                 store.db.run(bs::JOB_DONE, &[Arg::I(job.id)]);
-                self.builtin_say(ctx, &job.user_id, line(run.lang, Line::SheetGaveUp), spent).await;
+                self.builtin_reply(ctx, &job.user_id, room.as_ref(), &job.text, line(run.lang, Line::SheetGaveUp), spent).await;
                 continue;
             }
             if !policy::fits(*spent, policy::JOB_BASE) {
@@ -102,6 +111,7 @@ impl UserInbox {
                 job.at,
                 &job.user_id,
                 &job.name,
+                room.as_ref().map(RoomRef::sheet),
                 &job.text,
                 row.as_ref(),
             );
@@ -115,7 +125,7 @@ impl UserInbox {
                 store.db.run(bs::JOB_RETRY, &[Arg::I(now + retry_delay_ms(job.attempts)), Arg::I(job.id)]);
                 if job.attempts == 0 && job.told == 0 {
                     store.db.run(bs::JOB_MARK_TOLD, &[Arg::T(&job.user_id)]);
-                    self.builtin_say(ctx, &job.user_id, line(run.lang, Line::SheetRetrying), spent).await;
+                    self.builtin_reply(ctx, &job.user_id, room.as_ref(), &job.text, line(run.lang, Line::SheetRetrying), spent).await;
                 }
                 self.builtin_tell_queued(ctx, run, job.id, spent).await;
                 return;
@@ -130,7 +140,7 @@ impl UserInbox {
                 (false, false) => None,
             };
             if let Some(l) = said {
-                self.builtin_say(ctx, &job.user_id, line(run.lang, l), spent).await;
+                self.builtin_reply(ctx, &job.user_id, room.as_ref(), &job.text, line(run.lang, l), spent).await;
             }
         }
     }
@@ -154,7 +164,8 @@ impl UserInbox {
                 return;
             }
             store.db.run(bs::JOB_MARK_TOLD, &[Arg::T(&a.user_id)]);
-            self.builtin_say(ctx, &a.user_id, line(run.lang, Line::SheetQueued), spent).await;
+            let room = RoomRef::parse(a.room_json.as_deref());
+            self.builtin_reply(ctx, &a.user_id, room.as_ref(), &a.text, line(run.lang, Line::SheetQueued), spent).await;
         }
     }
 }

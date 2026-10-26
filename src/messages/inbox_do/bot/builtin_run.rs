@@ -29,6 +29,7 @@ use super::builtin::KV_HOLD_UNTIL;
 use super::builtin_ai::{self, Role, Turn};
 use super::builtin_copy::{line, Line};
 use super::builtin_policy::{self as policy, ProposalStep};
+use super::builtin_room::{context_key, RoomRef};
 use super::builtin_store as bs;
 use super::outbox::retry_delay_ms;
 use super::store::{Arg, Exec};
@@ -56,6 +57,9 @@ struct ProposalRow {
     row_json: String,
     text: String,
     at: i64,
+    /// The room call it came from, if it did (`builtin_room::RoomRef`).
+    #[serde(default)]
+    room_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +78,14 @@ enum Handled {
     Abandon,
     /// Its worst case does not fit what the round has left: leave it for the next tick.
     NoRoom,
+}
+
+/// What a member wrote, and where: 1:1 (`room: None`) or as a call in a room.
+struct Ask {
+    from: String,
+    name: String,
+    text: String,
+    room: Option<RoomRef>,
 }
 
 /// What a round needs at hand.
@@ -147,10 +159,12 @@ impl UserInbox {
                 break;
             }
             let update: serde_json::Value = serde_json::from_str(&row.json).unwrap_or_default();
-            let handled = if update.get("kind").and_then(|k| k.as_str()) == Some("message") {
-                self.builtin_message(ctx, run, &update, row.attempts, now, spent).await
-            } else {
-                Handled::Done // a `ping` from program mode, or a kind this build does not handle
+            let handled = match update.get("kind").and_then(|k| k.as_str()) {
+                // A room call is a message whose answer goes to the room (`builtin_room.rs`).
+                Some("message" | "call") => self.builtin_message(ctx, run, &update, row.attempts, now, spent).await,
+                // `added` / `removed`, a `ping` from program mode, or a kind this build does not
+                // handle: nothing to answer.
+                _ => Handled::Done,
             };
             let id = JsValue::from_f64(row.update_id as f64);
             match handled {
@@ -180,10 +194,12 @@ impl UserInbox {
         spent: &mut u32,
     ) -> Handled {
         let s = |p: &str| update.pointer(p).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let (from, text) = (s("/chat/user_id"), s("/message/text"));
-        let name = s("/who/display_name");
+        // A call's `chat` is the room; who called is `who`, which the relay filled from D1.
+        let room = RoomRef::of_update(update);
+        let from = if room.is_some() { s("/who/user_id") } else { s("/chat/user_id") };
+        let ask = Ask { from, name: s("/who/display_name"), text: s("/message/text"), room };
         let at = update.get("at").and_then(|v| v.as_i64()).unwrap_or(now);
-        if from.is_empty() {
+        if ask.from.is_empty() {
             return Handled::Done;
         }
         match run.cfg.kind {
@@ -193,23 +209,39 @@ impl UserInbox {
                     return Handled::NoRoom;
                 }
                 self.builtin_note(Err(super::builtin::NOT_CONNECTED), now);
-                self.builtin_say(ctx, &from, line(run.lang, Line::NotSetUp), spent).await;
+                self.builtin_answer(ctx, &ask, line(run.lang, Line::NotSetUp), spent).await;
                 Handled::Done
             }
             Kind::Sheet => {
-                self.builtin_queue_row(&from, &name, &text, None, at, false, now);
+                self.builtin_queue_row(&ask.from, &ask.name, &ask.text, None, at, false, now, ask.room.as_ref());
                 Handled::Done
             }
             Kind::Ai if !policy::fits(*spent, policy::AI_BASE) => Handled::NoRoom,
-            Kind::Ai => self.builtin_ai_turn(ctx, run, &from, &name, &text, attempts, now, spent).await,
+            Kind::Ai => self.builtin_ai_turn(ctx, run, &ask, attempts, now, spent).await,
         }
     }
 
-    /// A row owed to the sheet.
+    /// Answer what `ask` wrote, where it wrote it: 1:1, or in the room replying to the call.
+    async fn builtin_answer(&self, ctx: &BotCtx, ask: &Ask, text: &str, spent: &mut u32) {
+        self.builtin_reply(ctx, &ask.from, ask.room.as_ref(), &ask.text, text, spent).await;
+    }
+
+    /// A row owed to the sheet; `room` when it came from a call in one.
     #[allow(clippy::too_many_arguments)]
-    fn builtin_queue_row(&self, user: &str, name: &str, text: &str, row: Option<&str>, at: i64, confirm: bool, now: i64) {
+    fn builtin_queue_row(
+        &self,
+        user: &str,
+        name: &str,
+        text: &str,
+        row: Option<&str>,
+        at: i64,
+        confirm: bool,
+        now: i64,
+        room: Option<&RoomRef>,
+    ) {
         let text = builtin_ai::cut(text, builtin_ai::MAX_INPUT_CHARS);
         let row_arg = row.map_or(Arg::Null, Arg::T);
+        let room_json = room.map(RoomRef::to_json);
         self.bot_store().db.run(
             bs::JOB_PUSH,
             &[
@@ -221,6 +253,7 @@ impl UserInbox {
                 Arg::I(i64::from(confirm)),
                 Arg::I(now),
                 Arg::I(now),
+                room_json.as_deref().map_or(Arg::Null, Arg::T),
             ],
         );
     }
@@ -237,14 +270,11 @@ impl UserInbox {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn builtin_ai_turn(
         &self,
         ctx: &BotCtx,
         run: &Run,
-        from: &str,
-        name: &str,
-        text: &str,
+        ask: &Ask,
         attempts: i64,
         now: i64,
         spent: &mut u32,
@@ -252,17 +282,25 @@ impl UserInbox {
         let Some(ai) = run.cfg.ai.as_ref() else {
             return Handled::Done;
         };
+        let (from, name, text) = (ask.from.as_str(), ask.name.as_str(), ask.text.as_str());
+        let room = ask.room.as_ref();
+        // Whose conversation this is: the member's 1:1 chat, or that member in that room.
+        let context = context_key(from, room);
         let store = self.bot_store();
         let sql = self.state.storage().sql();
         // Forgotten on read, too: nothing older than its keep is ever used.
         store.db.run(bs::TURNS_EXPIRE, &[Arg::I(now - bs::TURN_TTL_MS)]);
         store.db.run(bs::PROPOSAL_EXPIRE, &[Arg::I(now - bs::PROPOSAL_KEEP_MS)]);
-        // A row waiting for this member's yes; whatever they say next settles it.
-        let proposal: Option<ProposalRow> = sql
-            .exec_raw(bs::PROPOSAL_GET, Some(vec![JsValue::from_str(from)]))
-            .and_then(|c| c.to_array())
-            .ok()
-            .and_then(|v: Vec<ProposalRow>| v.into_iter().next());
+        // A row waiting for this member's yes; whatever they say next IN THEIR 1:1 CHAT settles
+        // it. A room call never does: the confirmation is the caller's alone (`builtin_room.rs`).
+        let proposal: Option<ProposalRow> = if room.is_some() {
+            None
+        } else {
+            sql.exec_raw(bs::PROPOSAL_GET, Some(vec![JsValue::from_str(from)]))
+                .and_then(|c| c.to_array())
+                .ok()
+                .and_then(|v: Vec<ProposalRow>| v.into_iter().next())
+        };
         let step = policy::proposal_step(proposal.as_ref().map(|p| p.at), run.cfg.writes_sheet(), text, now);
         if proposal.is_some() {
             store.db.run(bs::PROPOSAL_DROP, &[Arg::T(from)]);
@@ -271,9 +309,11 @@ impl UserInbox {
         // (`policy::settled_exchange`): without it the model never learned a row was saved, and on
         // Haiku told members saved rows were still waiting (lab, 2026-10-26).
         if let Some((said, line_out)) = policy::settled_exchange(run.lang, &step) {
-            self.builtin_remember(from, text, line_out, now);
+            self.builtin_remember(&context, text, line_out, now);
             if let (ProposalStep::Confirm, Some(p)) = (&step, proposal.as_ref()) {
-                self.builtin_queue_row(from, name, &p.text, Some(&p.row_json), now, true, now);
+                // A row proposed for a room call keeps that room: its "Kaydedildi." goes there.
+                let came_from = RoomRef::parse(p.room_json.as_deref());
+                self.builtin_queue_row(from, name, &p.text, Some(&p.row_json), now, true, now, came_from.as_ref());
                 return Handled::Done;
             }
             if let Some(l) = said {
@@ -282,21 +322,22 @@ impl UserInbox {
             return Handled::Done;
         }
         let day = bs::day_of(now);
+        // The cap counts per member, across their 1:1 chat and every room.
         let used = store.db.int(bs::USAGE_GET, &[Arg::T(from), Arg::I(day)]).unwrap_or(0);
         if used >= bs::DAILY_CALLS {
-            self.builtin_say(ctx, from, line(run.lang, Line::DailyLimit), spent).await;
+            self.builtin_answer(ctx, ask, line(run.lang, Line::DailyLimit), spent).await;
             return Handled::Done;
         }
         let Some(key) = self.builtin_api_key() else {
             self.builtin_note(Err("ai/no-key"), now);
-            self.builtin_say(ctx, from, line(run.lang, Line::AiUnavailable), spent).await;
+            self.builtin_answer(ctx, ask, line(run.lang, Line::AiUnavailable), spent).await;
             return Handled::Done;
         };
         let history: Vec<Turn> = sql
             .exec_raw(
                 bs::TURNS_RECENT,
                 Some(vec![
-                    JsValue::from_str(from),
+                    JsValue::from_str(&context),
                     JsValue::from_f64((now - bs::TURN_TTL_MS) as f64),
                     JsValue::from_f64((bs::CONTEXT_TURNS * 2) as f64),
                 ]),
@@ -307,7 +348,8 @@ impl UserInbox {
             .filter_map(|r| Some(Turn { role: Role::parse(&r.role)?, text: r.text }))
             .collect();
         let history = policy::whole_turns(history);
-        let system = builtin_ai::system_prompt(ai, &run.bot_name, name, run.cfg.writes_sheet(), now);
+        let room_name = room.map(|r| r.name.as_str());
+        let system = builtin_ai::system_prompt(ai, &run.bot_name, name, room_name, run.cfg.writes_sheet(), now);
         let body = builtin_ai::request_body(ai, &system, &history, text);
         store.db.run(bs::USAGE_BUMP, &[Arg::T(from), Arg::I(day)]);
         *spent += 1;
@@ -323,20 +365,50 @@ impl UserInbox {
                     return Handled::Retry;
                 }
                 let l = if builtin_ai::transient(code) { Line::TryLater } else { Line::AiUnavailable };
-                self.builtin_say(ctx, from, line(run.lang, l), spent).await;
+                self.builtin_answer(ctx, ask, line(run.lang, l), spent).await;
                 return Handled::Done;
             }
         };
         self.builtin_note(Ok(()), now);
         let user_text = builtin_ai::cut(text, builtin_ai::MAX_INPUT_CHARS);
-        self.builtin_remember(from, &user_text, &answer, now);
+        self.builtin_remember(&context, &user_text, &answer, now);
         let (shown, row) = builtin_ai::split_row(&answer);
-        let proposal = row
-            .filter(|_| ai.sheet_tool && run.cfg.writes_sheet())
-            .and_then(|r| Some((policy::confirm_text(run.lang, &shown, &r, MAX_REPLY_CHARS)?, r)));
+        let row = row.filter(|_| ai.sheet_tool && run.cfg.writes_sheet());
+        let room_json = room.map(RoomRef::to_json);
+        let propose = |r: &super::builtin_sheet::Row| {
+            let room_arg = room_json.as_deref().map_or(Arg::Null, Arg::T);
+            store.db.run(
+                bs::PROPOSAL_PUT,
+                &[Arg::T(from), Arg::T(&r.to_json()), Arg::T(&user_text), Arg::I(now), room_arg],
+            );
+        };
+        if let Some(room) = room {
+            // The answer to the room; a row it proposes goes to the caller alone, shown whole
+            // with nothing of the prose (the room has that) but the group it is for, and is
+            // settled in their 1:1 chat. One proposal waits per member: one still waiting is
+            // replaced, and the new one says so, so their next yes or no answers what they see.
+            if !shown.trim().is_empty() {
+                self.builtin_answer(ctx, ask, &shown, spent).await;
+            }
+            let waiting: Option<ProposalRow> = sql
+                .exec_raw(bs::PROPOSAL_GET, Some(vec![JsValue::from_str(from)]))
+                .and_then(|c| c.to_array())
+                .ok()
+                .and_then(|v: Vec<ProposalRow>| v.into_iter().next());
+            let replaced = waiting.is_some_and(|p| !bs::lapsed(p.at, now));
+            let header = policy::room_proposal_header(run.lang, &room.name, replaced);
+            if let Some((confirm, r)) =
+                row.and_then(|r| Some((policy::confirm_text(run.lang, &header, &r, MAX_REPLY_CHARS)?, r)))
+            {
+                propose(&r);
+                self.builtin_say(ctx, from, &confirm, spent).await;
+            }
+            return Handled::Done;
+        }
+        let proposal = row.and_then(|r| Some((policy::confirm_text(run.lang, &shown, &r, MAX_REPLY_CHARS)?, r)));
         let reply = match proposal {
             Some((text, r)) => {
-                store.db.run(bs::PROPOSAL_PUT, &[Arg::T(from), Arg::T(&r.to_json()), Arg::T(&user_text), Arg::I(now)]);
+                propose(&r);
                 text
             }
             // No row, or one too big to show whole: the prose alone.
@@ -348,7 +420,8 @@ impl UserInbox {
         Handled::Done
     }
 
-    /// One exchange into the member's context, keeping the last `CONTEXT_TURNS`.
+    /// One exchange into a context (`builtin_room::context_key`: a member 1:1, or a member in a
+    /// room), keeping its last `CONTEXT_TURNS`.
     fn builtin_remember(&self, from: &str, user: &str, assistant: &str, now: i64) {
         let db = self.bot_store().db;
         let user = builtin_ai::cut(user, builtin_ai::MAX_INPUT_CHARS);

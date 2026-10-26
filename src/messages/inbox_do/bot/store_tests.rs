@@ -6,7 +6,7 @@ use super::*;
 use rusqlite::{types::Value, Connection};
 use sezi_bot_engine::BotStore;
 
-pub(super) struct Lite(pub(super) Connection);
+pub(in crate::messages::inbox_do::bot) struct Lite(pub(in crate::messages::inbox_do::bot) Connection);
 
 #[path = "engine_tests.rs"]
 mod engine;

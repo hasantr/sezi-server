@@ -73,18 +73,22 @@ fn a_members_message_is_cut_at_four_thousand_characters() {
 
 #[test]
 fn the_system_prompt_carries_the_instructions_and_the_row_protocol_only_when_asked() {
-    let plain = system_prompt(&ai(Provider::Anthropic, false), "Kâtip", "Ayşe", false, NOW);
+    let plain = system_prompt(&ai(Provider::Anthropic, false), "Kâtip", "Ayşe", None, false, NOW);
     assert!(plain.contains("\"Kâtip\"") && plain.contains("\"Ayşe\""));
     assert!(plain.contains("<instructions>\nAnswer questions about hearings.\n</instructions>"));
     assert!(!plain.contains("ROW:"));
-    let unconnected = system_prompt(&ai(Provider::Anthropic, true), "Kâtip", "Ayşe", false, NOW);
+    let unconnected = system_prompt(&ai(Provider::Anthropic, true), "Kâtip", "Ayşe", None, false, NOW);
     assert!(!unconnected.contains("ROW:"), "rows on but no sheet yet: no row is asked for");
-    let rows = system_prompt(&ai(Provider::Anthropic, true), "Kâtip", "Ayşe", true, NOW);
+    let rows = system_prompt(&ai(Provider::Anthropic, true), "Kâtip", "Ayşe", None, true, NOW);
     assert!(plain.contains("Today is Monday, 26 October 2026 (UTC)."), "every prompt knows the date");
     assert!(rows.contains("NO row is waiting"), "a settled row is never listed as pending");
     assert!(rows.contains("cannot see the spreadsheet"), "nothing claimed beyond what it remembers");
     assert!(rows.contains("\"Kaydedildi.\""), "the saved marker the model reads back");
     assert!(rows.contains("ROW: {\"Column\": \"value\", ...}"));
+    assert!(plain.contains("one to one"));
+    let room = system_prompt(&ai(Provider::Anthropic, false), "Kâtip", "Ayşe", Some("Hukuk"), false, NOW);
+    assert!(room.contains("in the group \"Hukuk\"") && room.contains("everyone in the group sees"));
+    assert!(!room.contains("one to one"));
 }
 
 #[test]

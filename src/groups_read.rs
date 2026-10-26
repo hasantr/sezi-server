@@ -134,7 +134,8 @@ struct MemberRow {
 
 /// Every row of the group, pending invitees included — which is why a change to any row's
 /// role or status is a change to what all the OTHER members see, and therefore why the
-/// membership handlers nudge the whole room (see `groups_notify.rs`).
+/// membership handlers nudge the whole room (see `groups_notify.rs`). The room's bots ride along
+/// as `room_bots` ([`ROOM_BOTS_SQL`]), and adding or removing one nudges the room the same way.
 pub(super) async fn member_list(db: &D1Database, group_id: &str) -> Result<serde_json::Value> {
     let rows: Vec<MemberRow> = db
         .prepare(
@@ -160,5 +161,40 @@ pub(super) async fn member_list(db: &D1Database, group_id: &str) -> Result<serde
             })
         })
         .collect();
-    Ok(serde_json::json!({ "members": members }))
+    let bot_rows: Vec<RoomBotRow> = db
+        .prepare(ROOM_BOTS_SQL)
+        .bind(&[d1_text(group_id)])?
+        .all()
+        .await?
+        .results()?;
+    let room_bots: Vec<_> = bot_rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "bot_id": r.bot_id,
+                "name": r.name,
+                "added_by": r.added_by,
+                "added_at": r.added_at,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "members": members, "room_bots": room_bots }))
+}
+
+/// The room's bots for `member_list` — beside `members`, never among them: a bot is not a
+/// `group_members` row and no client may count it as one (it would hand it the room key). A
+/// deleted bot is left out; a disabled one stays (turning a bot off keeps its rooms). The count
+/// is bounded by `bots::provision::MAX_BOTS`. Bind: ?1 group_id.
+pub(super) const ROOM_BOTS_SQL: &str = "SELECT gb.bot_id, b.name, gb.added_by, gb.added_at
+       FROM group_bots gb JOIN bots b ON b.bot_id = gb.bot_id
+      WHERE gb.group_id = ?1 AND b.deleted_at IS NULL
+      ORDER BY gb.added_at, gb.bot_id";
+
+#[derive(Deserialize)]
+struct RoomBotRow {
+    bot_id: String,
+    name: String,
+    #[serde(default)]
+    added_by: Option<String>,
+    added_at: i64,
 }

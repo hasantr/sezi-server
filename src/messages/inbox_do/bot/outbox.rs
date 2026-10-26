@@ -6,7 +6,12 @@
 //! drain sends at most a budget's worth — the 50-subrequest ceiling `messages/budget.rs` assumes,
 //! less headroom — and leaves the rest for the next alarm. A row that keeps failing backs off
 //! (5 s, 30 s, 2 min, 10 min, then hourly) and is dropped after 24 h.
+//!
+//! A `room_send` (Phase 3, `room.rs`) is the one row paid in parts: a room post handed to as many
+//! members as the drain can pay for, the row rewritten with who has it, and the rest sent at once
+//! by the next drain.
 
+use super::room::RoomSendStep;
 use super::*;
 
 /// Subrequests one drain may spend (less when a built-in round spent first: `builtin_policy`).
@@ -30,6 +35,19 @@ pub(super) const OUTBOX_RETRY: &str =
 /// Bind: cutoff.
 pub(super) const OUTBOX_EXPIRE: &str = "DELETE FROM bot_outbox WHERE created_at < ?";
 pub(super) const OUTBOX_NEXT: &str = "SELECT MIN(next_at) AS t FROM bot_outbox";
+/// A `room_send` row after a part of it went: who has it now, and when the rest goes.
+/// Bind: body, attempts, next_at, id.
+pub(super) const OUTBOX_REWRITE: &str = "UPDATE bot_outbox SET body = ?, attempts = ?, next_at = ? WHERE id = ?";
+/// A `room_send` drain needs at least its two D1 reads and one member call.
+const ROOM_SEND_MIN: u32 = 3;
+/// Every row still owed for a room the bot left: its key shares and its posts' chunks.
+/// Bind: room.
+pub(super) const OUTBOX_DROP_ROOM: &str = "DELETE FROM bot_outbox
+      WHERE kind IN ('notify', 'room_send') AND json_extract(body, '$.room_id') = ?";
+/// The bot is back on: the room posts held off go now. Bind: now.
+pub(super) const OUTBOX_WAKE_ROOM_SENDS: &str = "UPDATE bot_outbox SET next_at = ? WHERE kind = 'room_send'";
+/// How long a `room_send` waits while the bot is off (its `/bot/wake` pulls it forward).
+const ROOM_SEND_HOLD_MS: i64 = super::room_plan::HOLD_MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OutKind {
@@ -38,6 +56,8 @@ pub(super) enum OutKind {
     ForwardFailed,
     /// The program took the member's message: their blue tick.
     ForwardRead,
+    /// A room post, encrypted, owed to the room's members (Phase 3).
+    RoomSend,
 }
 
 impl OutKind {
@@ -47,11 +67,12 @@ impl OutKind {
             OutKind::ForwardDelivered => "forward_delivered",
             OutKind::ForwardFailed => "forward_failed",
             OutKind::ForwardRead => "forward_read",
+            OutKind::RoomSend => "room_send",
         }
     }
 
     fn parse(s: &str) -> Option<Self> {
-        [Self::Notify, Self::ForwardDelivered, Self::ForwardFailed, Self::ForwardRead]
+        [Self::Notify, Self::ForwardDelivered, Self::ForwardFailed, Self::ForwardRead, Self::RoomSend]
             .into_iter()
             .find(|k| k.as_str() == s)
     }
@@ -83,6 +104,18 @@ struct NotifyBody {
     envelope_b64: String,
     #[serde(default)]
     msg_uid: Option<String>,
+    /// A room key share names its room (`room::bot_queue_room_shares`; its `session_id` is there
+    /// for diagnosis).
+    #[serde(default)]
+    room_id: Option<String>,
+}
+
+/// May a queued notify still go? A room key share only while the bot still holds a session in
+/// that room: once it left, the room is forgotten and the share is dropped. A share of a session
+/// since rotated still goes — the post it opens was encrypted for that member while they were one
+/// (a removal deletes the room's owed rows outright, `OUTBOX_DROP_ROOM`).
+pub(super) fn share_still_current(room: Option<&str>, current: impl Fn(&str) -> Option<String>) -> bool {
+    room.is_none_or(|r| current(r).is_some())
 }
 
 #[derive(Deserialize)]
@@ -146,11 +179,35 @@ impl UserInbox {
         for row in due {
             let worst = match OutKind::parse(&row.kind) {
                 Some(OutKind::Notify) => NOTIFY_WORST,
+                Some(OutKind::RoomSend) => ROOM_SEND_MIN,
                 Some(_) => 1,
                 None => 0,
             };
             if spent + worst > budget {
                 break;
+            }
+            if OutKind::parse(&row.kind) == Some(OutKind::RoomSend) {
+                let (step, cost) = self.bot_send_room_chunk(ctx, &row.body, budget - spent).await;
+                spent += cost;
+                let id = JsValue::from_f64(row.id as f64);
+                let rewrite = |body: String, attempts: i64, next: i64| {
+                    let args = vec![
+                        JsValue::from_str(&body),
+                        JsValue::from_f64(attempts as f64),
+                        JsValue::from_f64(next as f64),
+                        id.clone(),
+                    ];
+                    let _ = sql.exec_raw(OUTBOX_REWRITE, Some(args));
+                };
+                match step {
+                    RoomSendStep::Done => {
+                        let _ = sql.exec_raw(OUTBOX_DONE, Some(vec![id.clone()]));
+                    }
+                    RoomSendStep::Progress(body) => rewrite(body, 0, now),
+                    RoomSendStep::Retry(body) => rewrite(body, row.attempts + 1, now + retry_delay_ms(row.attempts)),
+                    RoomSendStep::Hold => rewrite(row.body.clone(), row.attempts, now + ROOM_SEND_HOLD_MS),
+                }
+                continue;
             }
             let (ok, cost) = match OutKind::parse(&row.kind) {
                 Some(OutKind::Notify) => self.bot_send_notify(ctx, &row.body).await,
@@ -173,6 +230,11 @@ impl UserInbox {
         let Ok(n) = serde_json::from_str::<NotifyBody>(body) else {
             return (true, 0);
         };
+        let store = self.bot_store();
+        let current = |r: &str| sezi_bot_engine::RoomStore::room_session(&store, r).map(|s| s.session_id);
+        if !share_still_current(n.room_id.as_deref(), current) {
+            return (true, 0); // a key share for a room the bot left: drop it
+        }
         let Ok(namespace) = self.env.durable_object("USER_INBOX") else {
             return (false, 0);
         };
@@ -241,6 +303,7 @@ impl UserInbox {
             self.bot_webhook_next(),
             self.bot_builtin_next(),
             self.bot_builtin_expiry_next(),
+            self.bot_room_next(),
         ]
             .into_iter()
             .flatten()
@@ -263,10 +326,10 @@ mod tests {
 
     #[test]
     fn every_kind_survives_its_own_name() {
-        for k in [OutKind::Notify, OutKind::ForwardDelivered, OutKind::ForwardFailed, OutKind::ForwardRead] {
+        for k in [OutKind::Notify, OutKind::ForwardDelivered, OutKind::ForwardFailed, OutKind::ForwardRead, OutKind::RoomSend] {
             assert_eq!(OutKind::parse(k.as_str()), Some(k));
         }
-        assert_eq!(OutKind::parse("room_send"), None);
+        assert_eq!(OutKind::parse("webhook"), None);
     }
 
     #[test]

@@ -68,15 +68,29 @@ pub(super) fn cut(text: &str, n: usize) -> String {
 }
 
 /// The system prompt: who the bot is and who it talks to, the owner's instructions verbatim,
-/// and — for a bot that writes rows to a connected sheet (`rows`) — the row protocol. English,
-/// as an instruction to a model.
-pub(super) fn system_prompt(ai: &AiConfig, bot_name: &str, member_name: &str, rows: bool, now_ms: i64) -> String {
+/// and — for a bot that writes rows to a connected sheet (`rows`) — the row protocol. `room` is
+/// the group's name when the member called the bot there (everyone in it sees the answer).
+/// English, as an instruction to a model.
+pub(super) fn system_prompt(
+    ai: &AiConfig,
+    bot_name: &str,
+    member_name: &str,
+    room: Option<&str>,
+    rows: bool,
+    now_ms: i64,
+) -> String {
+    let setting = match room {
+        None => format!("talking one to one with a member named \"{member_name}\""),
+        Some(group) => format!(
+            "answering a member named \"{member_name}\" who called you in the group \"{group}\"; \
+             everyone in the group sees your answer, so write it for them all"
+        ),
+    };
     let mut s = format!(
-        "You are \"{bot_name}\", a bot on a private Sezi messaging server, talking one to one with \
-         a member named \"{member_name}\". Answer in plain text without Markdown, briefly, in the \
-         language of the member's latest message unless the instructions say otherwise. You see \
-         only what this member writes to you. {}\n\nThe bot owner's instructions:\n\
-         <instructions>\n{}\n</instructions>",
+        "You are \"{bot_name}\", a bot on a private Sezi messaging server, {setting}. Answer in \
+         plain text without Markdown, briefly, in the language of the member's latest message \
+         unless the instructions say otherwise. You see only what this member writes to you. \
+         {}\n\nThe bot owner's instructions:\n<instructions>\n{}\n</instructions>",
         today_line(now_ms),
         ai.instructions
     );

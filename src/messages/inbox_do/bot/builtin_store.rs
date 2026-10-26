@@ -22,15 +22,26 @@ pub(super) const TABLES: [&str; 5] = [
     "CREATE TABLE IF NOT EXISTS bot_ai_usage (
         user_id TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL,
         PRIMARY KEY (user_id, day))",
+    // `room_json` (both tables): the room call it came from, `{"id","name","call_uid"}`, or NULL
+    // for a 1:1 message (`builtin_room.rs`).
     "CREATE TABLE IF NOT EXISTS bot_ai_proposals (
-        user_id TEXT PRIMARY KEY, row_json TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)",
+        user_id TEXT PRIMARY KEY, row_json TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL,
+        room_json TEXT)",
     // `confirm` = an AI bot's row the member said yes to: its landing is said ("Kaydedildi").
     // `told` = its author has heard the sheet is failing (so its landing is said, late).
     "CREATE TABLE IF NOT EXISTS bot_sheet_jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, name TEXT NOT NULL,
         text TEXT NOT NULL, row_json TEXT, at INTEGER NOT NULL, confirm INTEGER NOT NULL DEFAULT 0,
         attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
-        told INTEGER NOT NULL DEFAULT 0)",
+        told INTEGER NOT NULL DEFAULT 0, room_json TEXT)",
+];
+
+/// Columns added after the tables first shipped, for an inbox whose tables are older. Run once
+/// per inbox (`bot_kv` `builtin_schema` = how many have run); each fails harmlessly on a table
+/// `TABLES` just made with the column already in it.
+pub(super) const UPGRADES: [&str; 2] = [
+    "ALTER TABLE bot_ai_proposals ADD COLUMN room_json TEXT",
+    "ALTER TABLE bot_sheet_jobs ADD COLUMN room_json TEXT",
 ];
 
 /// Turns of context, each two rows.
@@ -77,10 +88,10 @@ pub(super) const USAGE_BUMP: &str = "INSERT INTO bot_ai_usage (user_id, day, n) 
 pub(super) const USAGE_EXPIRE: &str = "DELETE FROM bot_ai_usage WHERE day < ?";
 
 /// Bind: user.
-pub(super) const PROPOSAL_GET: &str = "SELECT row_json, text, at FROM bot_ai_proposals WHERE user_id = ?";
-/// Bind: user, row_json, text, at.
-pub(super) const PROPOSAL_PUT: &str = "INSERT OR REPLACE INTO bot_ai_proposals (user_id, row_json, text, at)
-      VALUES (?, ?, ?, ?)";
+pub(super) const PROPOSAL_GET: &str = "SELECT row_json, text, at, room_json FROM bot_ai_proposals WHERE user_id = ?";
+/// Bind: user, row_json, text, at, room_json (or NULL).
+pub(super) const PROPOSAL_PUT: &str = "INSERT OR REPLACE INTO bot_ai_proposals (user_id, row_json, text, at, room_json)
+      VALUES (?, ?, ?, ?, ?)";
 /// Bind: user.
 pub(super) const PROPOSAL_DROP: &str = "DELETE FROM bot_ai_proposals WHERE user_id = ?";
 /// Every waiting row (the sheet it was meant for changed or went).
@@ -92,17 +103,19 @@ pub(super) const EXPIRY_NEXT: &str = "SELECT MIN(t) AS t FROM (
 /// Bind: cutoff.
 pub(super) const PROPOSAL_EXPIRE: &str = "DELETE FROM bot_ai_proposals WHERE at < ?";
 
-/// Bind: user, name, text, row_json (or NULL), at, confirm, next_at, created_at.
+/// Bind: user, name, text, row_json (or NULL), at, confirm, next_at, created_at, room_json (or NULL).
 pub(super) const JOB_PUSH: &str = "INSERT INTO bot_sheet_jobs
-      (user_id, name, text, row_json, at, confirm, attempts, next_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)";
+      (user_id, name, text, row_json, at, confirm, attempts, next_at, created_at, room_json)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)";
 /// Oldest first: rows land in the order they were written. Bind: limit.
 pub(super) const JOB_DUE: &str = "SELECT id, user_id, name, text, row_json, at, confirm, attempts, next_at,
-      created_at, told FROM bot_sheet_jobs ORDER BY id LIMIT ?";
-/// Authors of rows waiting behind a failing head who have not heard so, oldest first.
+      created_at, told, room_json FROM bot_sheet_jobs ORDER BY id LIMIT ?";
+/// Authors of rows waiting behind a failing head who have not heard so, oldest first, with their
+/// earliest such row's room and words (SQLite takes bare columns from the `MIN(id)` row).
 /// Bind: the head's id, limit.
-pub(super) const JOB_BEHIND_UNTOLD: &str = "SELECT user_id FROM bot_sheet_jobs WHERE id > ? AND told = 0
-      GROUP BY user_id ORDER BY MIN(id) LIMIT ?";
+pub(super) const JOB_BEHIND_UNTOLD: &str = "SELECT user_id, room_json, text, MIN(id) AS first FROM bot_sheet_jobs
+      WHERE id > ? AND told = 0
+      GROUP BY user_id ORDER BY first LIMIT ?";
 /// This author has heard the sheet is failing: none of their rows says so again. Bind: user.
 pub(super) const JOB_MARK_TOLD: &str = "UPDATE bot_sheet_jobs SET told = 1 WHERE user_id = ?";
 /// When the head of the queue is due; NULL when it is empty.

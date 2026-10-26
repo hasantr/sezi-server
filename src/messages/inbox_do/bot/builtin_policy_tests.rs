@@ -176,3 +176,16 @@ fn a_settled_row_is_remembered_as_what_the_member_was_told() {
     let lapsed = settled_exchange(Lang::Tr, &ProposalStep::Lapsed).unwrap();
     assert_eq!(lapsed.0, Some(Line::ProposalLapsed));
 }
+
+/// A row proposed for a room call names its group, and says so when it replaced a waiting one:
+/// the 1:1 "evet" confirms exactly the row the member last saw (review, 2026-10-26).
+#[test]
+fn a_room_proposal_names_its_group_and_a_replacement_says_so() {
+    assert_eq!(room_proposal_header(Lang::Tr, " Hukuk ", false), "“Hukuk” grubundaki mesajın için:");
+    let replaced = room_proposal_header(Lang::En, "Law", true);
+    assert_eq!(replaced, "This replaces the earlier proposal; your answer is for this one.\nFor your message in the group \"Law\":");
+    let row = Row(vec![("Tarih".into(), "2026-10-27".into())]);
+    let text = confirm_text(Lang::Tr, &room_proposal_header(Lang::Tr, "Hukuk", true), &row, 4000).unwrap();
+    assert!(text.starts_with("Önceki öneri geçersiz"), "{text}");
+    assert!(text.contains("“Hukuk”") && text.contains("• Tarih: 2026-10-27") && text.ends_with("evet / hayır"));
+}

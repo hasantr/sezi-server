@@ -204,6 +204,22 @@ pub enum InnerMessage {
         icon: String,
         added_by: String,
     },
+    /// Local "a bot was added to / removed from this group" notice — the chat row "Ayşe,
+    /// Duruşma Defteri botunu ekledi" (board R9-Bots-Group, `docs/BOTS_BUILD.md` Phase 3).
+    ///
+    /// NEVER GOES TO THE OTHER SIDE, for the reason [`InnerMessage::RoomAccessNotice`] gives: each
+    /// device writes its own row when its own group refresh sees the room's `room_bots` change
+    /// (`kernel/room_bots.rs`), so a peer cannot announce a bot nobody added, nor bury one.
+    ///
+    /// `bot_id`: which bot. `event`: `"added"` | `"removed"` — a string, like `CallLog.status`,
+    /// so an older reader degrades to `Unknown`. `by`: the admin the relay names as having added
+    /// it; `None` for a removal (the refresh that sees it does not say who). The UI words it.
+    RoomBotNotice {
+        bot_id: String,
+        event: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        by: Option<String>,
+    },
     /// P2P blob offer — the sender is serving the raw bytes over iroh-blobs; this
     /// Olm-encrypted message carries only the **ticket + manifest** to the receiver. The
     /// receiver parses the ticket, calls `recv_blob` and pulls the bytes directly over
@@ -773,8 +789,13 @@ pub enum InnerMessage {
     /// `ext.mentions`, or `/command`). Only a bot ever receives it; a human kernel drops one
     /// ([`InnerMessage::is_bot_bound`], `crate::bots`). Phase 3 sends it; it is declared now so
     /// every human build already refuses it. `docs/BOTS_BUILD.md` §2.6.
+    ///
+    /// `msg_uid` (the call's own id in the room) goes on the wire as `origin_msg_uid`: a variant
+    /// field named `msg_uid` is shadowed by `ChatPayload.msg_uid` under `flatten` and the frame
+    /// fails to decode ("missing field") — the `GroupOutboundCopy::origin_local_id` hazard.
     BotCall {
         room_id: String,
+        #[serde(rename = "origin_msg_uid")]
         msg_uid: String,
         body: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -782,10 +803,12 @@ pub enum InnerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         utc_offset_min: Option<i32>,
     },
-    /// A tap on a bot's button, sent to that bot alone (Phase 4). Bot-bound like `BotCall`.
+    /// A tap on a bot's button, sent to that bot alone (Phase 4). Bot-bound like `BotCall`, and
+    /// its `msg_uid` (the bot message tapped) is `origin_msg_uid` on the wire for the same reason.
     BotTap {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room_id: Option<String>,
+        #[serde(rename = "origin_msg_uid")]
         msg_uid: String,
         action_id: String,
     },
@@ -919,6 +942,8 @@ impl InnerMessage {
     ///   the same class as `RoomAccessNotice`, for the same reason.
     /// - `PluginAddedNotice` is this device's record of an install it applied; from a peer it
     ///   would let anyone announce an app nobody added.
+    /// - `RoomBotNotice` is this device's record of a bot its own refresh saw join or leave the
+    ///   room; from a peer it would let anyone announce a bot nobody added.
     ///
     /// Note this is about the CONTENT paths. None of these variants is ever sent, so rejecting
     /// them costs nothing that any honest client does.
@@ -929,6 +954,7 @@ impl InnerMessage {
                 | InnerMessage::RoomAccessNotice { .. }
                 | InnerMessage::CallRecordingNotice { .. }
                 | InnerMessage::PluginAddedNotice { .. }
+                | InnerMessage::RoomBotNotice { .. }
         )
     }
 
