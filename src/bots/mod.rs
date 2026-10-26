@@ -8,6 +8,7 @@
 //! | File | What |
 //! |---|---|
 //! | `admin.rs` | the owner's `/admin/bots` surface: create (key shown once), list, change, renew, delete |
+//! | `builtin.rs` · `builtin_rules.rs` | a built-in bot (sheet, AI): the owner's routes · its rules, limits and URL rule |
 //! | `api.rs` | `/bot/v1/:method` — `getMe`, `getUpdates`, `sendMessage`, `setWebhook`, `deleteWebhook` |
 //! | `webhook.rs` | the webhook's derived secret, its signature and envelope, one POST |
 //! | `listing.rs` | `GET /bots` — the enabled bots, for any active member |
@@ -19,6 +20,8 @@
 
 pub mod admin;
 pub mod api;
+pub mod builtin;
+pub(crate) mod builtin_rules;
 pub mod listing;
 pub(crate) mod provision;
 pub(crate) mod token;

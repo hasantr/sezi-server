@@ -9,6 +9,8 @@
 //! | `deleteWebhook` | `{}` | `{ok}` |
 //!
 //! With a webhook set, `getUpdates` answers `bot/webhook-active` (409): one queue, one reader.
+//! A built-in bot (`builtin.rs`) is that reader: `getUpdates` and `setWebhook` answer
+//! `bot/builtin-active` (409) until the owner returns it to program mode.
 //!
 //! Phase 1 writes 1:1 text only: a `room_id`, `reply_to` or `buttons` answers `bot/unsupported`
 //! rather than being dropped in silence. Errors are `{ok:false, error:"bot/<code>"}`.
@@ -94,6 +96,9 @@ async fn set_webhook(env: &Env, db: &D1Database, bot: &BotAuth, url: &str, token
     };
     let call = serde_json::json!({ "url": url, "secret": secret });
     let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/webhook", Some(call.to_string())).await?;
+    if resp.status_code() == 409 {
+        return crate::respond::passthrough(resp).await; // `bot/builtin-active`
+    }
     if resp.status_code() != 204 {
         return bot_err(502, "inbox-unavailable");
     }

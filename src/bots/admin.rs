@@ -7,13 +7,16 @@
 //! | `PATCH /admin/bots/:id {name?, about?, disabled?}` | change, turn off, turn back on |
 //! | `POST /admin/bots/:id/token` | a new key; the old one stops at once |
 //! | `DELETE /admin/bots/:id` | soft delete: the account and its name stay for old messages |
-//! | `POST /admin/bots/:id/test` | "Dene": a `ping` update to the program → `{ok, update_id}` |
+//! | `POST /admin/bots/:id/test` | "Dene": a `ping` update to the program → `{ok, update_id}`; a built-in bot runs NOW → `{ok, kind, outcome, answer?}` |
+//! | `PUT`/`GET /admin/bots/:id/builtin` | a built-in bot's configuration (`builtin.rs`) |
 //!
 //! Each listed bot carries `program_seen_at` (seconds: its last API call or taken webhook),
 //! `waiting_since` (ms: the oldest update its program has not been handed), `webhook` (set or
 //! not) and `program_silent` — "Programından haber yok": an update has waited 10 minutes and
 //! the program has not been seen in that time (BOTS_BUILD §5, R9 decision 4). Otherwise the
-//! page shows "last seen".
+//! page shows "last seen". A built-in bot (`builtin` = `sheet` / `ai`) is never silent — the relay
+//! is its program — and carries `ai_provider`, `ai_model`, `last_ok_at` (ms) and `last_error`
+//! (a typed code) instead; no secret and no instructions are listed.
 //!
 //! OWNER-only, through `require_active_auth` (a revoked device's access token is refused at
 //! once — the `admin/mod.rs` guard explains why `require_auth` is never enough here).
@@ -45,7 +48,7 @@ pub(crate) fn program_silent(waiting_since_ms: Option<i64>, seen_at_s: Option<i6
 }
 
 /// The owner's user id, or the refusal to send.
-async fn owner(req: &Request, env: &Env) -> std::result::Result<String, Response> {
+pub(crate) async fn owner(req: &Request, env: &Env) -> std::result::Result<String, Response> {
     let user_id = require_active_auth(req, env).await?.user_id;
     require_owner(&user_id, env).await?;
     Ok(user_id)
@@ -151,6 +154,8 @@ struct BotRow {
     about: Option<String>,
     #[serde(default)]
     builtin: Option<String>,
+    #[serde(default)]
+    ai_provider: Option<String>,
     created_at: i64,
     #[serde(default)]
     disabled_at: Option<i64>,
@@ -165,7 +170,7 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
     let rows: Vec<BotRow> = db
         .prepare(
-            "SELECT bot_id, name, about, builtin, created_at, disabled_at, program_seen_at
+            "SELECT bot_id, name, about, builtin, ai_provider, created_at, disabled_at, program_seen_at
                FROM bots WHERE deleted_at IS NULL ORDER BY created_at, bot_id",
         )
         .all()
@@ -177,6 +182,12 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         waiting_since: Option<i64>,
         #[serde(default)]
         webhook: bool,
+        #[serde(default)]
+        ai_model: Option<String>,
+        #[serde(default)]
+        last_ok_at: Option<i64>,
+        #[serde(default)]
+        last_error: Option<String>,
     }
     let now = now_ms() as i64;
     let mut out = Vec::with_capacity(rows.len());
@@ -189,7 +200,11 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         let mut v = serde_json::to_value(&row).map_err(|e| Error::RustError(e.to_string()))?;
         v["waiting_since"] = state.waiting_since.into();
         v["webhook"] = state.webhook.into();
-        v["program_silent"] = program_silent(state.waiting_since, row.program_seen_at, now).into();
+        let silent = row.builtin.is_none() && program_silent(state.waiting_since, row.program_seen_at, now);
+        v["program_silent"] = silent.into();
+        v["ai_model"] = state.ai_model.into();
+        v["last_ok_at"] = state.last_ok_at.into();
+        v["last_error"] = state.last_error.into();
         out.push(v);
     }
     Response::from_json(&serde_json::json!({ "bots": out }))
@@ -203,7 +218,7 @@ struct PatchBody {
 }
 
 /// A bot that exists and is not deleted.
-async fn live_bot(db: &D1Database, bot_id: &str) -> Result<bool> {
+pub(crate) async fn live_bot(db: &D1Database, bot_id: &str) -> Result<bool> {
     #[derive(Deserialize)]
     struct R {
         #[allow(dead_code)] // an existence check; the value is never read
@@ -276,6 +291,14 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         None => {}
     }
     db.batch(stmts).await?;
+    // A built-in bot held its queue while it was off; back on, it runs now.
+    if body.disabled == Some(false) {
+        let _ = super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/wake", None).await;
+    }
+    // Members read a bot's name, line and on/off state from `GET /bots`, which their kernel
+    // re-reads on a `contact_update`. Without this nudge a turned-off bot still looked on to them
+    // until their app restarted (lab, 2026-10-26).
+    provision::nudge_humans(&ctx.env, &db).await;
     no_content()
 }
 
@@ -312,6 +335,8 @@ pub async fn renew_token(req: Request, ctx: RouteContext<()>) -> Result<Response
 
 /// "Dene": a `ping` update, carrying the owner as `who`, that the program receives like any
 /// other — by poll or webhook. A program that answers it shows the owner the whole loop works.
+/// A built-in bot is run NOW instead, and the answer is its measured outcome
+/// (`{ok, kind, outcome: "ok" | "<code>", answer?}`).
 pub async fn test(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let owner_id = match owner(&req, &ctx.env).await {
         Ok(u) => u,
@@ -336,8 +361,22 @@ pub async fn test(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .bind(&[d1_text(&owner_id)])?
         .first(None)
         .await?;
+    #[derive(Deserialize)]
+    struct Builtin {
+        #[serde(default)]
+        builtin: Option<String>,
+    }
+    let builtin: Option<Builtin> = db
+        .prepare("SELECT builtin FROM bots WHERE bot_id = ?1")
+        .bind(&[d1_text(&bot_id)])?
+        .first(None)
+        .await?;
+    let path = match builtin.and_then(|b| b.builtin).as_deref() {
+        Some("sheet" | "ai") => "/bot/builtin-test",
+        _ => "/bot/ping",
+    };
     let call = serde_json::json!({ "who": who });
-    let resp = super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/ping", Some(call.to_string())).await?;
+    let resp = super::bot_inbox(&ctx.env, &bot_id, Method::Post, path, Some(call.to_string())).await?;
     crate::respond::passthrough(resp).await
 }
 
@@ -374,6 +413,26 @@ mod tests {
     use super::program_silent;
 
     const MIN: i64 = 60_000;
+
+    /// The body of `pub async fn <name>` in `src`, up to the next top-level `fn`.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(&format!("pub async fn {name}(")).expect(name);
+        let rest = &src[start..];
+        let end = rest[1..].find("\npub async fn ").map_or(rest.len(), |i| i + 1);
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_owner_change_members_see_nudges_them() {
+        // What members are shown of a bot (name, line, on/off, the AI chip) is `GET /bots`, which
+        // their kernel re-reads on a `contact_update` only. Measured in the lab: a bot turned off
+        // or made an AI bot looked unchanged to members until their app restarted.
+        let admin = include_str!("admin.rs");
+        for f in ["create", "update", "delete"] {
+            assert!(fn_body(admin, f).contains("nudge_humans("), "admin::{f}");
+        }
+        assert!(fn_body(include_str!("builtin.rs"), "put").contains("nudge_humans("), "builtin::put");
+    }
 
     #[test]
     fn silent_only_after_an_update_waited_ten_minutes_unseen() {

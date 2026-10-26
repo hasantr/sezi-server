@@ -76,10 +76,10 @@ fn no_route_gates_on_the_stateless_jwt_alone() {
 /// exact omission shipped once before (2026-08-25, `self_provision.rs`'s own history).
 #[test]
 fn the_migration_is_wired_into_self_provision() {
-    let src = include_str!("self_provision.rs");
+    let src = include_str!("self_provision_migrations.rs");
     assert!(
         src.contains("0038_instrument_pack.sql"),
-        "migrations/0038_instrument_pack.sql must be include_str!'d by self_provision.rs"
+        "migrations/0038_instrument_pack.sql must be include_str!'d by self_provision_migrations.rs"
     );
     assert!(
         src.contains("(\n        \"0038_instrument_pack\","),

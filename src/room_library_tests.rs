@@ -18,7 +18,7 @@ const NOW: i64 = 1_780_000_000;
 /// once (2026-08-25); `the_migrations_list_matches_the_folder` catches it too, this names the file.
 #[test]
 fn the_migration_is_wired_into_self_provision() {
-    let src = include_str!("self_provision.rs");
+    let src = include_str!("self_provision_migrations.rs");
     assert!(src.contains("include_str!(\"../migrations/0040_room_library.sql\")"));
     assert!(src.contains("\"0040_room_library\","));
 }

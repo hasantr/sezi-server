@@ -136,6 +136,10 @@ impl UserInbox {
     pub(super) fn bot_set_webhook(&self, body: WebhookBody) -> Result<Response> {
         let store = self.bot_store();
         match (body.url, body.secret) {
+            // A built-in runner is the queue's one reader; the owner turns it off first.
+            (Some(_), _) if self.builtin_config().is_some() => {
+                return crate::bots::api::bot_err(409, "builtin-active");
+            }
             (Some(url), Some(secret)) => {
                 store.kv_put("webhook_url", &url);
                 store.kv_put("webhook_secret", &secret);

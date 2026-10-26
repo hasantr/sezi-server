@@ -125,6 +125,9 @@ impl UserInbox {
         if self.bot_store().kv_get("webhook_url").is_some() {
             return crate::bots::api::bot_err(409, "webhook-active");
         }
+        if self.builtin_config().is_some() {
+            return crate::bots::api::bot_err(409, "builtin-active");
+        }
         let ctx = self.bot_ctx()?;
         let sql = self.state.storage().sql();
         if offset > 0 {

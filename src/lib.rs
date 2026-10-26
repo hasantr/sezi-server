@@ -196,6 +196,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .patch_async("/admin/bots/:id", bots::admin::update)
         .post_async("/admin/bots/:id/token", bots::admin::renew_token)
         .post_async("/admin/bots/:id/test", bots::admin::test)
+        .put_async("/admin/bots/:id/builtin", bots::builtin::put)
+        .get_async("/admin/bots/:id/builtin", bots::builtin::get)
         .get_async("/bots", bots::listing::list)
         .delete_async("/admin/bots/:id", bots::admin::delete)
         .post_async("/bot/v1/:method", bots::api::dispatch)

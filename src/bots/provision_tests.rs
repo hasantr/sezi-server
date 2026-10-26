@@ -301,3 +301,24 @@ fn a_member_who_removed_the_bot_is_not_granted_it_again() {
     db.execute(GRANT_ALL_HUMANS_SQL, params![BOT, NOW + 2]).unwrap();
     assert_eq!(authz(&db, "alice", BOT).0, 0, "INSERT OR IGNORE never reopens a revoked pair");
 }
+
+#[test]
+fn setting_a_built_in_kind_lists_it_with_its_provider_and_drops_the_webhook() {
+    use crate::bots::builtin::SET_BUILTIN_SQL;
+    use crate::bots::listing::LIST_SQL;
+    let db = setup();
+    provision(&db);
+    db.execute("UPDATE bots SET webhook_url = 'https://example.com/hook' WHERE bot_id = ?1", [BOT]).unwrap();
+    db.execute(SET_BUILTIN_SQL, params![BOT, "ai", "anthropic"]).unwrap();
+    let listed: (String, Option<String>, Option<String>) = db
+        .query_row(LIST_SQL, [], |r| Ok((r.get("bot_id")?, r.get("builtin")?, r.get("ai_provider")?)))
+        .unwrap();
+    assert_eq!(listed, (BOT.to_string(), Some("ai".into()), Some("anthropic".into())));
+    let hook: Option<String> =
+        db.query_row("SELECT webhook_url FROM bots WHERE bot_id = ?1", [BOT], |r| r.get(0)).unwrap();
+    assert_eq!(hook, None, "one queue, one reader");
+    db.execute(SET_BUILTIN_SQL, params![BOT, Option::<String>::None, Option::<String>::None]).unwrap();
+    let back: (Option<String>, Option<String>) =
+        db.query_row(LIST_SQL, [], |r| Ok((r.get("builtin")?, r.get("ai_provider")?))).unwrap();
+    assert_eq!(back, (None, None), "program mode again");
+}

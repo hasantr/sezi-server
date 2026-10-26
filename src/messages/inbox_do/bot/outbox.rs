@@ -9,8 +9,10 @@
 
 use super::*;
 
-/// Subrequests one drain may spend.
-const DRAIN_BUDGET: u32 = 35;
+/// Subrequests one drain may spend (less when a built-in round spent first: `builtin_policy`).
+pub(super) const DRAIN_BUDGET: u32 = 35;
+/// A `notify` at its worst: the call and the member's wake (`bot_send_notify`).
+pub(super) const NOTIFY_WORST: u32 = 5;
 /// A row older than this is given up on.
 const OUTBOX_TTL_MS: i64 = 24 * 3600 * 1000;
 
@@ -120,13 +122,18 @@ impl UserInbox {
         self.bot_outbox_push(OutKind::Notify, &body, now);
     }
 
-    /// Send what is due, within the budget.
+    /// Send what is due, within the drain's own budget.
     pub(super) async fn bot_drain_outbox(&self, ctx: &BotCtx) {
+        self.bot_drain_outbox_within(ctx, DRAIN_BUDGET).await;
+    }
+
+    /// Send what is due within `budget` subrequests: a row is sent only when its worst case fits.
+    pub(super) async fn bot_drain_outbox_within(&self, ctx: &BotCtx, budget: u32) {
         let now = (now_secs() * 1000) as i64;
         let sql = self.state.storage().sql();
         let _ = sql.exec_raw(OUTBOX_EXPIRE, Some(vec![JsValue::from_f64((now - OUTBOX_TTL_MS) as f64)]));
         let due: Vec<DueRow> = match sql
-            .exec_raw(OUTBOX_DUE, Some(vec![JsValue::from_f64(now as f64), JsValue::from_f64(DRAIN_BUDGET as f64)]))
+            .exec_raw(OUTBOX_DUE, Some(vec![JsValue::from_f64(now as f64), JsValue::from_f64(budget as f64)]))
             .and_then(|c| c.to_array())
         {
             Ok(rows) => rows,
@@ -137,7 +144,12 @@ impl UserInbox {
         };
         let mut spent = 0u32;
         for row in due {
-            if spent >= DRAIN_BUDGET {
+            let worst = match OutKind::parse(&row.kind) {
+                Some(OutKind::Notify) => NOTIFY_WORST,
+                Some(_) => 1,
+                None => 0,
+            };
+            if spent + worst > budget {
                 break;
             }
             let (ok, cost) = match OutKind::parse(&row.kind) {
@@ -224,7 +236,12 @@ impl UserInbox {
             self.arm_alarm_within(0).await;
             return;
         }
-        let next = [store.db.int(OUTBOX_NEXT, &[]), self.bot_webhook_next()]
+        let next = [
+            store.db.int(OUTBOX_NEXT, &[]),
+            self.bot_webhook_next(),
+            self.bot_builtin_next(),
+            self.bot_builtin_expiry_next(),
+        ]
             .into_iter()
             .flatten()
             .min();

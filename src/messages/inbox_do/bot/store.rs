@@ -109,6 +109,8 @@ pub(super) fn repair_key(user_id: &str) -> String {
 pub(super) enum Arg<'a> {
     T(&'a str),
     I(i64),
+    /// SQL NULL.
+    Null,
 }
 
 /// The three things the store asks of a SQLite connection. The DO's `SqlStorage` is one; a
@@ -242,6 +244,7 @@ fn js_args(args: &[Arg<'_>]) -> Vec<JsValue> {
         .map(|a| match a {
             Arg::T(s) => JsValue::from_str(s),
             Arg::I(n) => JsValue::from_f64(*n as f64),
+            Arg::Null => JsValue::NULL,
         })
         .collect()
 }

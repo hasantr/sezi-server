@@ -95,9 +95,26 @@ impl UserInbox {
     /// `sendMessage` with text, 1:1. The Worker has already checked that `to` is an active
     /// human who has not blocked the bot.
     pub(super) async fn bot_send_text(&self, ctx: &BotCtx, to: &str, text: &str) -> Result<Response> {
+        let Some((msg_uid, _)) = self.bot_encrypt_text(ctx, to, text).await? else {
+            return crate::bots::api::bot_err(409, "no-devices");
+        };
+        self.bot_drain_outbox(ctx).await;
+        self.bot_rearm().await;
+        Response::from_json(&serde_json::json!({ "ok": true, "message_id": msg_uid }))
+    }
+
+    /// A built-in bot's text: encrypted and queued, sent by the tick's outbox drain. The
+    /// subrequests it took (the device read and the key claims).
+    pub(super) async fn bot_send_text_queued(&self, ctx: &BotCtx, to: &str, text: &str) -> Result<u32> {
+        Ok(self.bot_encrypt_text(ctx, to, text).await?.map_or(1, |(_, cost)| cost))
+    }
+
+    /// Encrypt `text` to every device of `to` and queue the envelopes: the message id and the
+    /// subrequests spent, or `None` when `to` has no device.
+    async fn bot_encrypt_text(&self, ctx: &BotCtx, to: &str, text: &str) -> Result<Option<(String, u32)>> {
         let devices = self.bot_member_devices(to).await?;
         if devices.is_empty() {
-            return crate::bots::api::bot_err(409, "no-devices");
+            return Ok(None);
         }
         let need = devices_without_session(&self.bot_store(), to, &devices);
         let claimed = self.bot_claim_keys(to, &need).await?;
@@ -108,9 +125,8 @@ impl UserInbox {
         let effects = send_direct(&mut self.bot_store(), &ctx.key, to, &devices, &claimed, &payload)
             .map_err(|e| Error::RustError(format!("bot send: {e}")))?;
         self.bot_queue_effects(effects, Some(&payload_json), now);
-        self.bot_drain_outbox(ctx).await;
-        self.bot_rearm().await;
-        Response::from_json(&serde_json::json!({ "ok": true, "message_id": msg_uid }))
+        // `build_device_bundle` is at most six D1 calls per claimed device (`keys/bundle_slot.rs`).
+        Ok(Some((msg_uid, 1 + 6 * need.len() as u32)))
     }
 
     /// The engine's `Effect::Repair`: the bot's own pair-ack to every device of `user`, then what
@@ -209,6 +225,7 @@ impl UserInbox {
         let _ = sql.exec_raw("DELETE FROM bot_sent WHERE created_at < ?", cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::store::SEEN_EXPIRE, cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::deliver::SRC_ORPHANS, sql_no_args());
+        self.builtin_housekeeping(now);
         let store = self.bot_store();
         let checked = store.kv_get("otk_checked_at").and_then(|v| v.parse::<i64>().ok());
         if checked.is_some_and(|t| now - t < OTK_CHECK_EVERY_MS) {

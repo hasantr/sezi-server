@@ -68,7 +68,10 @@ impl UserInbox {
             self.bot_repair(&ctx, user).await;
         }
         self.bot_deliver_webhooks(&ctx).await;
-        self.bot_drain_outbox(&ctx).await;
+        // A built-in bot answers here; its replies go out with the drain below.
+        // The two share the tick's purse: the drain gets what the round left (`builtin_policy`).
+        let round = self.bot_builtin_round(&ctx).await;
+        self.bot_drain_outbox_within(&ctx, super::builtin_policy::drain_budget(round)).await;
         self.bot_housekeeping(&ctx).await;
         Ok(())
     }

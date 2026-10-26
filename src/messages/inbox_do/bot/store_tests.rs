@@ -16,6 +16,7 @@ fn values(args: &[Arg<'_>]) -> Vec<Value> {
         .map(|a| match a {
             Arg::T(s) => Value::Text(s.to_string()),
             Arg::I(n) => Value::Integer(*n),
+            Arg::Null => Value::Null,
         })
         .collect()
 }

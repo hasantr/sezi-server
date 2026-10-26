@@ -12,13 +12,26 @@
 //! | `outbox.rs` | what the tick owes the network, drained under a subrequest budget |
 //! | `updates.rs` | the update JSON and `getUpdates`' long poll |
 //! | `deliver.rs` | the webhook round, the owner's ping, and "taken" → the member's `forward-read` |
+//! | `builtin.rs` | a built-in bot (sheet, AI): its configuration and secrets, the owner's test |
+//! | `builtin_run.rs` · `builtin_jobs.rs` | the built-in runner's round: members' updates · rows owed to the sheet |
+//! | `builtin_policy.rs` | the round's pure decisions: budget, a pending row, a proposal's text |
+//! | `builtin_ai.rs` · `builtin_sheet.rs` | the model call (two dialects) · the sheet's POST |
+//! | `builtin_store.rs` · `builtin_copy.rs` | the built-in tables · every line the bot says itself |
 //!
 //! Internal routes (a DO stub is not public; only `bots/` in the Worker calls them):
 //! `/bot/init`, `/bot/updates`, `/bot/api`, `/bot/state`, `/bot/webhook`, `/bot/webhook-secret`,
-//! `/bot/ping`.
+//! `/bot/ping`, `/bot/builtin`, `/bot/builtin-test`, `/bot/wake`.
 
 use super::*;
 
+mod builtin;
+mod builtin_ai;
+mod builtin_copy;
+mod builtin_jobs;
+mod builtin_policy;
+mod builtin_run;
+mod builtin_sheet;
+mod builtin_store;
 mod deliver;
 mod ingest;
 mod outbox;
@@ -65,7 +78,7 @@ impl UserInbox {
     /// The bot tables; idempotent and synchronous.
     fn bot_tables(&self) -> Result<()> {
         let sql = self.state.storage().sql();
-        for t in store::TABLES {
+        for t in store::TABLES.iter().chain(builtin_store::TABLES.iter()) {
             sql.exec_raw(t, sql_no_args())?;
         }
         Ok(())
@@ -116,6 +129,13 @@ impl UserInbox {
                 let body: serde_json::Value = req.json().await?;
                 self.bot_ping(body.get("who").cloned().unwrap_or_default()).await
             }
+            (Method::Post, "/bot/builtin") => self.bot_builtin_set(req.json().await?).await,
+            (Method::Get, "/bot/builtin") => self.bot_builtin_get(),
+            (Method::Post, "/bot/builtin-test") => {
+                let body: serde_json::Value = req.json().await?;
+                self.bot_builtin_test(body.get("who").cloned().unwrap_or_default()).await
+            }
+            (Method::Post, "/bot/wake") => self.bot_wake().await,
             _ => Response::error("not found", 404),
         }
     }
@@ -155,15 +175,20 @@ impl UserInbox {
         let s = self.bot_store();
         let count = |t: &str| s.db.int(&format!("SELECT COUNT(*) AS n FROM {t}"), &[]).unwrap_or(-1);
         let count_opt = |q: &str| s.db.int(q, &[]);
-        Response::from_json(&serde_json::json!({
+        let mut state = serde_json::json!({
             "bot_id": s.kv_get("bot_id"),
             "pending": count("pending"),
             "updates": count("bot_updates"),
             "outbox": count("bot_outbox"),
             "sent": count("bot_sent"),
+            "sheet_jobs": count("bot_sheet_jobs"),
             "waiting_since": count_opt(deliver::WAITING_SINCE),
             "webhook": s.kv_get("webhook_url").is_some(),
-        }))
+        });
+        if let (Some(m), serde_json::Value::Object(b)) = (state.as_object_mut(), self.builtin_state()) {
+            m.extend(b);
+        }
+        Response::from_json(&state)
     }
 
     /// `/notify` in bot mode: the frame is stored (by the caller, as for anyone); the bot is
