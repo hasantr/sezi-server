@@ -16,6 +16,11 @@ const SENT_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 /// How often the tick looks at the bot's one-time-key pool in D1.
 const OTK_CHECK_EVERY_MS: i64 = 10 * 60 * 1000;
 
+/// A message id of the bot's: `b-<uuid>`.
+pub(super) fn new_msg_uid() -> String {
+    format!("b-{}", uuid::Uuid::new_v4())
+}
+
 #[derive(Deserialize)]
 struct FailedRow {
     device_id: String,
@@ -92,41 +97,43 @@ impl UserInbox {
         }
     }
 
-    /// `sendMessage` with text, 1:1. The Worker has already checked that `to` is an active
-    /// human who has not blocked the bot.
-    pub(super) async fn bot_send_text(&self, ctx: &BotCtx, to: &str, text: &str) -> Result<Response> {
-        let Some((msg_uid, _)) = self.bot_encrypt_text(ctx, to, text).await? else {
+    /// `sendMessage` with text, 1:1, as `msg_uid`. The Worker has already checked that `to` is an
+    /// active human who has not blocked the bot.
+    pub(super) async fn bot_send_text(&self, ctx: &BotCtx, to: &str, text: &str, msg_uid: &str) -> Result<Response> {
+        if self.bot_encrypt_text(ctx, to, text, msg_uid).await?.is_none() {
             return crate::bots::api::bot_err(409, "no-devices");
-        };
+        }
+        // Queued: the outbox delivers it whatever happens to this request from here on, so a
+        // retry under its `client_id` is answered, never sent again.
+        super::send_replay::mark_sent(&self.bot_store().db, msg_uid);
         self.bot_drain_outbox(ctx).await;
         self.bot_rearm().await;
-        Response::from_json(&serde_json::json!({ "ok": true, "message_id": msg_uid }))
+        Response::from_json(&crate::bots::api_answer::sent(msg_uid))
     }
 
     /// A built-in bot's text: encrypted and queued, sent by the tick's outbox drain. The
     /// subrequests it took (the device read and the key claims).
     pub(super) async fn bot_send_text_queued(&self, ctx: &BotCtx, to: &str, text: &str) -> Result<u32> {
-        Ok(self.bot_encrypt_text(ctx, to, text).await?.map_or(1, |(_, cost)| cost))
+        Ok(self.bot_encrypt_text(ctx, to, text, &new_msg_uid()).await?.unwrap_or(1))
     }
 
-    /// Encrypt `text` to every device of `to` and queue the envelopes: the message id and the
+    /// Encrypt `text` to every device of `to` as `msg_uid` and queue the envelopes: the
     /// subrequests spent, or `None` when `to` has no device.
-    async fn bot_encrypt_text(&self, ctx: &BotCtx, to: &str, text: &str) -> Result<Option<(String, u32)>> {
+    async fn bot_encrypt_text(&self, ctx: &BotCtx, to: &str, text: &str, msg_uid: &str) -> Result<Option<u32>> {
         let devices = self.bot_member_devices(to).await?;
         if devices.is_empty() {
             return Ok(None);
         }
         let need = devices_without_session(&self.bot_store(), to, &devices);
         let claimed = self.bot_claim_keys(to, &need).await?;
-        let msg_uid = format!("b-{}", uuid::Uuid::new_v4());
-        let payload = text_payload(text, &msg_uid);
+        let payload = text_payload(text, msg_uid);
         let payload_json = serde_json::to_string(&payload).map_err(|e| Error::RustError(e.to_string()))?;
         let now = (now_secs() * 1000) as i64;
         let effects = send_direct(&mut self.bot_store(), &ctx.key, to, &devices, &claimed, &payload)
             .map_err(|e| Error::RustError(format!("bot send: {e}")))?;
         self.bot_queue_effects(effects, Some(&payload_json), now);
         // `build_device_bundle` is at most six D1 calls per claimed device (`keys/bundle_slot.rs`).
-        Ok(Some((msg_uid, 1 + 6 * need.len() as u32)))
+        Ok(Some(1 + 6 * need.len() as u32))
     }
 
     /// The engine's `Effect::Repair`: the bot's own pair-ack to every device of `user`, then what
@@ -224,6 +231,7 @@ impl UserInbox {
         let _ = sql.exec_raw(super::updates::UPDATE_EXPIRE, cutoff(super::updates::UPDATE_TTL_MS));
         let _ = sql.exec_raw("DELETE FROM bot_sent WHERE created_at < ?", cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::store::SEEN_EXPIRE, cutoff(SENT_TTL_MS));
+        let _ = sql.exec_raw(super::send_replay::CLIENT_EXPIRE, cutoff(super::send_replay::CLIENT_ID_TTL_MS));
         let _ = sql.exec_raw(super::deliver::SRC_ORPHANS, sql_no_args());
         self.builtin_housekeeping(now);
         self.bot_room_housekeeping(now);

@@ -211,3 +211,25 @@ fn authors_behind_a_failing_head_are_told_once_each() {
     let told: i64 = c.query_row("SELECT SUM(told) FROM bot_sheet_jobs", [], |r| r.get(0)).unwrap();
     assert_eq!(told, 4, "every row of a told author: its landing is said late");
 }
+
+#[test]
+fn sheet_rows_count_per_member_per_day_apart_from_model_calls() {
+    let c = db();
+    let get = |u: &str, d: i64| -> Option<i64> { c.query_row(SHEET_USAGE_GET, params![u, d], |r| r.get(0)).ok() };
+    assert_eq!(get("alice", 7), None);
+    for _ in 0..3 {
+        c.execute(SHEET_USAGE_BUMP, params!["alice", 7]).unwrap();
+    }
+    c.execute(SHEET_USAGE_BUMP, params!["alice", 8]).unwrap();
+    c.execute(SHEET_USAGE_BUMP, params!["bob", 7]).unwrap();
+    assert_eq!((get("alice", 7), get("alice", 8), get("bob", 7)), (Some(3), Some(1), Some(1)));
+    let calls: Option<i64> = c.query_row(USAGE_GET, params!["alice", 7], |r| r.get(0)).ok();
+    assert_eq!(calls, None, "a row is not a model call");
+    // Leaving AI mode does not hand a member a fresh day of rows.
+    for q in AI_FORGET {
+        c.execute(q, []).unwrap();
+    }
+    assert_eq!(get("alice", 7), Some(3));
+    c.execute(SHEET_USAGE_EXPIRE, [8]).unwrap();
+    assert_eq!((get("alice", 7), get("alice", 8)), (None, Some(1)));
+}

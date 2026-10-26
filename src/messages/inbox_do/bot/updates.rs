@@ -10,7 +10,7 @@
 //!
 //! `who` is the relay's, from D1 — never the sender's word. `update_id` is the row id, added
 //! when read. Kept 24 h (R9 decision 3); `getUpdates` with an `offset` confirms and deletes
-//! everything below it, Telegram's way.
+//! everything below it that a poll handed out, Telegram's way — and nothing it never handed out.
 
 use super::*;
 
@@ -20,12 +20,17 @@ pub(super) const UPDATE_TTL_MS: i64 = 24 * 3600 * 1000;
 /// Bind: json, created_at.
 pub(super) const UPDATE_PUSH: &str =
     "INSERT INTO bot_updates (json, created_at) VALUES (?, ?) RETURNING update_id";
-/// Bind: offset.
-pub(super) const UPDATE_CONFIRM: &str = "DELETE FROM bot_updates WHERE update_id < ?";
-/// Bind: offset, limit.
+/// Confirm: every update below the offset that a poll HANDED OUT (`delivered_at`). One never
+/// handed out stays, whatever the offset says — a program that sent a wrong offset (a clock,
+/// another bot's counter) loses nothing it never saw. Until 2026-10-26 this deleted every row
+/// below the offset. Bind: offset.
+pub(super) const UPDATE_CONFIRM: &str =
+    "DELETE FROM bot_updates WHERE update_id < ? AND delivered_at IS NOT NULL";
+/// What a poll answers: from the offset on, plus anything below it never handed out (left there by
+/// a wrong offset, or by a webhook since cleared), in update order. Bind: offset, limit.
 pub(super) const UPDATE_READ: &str = "SELECT update_id, json FROM bot_updates
-      WHERE update_id >= ? ORDER BY update_id LIMIT ?";
-/// Bind: now, offset, last update_id read.
+      WHERE update_id >= ? OR delivered_at IS NULL ORDER BY update_id LIMIT ?";
+/// Bind: now, first update_id read, last update_id read.
 pub(super) const UPDATE_MARK: &str = "UPDATE bot_updates SET delivered_at = ?,
       attempts = attempts + 1 WHERE update_id >= ? AND update_id <= ?";
 /// Bind: cutoff.
@@ -194,26 +199,19 @@ impl UserInbox {
         };
         if let Some(last) = rows.last() {
             let now = (now_secs() * 1000) as i64;
+            let first = rows.first().map_or(last.update_id, |r| r.update_id);
             let args = vec![
                 JsValue::from_f64(now as f64),
-                JsValue::from_f64(offset as f64),
+                JsValue::from_f64(first as f64),
                 JsValue::from_f64(last.update_id as f64),
             ];
             let _ = sql.exec_raw(UPDATE_MARK, Some(args));
             // The program has them: the members' blue ticks go out with the next tick.
-            let first = rows.first().map_or(last.update_id, |r| r.update_id);
             self.bot_updates_taken(&ctx, first, last.update_id, now);
             self.arm_alarm_within(0).await;
         }
-        let updates: Vec<serde_json::Value> = rows
-            .into_iter()
-            .filter_map(|r| {
-                let mut u: serde_json::Value = serde_json::from_str(&r.json).ok()?;
-                u["update_id"] = r.update_id.into();
-                Some(u)
-            })
-            .collect();
-        Response::from_json(&serde_json::json!({ "ok": true, "updates": updates }))
+        let rows = rows.into_iter().map(|r| (r.update_id, r.json));
+        Response::from_json(&crate::bots::api_answer::updates(rows))
     }
 }
 

@@ -88,6 +88,31 @@ fn updates_older_than_the_window_expire() {
     assert_eq!(read(&c, 0, 100), vec![2]);
 }
 
+/// A program that sends an offset past anything it was handed (a clock as the offset, another
+/// bot's counter, an off-by-a-thousand) must not destroy members' messages it never saw. Until
+/// 2026-10-26 `offset` deleted every row below it, handed out or not.
+#[test]
+fn a_far_future_offset_deletes_nothing_the_program_was_never_handed() {
+    let c = db();
+    for i in 0..4 {
+        c.query_row(UPDATE_PUSH, params![format!("{{\"n\":{i}}}"), 1_000 + i], |r| r.get::<_, i64>(0)).unwrap();
+    }
+    // The program was handed 1 and 2 (a poll's answer marks them), never 3 and 4.
+    c.execute(UPDATE_MARK, params![9_999, 1, 2]).unwrap();
+    c.execute(UPDATE_CONFIRM, [1_761_200_000_000_i64]).unwrap();
+    let left: Vec<i64> = {
+        let mut s = c.prepare("SELECT update_id FROM bot_updates ORDER BY update_id").unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(left, vec![3, 4], "only what the program was handed is confirmed");
+    // What it was never handed is still served, though it sits below that offset.
+    assert_eq!(read(&c, 1_761_200_000_000, 100), vec![3, 4]);
+    // Once handed, the next offset past it confirms it as usual.
+    c.execute(UPDATE_MARK, params![10_000, 3, 4]).unwrap();
+    c.execute(UPDATE_CONFIRM, [5]).unwrap();
+    assert!(read(&c, 5, 100).is_empty());
+}
+
 #[test]
 fn a_call_names_its_room_and_the_callers_room_role_from_the_relay() {
     let who = Who { user_id: "alice".into(), display_name: Some("Alice".into()), server_role: Some("member".into()) };

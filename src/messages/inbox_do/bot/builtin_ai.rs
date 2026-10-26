@@ -13,7 +13,7 @@
 //! member's message cut at 4,000 characters, the member's last 10 turns as context.
 
 use super::builtin_sheet::Row;
-use crate::bots::builtin_rules::{AiConfig, Provider};
+use crate::bots::builtin_rules::{outbound_url, AiConfig, Provider};
 use worker::*;
 
 /// Output tokens one answer may take, the model's thinking included. Current Claude models think
@@ -303,9 +303,22 @@ pub(super) async fn with_timeout<F: std::future::Future>(f: F, ms: u64) -> Optio
     }
 }
 
+/// The address a model call goes to, judged NOW by the rule the owner's `base_url` met when it was
+/// set (`builtin_rules::outbound_url`): one stored under the lab's LAN escape, since turned off,
+/// is not called (audit 2026-10-26, beside note 1.4). Refused = `ai/unreachable`, as a dead host.
+pub(super) fn call_url(ai: &AiConfig, allow_lan: bool) -> std::result::Result<String, &'static str> {
+    outbound_url(&endpoint(ai), allow_lan).map(|u| u.to_string()).ok_or("ai/unreachable")
+}
+
 /// One model call: the answer's text, or the failure's code. Nothing about the request or the
 /// answer is logged.
-pub(super) async fn call(ai: &AiConfig, key: &str, body: &serde_json::Value) -> std::result::Result<String, &'static str> {
+pub(super) async fn call(
+    ai: &AiConfig,
+    key: &str,
+    body: &serde_json::Value,
+    allow_lan: bool,
+) -> std::result::Result<String, &'static str> {
+    let url = call_url(ai, allow_lan)?;
     let headers = Headers::new();
     let set = |k: &str, v: &str| headers.set(k, v).map_err(|_| "ai/bad-key");
     set("content-type", "application/json")?;
@@ -317,7 +330,7 @@ pub(super) async fn call(ai: &AiConfig, key: &str, body: &serde_json::Value) -> 
         .with_headers(headers)
         .with_redirect(RequestRedirect::Manual)
         .with_body(Some(body.to_string().into()));
-    let req = Request::new_with_init(&endpoint(ai), &init).map_err(|_| "ai/bad-response")?;
+    let req = Request::new_with_init(&url, &init).map_err(|_| "ai/bad-response")?;
     let Some(Ok(mut resp)) = with_timeout(Fetch::Request(req).send(), CALL_TIMEOUT_MS).await else {
         return Err("ai/unreachable");
     };

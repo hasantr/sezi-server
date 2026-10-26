@@ -56,6 +56,27 @@ pub const MAX_RECEIVE_BITS_PER_SEC: i64 = 60_000_000;
 /// claim an hour at full rate when it comes back.
 pub const MAX_REPORT_GAP_SECS: i64 = 300;
 
+/// Sessions one member may open per [`SESSION_WINDOW_SECS`] — the KV brake in front of
+/// Cloudflare (`ratelimit::admit_env`, fails open). A join is one; a link that never comes back
+/// from an ICE restart opens one more (`group_call_sfu_recovery.dart`).
+pub const SESSIONS_PER_WINDOW: usize = 20;
+pub const SESSION_WINDOW_SECS: u64 = 300;
+
+/// Sessions one member may open in the day `sfu_sessions` keeps them: the BOUND, counted in D1,
+/// because the KV brake is lost whenever its binding or KV itself is. Until 2026-10-26 a member
+/// could open sessions on the owner's Cloudflare app as fast as the relay answered (audit note 1.3).
+pub const MAX_SESSIONS_PER_DAY: i64 = 200;
+
+/// The KV key of a member's session brake.
+pub fn session_rate_key(user_id: &str) -> String {
+    format!("sfu:session:{user_id}")
+}
+
+/// May a member who opened `opened` sessions in the last day open another?
+pub fn session_within_bound(opened: i64) -> bool {
+    opened < MAX_SESSIONS_PER_DAY
+}
+
 /// Whether a call in this room may go through the SFU now, and if not, why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {

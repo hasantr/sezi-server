@@ -226,7 +226,7 @@ impl UserInbox {
                         let bot_name = self.builtin_bot_name().await.unwrap_or_default();
                         let system = builtin_ai::system_prompt(ai, &bot_name, name, None, cfg.writes_sheet(), now);
                         let body = builtin_ai::request_body(ai, &system, &[] as &[Turn], text);
-                        match builtin_ai::call(ai, &key, &body).await {
+                        match builtin_ai::call(ai, &key, &body, allow_lan(&self.env)).await {
                             Ok(t) => (Ok(()), Some(builtin_ai::split_row(&t).0)),
                             Err(code) => (Err(code), None),
                         }

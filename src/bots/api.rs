@@ -3,10 +3,13 @@
 //! | method | body | answer |
 //! |---|---|---|
 //! | `getMe` | `{}` | `{ok, bot:{bot_id, name, about}}` |
-//! | `getUpdates` | `{offset?, timeout? 0..25, limit? 1..100}` | `{ok, updates:[…]}`; below `offset` is confirmed and deleted |
-//! | `sendMessage` | `{chat:{user_id}\|{room_id}, text ≤4000, reply_to?}` | `{ok, message_id}` (`b-<uuid>`) |
+//! | `getUpdates` | `{offset?, timeout? 0..25, limit? 1..100}` | `{ok, updates:[…]}`; below `offset`, what a poll handed out is confirmed and deleted |
+//! | `sendMessage` | `{chat:{user_id}\|{room_id}, text ≤4000, reply_to?, client_id?}` | `{ok, message_id}` (`b-<uuid>`); a repeated `client_id` answers the first send's `message_id` with `duplicate: true` |
 //! | `setWebhook` | `{url}` (https; `""` or `null` clears) | `{ok, webhook_secret}` |
 //! | `deleteWebhook` | `{}` | `{ok}` |
+//!
+//! Every body is a JSON object of at most 64 KiB whose fields have their documented types
+//! (`api_input.rs`); anything else is refused before a lookup.
 //!
 //! With a webhook set, `getUpdates` answers `bot/webhook-active` (409): one queue, one reader.
 //! A built-in bot (`builtin.rs`) is that reader: `getUpdates` and `setWebhook` answer
@@ -21,15 +24,11 @@
 //! The Worker checks the key and who the bot may write to; the bot's inbox does the encryption.
 //! A bot may write to an active human of this server who has not blocked it, and to nobody else.
 
+use super::api_input::{self as input, Chat, SendReq};
 use super::token::{self, BotAuth};
 use crate::d1util::d1_text;
 use serde::Deserialize;
 use worker::*;
-
-const MAX_TEXT_CHARS: usize = 4000;
-const SENDS_PER_MINUTE: usize = 60;
-const MAX_POLL_SECS: i64 = 25;
-const MAX_LIMIT: i64 = 100;
 
 /// Is the target an active human, and is there a block between them? Bind: target, bot.
 pub(crate) const SEND_TARGET_SQL: &str = "SELECT
@@ -38,9 +37,14 @@ pub(crate) const SEND_TARGET_SQL: &str = "SELECT
                WHERE (blocker_user_id = ?1 AND blocked_user_id = ?2)
                   OR (blocker_user_id = ?2 AND blocked_user_id = ?1)) AS blocked";
 
+/// The owner's copy of the webhook (`GET /admin/bots`), written only when it changes: a program
+/// calling `setWebhook` with the same URL on every start (or in a loop) writes no D1 row.
+/// Bind: bot_id, url (NULL clears).
+pub(crate) const SET_WEBHOOK_SQL: &str =
+    "UPDATE bots SET webhook_url = ?2 WHERE bot_id = ?1 AND webhook_url IS NOT ?2";
+
 pub(crate) fn bot_err(status: u16, code: &str) -> Result<Response> {
-    let body = serde_json::json!({ "ok": false, "error": format!("bot/{code}") });
-    Ok(Response::from_json(&body)?.with_status(status))
+    Ok(Response::from_json(&super::api_answer::error(code))?.with_status(status))
 }
 
 pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -54,16 +58,22 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     }
     // "When did the program last show up" (the owner's "no word from it" line).
     super::mark_program_seen(&ctx.env, &bot.bot_id).await;
-    let body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+    let body = match read_body(&mut req).await? {
+        Ok(b) => b,
+        Err((status, code)) => return bot_err(status, code),
+    };
     match method.as_str() {
-        "getMe" => Response::from_json(&serde_json::json!({
-            "ok": true,
-            "bot": { "bot_id": bot.bot_id, "name": bot.name, "about": bot.about },
-        })),
+        "getMe" => Response::from_json(&super::api_answer::me(&bot.bot_id, &bot.name, bot.about.as_deref())),
         "getUpdates" => get_updates(&ctx.env, &bot, &body).await,
-        "sendMessage" => send_message(&ctx.env, &db, &bot, body).await,
+        "sendMessage" => match input::parse_send(&body) {
+            Ok(send) => send_message(&ctx.env, &db, &bot, send).await,
+            Err((status, code)) => bot_err(status, code),
+        },
         "setWebhook" => {
-            let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let url = match input::parse_webhook(&body) {
+                Ok(u) => u.unwrap_or(""),
+                Err((status, code)) => return bot_err(status, code),
+            };
             // authenticate() just read this very header.
             let token = crate::auth::middleware::extract_bearer(&req).unwrap_or_default();
             set_webhook(&ctx.env, &db, &bot, url, &token).await
@@ -73,17 +83,48 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     }
 }
 
-async fn get_updates(env: &Env, bot: &BotAuth, body: &serde_json::Value) -> Result<Response> {
-    let int = |k: &str| body.get(k).and_then(|v| v.as_i64());
-    let offset = int("offset").unwrap_or(0);
-    let timeout = int("timeout").unwrap_or(0);
-    let limit = int("limit").unwrap_or(MAX_LIMIT);
-    if offset < 0 || !(0..=MAX_POLL_SECS).contains(&timeout) || !(1..=MAX_LIMIT).contains(&limit) {
-        return bot_err(400, "bad-request");
+/// The body, at most `api_input::MAX_BODY_BYTES`: refused unread when its `content-length` says
+/// it is bigger, and again by what was actually read (a length can lie, or be absent).
+async fn read_body(req: &mut Request) -> Result<std::result::Result<serde_json::Value, input::Refusal>> {
+    let declared = req
+        .headers()
+        .get("content-length")?
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if input::body_too_large(declared) {
+        return Ok(Err((413, "too-large")));
     }
-    let q = serde_json::json!({ "offset": offset, "timeout": timeout, "limit": limit });
-    let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/updates", Some(q.to_string())).await?;
-    crate::respond::passthrough(resp).await
+    let bytes = req.bytes().await.unwrap_or_default();
+    Ok(input::parse_body(&bytes))
+}
+
+/// The bot inbox's answer as the program gets it: as it is when it is the documented `{ok, …}`
+/// JSON below 500 (`api_input::is_program_answer`), with its `Retry-After`; anything else —
+/// the inbox threw, was purged under the call, answered plain text — is `bot/inbox-unavailable`.
+async fn inbox_answer(resp: Result<Response>) -> Result<Response> {
+    let Ok(mut resp) = resp else {
+        return bot_err(502, "inbox-unavailable");
+    };
+    let status = resp.status_code();
+    let body = resp.bytes().await.unwrap_or_default();
+    if !input::is_program_answer(status, &body) {
+        return bot_err(502, "inbox-unavailable");
+    }
+    // A fresh response: one that came out of `fetch` has immutable headers (`respond::passthrough`).
+    let mut out = Response::from_bytes(body)?.with_status(status);
+    out.headers_mut().set("content-type", "application/json")?;
+    if let Some(wait) = resp.headers().get("retry-after")? {
+        out.headers_mut().set("Retry-After", &wait)?;
+    }
+    Ok(out)
+}
+
+async fn get_updates(env: &Env, bot: &BotAuth, body: &serde_json::Value) -> Result<Response> {
+    let q = match input::parse_updates(body) {
+        Ok(q) => q,
+        Err((status, code)) => return bot_err(status, code),
+    };
+    let q = serde_json::json!({ "offset": q.offset, "timeout": q.timeout, "limit": q.limit });
+    inbox_answer(super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/updates", Some(q.to_string())).await).await
 }
 
 /// Set (`url` non-empty) or clear the webhook. The secret is derived from the key the program
@@ -98,88 +139,39 @@ async fn set_webhook(env: &Env, db: &D1Database, bot: &BotAuth, url: &str, token
         (Some(url), Some(super::webhook::derive_secret(token)))
     };
     let call = serde_json::json!({ "url": url, "secret": secret });
-    let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/webhook", Some(call.to_string())).await?;
-    if resp.status_code() == 409 {
-        return crate::respond::passthrough(resp).await; // `bot/builtin-active`
+    let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/webhook", Some(call.to_string())).await;
+    match resp.as_ref().map(Response::status_code) {
+        Ok(204) => {}
+        Ok(409) => return inbox_answer(resp).await, // `bot/builtin-active`
+        _ => return bot_err(502, "inbox-unavailable"),
     }
-    if resp.status_code() != 204 {
-        return bot_err(502, "inbox-unavailable");
-    }
-    db.prepare("UPDATE bots SET webhook_url = ?2 WHERE bot_id = ?1")
+    db.prepare(SET_WEBHOOK_SQL)
         .bind(&[d1_text(&bot.bot_id), crate::d1util::d1_opt_text(url.as_deref())])?
         .run()
         .await?;
-    match secret {
-        Some(s) => Response::from_json(&serde_json::json!({ "ok": true, "webhook_secret": s })),
-        None => Response::from_json(&serde_json::json!({ "ok": true })),
-    }
+    Response::from_json(&super::api_answer::webhook(secret.as_deref()))
 }
 
-#[derive(Deserialize)]
-struct Chat {
-    user_id: Option<String>,
-    room_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SendBody {
-    chat: Chat,
-    text: String,
-    #[serde(default)]
-    reply_to: Option<String>,
-    #[serde(default)]
-    buttons: Option<serde_json::Value>,
-}
-
-async fn send_message(
-    env: &Env,
-    db: &D1Database,
-    bot: &BotAuth,
-    body: serde_json::Value,
-) -> Result<Response> {
-    let Ok(body) = serde_json::from_value::<SendBody>(body) else {
-        return bot_err(400, "bad-request");
-    };
-    if body.buttons.is_some() {
-        return bot_err(400, "unsupported");
-    }
-    let text = body.text.trim_end();
-    if text.trim().is_empty() || text.chars().count() > MAX_TEXT_CHARS {
-        return bot_err(400, "bad-text");
-    }
-    let room = match (body.chat.room_id, body.chat.user_id.as_deref()) {
-        (Some(room), None) if !room.is_empty() && room.len() <= 64 => Some(room),
-        (None, Some(_)) => None,
-        _ => return bot_err(400, "bad-request"),
-    };
-    // A reply names a room call (`update.message.message_id`); 1:1 replies are not built yet.
-    if room.is_none() && body.reply_to.is_some() {
-        return bot_err(400, "unsupported");
-    }
-    if !crate::ratelimit::check_rate_limit_env(
-        env,
-        &format!("bot_send:{}", bot.bot_id),
-        SENDS_PER_MINUTE,
-        60,
-    )
-    .await
-    {
-        return bot_err(429, "rate-limited");
-    }
-    if let Some(room_id) = room {
-        // Only into a room whose admins added this bot (`group_bots`); the bot's inbox asks again
-        // before anything leaves, so a removal in between still stops the post.
-        if !crate::groups::bots::is_room_bot(db, &room_id, &bot.bot_id).await? {
-            return bot_err(403, "not-in-room");
+/// A `sendMessage` that `api_input::parse_send` accepted: who it may go to, then the bot's inbox,
+/// which counts the send limits (`inbox_do/bot/send_guard.rs`: 60 a minute, 30 into one chat,
+/// `bot/rate-limited` with `retry_after`) — exactly, and without the KV put per send the
+/// server's shared limiter cannot afford.
+async fn send_message(env: &Env, db: &D1Database, bot: &BotAuth, send: SendReq) -> Result<Response> {
+    let to = match send.chat {
+        Chat::Room(room_id) => {
+            // Only into a room whose admins added this bot (`group_bots`); the bot's inbox asks
+            // again before anything leaves, so a removal in between still stops the post.
+            if !crate::groups::bots::is_room_bot(db, &room_id, &bot.bot_id).await? {
+                return bot_err(403, "not-in-room");
+            }
+            let call = serde_json::json!({
+                "method": "sendRoom", "room_id": room_id, "text": send.text, "reply_to": send.reply_to,
+                "client_id": send.client_id,
+            });
+            let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/api", Some(call.to_string())).await;
+            return inbox_answer(resp).await;
         }
-        let call = serde_json::json!({
-            "method": "sendRoom", "room_id": room_id, "text": text, "reply_to": body.reply_to,
-        });
-        let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/api", Some(call.to_string())).await?;
-        return crate::respond::passthrough(resp).await;
-    }
-    let Some(to) = body.chat.user_id.filter(|u| u.len() == 36) else {
-        return bot_err(400, "bad-request");
+        Chat::User(to) => to,
     };
     #[derive(Deserialize)]
     struct Target {
@@ -196,7 +188,8 @@ async fn send_message(
         Some(t) if t.human == 1 => return bot_err(403, "blocked"),
         _ => return bot_err(403, "not-a-member"),
     }
-    let call = serde_json::json!({ "method": "sendMessage", "to": to, "text": text });
-    let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/api", Some(call.to_string())).await?;
-    crate::respond::passthrough(resp).await
+    let call = serde_json::json!({
+        "method": "sendMessage", "to": to, "text": send.text, "client_id": send.client_id,
+    });
+    inbox_answer(super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/api", Some(call.to_string())).await).await
 }

@@ -171,3 +171,14 @@ fn the_date_line_is_the_civil_date_in_utc() {
     assert_eq!(today_line(951_782_400_000), "Today is Tuesday, 29 February 2000 (UTC).", "a leap day");
     assert_eq!(today_line(1_798_761_599_000), "Today is Thursday, 31 December 2026 (UTC).", "one second before the year turns");
 }
+
+/// A model address stored while the lab's LAN escape was on is judged again at every call.
+#[test]
+fn a_stored_model_address_is_judged_again_before_the_call() {
+    let mut a = ai(Provider::Openai, false);
+    a.base_url = Some("http://10.0.0.5:11434/v1".into());
+    assert_eq!(call_url(&a, true).as_deref(), Ok("http://10.0.0.5:11434/v1/chat/completions"));
+    assert_eq!(call_url(&a, false), Err("ai/unreachable"));
+    let d = ai(Provider::Anthropic, false);
+    assert_eq!(call_url(&d, false).as_deref(), Ok("https://api.anthropic.com/v1/messages"));
+}

@@ -24,6 +24,7 @@ fn every_statement_prepares_on_the_real_schema() {
         SQL_USER_REPORTED_SINCE,
         SQL_PRUNE_SESSIONS,
         SQL_TOP_ROOMS,
+        SQL_USER_SESSIONS_SINCE,
     ] {
         db.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -125,4 +126,35 @@ fn a_members_reports_share_one_clock_however_many_sessions_they_open() {
     }
     assert_eq!(counted, policy::clamp_report(i64::MAX, 300), "300 sessions are one member's five minutes");
     assert_eq!(since("alice"), Some(1_000), "another member's clock is their own");
+}
+
+/// Opening a session was free and unlimited: each `POST /calls/sfu/sessions` is a call to
+/// Cloudflare Realtime on the owner's app and a D1 row (audit 2026-10-26, note 1.3). The KV brake
+/// in front fails open, so the bound is this count of a member's sessions over the day the table
+/// keeps, asked before Cloudflare is.
+#[test]
+fn a_members_sessions_are_counted_and_bounded_before_cloudflare_is_asked() {
+    let db = db();
+    let opened = |user: &str, since: i64| -> i64 {
+        db.query_row(SQL_USER_SESSIONS_SINCE, params![user, since], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(opened("mallory", 0), 0);
+    for i in 0..5 {
+        db.execute(SQL_INSERT_SESSION, params![format!("m{i}"), "r1", "c1", "mallory", 1_000 + i]).unwrap();
+    }
+    db.execute(SQL_INSERT_SESSION, params!["a0", "r1", "c1", "alice", 1_000]).unwrap();
+    assert_eq!(opened("mallory", 0), 5);
+    assert_eq!(opened("mallory", 1_003), 2, "only inside the window");
+    assert_eq!(opened("alice", 0), 1, "another member's sessions are their own");
+    assert!(policy::session_within_bound(policy::MAX_SESSIONS_PER_DAY - 1));
+    assert!(!policy::session_within_bound(policy::MAX_SESSIONS_PER_DAY));
+
+    let src = include_str!("mod.rs");
+    let start = src.find("pub async fn new_session(").unwrap();
+    let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+    let cf = body.find("cf::new_session(").expect("the Cloudflare call");
+    for gate in ["admit_env(", "SQL_USER_SESSIONS_SINCE", "session_within_bound("] {
+        assert!(body.find(gate).unwrap_or_else(|| panic!("{gate} missing")) < cf, "{gate} after Cloudflare");
+    }
+    assert!(body.find("member(").unwrap() < body.find("admit_env(").unwrap(), "keyed by the member, so after the check");
 }

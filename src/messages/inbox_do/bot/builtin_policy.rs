@@ -72,6 +72,31 @@ pub(super) fn round_gate(row: Result<Option<(String, bool)>, ()>) -> Gate {
     }
 }
 
+// ── A sheet bot's per-member cap ────────────────────────────────────────────────────────────
+
+/// The code a refused row is logged with (a member hears `Line::SheetDailyLimit`).
+pub(super) const ROW_REFUSED: &str = "bot/sheet-daily-limit";
+
+/// What a sheet bot does with a member's next message.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RowAdmission {
+    /// Under the day's cap: it becomes a row.
+    Queue,
+    /// Over it: no row. `say` only for the first refusal of the day, so a member who keeps
+    /// writing is not answered (a send each) for every message past the cap.
+    Refuse { say: bool },
+}
+
+/// `used_today` = the member's messages this sheet bot already counted today (`bs::DAILY_ROWS`),
+/// refused ones included.
+pub(super) fn row_admission(used_today: i64) -> RowAdmission {
+    if used_today < bs::DAILY_ROWS {
+        RowAdmission::Queue
+    } else {
+        RowAdmission::Refuse { say: used_today == bs::DAILY_ROWS }
+    }
+}
+
 // ── Proposals ───────────────────────────────────────────────────────────────────────────────
 
 /// What a member's message does to the row waiting for their yes. The caller drops the stored

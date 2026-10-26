@@ -38,7 +38,49 @@ use super::handlers::validate_and_store_signed_list;
 const LINK_TTL_SEC: i64 = 120;
 const REFRESH_TTL_SEC: i64 = 30 * 24 * 60 * 60;
 const ACCESS_TTL_SEC: u64 = 15 * 60;
-const MAX_PENDING: i64 = 50; // global ceiling on pending links (DoS guard)
+/// Links one address may start per door window (`door_bucket`, five minutes): a few attempts of
+/// one person, or a handful of people behind one NAT. A link lives `LINK_TTL_SEC`, so this is also
+/// what one address can hold pending at once.
+pub(crate) const LINK_STARTS_PER_ADDRESS: usize = 10;
+/// The same for one IPv6 /48 across all its /64s (`ratelimit::door_miss_buckets` explains why).
+pub(crate) const LINK_STARTS_PER_PREFIX: usize = 4 * LINK_STARTS_PER_ADDRESS;
+
+/// The D1 buckets a link start is counted in, with their limits, most specific first: the address
+/// (an IPv6 one as its /64, `ratelimit::door_address`), and for IPv6 its /48 too.
+///
+/// **No server-wide ceiling.** Until 2026-10-26 the only bound was fifty pending links for the
+/// whole server, which anyone could keep full from five addresses — and then nobody could link a
+/// device (audit note 1.2). As at the door, whatever bounds the whole server is a lever one actor
+/// can pull against everyone; per address, a flood costs addresses and blocks only its own. Rows
+/// stay bounded: each address holds at most its budget, every row expires in `LINK_TTL_SEC`, and
+/// expired ones are swept at the next start.
+pub(crate) fn link_start_buckets(ip: &str) -> Vec<(String, usize)> {
+    let mut buckets = vec![(format!("link:start:{}", crate::ratelimit::door_address(ip)), LINK_STARTS_PER_ADDRESS)];
+    if let Ok(std::net::IpAddr::V6(v6)) = ip.parse::<std::net::IpAddr>() {
+        if v6.to_ipv4_mapped().is_none() {
+            let s = v6.segments();
+            buckets.push((format!("link:start48:{:x}:{:x}:{:x}::/48", s[0], s[1], s[2]), LINK_STARTS_PER_PREFIX));
+        }
+    }
+    buckets
+}
+
+/// Take one start from every bucket of `ip`, all or nothing; `Err` = the `Retry-After` of the one
+/// that refused. Counted in D1 (`door_bucket::reserve`, fails closed), so unlike the KV limiter in
+/// front of it this is a bound.
+async fn reserve_link_start(db: &D1Database, ip: &str, now: i64) -> std::result::Result<(), u64> {
+    let mut taken = Vec::new();
+    for (bucket, limit) in link_start_buckets(ip) {
+        match crate::door_bucket::reserve(db, &bucket, limit, now).await {
+            crate::door_bucket::Reserved::Taken(r) => taken.push(r),
+            crate::door_bucket::Reserved::Refused { retry_after_s } => {
+                crate::door_bucket::refund_door(db, &taken).await;
+                return Err(retry_after_s);
+            }
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------- link-start
 
@@ -100,21 +142,19 @@ pub async fn link_start(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
     let db = ctx.env.d1("DB")?;
     let now = now_secs() as i64;
 
-    // Global ceiling on pending links (DoS).
-    #[derive(Deserialize)]
-    struct CountRow {
-        c: i64,
+    // This address's budget of starts (`link_start_buckets`): its own pending links, never
+    // anybody else's. Taken after the proof, so a malformed request spends nothing.
+    if let Err(retry_after_s) = reserve_link_start(&db, &ip, now).await {
+        let mut resp = json_err(429, "too_many_pending")?;
+        resp.headers_mut().set("Retry-After", &retry_after_s.to_string())?;
+        return Ok(resp);
     }
-    let cnt: Option<CountRow> = db
-        .prepare(
-            "SELECT COUNT(*) AS c FROM link_requests WHERE status='pending' AND expires_at > ?",
-        )
+    // Stale entries go now rather than at the daily sweep: an expired pending link can never be
+    // approved (`link_approve` answers 410) and only takes room.
+    db.prepare("DELETE FROM link_requests WHERE status='pending' AND expires_at <= ?")
         .bind(&[d1_int(now)])?
-        .first(None)
+        .run()
         .await?;
-    if cnt.map(|r| r.c).unwrap_or(0) >= MAX_PENDING {
-        return json_err(429, "too_many_pending");
-    }
 
     let link_code = b64u_encode(&random_bytes(32));
     db.prepare(

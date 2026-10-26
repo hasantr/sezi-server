@@ -42,11 +42,13 @@ pub(super) enum Line {
     ProposalFromRoom,
     /// Heads a proposal that replaced one still waiting for an answer.
     ProposalReplaced,
+    /// Past the rows a member may send a sheet bot a day (`builtin_store::DAILY_ROWS`).
+    SheetDailyLimit,
 }
 
 /// Every line, for the tests.
 #[cfg(test)]
-pub(super) const ALL: [Line; 16] = [
+pub(super) const ALL: [Line; 17] = [
     Line::AiUnavailable,
     Line::TryLater,
     Line::DailyLimit,
@@ -63,6 +65,7 @@ pub(super) const ALL: [Line; 16] = [
     Line::NotSetUp,
     Line::ProposalFromRoom,
     Line::ProposalReplaced,
+    Line::SheetDailyLimit,
 ];
 
 pub(super) fn line(lang: Lang, l: Line) -> &'static str {
@@ -103,6 +106,12 @@ pub(super) fn line(lang: Lang, l: Line) -> &'static str {
         (Lang::En, Line::ProposalFromRoom) => "For your message in the group \"{room}\":",
         (Lang::Tr, Line::ProposalReplaced) => "Önceki öneri geçersiz; cevabın bunun için.",
         (Lang::En, Line::ProposalReplaced) => "This replaces the earlier proposal; your answer is for this one.",
+        (Lang::Tr, Line::SheetDailyLimit) => {
+            "Bugünlük kayıt sınırına ulaştın (günde 200 kayıt). Bugün bundan sonra yazdıkların kaydedilmeyecek; yarın yine yazabilirsin."
+        }
+        (Lang::En, Line::SheetDailyLimit) => {
+            "You've reached today's limit (200 entries a day). Nothing more you write today will be saved; you can write again tomorrow."
+        }
     }
 }
 

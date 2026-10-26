@@ -53,9 +53,15 @@ pub(crate) const SQL_TOUCH_REPORT: &str =
 pub(crate) const SQL_USER_REPORTED_SINCE: &str =
     "SELECT MAX(COALESCE(last_report_at, created_at)) AS t FROM sfu_sessions WHERE user_id = ?";
 pub(crate) const SQL_PRUNE_SESSIONS: &str = "DELETE FROM sfu_sessions WHERE created_at < ?";
+/// Sessions a member opened since a moment (`policy::MAX_SESSIONS_PER_DAY`). Bind: user, since.
+pub(crate) const SQL_USER_SESSIONS_SINCE: &str =
+    "SELECT COUNT(*) AS n FROM sfu_sessions WHERE user_id = ? AND created_at >= ?";
 
 /// A session row is kept this long (a day); older rows are pruned when a new one is opened.
 const SESSION_KEEP_SECS: i64 = 24 * 60 * 60;
+/// What a member past the day's session bound is told to wait. The count slides over a day, so
+/// the exact moment would take another read; a fixed hour says "not soon" without guessing.
+const SESSION_BOUND_RETRY_SECS: u64 = 60 * 60;
 
 #[derive(Deserialize)]
 pub(crate) struct UsageRow {
@@ -147,8 +153,33 @@ pub async fn new_session(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         Ok(uid) => uid,
         Err(resp) => return Ok(resp),
     };
-    let d = decision_for(&ctx.env, &db, &body.room_id).await?;
     let now = now_secs() as i64;
+    // Each session is a call to Cloudflare on the owner's app: braked per member in KV, bounded
+    // per member in D1 (the brake fails open).
+    let brake = crate::ratelimit::admit_env(
+        &ctx.env,
+        &policy::session_rate_key(&uid),
+        policy::SESSIONS_PER_WINDOW,
+        policy::SESSION_WINDOW_SECS,
+    )
+    .await;
+    if let crate::ratelimit::Admission::Refused { retry_after_s } = brake {
+        return crate::respond::rate_limited(retry_after_s);
+    }
+    #[derive(Deserialize)]
+    struct Opened {
+        n: i64,
+    }
+    let opened = db
+        .prepare(SQL_USER_SESSIONS_SINCE)
+        .bind(&[d1_text(&uid), d1_int(now - SESSION_KEEP_SECS)])?
+        .first::<Opened>(None)
+        .await?
+        .map_or(0, |o| o.n);
+    if !policy::session_within_bound(opened) {
+        return crate::respond::rate_limited(SESSION_BOUND_RETRY_SECS);
+    }
+    let d = decision_for(&ctx.env, &db, &body.room_id).await?;
     if !d.available {
         // Past the month's limit a call already going on is still joined through the SFU.
         #[derive(Deserialize)]

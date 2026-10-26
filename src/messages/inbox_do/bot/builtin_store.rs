@@ -9,12 +9,13 @@
 //! | `bot_ai_usage` | model calls per member per (UTC) day | 2 days |
 //! | `bot_ai_proposals` | the row an AI bot asked a member to confirm | waits 10 min, kept 24 h to say it lapsed |
 //! | `bot_sheet_jobs` | rows owed to the sheet, in order | until written, or 23 h |
+//! | `bot_sheet_usage` | a sheet bot's rows per member per (UTC) day | 2 days |
 //!
 //! A "turn" is one exchange — the member's message and the bot's answer — so 10 turns are the
 //! last 20 rows.
 
 /// Created beside `store::TABLES`.
-pub(super) const TABLES: [&str; 5] = [
+pub(super) const TABLES: [&str; 6] = [
     "CREATE TABLE IF NOT EXISTS bot_ai_turns (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
         role TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)",
@@ -34,6 +35,11 @@ pub(super) const TABLES: [&str; 5] = [
         text TEXT NOT NULL, row_json TEXT, at INTEGER NOT NULL, confirm INTEGER NOT NULL DEFAULT 0,
         attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
         told INTEGER NOT NULL DEFAULT 0, room_json TEXT)",
+    // Not `bot_ai_usage`: leaving AI mode forgets that one, and a change of kind must not hand a
+    // member a fresh day of rows.
+    "CREATE TABLE IF NOT EXISTS bot_sheet_usage (
+        user_id TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL,
+        PRIMARY KEY (user_id, day))",
 ];
 
 /// Columns added after the tables first shipped, for an inbox whose tables are older. Run once
@@ -50,6 +56,10 @@ pub(super) const CONTEXT_TURNS: i64 = 10;
 pub(super) const TURN_TTL_MS: i64 = 24 * 3600 * 1000;
 /// Model calls a member gets a day.
 pub(super) const DAILY_CALLS: i64 = 50;
+/// Rows a member may send a sheet bot a day, 1:1 and from every room together. Each is a stored
+/// job, up to seven subrequests and a line in the owner's sheet; without a cap one member could
+/// fill the sheet and keep the queue's head busy for everyone (audit 2026-10-26, note 1.1).
+pub(super) const DAILY_ROWS: i64 = 200;
 /// How long a proposed row waits for a yes.
 pub(super) const PROPOSAL_WAIT_MS: i64 = 10 * 60 * 1000;
 /// How long a lapsed proposal is kept, to say so.
@@ -86,6 +96,14 @@ pub(super) const USAGE_BUMP: &str = "INSERT INTO bot_ai_usage (user_id, day, n) 
       ON CONFLICT(user_id, day) DO UPDATE SET n = n + 1";
 /// Bind: the oldest day kept.
 pub(super) const USAGE_EXPIRE: &str = "DELETE FROM bot_ai_usage WHERE day < ?";
+
+/// A sheet bot's rows from a member on a day. Bind: user, day.
+pub(super) const SHEET_USAGE_GET: &str = "SELECT n FROM bot_sheet_usage WHERE user_id = ? AND day = ?";
+/// Bind: user, day.
+pub(super) const SHEET_USAGE_BUMP: &str = "INSERT INTO bot_sheet_usage (user_id, day, n) VALUES (?, ?, 1)
+      ON CONFLICT(user_id, day) DO UPDATE SET n = n + 1";
+/// Bind: the oldest day kept.
+pub(super) const SHEET_USAGE_EXPIRE: &str = "DELETE FROM bot_sheet_usage WHERE day < ?";
 
 /// Bind: user.
 pub(super) const PROPOSAL_GET: &str = "SELECT row_json, text, at, room_json FROM bot_ai_proposals WHERE user_id = ?";

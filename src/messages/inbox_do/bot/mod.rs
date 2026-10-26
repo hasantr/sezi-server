@@ -9,6 +9,8 @@
 //! | `store.rs` | the bot tables (created lazily, only here) and the engine's `BotStore` over them |
 //! | `ingest.rs` | the alarm's tick: open stored frames in one synchronous block, ack, queue |
 //! | `send.rs` | `sendMessage`, pair-acks (repair and reply), resends after a re-pair |
+//! | `send_guard.rs` | what a program's sends are held to: 60 a minute, 30 into one chat |
+//! | `send_replay.rs` | idempotent sending: a repeated `client_id` answers the first `message_id` |
 //! | `outbox.rs` | what the tick owes the network, drained under a subrequest budget |
 //! | `updates.rs` | the update JSON and `getUpdates`' long poll |
 //! | `deliver.rs` | the webhook round, the owner's ping, and "taken" → the member's `forward-read` |
@@ -45,6 +47,8 @@ mod room_plan;
 mod room_send;
 mod room_store;
 mod send;
+mod send_guard;
+mod send_replay;
 mod store;
 mod updates;
 
@@ -87,7 +91,8 @@ impl UserInbox {
     /// The bot tables; idempotent and synchronous.
     fn bot_tables(&self) -> Result<()> {
         let sql = self.state.storage().sql();
-        for t in store::TABLES.iter().chain(builtin_store::TABLES.iter()).chain(room_store::TABLES.iter()) {
+        let tables = store::TABLES.iter().chain(builtin_store::TABLES.iter()).chain(room_store::TABLES.iter());
+        for t in tables.chain(send_guard::TABLES.iter()).chain(send_replay::TABLES.iter()) {
             sql.exec_raw(t, sql_no_args())?;
         }
         // Columns added since an older inbox made its tables: each once, its failure on a table
@@ -180,18 +185,53 @@ impl UserInbox {
         Response::empty().map(|r| r.with_status(204))
     }
 
+    /// A program's `sendMessage`, after the Worker's checks: a repeated `client_id`
+    /// (`send_replay.rs`), the send limits (`send_guard.rs`), then the send. A send that did not
+    /// happen gives its slot and its `client_id` back.
     async fn bot_api(&self, body: &serde_json::Value) -> Result<Response> {
         let ctx = self.bot_ctx()?;
         let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
-        match s("method") {
-            "sendMessage" => self.bot_send_text(&ctx, s("to"), s("text")).await,
-            // The Worker checked `group_bots`; the room round checks it again before sending.
-            "sendRoom" => {
-                let reply_to = body.get("reply_to").and_then(|v| v.as_str());
-                self.bot_send_room_text(s("room_id"), s("text"), reply_to).await
-            }
-            _ => crate::bots::api::bot_err(404, "unknown-method"),
+        let method = s("method");
+        if !matches!(method, "sendMessage" | "sendRoom") {
+            return crate::bots::api::bot_err(404, "unknown-method");
         }
+        let room = (method == "sendRoom").then(|| s("room_id"));
+        let reply_to = body.get("reply_to").and_then(|v| v.as_str());
+        let client_id = body.get("client_id").and_then(|v| v.as_str());
+        let chat = send_guard::chat_key(Some(s("to")), room);
+        let fp = send_replay::fingerprint(&chat, s("text"), reply_to);
+        if let Some(cid) = client_id {
+            match self.bot_client_replay(cid, &fp).await {
+                send_replay::Replay::New => {}
+                send_replay::Replay::Sent(message_id) => return send_replay::duplicate(&message_id),
+                send_replay::Replay::Conflict => return crate::bots::api::bot_err(409, "client-id-reused"),
+                send_replay::Replay::InFlight => return crate::bots::api::bot_err(409, "in-progress"),
+            }
+        }
+        // From the replay's last read to the reservation: no `await`, so no second call of the
+        // same `client_id` can slip in between.
+        let db = self.bot_store().db;
+        let now = crate::utils::now_ms() as i64;
+        let slot = match send_guard::take_slot(&db, &chat, now) {
+            Ok(slot) => slot,
+            Err(retry_after_s) => return send_guard::rate_limited(retry_after_s),
+        };
+        let msg_uid = send::new_msg_uid();
+        if let Some(cid) = client_id {
+            send_replay::reserve(&db, cid, &fp, &msg_uid, now);
+        }
+        let sent = match room {
+            None => self.bot_send_text(&ctx, s("to"), s("text"), &msg_uid).await,
+            // The Worker checked `group_bots`; the room round checks it again before sending.
+            Some(room_id) => self.bot_send_room_text(room_id, s("text"), reply_to, &msg_uid).await,
+        };
+        if !matches!(&sent, Ok(r) if r.status_code() == 200) {
+            send_guard::refund(&db, slot);
+            if let Some(cid) = client_id {
+                send_replay::release(&db, cid);
+            }
+        }
+        sent
     }
 
     /// Counts, for diagnosis and the owner's page. No content.
@@ -211,6 +251,8 @@ impl UserInbox {
             "rooms_keyed": count("bot_megolm"),
             "waiting_since": count_opt(deliver::WAITING_SINCE),
             "webhook": s.kv_get("webhook_url").is_some(),
+            // Set, but its URL fails the outbound rule now: delivered nothing (`deliver::Hook`).
+            "webhook_refused": self.bot_webhook() == deliver::Hook::Refused,
         });
         if let (Some(m), serde_json::Value::Object(b)) = (state.as_object_mut(), self.builtin_state()) {
             m.extend(b);

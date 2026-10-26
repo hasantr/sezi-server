@@ -107,3 +107,13 @@ fn a_call_is_going_on_while_media_is_reported_and_for_a_lesson_s_length_at_most(
     assert!(!call_is_running(1, None, now));
     assert!(!call_is_running(3, Some(now - RUNNING_CALL_MAX_AGE_SECS - 1), now), "not all month");
 }
+
+#[test]
+fn opening_sessions_is_braked_per_member_and_leaves_room_for_a_bad_network() {
+    assert_eq!(session_rate_key("u1"), "sfu:session:u1");
+    assert_ne!(session_rate_key("u1"), session_rate_key("u2"), "one member's budget is their own");
+    // A join, an ICE restart that never connects and a new side, a few times over: a member on
+    // a bad network still gets in.
+    const { assert!(SESSIONS_PER_WINDOW >= 10 && SESSION_WINDOW_SECS <= 600) };
+    const { assert!(MAX_SESSIONS_PER_DAY as usize >= SESSIONS_PER_WINDOW * 4) };
+}

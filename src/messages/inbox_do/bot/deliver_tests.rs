@@ -68,6 +68,8 @@ fn taken_sources_are_read_once_and_orphans_go() {
     assert_eq!(read(a, b).len(), 2);
     c.execute(SRC_DROP, [a, b]).unwrap();
     assert!(read(a, b).is_empty(), "taken once");
+    // A poll handed all three out; its next offset confirms them.
+    c.execute(super::super::updates::UPDATE_MARK, [9_999, a, d]).unwrap();
     c.execute(UPDATE_CONFIRM, [d + 1]).unwrap();
     c.execute(SRC_ORPHANS, []).unwrap();
     assert!(read(a, d).is_empty(), "an update's source goes with it");
@@ -111,6 +113,41 @@ fn a_bot_turned_off_is_posted_nothing_and_marks_nothing_read() {
     assert!(round.contains("with_timeout(\n                crate::bots::webhook::post("), "an unbounded webhook POST");
     // `/bot/wake` (the owner turning it back on) ends the hold at once.
     assert!(fn_body(include_str!("builtin.rs"), "bot_wake").contains("KV_WEBHOOK_HOLD"));
+}
+
+/// `setWebhook` has refused a URL into the relay's own network since 22c34670, but a URL stored
+/// before that stayed in the inbox and was POSTed to on every update (audit 2026-10-26, note 1.4).
+/// The rule is asked again at delivery: a refused webhook gets nothing, holds the queue as a
+/// failing one does, arms no alarm, and the owner's listing says so.
+#[test]
+fn a_webhook_stored_before_the_url_rule_is_judged_again_at_delivery() {
+    let s = || Some("secret".to_string());
+    for old in ["http://192.168.1.1/hook", "https://10.0.0.5/x", "https://router.lan/x", "https://nas.local/x", "https://localhost/x"] {
+        assert_eq!(webhook_at_delivery(Some(old.into()), s(), false), Hook::Refused, "{old}");
+    }
+    let live = "https://script.google.com/macros/s/abc/exec";
+    assert_eq!(webhook_at_delivery(Some(live.into()), s(), false), Hook::Live(live.into(), "secret".into()));
+    assert_eq!(
+        webhook_at_delivery(Some("http://192.168.1.1/hook".into()), s(), true),
+        Hook::Live("http://192.168.1.1/hook".into(), "secret".into()),
+        "the lab escape lifts it here as at the set"
+    );
+    assert_eq!(webhook_at_delivery(None, s(), false), Hook::None);
+    assert_eq!(webhook_at_delivery(Some(live.into()), None, false), Hook::None, "nothing to sign with");
+
+    let src = include_str!("deliver.rs");
+    let code = src.split("#[cfg(test)]").next().unwrap();
+    // Every reader of the stored webhook goes through the judgement: the round and its alarm.
+    for f in ["bot_deliver_webhooks", "bot_webhook_next"] {
+        let body = fn_body(code, f);
+        assert!(body.contains("self.bot_webhook()"), "{f} reads the webhook unjudged");
+        assert!(!body.contains("kv_get(\"webhook_url\")"), "{f} reads the raw URL");
+    }
+    let round = fn_body(code, "bot_deliver_webhooks");
+    assert!(round.find("Hook::Live(").unwrap() < round.find("webhook::post(").unwrap());
+    // What the owner sees: `/bot/state` and `GET /admin/bots`.
+    assert!(fn_body(include_str!("mod.rs"), "bot_state").contains("\"webhook_refused\""));
+    assert!(include_str!("../../../bots/admin.rs").contains("v[\"webhook_refused\"]"));
 }
 
 #[test]

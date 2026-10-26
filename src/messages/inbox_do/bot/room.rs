@@ -230,16 +230,20 @@ impl UserInbox {
         self.bot_store().db.run(rs::POST_PUSH, &[Arg::T(room_id), Arg::T(&json), Arg::I(now)]);
     }
 
-    /// The bot's text into a room, as a reply to `reply` when given. Its message id.
-    pub(super) fn bot_queue_room_text(&self, room_id: &str, text: &str, reply: Option<&ReplyRef>, now: i64) -> String {
-        let msg_uid = format!("b-{}", uuid::Uuid::new_v4());
-        self.bot_queue_room_post(room_id, &room_text_payload(text, &msg_uid, reply), now);
-        msg_uid
+    /// The bot's text into a room as `msg_uid`, as a reply to `reply` when given.
+    pub(super) fn bot_queue_room_text(&self, room_id: &str, text: &str, reply: Option<&ReplyRef>, msg_uid: &str, now: i64) {
+        self.bot_queue_room_post(room_id, &room_text_payload(text, msg_uid, reply), now);
     }
 
-    /// `sendMessage` into a room. The Worker has already checked `group_bots`; the room round
-    /// checks it again before anything leaves.
-    pub(super) async fn bot_send_room_text(&self, room_id: &str, text: &str, reply_to: Option<&str>) -> Result<Response> {
+    /// `sendMessage` into a room, as `msg_uid`. The Worker has already checked `group_bots`; the
+    /// room round checks it again before anything leaves.
+    pub(super) async fn bot_send_room_text(
+        &self,
+        room_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        msg_uid: &str,
+    ) -> Result<Response> {
         let reply = match reply_to.filter(|r| !r.is_empty()) {
             Some(uid) => match self.bot_call_reply(room_id, uid) {
                 Some(r) => Some(r),
@@ -248,9 +252,11 @@ impl UserInbox {
             None => None,
         };
         let now = (now_secs() * 1000) as i64;
-        let msg_uid = self.bot_queue_room_text(room_id, text, reply.as_ref(), now);
+        self.bot_queue_room_text(room_id, text, reply.as_ref(), msg_uid, now);
+        // Queued: the room round sends it whatever happens to this request (`send_replay.rs`).
+        super::send_replay::mark_sent(&self.bot_store().db, msg_uid);
         self.arm_alarm_within(0).await;
-        Response::from_json(&serde_json::json!({ "ok": true, "message_id": msg_uid }))
+        Response::from_json(&crate::bots::api_answer::sent(msg_uid))
     }
 
     /// The room's generation in this inbox: moved by every `/bot/room-event`.

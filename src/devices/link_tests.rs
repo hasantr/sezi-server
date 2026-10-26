@@ -8,7 +8,46 @@
 //! `include_str!` rather than reading from disk: it binds at COMPILE time, so renaming or moving
 //! `link.rs` breaks the build instead of silently emptying the guard.
 
+use super::link_start_buckets;
+
 const LINK_SRC: &str = include_str!("link.rs");
+
+/// `link-start` is pre-auth, and its only ceiling used to be fifty pending links for the whole
+/// server: five addresses at the per-IP rate (10 a minute, a link living 120 s) kept it full, and
+/// no one could link a device (audit 2026-10-26, note 1.2). Its budget is now per address — the
+/// door's model (`ratelimit::door_miss_buckets`): no server-wide lever.
+#[test]
+fn one_address_cannot_spend_another_addresss_link_starts() {
+    let keys = |ip: &str| link_start_buckets(ip).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+    let (a, b) = (keys("203.0.113.7"), keys("198.51.100.9"));
+    assert_eq!(a.len(), 1, "an IPv4 address has its own bucket only");
+    assert!(a.iter().all(|k| !b.contains(k)), "{a:?} / {b:?}");
+    // One IPv6 host owns its /64; a /48 is one site, bounded at a few /64s' worth.
+    let v6 = keys("2001:db8:1:2:aaaa::1");
+    assert_eq!(v6, keys("2001:db8:1:2:bbbb::9"), "one /64, one budget");
+    assert_eq!(v6.len(), 2);
+    assert_eq!(v6[1], keys("2001:db8:1:3::1")[1], "the /48 is shared across its /64s");
+    assert_ne!(v6[0], keys("2001:db8:1:3::1")[0]);
+    for (k, limit) in link_start_buckets("2001:db8::1") {
+        assert!(k.starts_with("link:start"), "{k}: not a door miss bucket");
+        assert!(limit > 0);
+    }
+
+    let src = handler_src("pub async fn link_start");
+    assert!(
+        !src.contains("COUNT(*)"),
+        "link-start must not count every pending link on the server: that ceiling is a lever \
+         anyone can pull to stop everyone linking"
+    );
+    let reserve = src.find("reserve_link_start(").expect("a per-address budget counted in D1");
+    assert!(LINK_SRC.contains("crate::door_bucket::reserve("), "counted in D1, not the fail-open KV");
+    let insert = src.find("INSERT INTO link_requests").expect("the insert");
+    assert!(reserve < insert, "the budget is taken before the row is written");
+    assert!(
+        src.contains("DELETE FROM link_requests WHERE status='pending' AND expires_at"),
+        "stale pending links are swept at start, not only by the daily cron"
+    );
+}
 
 /// The text of one handler, from its signature up to the next top-level `fn`. Slicing to the
 /// next item matters for the negative assertions: without it, a gate belonging to the handler

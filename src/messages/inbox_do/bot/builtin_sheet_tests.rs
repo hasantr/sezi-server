@@ -115,3 +115,14 @@ fn apps_scripts_302_is_followed_as_a_get_under_the_url_rule() {
         "the lab escape reaches the stand-in"
     );
 }
+
+/// A sheet address stored while the lab's LAN escape was on is judged again at every write:
+/// with the escape off it is not fetched, and a public one passes as written.
+#[test]
+fn a_stored_sheet_address_is_judged_again_before_its_first_fetch() {
+    assert_eq!(first_hop("http://192.168.1.10/exec", true).as_deref(), Ok("http://192.168.1.10/exec"));
+    assert_eq!(first_hop("http://192.168.1.10/exec", false), Err("bot/sheet-unreachable"));
+    assert_eq!(first_hop("https://localhost/exec", false), Err("bot/sheet-unreachable"));
+    let public = "https://script.google.com/macros/s/AKfy/exec";
+    assert_eq!(first_hop(public, false).as_deref(), Ok(public));
+}

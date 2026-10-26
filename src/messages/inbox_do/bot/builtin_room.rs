@@ -85,7 +85,8 @@ impl UserInbox {
             Some(r) => {
                 let text = super::builtin_ai::cut(text.trim(), super::builtin_run::MAX_REPLY_CHARS);
                 let now = (now_secs() * 1000) as i64;
-                self.bot_queue_room_text(&r.id, &text, Some(&r.reply(to, call_text)), now);
+                let msg_uid = super::send::new_msg_uid();
+                self.bot_queue_room_text(&r.id, &text, Some(&r.reply(to, call_text)), &msg_uid, now);
             }
         }
     }

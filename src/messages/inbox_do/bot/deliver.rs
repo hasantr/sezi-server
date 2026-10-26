@@ -20,6 +20,9 @@
 //! runner's own gate) before it POSTs, and while it is off — or deleted, or D1 silent — it sends
 //! nothing and marks nothing read, and waits (`KV_WEBHOOK_HOLD`) until `/bot/wake` or the hold
 //! ends. Until 2026-10-26 a turned-off program bot went on receiving every member's message.
+//!
+//! **The URL is judged at delivery too** (`webhook_at_delivery`), by the same rule `setWebhook`
+//! applies: a stored URL that fails it now is POSTed nothing and holds the queue (`Hook::Refused`).
 
 use super::builtin_policy::{round_gate, Gate};
 use super::outbox::{retry_delay_ms, OutKind};
@@ -66,10 +69,35 @@ pub(super) const HOOK_DONE: &str = "DELETE FROM bot_updates WHERE update_id = ?"
 pub(super) const WAITING_SINCE: &str =
     "SELECT MIN(created_at) AS t FROM bot_updates WHERE delivered_at IS NULL";
 
-/// The webhook in force: (url, secret).
-pub(super) fn webhook_of(store: &super::store::SqlBotStore<super::store::DoSql>) -> Option<(String, String)> {
-    Some((store.kv_get("webhook_url")?, store.kv_get("webhook_secret")?))
+/// The stored webhook, as delivery sees it.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Hook {
+    /// None set (or no secret to sign with): the program polls.
+    None,
+    /// Set, but its URL fails the outbound rule (`bots::webhook::clean_url`) now: nothing is
+    /// POSTed, the queue waits as behind a failing webhook, and no alarm is armed for it. The
+    /// owner's listing shows `webhook_refused`; the program's next `setWebhook` (checked) or
+    /// `deleteWebhook` ends it.
+    Refused,
+    /// (url, secret), the URL as the rule writes it.
+    Live(String, String),
 }
+
+/// Judge the stored webhook at delivery. `setWebhook` has checked a URL since 22c34670, but one
+/// stored before that — or under the lab escape since turned off — was POSTed to on its word:
+/// on a self-hosted relay that reaches the owner's LAN (audit 2026-10-26, note 1.4).
+pub(super) fn webhook_at_delivery(url: Option<String>, secret: Option<String>, allow_lan: bool) -> Hook {
+    let (Some(url), Some(secret)) = (url, secret) else {
+        return Hook::None;
+    };
+    match crate::bots::webhook::clean_url(&url, allow_lan) {
+        Some(url) => Hook::Live(url, secret),
+        None => Hook::Refused,
+    }
+}
+
+/// The code a refused webhook is logged with.
+const WEBHOOK_REFUSED: &str = "bot/webhook-url-refused";
 
 /// One member's frames the program just took, as `forward-read` bodies: per sender, the remote
 /// ids and their msg_uids, in parallel.
@@ -116,6 +144,13 @@ pub(super) struct WebhookBody {
 }
 
 impl UserInbox {
+    /// The stored webhook, judged now (`webhook_at_delivery`).
+    pub(super) fn bot_webhook(&self) -> Hook {
+        let store = self.bot_store();
+        let allow_lan = crate::bots::builtin_rules::allow_lan(&self.env);
+        webhook_at_delivery(store.kv_get("webhook_url"), store.kv_get("webhook_secret"), allow_lan)
+    }
+
     pub(super) fn bot_note_update_src(&self, update_id: i64, from: &str, remote_id: i64, uid: Option<&str>) {
         self.bot_store().db.run(
             SRC_PUT,
@@ -200,8 +235,14 @@ impl UserInbox {
     /// The tick's webhook round. Errors are logged; the alarm re-arms from `HOOK_NEXT`.
     pub(super) async fn bot_deliver_webhooks(&self, ctx: &BotCtx) {
         let store = self.bot_store();
-        let Some((url, secret)) = webhook_of(&store) else {
-            return;
+        let (url, secret) = match self.bot_webhook() {
+            Hook::Live(url, secret) => (url, secret),
+            Hook::Refused => {
+                // Only reached on a tick something else armed: `bot_webhook_next` arms nothing.
+                console_log!("[bot] webhook not delivered: {WEBHOOK_REFUSED}");
+                return;
+            }
+            Hook::None => return,
         };
         let start = (now_secs() * 1000) as i64;
         if self.bot_webhook_next().is_none_or(|t| t > start) {
@@ -268,8 +309,10 @@ impl UserInbox {
 
     /// When the webhook's queue next needs the alarm, if a webhook is set and anything waits.
     pub(super) fn bot_webhook_next(&self) -> Option<i64> {
+        if !matches!(self.bot_webhook(), Hook::Live(..)) {
+            return None; // none, or refused: no alarm comes back for it
+        }
         let store = self.bot_store();
-        webhook_of(&store)?;
         let hold = store.kv_get(KV_WEBHOOK_HOLD).and_then(|v| v.parse::<i64>().ok());
         webhook_next(store.db.int(HOOK_NEXT, &[]), hold)
     }

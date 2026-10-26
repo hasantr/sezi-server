@@ -211,9 +211,19 @@ async fn fetch_once(url: &str, body: Option<&str>) -> Option<Response> {
         .and_then(|r| r.ok())
 }
 
+/// The sheet's own address, judged NOW by the rule every redirect hop meets (`next_hop`) and the
+/// owner's address met when it was set: one stored under the lab's LAN escape, since turned off,
+/// is not fetched (audit 2026-10-26, beside note 1.4). Refused = unreachable, spending nothing.
+pub(crate) fn first_hop(url: &str, allow_lan: bool) -> std::result::Result<String, &'static str> {
+    outbound_url(url, allow_lan).map(|u| u.to_string()).ok_or("bot/sheet-unreachable")
+}
+
 /// Write one body to the sheet: the outcome, and the subrequests it took.
 pub(crate) async fn post(url: &str, body: &str, allow_lan: bool) -> (std::result::Result<(), &'static str>, u32) {
-    let mut at = url.to_string();
+    let Ok(first) = first_hop(url, allow_lan) else {
+        return (Err("bot/sheet-unreachable"), 0);
+    };
+    let mut at = first;
     let mut as_post = true;
     let mut spent = 0;
     for _ in 0..MAX_HOPS {

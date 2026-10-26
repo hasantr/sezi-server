@@ -189,3 +189,28 @@ fn a_room_proposal_names_its_group_and_a_replacement_says_so() {
     assert!(text.starts_with("Önceki öneri geçersiz"), "{text}");
     assert!(text.contains("“Hukuk”") && text.contains("• Tarih: 2026-10-27") && text.ends_with("evet / hayır"));
 }
+
+/// One member could fill the owner's sheet: every message to a sheet bot became a row, a stored
+/// job and up to seven subrequests, with nothing counting them (audit 2026-10-26, note 1.1). A
+/// member now gets `DAILY_ROWS` rows a day; past that they hear it ONCE and nothing is queued.
+#[test]
+fn a_sheet_bot_takes_a_bounded_number_of_rows_from_one_member_a_day() {
+    assert_eq!(row_admission(0), RowAdmission::Queue);
+    assert_eq!(row_admission(bs::DAILY_ROWS - 1), RowAdmission::Queue, "the last row of the day");
+    assert_eq!(row_admission(bs::DAILY_ROWS), RowAdmission::Refuse { say: true }, "told once");
+    assert_eq!(row_admission(bs::DAILY_ROWS + 1), RowAdmission::Refuse { say: false }, "then silent");
+    assert_eq!(row_admission(i64::MAX), RowAdmission::Refuse { say: false });
+    assert!(ROW_REFUSED.starts_with("bot/"));
+    let said = line(Lang::Tr, Line::SheetDailyLimit);
+    assert!(said.contains(&bs::DAILY_ROWS.to_string()), "the line names the cap: {said}");
+    // The sheet arm of the runner asks before it queues, and counts what it takes.
+    let run = include_str!("builtin_run.rs");
+    let code = run.split("#[cfg(test)]").next().unwrap();
+    let start = code.find("fn builtin_sheet_row(").expect("the sheet arm has its own fn");
+    let rest = &code[start..];
+    let body = &rest[..rest[1..].find("\n    fn ").map_or(rest.len(), |i| i + 1)];
+    let ask = body.find("row_admission(").expect("the sheet arm asks the cap");
+    let queue = body.find("builtin_queue_row(").expect("and queues the row");
+    assert!(ask < queue, "the cap is asked before the row is queued");
+    assert!(body.contains("SHEET_USAGE_BUMP"), "every row is counted");
+}

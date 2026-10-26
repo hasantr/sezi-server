@@ -162,7 +162,7 @@ fn every_send_into_a_room_asks_the_gate_first() {
         }
     }
     let api = include_str!("../../../bots/api.rs");
-    let send = &api[api.find("if let Some(room_id) = room").expect("the room branch")..];
+    let send = &api[api.find("Chat::Room(room_id) =>").expect("the room branch")..];
     assert!(send.find("is_room_bot(").unwrap() < send.find("/bot/api").unwrap());
 }
 

@@ -12,7 +12,8 @@
 //!
 //! Each listed bot carries `program_seen_at` (seconds: its last API call or taken webhook),
 //! `waiting_since` (ms: the oldest update its program has not been handed), `webhook` (set or
-//! not) and `program_silent` — "Programından haber yok": an update has waited 10 minutes and
+//! not), `webhook_refused` (set, but its URL fails the outbound rule at delivery, so nothing is
+//! sent to it — one stored before the rule existed) and `program_silent` — "Programından haber yok": an update has waited 10 minutes and
 //! the program has not been seen in that time (BOTS_BUILD §5, R9 decision 4). Otherwise the
 //! page shows "last seen". A built-in bot (`builtin` = `sheet` / `ai`) is never silent — the relay
 //! is its program — and carries `ai_provider`, `ai_model`, `last_ok_at` (ms) and `last_error`
@@ -185,6 +186,8 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         #[serde(default)]
         webhook: bool,
         #[serde(default)]
+        webhook_refused: bool,
+        #[serde(default)]
         ai_model: Option<String>,
         #[serde(default)]
         last_ok_at: Option<i64>,
@@ -202,6 +205,7 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         let mut v = serde_json::to_value(&row).map_err(|e| Error::RustError(e.to_string()))?;
         v["waiting_since"] = state.waiting_since.into();
         v["webhook"] = state.webhook.into();
+        v["webhook_refused"] = state.webhook_refused.into();
         let silent = row.builtin.is_none() && program_silent(state.waiting_since, row.program_seen_at, now);
         v["program_silent"] = silent.into();
         v["ai_model"] = state.ai_model.into();
@@ -337,6 +341,19 @@ pub async fn renew_token(req: Request, ctx: RouteContext<()>) -> Result<Response
         return json_err(404, "not_found");
     }
     let secret = token::mint(&bot_id);
+    // A webhook in force is signed with the NEW key's secret from now on; the old one stops
+    // verifying, as the old key stops working. The inbox hears the new secret FIRST, and a renewal
+    // it did not take is refused with nothing changed: until 2026-10-26 a failed push was only
+    // logged, so the program held a new key while every webhook came signed with the old one's
+    // secret and failed its check. Should the token write below fail after the push, the webhooks
+    // signed meanwhile fail and wait on their retries, and the owner's next renewal heals both.
+    let push = serde_json::json!({ "secret": super::webhook::derive_secret(&secret) });
+    let pushed =
+        super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/webhook-secret", Some(push.to_string())).await;
+    if !renewal_reached_inbox(pushed.as_ref().map(|r| r.status_code())) {
+        console_warn!("bot key renewal refused bot={bot_id}: the inbox did not take the webhook secret");
+        return json_err(502, "inbox_unavailable");
+    }
     let now = d1_int(now_secs() as i64);
     db.batch(vec![
         db.prepare(token::REVOKE_TOKENS_SQL)
@@ -345,15 +362,13 @@ pub async fn renew_token(req: Request, ctx: RouteContext<()>) -> Result<Response
             .bind(&[d1_text(&token::hash(&secret)), d1_text(&bot_id), now])?,
     ])
     .await?;
-    // A webhook in force is signed with the NEW key's secret from now on; the old one stops
-    // verifying, as the old key stops working.
-    let push = serde_json::json!({ "secret": super::webhook::derive_secret(&secret) });
-    if let Err(e) =
-        super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/webhook-secret", Some(push.to_string())).await
-    {
-        console_warn!("bot webhook secret rotation failed bot={bot_id}: {e:?}");
-    }
     Response::from_json(&serde_json::json!({ "bot_id": bot_id, "token": secret }))
+}
+
+/// Whether the inbox took a renewed key's webhook secret: the call went through and answered 2xx.
+/// A DO that threw answers 500 as an `Ok` response, which is not taken.
+pub(crate) fn renewal_reached_inbox<E>(status: std::result::Result<u16, E>) -> bool {
+    matches!(status, Ok(s) if (200..300).contains(&s))
 }
 
 /// "Dene": a `ping` update, carrying the owner as `who`, that the program receives like any
@@ -455,6 +470,21 @@ mod tests {
             assert!(fn_body(admin, f).contains("nudge_humans("), "admin::{f}");
         }
         assert!(fn_body(include_str!("builtin.rs"), "put").contains("nudge_humans("), "builtin::put");
+    }
+
+    #[test]
+    fn a_key_renewal_the_inbox_did_not_take_changes_nothing() {
+        use super::renewal_reached_inbox as taken;
+        assert!(taken::<()>(Ok(204)));
+        assert!(!taken::<()>(Ok(500)), "a DO that threw answers 500 as an Ok response");
+        assert!(!taken(Err("no stub")));
+        // The order is the point: the inbox is asked before the old key is revoked, and a refusal
+        // returns before the token batch.
+        let body = fn_body(include_str!("admin.rs"), "renew_token");
+        let push = body.find("/bot/webhook-secret").expect("push");
+        let refuse = body.find("inbox_unavailable").expect("refusal");
+        let revoke = body.find("REVOKE_TOKENS_SQL").expect("revoke");
+        assert!(push < refuse && refuse < revoke, "push, refuse, then revoke");
     }
 
     #[test]

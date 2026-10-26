@@ -4,7 +4,8 @@
 //! has handled is "taken" — the member's `forward-read`, their blue tick.
 //!
 //! **What each kind does with a member's message.**
-//! - `sheet`: the message becomes a row owed to the sheet (`bot_sheet_jobs`), taken at once.
+//! - `sheet`: the message becomes a row owed to the sheet (`bot_sheet_jobs`), taken at once —
+//!   up to `DAILY_ROWS` a member a day; past that no row is queued and the member hears it once.
 //!   Before the sheet's address is set ("not connected"), each message is answered with one line
 //!   saying the bot is not set up yet; no row is queued and nothing is retried.
 //! - `ai`: one model call with that member's last 10 turns; the answer goes back as the bot's
@@ -212,13 +213,37 @@ impl UserInbox {
                 self.builtin_answer(ctx, &ask, line(run.lang, Line::NotSetUp), spent).await;
                 Handled::Done
             }
-            Kind::Sheet => {
-                self.builtin_queue_row(&ask.from, &ask.name, &ask.text, None, at, false, now, ask.room.as_ref());
-                Handled::Done
-            }
+            Kind::Sheet => self.builtin_sheet_row(ctx, run, &ask, at, now, spent).await,
             Kind::Ai if !policy::fits(*spent, policy::AI_BASE) => Handled::NoRoom,
             Kind::Ai => self.builtin_ai_turn(ctx, run, &ask, attempts, now, spent).await,
         }
+    }
+
+    /// A connected sheet bot's message: a row owed to the sheet while the member is under the
+    /// day's cap (`policy::row_admission`), counted either way; past it, nothing is queued and
+    /// the member hears so once.
+    async fn builtin_sheet_row(&self, ctx: &BotCtx, run: &Run, ask: &Ask, at: i64, now: i64, spent: &mut u32) -> Handled {
+        let store = self.bot_store();
+        let usage = [Arg::T(&ask.from), Arg::I(bs::day_of(now))];
+        let used = store.db.int(bs::SHEET_USAGE_GET, &usage).unwrap_or(0);
+        match policy::row_admission(used) {
+            policy::RowAdmission::Queue => {
+                store.db.run(bs::SHEET_USAGE_BUMP, &usage);
+                self.builtin_queue_row(&ask.from, &ask.name, &ask.text, None, at, false, now, ask.room.as_ref());
+            }
+            // Left for the next tick, uncounted: it is judged again there.
+            policy::RowAdmission::Refuse { say: true } if !policy::fits(*spent, policy::SAY_BASE) => {
+                return Handled::NoRoom;
+            }
+            policy::RowAdmission::Refuse { say } => {
+                store.db.run(bs::SHEET_USAGE_BUMP, &usage);
+                console_log!("[bot] built-in refusal {}", policy::ROW_REFUSED);
+                if say {
+                    self.builtin_answer(ctx, ask, line(run.lang, Line::SheetDailyLimit), spent).await;
+                }
+            }
+        }
+        Handled::Done
     }
 
     /// Answer what `ask` wrote, where it wrote it: 1:1, or in the room replying to the call.
@@ -353,7 +378,7 @@ impl UserInbox {
         let body = builtin_ai::request_body(ai, &system, &history, text);
         store.db.run(bs::USAGE_BUMP, &[Arg::T(from), Arg::I(day)]);
         *spent += 1;
-        let result = builtin_ai::call(ai, &key, &body).await;
+        let result = builtin_ai::call(ai, &key, &body, run.allow_lan).await;
         if !self.builtin_current(run) {
             return Handled::Abandon; // answered on instructions that are gone: nothing is kept
         }
@@ -437,5 +462,6 @@ impl UserInbox {
         db.run(bs::TURNS_EXPIRE, &[Arg::I(now - bs::TURN_TTL_MS)]);
         db.run(bs::PROPOSAL_EXPIRE, &[Arg::I(now - bs::PROPOSAL_KEEP_MS)]);
         db.run(bs::USAGE_EXPIRE, &[Arg::I(bs::day_of(now) - 1)]);
+        db.run(bs::SHEET_USAGE_EXPIRE, &[Arg::I(bs::day_of(now) - 1)]);
     }
 }
