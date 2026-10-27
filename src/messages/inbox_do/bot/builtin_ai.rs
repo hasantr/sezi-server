@@ -166,8 +166,37 @@ pub(super) fn http_failure(status: u16) -> Option<&'static str> {
         404 => Some("ai/bad-model"),
         429 => Some("ai/rate-limited"),
         502 | 503 | 529 => Some("ai/overloaded"),
+        // The provider refused the request itself (a parameter, the schema, the size, billing):
+        // not an answer that could not be read. Its `error.type` goes to the log ([`error_type`]).
+        400..=499 => Some("ai/bad-request"),
         s if !(200..300).contains(&s) => Some("ai/bad-response"),
         _ => None,
+    }
+}
+
+/// What kind of refusal a 4xx body names (`error.type`, in Anthropic's body and the OpenAI
+/// dialect's alike), for the log: one of the providers' documented types, `other` for a type not
+/// among them, `none` when the body names none. Never the message, and never an unknown type's
+/// text: either could echo the request, and the request is a hearing record.
+pub(super) fn error_type(body: &str) -> &'static str {
+    const KNOWN: [&str; 12] = [
+        "invalid_request_error",
+        "authentication_error",
+        "billing_error",
+        "permission_error",
+        "not_found_error",
+        "request_too_large",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+        "timeout_error",
+        "insufficient_quota",
+        "server_error",
+    ];
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    match v.pointer("/error/type").and_then(|t| t.as_str()) {
+        None => "none",
+        Some(t) => KNOWN.iter().copied().find(|k| *k == t).unwrap_or("other"),
     }
 }
 
@@ -333,6 +362,10 @@ pub(super) async fn call(
 ) -> std::result::Result<String, &'static str> {
     let url = call_url(ai, allow_lan)?;
     let (status, text) = post_json(&url, &auth_headers(ai.provider, key), &body.to_string(), CALL_TIMEOUT_MS).await?;
+    if (400..500).contains(&status) {
+        // The kind of refusal only (`error_type`): never the message, which could echo the turn.
+        console_log!("[bot] ai model refused the request: {status} {}", error_type(&text));
+    }
     parse_response(ai.provider, status, &text)
 }
 

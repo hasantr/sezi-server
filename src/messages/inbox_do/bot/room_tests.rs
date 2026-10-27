@@ -114,16 +114,16 @@ fn the_key_goes_to_active_members_live_devices_only() {
 fn the_room_round_leaves_the_drain_its_floor() {
     use super::super::builtin_policy::{drain_budget, TICK_PURSE};
     for round in 0..=TICK_PURSE + 5 {
-        let room = room_budget(round);
+        let room = room_budget(TICK_PURSE, round);
         assert!(room <= ROOM_ROUND_MAX, "round {round}");
         if round + DRAIN_FLOOR <= TICK_PURSE {
-            assert!(drain_budget(round + room) >= DRAIN_FLOOR, "round {round}");
+            assert!(drain_budget(TICK_PURSE, round + room) >= DRAIN_FLOOR, "round {round}");
         } else {
             assert_eq!(room, 0, "round {round}: nothing left for rooms");
         }
     }
-    assert_eq!(room_budget(0), ROOM_ROUND_MAX);
-    assert_eq!(room_budget(TICK_PURSE), 0);
+    assert_eq!(room_budget(TICK_PURSE, 0), ROOM_ROUND_MAX);
+    assert_eq!(room_budget(TICK_PURSE, TICK_PURSE), 0);
 }
 
 #[test]

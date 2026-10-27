@@ -68,6 +68,30 @@ fn the_shape_is_exact() {
 }
 
 #[test]
+fn the_party_is_read_whatever_its_case() {
+    // Structured outputs do not promise an enum's casing: "DAVACI" is "davacı". Turkish case
+    // folding, so the dotless capital I is ı and the dotted one i.
+    for (p, want) in [
+        ("DAVACI", Party::Plaintiff),
+        ("Davalı", Party::Defendant),
+        ("MAHKEME", Party::Court),
+        ("BİLİRKİŞİ", Party::Expert),
+        ("Bilirkişi", Party::Expert),
+        ("TANIK", Party::Witness),
+        ("DİĞER", Party::Other),
+        (" davacı ", Party::Plaintiff),
+    ] {
+        let m = check(&answer(|v| v["decisions"][0]["party"] = p.into())).unwrap_or_else(|e| panic!("{p}: {e}"));
+        assert_eq!(m.decisions[0].party, Some(want), "{p}");
+    }
+    // Folding is Turkish, not ASCII: a dotted capital where the word has a dotless ı is another
+    // word, and an unknown party stays invalid.
+    for p in ["DAVACİ", "hakim", "davac"] {
+        assert_eq!(check(&answer(|v| v["decisions"][0]["party"] = p.into())), Err(INVALID), "{p}");
+    }
+}
+
+#[test]
 fn an_invented_or_mangled_placeholder_is_refused() {
     for p in ["[KISI_9]", "[KİŞİ_1]", "[KISI_0]", "[TCKN_1]", "[ISIM_2]"] {
         let a = answer(|v| v["decisions"][1]["text"] = format!("{p} tanık listesini sunacak").into());
@@ -95,6 +119,52 @@ fn a_name_in_the_answer_is_a_leak() {
     assert_eq!(check(&n), Err(LEAK));
     let role = answer(|v| v["attendance"][0]["role"] = "Selin DEMİRKOL".into());
     assert_eq!(check(&role), Err(LEAK));
+}
+
+/// Ordinary legal prose a model writes (all fake): citations with a slash after a dotted
+/// abbreviation, institutions whose first word is also a given name, a statute's name in capitals,
+/// a document number. Each used to reject the whole paid answer as a leak.
+const LEGAL_PROSE: [&str; 10] = [
+    "Davacı vekili Yargıtay 2.HD/2023-1234 sayılı karara dayanarak nafakanın artırılmasını istedi",
+    "4721 s.TMK/m.166 uyarınca boşanma koşulları tartışılacak",
+    "6102 s.TTK/m.5 ve HMK m.119/1-ğ uyarınca dilekçe verilecek",
+    "Davacı vekili Deniz Ticaret Hukuku alanında uzman bilirkişi atanmasını talep etti",
+    "TÜRK MEDENİ KANUNU m.166 uyarınca evlilik birliğinin temelinden sarsıldığı iddia edildi",
+    "Zafer Bayramı tatili nedeniyle duruşma ertelendi",
+    "Davalı vekili Deniz Kuvvetleri Komutanlığı'na müzekkere yazılmasını istedi",
+    "Bankanın 12.03.2024 tarihli ve 20240312 sayılı yazısı dosyaya alındı",
+    "Fatih Sultan Mehmet Köprüsü geçiş kayıtları celbedilecek",
+    "Ankara Barosu'na ve Adli Tıp Kurumu 3. İhtisas Kurulu'na yazı yazılacak",
+];
+
+#[test]
+fn ordinary_legal_prose_is_not_a_leak() {
+    for text in LEGAL_PROSE {
+        for (field, a) in [
+            ("decision", answer(|v| v["decisions"][0]["text"] = text.into())),
+            ("notes", answer(|v| v["notes"] = text.into())),
+        ] {
+            assert!(check(&a).is_ok(), "{field}: {text} → {:?}", check(&a).err());
+        }
+    }
+}
+
+#[test]
+fn a_person_or_a_company_the_model_wrote_is_still_a_leak() {
+    // The nets that matter stay: a given name with a surname, in any case, a person after a
+    // role word, an honorific, a company form — whatever institution word stands beside them
+    // elsewhere in the sentence.
+    for text in [
+        "Ümit Kaya Ticaret Sicil Müdürlüğüne başvurdu",
+        "davacı Yılmaz duruşmaya geldi",
+        "Emine Hanım dinlenecek",
+        "tanık ahmet kara gelmedi",
+        "Deniz Ticaret Ltd. Şti. vekili gelmedi",
+        "Av. Kurtuluş Kara duruşmaya katıldı",
+    ] {
+        let a = answer(|v| v["decisions"][0]["text"] = text.into());
+        assert_eq!(check(&a), Err(LEAK), "{text}");
+    }
 }
 
 #[test]
@@ -163,6 +233,10 @@ fn a_link_in_the_answer_is_refused_since_restoring_would_fill_it_with_names() {
         "bkz. www.x.example/[KISI_4]",
         "bkz. x.example/r?a=[KISI_4]",
         "bkz. HTTPS://X.EXAMPLE/[KISI_4]",
+        "bkz. evil.com.tr/[KISI_4]",
+        "bkz. Evil.COM/?ad=[KISI_4]",
+        "bkz. x.co?ad=[KISI_4]",
+        "bkz. 4.cd.example/[KISI_4]",
     ];
     for l in links {
         assert_eq!(check(&answer(|v| v["notes"] = l.into())), Err(LEAK), "notes {l}");

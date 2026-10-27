@@ -1,5 +1,6 @@
-//! The built-in runner's round in the alarm's tick: members' updates, then rows owed to the
-//! sheet (`builtin_jobs.rs`). It follows the webhook round (`deliver.rs`): oldest first, a failure
+//! The built-in runner's round in the alarm's tick: members' updates and rows owed to the sheet
+//! (`builtin_jobs.rs`) — while both have work due they take turns going first, with the round's
+//! whole budget (`policy::jobs_go_first`). It follows the webhook round (`deliver.rs`): oldest first, a failure
 //! that is tried again holds the queue behind it on the outbox's ladder, and an update the runner
 //! has handled is "taken" — the member's `forward-read`, their blue tick.
 //!
@@ -21,7 +22,10 @@
 //!
 //! **Budget** (`builtin_policy`): an item starts only when its worst case fits what the round
 //! may still spend; the outbox drain after the round gets what the round left of the tick's
-//! purse. When work is still due, the alarm re-arms at once (`bot_builtin_next`).
+//! purse. When work is still due, the alarm re-arms at once (`bot_builtin_next`) — unless the part
+//! it belongs to had its turn and moved nothing (a sheet whose address or secret is gone): that
+//! part alone then waits on the outbox's ladder, 5 s up to hourly (`policy::after_part`), until it
+//! moves again or the owner sets the bot or turns it on.
 //!
 //! **A change of configuration mid-round.** Every owner's set bumps a generation. After every
 //! `await` the round checks it and, if it moved, stops where it is — the update it was on is
@@ -30,7 +34,7 @@
 //!
 //! Nothing a member wrote, nothing the model answered, and no key is logged: codes only.
 
-use super::builtin::KV_HOLD_UNTIL;
+use super::builtin::{KV_HOLD_UNTIL, KV_JOBS_HOLD, KV_JOBS_STALLS, KV_JOBS_TURN, KV_UPDATES_HOLD, KV_UPDATES_STALLS};
 use super::builtin_ai::{self, Role, Turn};
 use super::builtin_copy::{line, Line};
 use super::builtin_policy::{self as policy, ProposalStep};
@@ -131,9 +135,47 @@ impl UserInbox {
         }
         store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_HOLD_UNTIL)]);
         let run = Run { lang: cfg.lang, cfg, bot_name, allow_lan: allow_lan(&self.env), gen };
-        if self.builtin_updates(ctx, &run, &mut spent).await {
-            self.builtin_jobs(ctx, &run, &mut spent).await;
+        // Which part has work due now, each past its own wait; while both do, they take turns
+        // going first with the round's whole budget (`policy::jobs_go_first`).
+        let (updates_next, jobs_next) = self.builtin_parts_next().unwrap_or_default();
+        let update_due = updates_next.is_some_and(|t| t <= now);
+        let job_due = jobs_next.is_some_and(|t| t <= now);
+        let turn = store.kv_get(KV_JOBS_TURN).is_some();
+        let jobs_first = policy::jobs_go_first(update_due, job_due, turn);
+        let (updates_moved, jobs_moved) = if jobs_first {
+            let jobs = self.builtin_jobs(ctx, &run, &mut spent).await;
+            let updates = update_due && self.builtin_current(&run) && self.builtin_updates(ctx, &run, &mut spent).await.1;
+            (updates, jobs)
+        } else {
+            let (go_on, updates) = match update_due {
+                true => self.builtin_updates(ctx, &run, &mut spent).await,
+                false => (true, false),
+            };
+            (updates, go_on && job_due && self.builtin_jobs(ctx, &run, &mut spent).await)
+        };
+        if !self.builtin_current(&run) {
+            return spent; // the owner's set reset the turn and the waits; this round's findings are moot
         }
+        match policy::next_jobs_turn(update_due, job_due, turn) {
+            true => store.kv_put(KV_JOBS_TURN, "1"),
+            false => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_JOBS_TURN)]),
+        }
+        // A part that had its chance and moved nothing waits on the ladder, not a hot alarm.
+        let note = |hold: &str, stalls_key: &str, due: bool, first: bool, moved: bool| {
+            let stalls = store.kv_get(stalls_key).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+            let (stalls, wait) = policy::after_part(stalls, due, first, moved);
+            match stalls {
+                0 => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(stalls_key)]),
+                n => store.kv_put(stalls_key, &n.to_string()),
+            }
+            match (wait, moved) {
+                (Some(ms), _) => store.kv_put(hold, &(now + ms).to_string()),
+                (None, true) => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(hold)]),
+                (None, false) => {}
+            }
+        };
+        note(KV_UPDATES_HOLD, KV_UPDATES_STALLS, update_due, !jobs_first, updates_moved);
+        note(KV_JOBS_HOLD, KV_JOBS_STALLS, job_due, jobs_first, jobs_moved);
         spent
     }
 
@@ -142,8 +184,9 @@ impl UserInbox {
         self.builtin_gen() == run.gen
     }
 
-    /// The updates' part of the round; `false` when the round must end here.
-    async fn builtin_updates(&self, ctx: &BotCtx, run: &Run, spent: &mut u32) -> bool {
+    /// The updates' part of the round: `false` first when the round must end here, then whether
+    /// it moved any update (handled it, or backed it off).
+    async fn builtin_updates(&self, ctx: &BotCtx, run: &Run, spent: &mut u32) -> (bool, bool) {
         let sql = self.state.storage().sql();
         let due: Vec<DueUpdate> = match sql
             .exec_raw(bs::UPDATES_DUE, Some(vec![JsValue::from_f64(UPDATE_BATCH as f64)]))
@@ -152,13 +195,14 @@ impl UserInbox {
             Ok(r) => r,
             Err(e) => {
                 console_log!("[bot] built-in queue read failed: {e:?}");
-                return true;
+                return (true, false);
             }
         };
+        let mut moved = false;
         for row in due {
             let now = (now_secs() * 1000) as i64;
             if !self.builtin_current(run) {
-                return false; // the item before awaited, and the owner changed the bot meanwhile
+                return (false, moved); // the item before awaited, and the owner changed the bot meanwhile
             }
             if row.next_at.is_some_and(|t| t > now) {
                 break;
@@ -180,21 +224,22 @@ impl UserInbox {
             let id = JsValue::from_f64(row.update_id as f64);
             match handled {
                 Handled::Done => {
+                    moved = true;
                     self.bot_updates_taken(ctx, row.update_id, row.update_id, now);
                     // A file's manifest, key and all, goes with its handled update (§8.2).
                     let _ = sql.exec_raw(super::files::FILES_OF_UPDATE_DROP, Some(vec![id.clone()]));
                     let _ = sql.exec_raw(super::deliver::HOOK_DONE, Some(vec![id]));
                 }
                 Handled::Retry => {
+                    moved = true;
                     let next = JsValue::from_f64((now + retry_delay_ms(row.attempts)) as f64);
                     let _ = sql.exec_raw(super::deliver::HOOK_RETRY, Some(vec![next, id]));
                     break;
                 }
-                Handled::NoRoom => return false,
-                Handled::Abandon => return false,
+                Handled::NoRoom | Handled::Abandon => return (false, moved),
             }
         }
-        true
+        (true, moved)
     }
 
     async fn builtin_message(

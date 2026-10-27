@@ -10,7 +10,9 @@
 //! `inference_geo` (a top-level field, `us` or `global`) pins where inference runs; the answer's
 //! `usage.input_tokens` / `usage.output_tokens` go to the audit row. No `thinking` is sent: the
 //! current models think adaptively by default, and that thinking counts against `max_tokens`,
-//! hence the room. No server-side `fallbacks` either: a fallback may route to a Covered Model,
+//! hence the room — and `output_config.effort` (beside `format`) says how hard to think, rather
+//! than a model's default. No sampling parameters (the current models refuse them). No
+//! server-side `fallbacks` either: a fallback may route to a Covered Model,
 //! which §5.1 rules out for this bot — a refusal is answered rule-only instead.
 //!
 //! **The OpenAI dialect** (a direct `chat/completions`, never OpenRouter):
@@ -22,10 +24,23 @@
 use super::builtin_ai::{auth_headers, endpoint_for, http_failure};
 use crate::bots::builtin_rules::{HearingsConfig, Provider};
 
-/// Output tokens, thinking included (a 20-page record's decisions fit with room to think).
-pub(super) const MAX_OUTPUT_TOKENS: u32 = 16_000;
-/// How long the model may take: longer than the AI bot's minute, the input is a whole record.
-pub(super) const CALL_TIMEOUT_MS: u64 = 120_000;
+/// Anthropic's output ceiling, thinking included. The current models think adaptively and that
+/// thinking counts against `max_tokens`, so 16,000 could be spent thinking on a 20-page record
+/// before the JSON was finished (a cut-off answer is `hearings/model-invalid`, rule-only). Billed
+/// by what is used, not by this ceiling; [`EFFORT`] is what keeps the use down.
+pub(super) const ANTHROPIC_MAX_OUTPUT_TOKENS: u32 = 32_000;
+/// The OpenAI dialect's: its `max_tokens` above a model's own limit is a 400, and 16,384 is the
+/// ceiling of many of them.
+pub(super) const OPENAI_MAX_OUTPUT_TOKENS: u32 = 16_000;
+/// How hard the model thinks (`output_config.effort`). Said, never left to a default: Sonnet
+/// 5.5's is `high`, Haiku 5.5's `medium`, and the levels moved between generations. Restating
+/// numbered decisions and copying their deadline phrases is extraction, not a hard problem:
+/// `medium` keeps the thinking — the tokens and the wait — down without a weaker summary, and
+/// everything that matters is checked by the validator and the rules anyway.
+pub(super) const EFFORT: &str = "medium";
+/// How long the model may take, one non-streamed answer to a whole record: well past the AI bot's
+/// minute. A call given up on is a passing failure, tried again (`hearings_pipeline::after_call`).
+pub(super) const CALL_TIMEOUT_MS: u64 = 210_000;
 /// The schema's name in the OpenAI dialect.
 const SCHEMA_NAME: &str = "hearing_summary";
 
@@ -145,15 +160,15 @@ pub(super) fn request_body(h: &HearingsConfig, masked: &str) -> serde_json::Valu
     match h.provider {
         Provider::Anthropic => serde_json::json!({
             "model": h.model,
-            "max_tokens": MAX_OUTPUT_TOKENS,
+            "max_tokens": ANTHROPIC_MAX_OUTPUT_TOKENS,
             "system": SYSTEM_PROMPT,
             "messages": [{ "role": "user", "content": user }],
-            "output_config": { "format": { "type": "json_schema", "schema": schema() } },
+            "output_config": { "effort": EFFORT, "format": { "type": "json_schema", "schema": schema() } },
             "inference_geo": h.inference_geo.as_str(),
         }),
         Provider::Openai => serde_json::json!({
             "model": h.model,
-            "max_tokens": MAX_OUTPUT_TOKENS,
+            "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
             "messages": [
                 { "role": "system", "content": SYSTEM_PROMPT },
                 { "role": "user", "content": user },

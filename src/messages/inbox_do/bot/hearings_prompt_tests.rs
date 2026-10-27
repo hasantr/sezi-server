@@ -50,15 +50,25 @@ fn anthropic_gets_the_schema_the_geo_and_the_masked_record_only() {
     assert_eq!(body["output_config"]["format"]["type"], "json_schema");
     assert_eq!(body["output_config"]["format"]["schema"], schema());
     assert_eq!(body["inference_geo"], "us");
-    assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS);
+    // Thinking is adaptive and shares max_tokens with the answer: the effort is said, not left to
+    // a model's default (Sonnet 5.5's is `high`), and the ceiling leaves room for both.
+    assert_eq!(body["output_config"]["effort"], "medium");
+    assert_eq!(body["output_config"].as_object().unwrap().len(), 2, "effort and format, nothing else");
+    assert_eq!(body["max_tokens"], 32_000);
+    assert_eq!(body["max_tokens"], ANTHROPIC_MAX_OUTPUT_TOKENS);
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1, "no history: this kind keeps no turns");
     assert_eq!(messages[0]["content"], "<zabit>\nDAVACI : [KISI_1]\n</zabit>");
-    // Not sent: no thinking config (adaptive is the default), no sampling, no fallbacks (they may
-    // route to a Covered Model, §5.1), no tools.
-    for k in ["thinking", "temperature", "fallbacks", "tools", "metadata"] {
+    // Not sent: no thinking config (adaptive is the default), no sampling (refused by the current
+    // models), no fallbacks (they may route to a Covered Model, §5.1), no tools, nothing else.
+    for k in ["thinking", "temperature", "top_p", "top_k", "fallbacks", "tools", "metadata", "effort", "stream"] {
         assert!(body.get(k).is_none(), "{k}");
     }
+    let mut keys: Vec<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["inference_geo", "max_tokens", "messages", "model", "output_config", "system"]);
+    // A whole record at medium effort, not streamed: three minutes and more before giving up.
+    assert!((180_000..=240_000).contains(&CALL_TIMEOUT_MS), "{CALL_TIMEOUT_MS}");
     assert_eq!(endpoint(&h), "https://api.anthropic.com/v1/messages");
     let hs = headers(&h, "sk-ant-x");
     assert!(hs.contains(&("x-api-key", "sk-ant-x".into())));
@@ -76,6 +86,9 @@ fn the_openai_dialect_is_strict_json_schema_and_has_no_geo() {
     assert_eq!(body["response_format"]["json_schema"]["schema"], schema());
     assert_eq!(body["messages"][0]["role"], "system");
     assert!(body.get("inference_geo").is_none());
+    // Anthropic's effort is not this dialect's; its ceiling stays where most of its models allow.
+    assert!(body.get("output_config").is_none() && body.get("reasoning_effort").is_none());
+    assert_eq!(body["max_tokens"], OPENAI_MAX_OUTPUT_TOKENS);
     assert_eq!(endpoint(&h), "https://api.openai.com/v1/chat/completions");
 }
 
@@ -122,6 +135,9 @@ fn the_reply_is_read_with_its_tokens_and_every_failure_is_a_code() {
     assert_eq!(parse_response(Provider::Anthropic, 200, &cut.to_string()), Err("hearings/model-invalid"));
     let refused = serde_json::json!({ "content": [], "stop_reason": "refusal" });
     assert_eq!(parse_response(Provider::Anthropic, 200, &refused.to_string()), Err("ai/refused"));
+    // A request the provider refused (a schema or parameter it will not take) says so.
+    let bad = r#"{"type":"error","error":{"type":"invalid_request_error","message":"…"}}"#;
+    assert_eq!(parse_response(Provider::Anthropic, 400, bad), Err("ai/bad-request"));
     for (status, code) in [(0, "ai/unreachable"), (401, "ai/bad-key"), (404, "ai/bad-model"), (429, "ai/rate-limited"), (529, "ai/overloaded"), (500, "ai/bad-response")] {
         assert_eq!(parse_response(Provider::Anthropic, status, ""), Err(code));
     }

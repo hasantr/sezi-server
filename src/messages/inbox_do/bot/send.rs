@@ -21,6 +21,50 @@ pub(super) fn new_msg_uid() -> String {
     format!("b-{}", uuid::Uuid::new_v4())
 }
 
+/// Bind: user.
+pub(super) const SENT_FAIL_USER: &str = "UPDATE bot_sent SET failed = 1 WHERE user_id = ?";
+/// Bind: user, pending_id.
+pub(super) const SENT_COUNT_PENDING: &str = "SELECT COUNT(*) FROM bot_sent WHERE user_id = ? AND pending_id = ?";
+/// Bind: user, pending_id.
+pub(super) const SENT_FAIL_PENDING: &str = "UPDATE bot_sent SET failed = 1 WHERE user_id = ? AND pending_id = ?";
+/// Rows whose `/notify` has not answered yet, of one device. Bind: user, device.
+pub(super) const SENT_FAIL_UNRECORDED_DEVICE: &str =
+    "UPDATE bot_sent SET failed = 1 WHERE user_id = ? AND device_id = ? AND pending_id IS NULL";
+/// The same, of every device. Bind: user.
+pub(super) const SENT_FAIL_UNRECORDED: &str =
+    "UPDATE bot_sent SET failed = 1 WHERE user_id = ? AND pending_id IS NULL";
+
+/// Mark for a resend what a member's `delivery_failed` names.
+///
+/// `ids` are the member inbox's `pending` row ids of the frames that did not open (its ack path
+/// forwards the rows it deleted, `ack.rs`), which is what the outbox wrote into
+/// `bot_sent.pending_id` when `/notify` answered. Only those are marked: until 2026-10-27 every
+/// message of the member's last 7 days was, and the next pair-ack resent them all.
+/// - No ids: the whole member, as before (nothing better is known).
+/// - Ids none of which is recorded: the member's device answered before the bot heard `/notify`'s
+///   answer, so the frame is one of that device's rows with no `pending_id` yet; those are
+///   marked. A resend of one that did open is the same `msg_uid`, which the member's kernel drops.
+pub(super) fn mark_failed(db: &impl super::store::Exec, from: &str, device: Option<&str>, ids: &[i64]) {
+    use super::store::Arg;
+    if ids.is_empty() {
+        db.run(SENT_FAIL_USER, &[Arg::T(from)]);
+        return;
+    }
+    let mut recorded = false;
+    for &id in ids {
+        if db.int(SENT_COUNT_PENDING, &[Arg::T(from), Arg::I(id)]).unwrap_or(0) > 0 {
+            recorded = true;
+            db.run(SENT_FAIL_PENDING, &[Arg::T(from), Arg::I(id)]);
+        }
+    }
+    if !recorded {
+        match device {
+            Some(d) => db.run(SENT_FAIL_UNRECORDED_DEVICE, &[Arg::T(from), Arg::T(d)]),
+            None => db.run(SENT_FAIL_UNRECORDED, &[Arg::T(from)]),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct FailedRow {
     device_id: String,
@@ -143,20 +187,25 @@ impl UserInbox {
 
     /// The engine's `Effect::Repair`: the bot's own pair-ack to every device of `user`, then what
     /// that member could not read. Best effort: a failure waits for the next frame or
-    /// `delivery_failed`.
-    pub(super) async fn bot_repair(&self, ctx: &BotCtx, user: &str) {
-        if let Err(e) = self.bot_repair_inner(ctx, user).await {
+    /// `delivery_failed`. The subrequests it spent (at most `builtin_policy::REPAIR_BASE`, save a
+    /// resend to a device the pair-ack could not reach).
+    pub(super) async fn bot_repair(&self, ctx: &BotCtx, user: &str) -> u32 {
+        let mut spent = 0;
+        if let Err(e) = self.bot_repair_inner(ctx, user, &mut spent).await {
             console_log!("[bot] repair of {user} failed: {e:?}");
         }
-        self.bot_resend_failed(ctx, user).await;
+        spent + self.bot_resend_failed(ctx, user).await
     }
 
-    async fn bot_repair_inner(&self, ctx: &BotCtx, user: &str) -> Result<()> {
+    async fn bot_repair_inner(&self, ctx: &BotCtx, user: &str, spent: &mut u32) -> Result<()> {
+        *spent += 1;
         let devices = self.bot_member_devices(user).await?;
         if devices.is_empty() {
             return Ok(());
         }
         let need = devices_without_session(&self.bot_store(), user, &devices);
+        // `build_device_bundle` is at most six D1 calls per claimed device (`keys/bundle_slot.rs`).
+        *spent += 6 * need.len() as u32;
         let claimed = self.bot_claim_keys(user, &need).await?;
         let now = (now_secs() * 1000) as i64;
         let effects = send_pair_ack(&mut self.bot_store(), &ctx.key, user, &devices, &claimed)
@@ -167,13 +216,16 @@ impl UserInbox {
 
     /// Send again, to the same device, every message `user` reported it could not read. After a
     /// member's pair-ack this is ALL the host does — the engine already answered the pair-ack.
-    pub(super) async fn bot_resend_failed(&self, ctx: &BotCtx, user: &str) {
-        if let Err(e) = self.bot_resend_inner(ctx, user).await {
+    /// The subrequests it spent: the member's device read and a key claim per device at most.
+    pub(super) async fn bot_resend_failed(&self, ctx: &BotCtx, user: &str) -> u32 {
+        let mut spent = 0;
+        if let Err(e) = self.bot_resend_inner(ctx, user, &mut spent).await {
             console_log!("[bot] resend to {user} failed: {e:?}");
         }
+        spent
     }
 
-    async fn bot_resend_inner(&self, ctx: &BotCtx, user: &str) -> Result<()> {
+    async fn bot_resend_inner(&self, ctx: &BotCtx, user: &str, spent: &mut u32) -> Result<()> {
         let failed: Vec<FailedRow> = self
             .state
             .storage()
@@ -186,8 +238,12 @@ impl UserInbox {
         if failed.is_empty() {
             return Ok(());
         }
+        *spent += 1;
         let devices = self.bot_member_devices(user).await?;
         let now = (now_secs() * 1000) as i64;
+        // A device is claimed for once: one with no key to claim stays without a session, and
+        // asking again for each of its rows would spend six calls a row for nothing.
+        let mut claimed_for = std::collections::BTreeSet::new();
         for row in failed {
             let (Ok(payload), Some(device)) = (
                 serde_json::from_str::<ChatPayload>(&row.payload_json),
@@ -196,7 +252,9 @@ impl UserInbox {
                 continue; // a device since removed, or a payload this build cannot read
             };
             let one = std::slice::from_ref(device);
-            let need = devices_without_session(&self.bot_store(), user, one);
+            let mut need = devices_without_session(&self.bot_store(), user, one);
+            need.retain(|d| claimed_for.insert(d.clone()));
+            *spent += 6 * need.len() as u32;
             let claimed = self.bot_claim_keys(user, &need).await?;
             match send_direct(&mut self.bot_store(), &ctx.key, user, one, &claimed, &payload) {
                 Ok(effects) => self.bot_queue_effects(effects, Some(&row.payload_json), now),
@@ -209,13 +267,10 @@ impl UserInbox {
     /// `/forward-delivery-failed` in bot mode: a member could not read what the bot sent. Mark it
     /// for a resend, let the engine wipe and (if the bot is the lower id) re-pair; nothing goes
     /// into `forward_queue`, which no socket of a bot would ever drain.
-    pub(crate) async fn bot_delivery_failed(&self, from: &str) -> Result<Response> {
+    pub(crate) async fn bot_delivery_failed(&self, from: &str, device: Option<&str>, ids: &[i64]) -> Result<Response> {
         self.bot_tables()?;
         let ctx = self.bot_ctx()?;
-        self.state.storage().sql().exec_raw(
-            "UPDATE bot_sent SET failed = 1 WHERE user_id = ?",
-            Some(vec![JsValue::from_str(from)]),
-        )?;
+        mark_failed(&self.bot_store().db, from, device, ids);
         let now = (now_secs() * 1000) as i64;
         let effects = on_delivery_failed(&mut self.bot_store(), &ctx.bot_id, from, now);
         let repair = effects.iter().any(|e| matches!(e, Effect::Repair { .. }));
@@ -282,3 +337,7 @@ impl UserInbox {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "send_tests.rs"]
+mod tests;

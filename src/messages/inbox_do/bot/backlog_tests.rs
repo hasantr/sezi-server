@@ -117,3 +117,31 @@ fn every_member_update_is_admitted_before_it_is_queued() {
     assert!(tick.contains("bot_say_busy("), "a refused member is never told");
     assert!(include_str!("send.rs").contains("backlog::NOTICE_EXPIRE"));
 }
+
+/// A program that polls but never sends `offset` confirms nothing: what it was handed stays
+/// stored for 24 h, the bot's 2,000 fill, and every member hears the program is busy while the
+/// owner's page showed nothing wrong — the program was seen, nothing waited unhanded (review
+/// 2026-10-27, #19). The full queue is said, with how much of it the program has but never
+/// confirmed.
+#[test]
+fn a_full_queue_is_shown_to_the_owner_with_what_the_program_never_confirmed() {
+    let db = db();
+    for i in 0..PER_BOT - 1 {
+        queue(&db, if i % 2 == 0 { "a" } else { "b" }, T0);
+    }
+    assert!(!backlog_full(&db), "one short of the cap");
+    db.0.execute("UPDATE bot_updates SET delivered_at = ?1", [T0]).unwrap();
+    assert_eq!(unconfirmed(&db), PER_BOT - 1, "handed out, never confirmed");
+    queue(&db, "c", T0);
+    assert!(backlog_full(&db));
+    assert!(matches!(admit(&db, "d", T0, false), Verdict::Refused { code: "bot/queue-full", .. }), "the same line");
+    // `/bot/state` says it, and the owner's listing carries it.
+    let state = include_str!("mod.rs");
+    let state = &state[state.find("fn bot_state(").unwrap()..];
+    let state = &state[..state.find("\n    }\n").unwrap()];
+    assert!(state.contains("\"backlog_full\": backlog::backlog_full(&s.db)"));
+    assert!(state.contains("\"unconfirmed\": backlog::unconfirmed(&s.db)"));
+    let admin = include_str!("../../../bots/admin.rs");
+    assert!(admin.contains("v[\"backlog_full\"] = state.backlog_full.into();"));
+    assert!(admin.contains("v[\"unconfirmed\"] = state.unconfirmed.into();"));
+}

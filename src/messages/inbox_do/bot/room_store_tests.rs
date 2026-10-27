@@ -71,7 +71,7 @@ fn a_post_waits_in_order_and_a_room_left_drops_its_posts() {
         s.db.run(POST_PUSH, &[Arg::T(room), Arg::T("{}"), Arg::I(at)]);
     }
     let next = |s: &SqlBotStore<Lite>| -> Option<(i64, String)> {
-        s.db.0.query_row(POST_NEXT, [], |r| Ok((r.get(0)?, r.get(1)?))).ok()
+        s.db.0.query_row(POST_NEXT, rusqlite::params![0, "[]"], |r| Ok((r.get(0)?, r.get(1)?))).ok()
     };
     let (first, room) = next(&s).unwrap();
     assert_eq!(room, "r");
@@ -81,7 +81,7 @@ fn a_post_waits_in_order_and_a_room_left_drops_its_posts() {
     s.db.run(POSTS_DROP_ROOM, &[Arg::T("r")]);
     assert_eq!(next(&s).map(|n| n.1), Some("q".into()));
     s.db.run(POSTS_EXPIRE, &[Arg::I(4)]);
-    assert_eq!(s.db.int(POSTS_WAITING, &[]), Some(0));
+    assert_eq!(s.db.int(POSTS_WAITING, &[Arg::I(0)]), Some(0));
 }
 
 /// A key request waits once per (room, member), the newest replacing an older one, oldest first;
@@ -97,11 +97,11 @@ fn key_requests_wait_once_per_member_and_count_as_room_work() {
         st.query_map([10], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
     };
     assert_eq!(due(&s), vec![("q".into(), "v".into(), Some("s1".into())), ("r".into(), "u".into(), Some("s2".into()))]);
-    assert_eq!(s.db.int(POSTS_WAITING, &[]), Some(2));
+    assert_eq!(s.db.int(POSTS_WAITING, &[Arg::I(0)]), Some(2));
     s.db.run(ASK_DONE, &[Arg::T("q"), Arg::T("v")]);
     s.db.run(ASKS_DROP_ROOM, &[Arg::T("r")]);
     assert!(due(&s).is_empty());
-    assert_eq!(s.db.int(POSTS_WAITING, &[]), Some(0));
+    assert_eq!(s.db.int(POSTS_WAITING, &[Arg::I(0)]), Some(0));
 }
 
 #[test]

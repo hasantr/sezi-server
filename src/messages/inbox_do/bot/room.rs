@@ -28,6 +28,7 @@
 //! session.
 
 use super::outbox::OutKind;
+use super::room_order::{self, Attempt};
 use super::room_plan::{self as plan, CLAIM_COST, READS};
 use super::room_store as rs;
 use super::store::{Arg, Exec};
@@ -70,18 +71,19 @@ pub(crate) const ROOM_DEVICES_SQL: &str = "SELECT gm.user_id AS user_id, d.devic
 const POST_TTL_MS: i64 = 24 * 3600 * 1000;
 /// A call is remembered (for `reply_to`) this long.
 pub(super) const CALL_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
-/// The most the room round may spend in one tick, and what it leaves the drain at least.
+/// The most the room round may spend in one tick on the free plan (a bigger purse raises it by
+/// as much), and what every step before the drain leaves it at least.
 pub(super) const ROOM_ROUND_MAX: u32 = 24;
 pub(super) const DRAIN_FLOOR: u32 = 10;
 /// `bot_kv`: until when the room round's work waits (a stall, an error, the bot off).
 const KV_ROOM_HOLD: &str = "room_hold_until";
+/// `bot_kv`: room rounds in a row that moved nothing (`room_plan::wait_after_stall`).
+const KV_ROOM_STALLS: &str = "room_stalls";
 
-/// What the room round may spend after the built-in round spent `round_spent` of the purse.
-pub(super) fn room_budget(round_spent: u32) -> u32 {
-    super::builtin_policy::TICK_PURSE
-        .saturating_sub(round_spent)
-        .saturating_sub(DRAIN_FLOOR)
-        .min(ROOM_ROUND_MAX)
+/// What the room round may spend of `purse` after the tick spent `spent` of it.
+pub(super) fn room_budget(purse: u32, spent: u32) -> u32 {
+    let raised = purse.saturating_sub(super::builtin_policy::TICK_PURSE);
+    super::builtin_policy::before_drain(purse, spent).min(ROOM_ROUND_MAX + raised)
 }
 
 /// What D1 says of the bot and a room.
@@ -355,40 +357,59 @@ impl UserInbox {
     /// `budget` pays. What it spent. Never leaves the alarm re-firing at once without progress.
     pub(super) async fn bot_room_round(&self, ctx: &BotCtx, budget: u32) -> u32 {
         let mut spent = 0u32;
-        let (mut progressed, mut held) = self.bot_room_asks(ctx, budget, &mut spent).await;
-        let mut failed = false;
-        while spent + READS < budget {
-            let post: Option<PostRow> = self
+        let (asks_progressed, asks_held) = self.bot_room_asks(ctx, budget, &mut spent).await;
+        let spent = std::cell::Cell::new(spent);
+        let clock = || (now_secs() * 1000) as i64;
+        // The oldest post the round may try, while the budget pays for its reads.
+        let next = |tried: &str| -> Option<(i64, PostRow)> {
+            if spent.get() + READS >= budget {
+                return None;
+            }
+            let args = vec![JsValue::from_f64(clock() as f64), JsValue::from_str(tried)];
+            let post = self
                 .state
                 .storage()
                 .sql()
-                .exec_raw(rs::POST_NEXT, sql_no_args())
+                .exec_raw(rs::POST_NEXT, Some(args))
                 .and_then(|c| c.to_array())
                 .ok()
-                .and_then(|v: Vec<PostRow>| v.into_iter().next());
-            let Some(post) = post else { break };
-            match self.bot_room_post(ctx, &post, budget, &mut spent).await {
-                Ok(PostStep::Finished) => progressed = true,
-                Ok(PostStep::Partial { progressed: p }) => {
-                    progressed |= p;
-                    break;
-                }
-                Ok(PostStep::Held) => {
-                    held = true;
-                    break;
-                }
-                Err(e) => {
-                    console_log!("[bot] room post failed: {e:?}");
-                    failed = true;
-                    break;
+                .and_then(|v: Vec<PostRow>| v.into_iter().next())?;
+            Some((post.id, post))
+        };
+        let attempt = |post: PostRow| {
+            let spent = &spent;
+            async move {
+                let mut s = spent.get();
+                let step = self.bot_room_post(ctx, &post, budget, &mut s).await;
+                spent.set(s);
+                match step {
+                    Ok(PostStep::Finished) => Attempt::Moved,
+                    Ok(PostStep::Partial { progressed }) => Attempt::Partial { progressed },
+                    Ok(PostStep::Held) => Attempt::Held,
+                    Err(e) => {
+                        console_log!("[bot] room post failed: {e:?}");
+                        Attempt::Failed
+                    }
                 }
             }
+        };
+        // In order, a poison post set aside, the set-aside ones on their own (`room_order.rs`).
+        let round = room_order::post_round(&self.bot_store().db, clock, next, attempt).await;
+        let (progressed, held, failed) = (asks_progressed || round.progressed, asks_held || round.held, round.failed);
+        let spent = spent.get();
+        let now = clock();
+        let store = self.bot_store();
+        let waiting = store.db.int(rs::POSTS_WAITING, &[Arg::I(now)]).unwrap_or(0) > 0;
+        let stalls = store.kv_get(KV_ROOM_STALLS).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let full = plan::full_round(budget);
+        let (wait, stalls) = plan::wait_after_stall(waiting, progressed && !failed, held, full, stalls);
+        match wait {
+            None | Some(0) => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_ROOM_HOLD)]),
+            Some(ms) => store.kv_put(KV_ROOM_HOLD, &(now + ms).to_string()),
         }
-        let now = (now_secs() * 1000) as i64;
-        let waiting = self.bot_store().db.int(rs::POSTS_WAITING, &[]).unwrap_or(0) > 0;
-        match plan::wait_after_round(waiting, progressed && !failed, held) {
-            None | Some(0) => self.bot_store().db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_ROOM_HOLD)]),
-            Some(ms) => self.bot_store().kv_put(KV_ROOM_HOLD, &(now + ms).to_string()),
+        match stalls {
+            0 => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_ROOM_STALLS)]),
+            n => store.kv_put(KV_ROOM_STALLS, &n.to_string()),
         }
         spent
     }
@@ -482,10 +503,12 @@ impl UserInbox {
     }
 
     /// When the room work still waiting needs the alarm: at once, unless a round said to wait.
+    /// Only set-aside posts not yet due: the earliest one's next try.
     pub(super) fn bot_room_next(&self) -> Option<i64> {
         let store = self.bot_store();
-        if store.db.int(rs::POSTS_WAITING, &[]).unwrap_or(0) == 0 {
-            return None;
+        let now = (now_secs() * 1000) as i64;
+        if store.db.int(rs::POSTS_WAITING, &[Arg::I(now)]).unwrap_or(0) == 0 {
+            return store.db.int(rs::ASIDE_NEXT, &[]);
         }
         Some(store.kv_get(KV_ROOM_HOLD).and_then(|v| v.parse().ok()).unwrap_or(0))
     }
@@ -494,7 +517,9 @@ impl UserInbox {
     /// Synchronous.
     pub(super) fn bot_room_wake(&self, now: i64) {
         let db = self.bot_store().db;
-        db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_ROOM_HOLD)]);
+        for k in [KV_ROOM_HOLD, KV_ROOM_STALLS] {
+            db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(k)]);
+        }
         db.run(super::outbox::OUTBOX_WAKE_ROOM_SENDS, &[Arg::I(now)]);
     }
 
@@ -502,6 +527,7 @@ impl UserInbox {
     pub(super) fn bot_room_housekeeping(&self, now: i64) {
         let db = self.bot_store().db;
         db.run(rs::POSTS_EXPIRE, &[Arg::I(now - POST_TTL_MS)]);
+        db.run(room_order::FAIL_ORPHANS, &[]);
         db.run(rs::CALLS_EXPIRE, &[Arg::I(now - CALL_TTL_MS)]);
     }
 }

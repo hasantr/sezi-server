@@ -34,6 +34,17 @@ const KV_LAST_OK: &str = "builtin_last_ok_at";
 const KV_LAST_ERROR: &str = "builtin_last_error";
 /// While the bot is off, the runner looks again at this time (ms).
 pub(super) const KV_HOLD_UNTIL: &str = "builtin_hold_until";
+/// Until when a part of the round that could not move its due work waits (ms), and how many
+/// rounds in a row it could not (`builtin_policy::after_part`): the members' updates and the
+/// sheet's rows each on their own, so a stuck sheet holds no member's message.
+pub(super) const KV_UPDATES_HOLD: &str = "builtin_updates_hold";
+pub(super) const KV_UPDATES_STALLS: &str = "builtin_updates_stalls";
+pub(super) const KV_JOBS_HOLD: &str = "builtin_jobs_hold";
+pub(super) const KV_JOBS_STALLS: &str = "builtin_jobs_stalls";
+/// Present while it is the sheet's rows' turn to go first (`builtin_policy::jobs_go_first`).
+pub(super) const KV_JOBS_TURN: &str = "builtin_jobs_turn";
+/// Every wait a part of the round keeps: an owner's set or `/bot/wake` ends them at once.
+const PART_WAITS: [&str; 4] = [KV_UPDATES_HOLD, KV_UPDATES_STALLS, KV_JOBS_HOLD, KV_JOBS_STALLS];
 
 /// The owner's set, as the Worker forwards it after `builtin_rules::validate`.
 #[derive(Deserialize)]
@@ -99,6 +110,10 @@ impl UserInbox {
             _ => false,
         };
         store.db.run(bs::GEN_BUMP, &[]);
+        // A part that waited on the old settings (a sheet with no address, say) is tried at once.
+        for k in PART_WAITS {
+            store.db.run("DELETE FROM bot_kv WHERE k = ?", &[super::store::Arg::T(k)]);
+        }
         // A different bot is an untested one: nothing measured on the old settings carries over.
         if builtin_policy::changes_behaviour(old.as_ref(), new.as_ref(), body.api_key.is_some()) {
             for k in [KV_LAST_OK, KV_LAST_ERROR] {
@@ -222,7 +237,7 @@ impl UserInbox {
 
     /// `/bot/wake`: the bot was turned back on; whatever waits runs now.
     pub(super) async fn bot_wake(&self) -> Result<Response> {
-        for k in [KV_HOLD_UNTIL, super::deliver::KV_WEBHOOK_HOLD] {
+        for k in [KV_HOLD_UNTIL, super::deliver::KV_WEBHOOK_HOLD].into_iter().chain(PART_WAITS) {
             self.bot_store().db.run("DELETE FROM bot_kv WHERE k = ?", &[super::store::Arg::T(k)]);
         }
         // Its room work too: posts, key requests and chunks held while it was off.
@@ -340,15 +355,30 @@ impl UserInbox {
     }
 
     /// When the runner next needs the alarm: the head of the update queue or of the sheet's,
-    /// pushed back while the bot is off. `None` for a program bot, or when nothing waits.
+    /// each pushed back while its part waits out a stall, and both while the bot is off. `None`
+    /// for a program bot, or when nothing waits.
     pub(super) fn bot_builtin_next(&self) -> Option<i64> {
-        let cfg = self.builtin_config()?;
+        let (updates, jobs) = self.builtin_parts_next()?;
+        let next = [updates, jobs].into_iter().flatten().min()?;
         let store = self.bot_store();
-        // Rows count only for a bot that writes them: the round would not send them, and an
-        // alarm armed for them would fire at once, forever.
-        let jobs = cfg.writes_sheet().then(|| store.db.int(bs::JOB_NEXT, &[])).flatten();
-        let next = [store.db.int(super::deliver::HOOK_NEXT, &[]), jobs].into_iter().flatten().min()?;
         let hold = store.kv_get(KV_HOLD_UNTIL).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
         Some(next.max(hold))
+    }
+
+    /// When each part of the round next has work: (the members' updates, the sheet's rows),
+    /// each past its own stall wait (`KV_UPDATES_HOLD`, `KV_JOBS_HOLD`). `None` for a program bot.
+    pub(super) fn builtin_parts_next(&self) -> Option<(Option<i64>, Option<i64>)> {
+        let cfg = self.builtin_config()?;
+        let store = self.bot_store();
+        let wait = |k: &str| store.kv_get(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let updates = store.db.int(super::deliver::HOOK_NEXT, &[]).map(|t| t.max(wait(KV_UPDATES_HOLD)));
+        // Rows count only for a bot that writes them: the round would not send them, and an
+        // alarm armed for them would fire at once, forever.
+        let jobs = cfg
+            .writes_sheet()
+            .then(|| store.db.int(bs::JOB_NEXT, &[]))
+            .flatten()
+            .map(|t| t.max(wait(KV_JOBS_HOLD)));
+        Some((updates, jobs))
     }
 }

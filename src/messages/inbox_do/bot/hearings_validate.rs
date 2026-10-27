@@ -10,13 +10,28 @@
 //!    may LOOK like one without being one (`[KİŞİ_1]`, `[KISI_0]`): an invented or mangled
 //!    placeholder is `hearings/model-invalid` — restoring would leave it, or worse, guess.
 //! 3. **No name-like text.** The model saw no names, so a name in its answer is fabricated or a
-//!    masking miss. Each string is run through `sezi_redact::leak_check_with` (tier 1–2 hits and
-//!    every vault value, case-folded) and through the whole redactor once more with the
-//!    placeholders blanked: anything it would mask — a person, a company, an all-caps run, a
-//!    number, another file's number — is `hearings/model-leak`. Stricter than the plan's "strip
-//!    and flag": a partial answer with holes in it is worse than the rule-only one. So is a link
-//!    (a scheme, `www.`, `host.tld/…`): the 1:1 answer restores the placeholders inside it, and a
-//!    tap would send the names to whatever address an injected record chose.
+//!    masking miss. Each string is run through `sezi_redact::leak_check_with` (tier 1–2 hits —
+//!    identity numbers, phones, e-mail, plates, case numbers, addresses — and every vault value,
+//!    case-folded): any hit is `hearings/model-leak`, with no exception. Then through the whole
+//!    redactor once more with the placeholders blanked, for what the model wrote itself: a person
+//!    (a given name and surname, a name after a role word or an honorific), a company, an all-caps
+//!    run — also `hearings/model-leak`, UNLESS the hit names an institution, a law or a day rather
+//!    than a person: its last word, or one of the two words after it, is the head of such a name
+//!    ("Zafer Bayramı", "Deniz Ticaret Hukuku", "Deniz Kuvvetleri Komutanlığı", "TÜRK MEDENİ
+//!    KANUNU"; [`INSTITUTION_HEADS`]). A company form is never excused, and the residual net for
+//!    long digit runs is not asked at all: a number the record had is a vault value (caught
+//!    above), and one the model made up is nobody's data. Until 2026-10-27 every category of the
+//!    second run rejected the answer, so ordinary legal prose fell to rule-only.
+//!
+//!    **The whole answer, not the string** (§5.4 says "stripped and flagged"): what is left to
+//!    catch is real data or a name the model put in a decision, and a summary with that decision
+//!    cut out of it is worse than the rule-only answer, which at least has every decision.
+//!
+//!    A **link** is a leak too: the 1:1 answer restores the placeholders inside it, and a tap would
+//!    send the names to whatever address an injected record chose ([`has_link`]: a scheme, `www.`,
+//!    a host of a common top-level domain before `/`, `?` or `#`, or ANY dotted host in one word
+//!    with a placeholder). A citation's slash ("Yargıtay 2.HD/2023-1234", "4721 s.TMK/m.166") is
+//!    not a link.
 //! 4. **Dates.** Real calendar dates, 2000 to (hearing date + 3 years); a next hearing after the
 //!    hearing. A bad one is `hearings/model-invalid`.
 //! 5. **The rules win.** Court and esas no never come from the model at all. The next hearing is
@@ -53,8 +68,12 @@ pub(super) enum Party {
 }
 
 impl Party {
+    /// The schema's enum, read whatever its casing: structured outputs constrain the answer to
+    /// the schema, but do not promise an enum value's case, so "DAVACI" is "davacı". Folded the
+    /// Turkish way (`I` → `ı`, `İ` → `i`, then lower case) — `str::to_lowercase` alone would make
+    /// "DAVACI" "davaci" and "BİLİRKİŞİ" an `i` with a combining dot.
     fn parse(s: &str) -> Option<Self> {
-        Some(match s {
+        Some(match fold_tr(s.trim()).as_str() {
             "davacı" => Party::Plaintiff,
             "davalı" => Party::Defendant,
             "mahkeme" => Party::Court,
@@ -247,28 +266,102 @@ fn clean(s: &str, vault: &Vault) -> Result<(), &'static str> {
     }
     blank.push_str(&s[prev..]);
     let again = redact(&blank, &Policy::default()).map_err(|_| LEAK)?;
-    let kept = |c: Category| matches!(c, Category::Esas | Category::Mahkeme);
-    if again.counts.iter().any(|(c, _, _)| !kept(c)) {
+    let leaks = again.spans.iter().any(|sp| match sp.placeholder.category {
+        // The record's own esas no and court are what the rules restore; a long digit run the
+        // model made up is nobody's (module doc, 3.).
+        Category::Esas | Category::Mahkeme | Category::Numara => false,
+        Category::Kisi | Category::Ad => !names_an_institution(&blank, sp.original.clone()),
+        _ => true,
+    });
+    if leaks {
         return Err(LEAK);
     }
     Ok(())
 }
 
-/// A web address in `s`: a scheme (`://`, `mailto:`), `www.`, or a dotted host whose last label
-/// is a word, followed by a `/` ("x.example/r?a=…"). Amounts ("3.000,00"), statutes ("HMK
-/// m.324/1", "324. md.") and times are not: their last dotted part is a number, or a space
-/// follows the dot.
+/// The head word of a name that is an institution, a law, a field of law or a day — never a
+/// person's surname — as the start of its folded form ("bakanlığ" is "Bakanlığı",
+/// "Bakanlığı'na", "Bakanlığından").
+const INSTITUTION_HEADS: [&str; 44] = [
+    "bakanlığ", "müdürlüğ", "başkanlığ", "komutanlığ", "kaymakamlığ", "valiliğ", "başsavcılığ",
+    "savcılığ", "hakimliğ", "mahkemes", "daires", "kurum", "kurul", "hastanes", "üniversites",
+    "fakültes", "enstitüs", "belediyes", "odas", "baros", "noterliğ", "kanun", "yasas", "hukuk",
+    "tüzüğ", "yönetmeliğ", "bayram", "savaş", "köprüs", "meydan", "park", "müzes", "merkez",
+    "kuvvetler", "holding", "ofis", "okul", "lises", "camii", "havaliman", "limanı", "istasyon",
+    "terminal", "gazetes",
+];
+
+/// The redactor's hit at `range` of `s` is the start of an institution's name rather than a
+/// person: its last word, or one of the next two words (joined to it by spaces), is a head in
+/// [`INSTITUTION_HEADS`].
+fn names_an_institution(s: &str, range: std::ops::Range<usize>) -> bool {
+    let word_key = |w: &str| {
+        // A suffix after an apostrophe is the case ending: "Komutanlığı'na" is "komutanlığı".
+        let w = w.split(['\'', '’']).next().unwrap_or("");
+        fold_tr(w.trim_matches(|c: char| !c.is_alphanumeric()))
+    };
+    let is_head = |w: &str| {
+        let k = word_key(w);
+        !k.is_empty() && INSTITUTION_HEADS.iter().any(|h| k.starts_with(h))
+    };
+    let hit = s.get(range.clone()).unwrap_or("");
+    if hit.split_whitespace().last().is_some_and(is_head) {
+        return true;
+    }
+    s.get(range.end..).unwrap_or("").split_whitespace().take(2).any(is_head)
+}
+
+/// Lower case, the Turkish way: `I` → `ı`, `İ` → `i` (`str::to_lowercase` alone makes "DAVACI"
+/// "davaci" and "İ" an `i` with a combining dot).
+fn fold_tr(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            'I' => vec!['ı'],
+            'İ' => vec!['i'],
+            c => c.to_lowercase().collect(),
+        })
+        .collect()
+}
+
+/// Top-level domains a link is recognised by when nothing else marks it as one: the common
+/// generic and country ones, and the reserved names examples use. A legal abbreviation before a
+/// slash ("2.HD/", "s.TMK/", "m.119/") is none of these.
+const LINK_TLDS: [&str; 40] = [
+    "com", "net", "org", "info", "biz", "io", "co", "me", "app", "dev", "xyz", "site", "online", "link",
+    "top", "shop", "club", "page", "pw", "ws", "tr", "gov", "edu", "ai", "ly", "to", "cc", "tv", "us", "uk",
+    "eu", "de", "ru", "nl", "fr", "cn", "example", "test", "invalid", "localhost",
+];
+
+/// A web address in `s`: a scheme (`://`, `mailto:`), `www.`, a dotted host whose last label is
+/// one of [`LINK_TLDS`] followed by `/`, `?` or `#` ("x.example/r?a=…", "x.co?ad=…"), or — in a
+/// word that also holds a placeholder — ANY dotted host before `/`, `?` or `#`: restoring would
+/// put a name into it, so no top-level domain is given the benefit of the doubt there. Citations
+/// ("Yargıtay 2.HD/2023-1234", "4721 s.TMK/m.166", "HMK m.119/1"), amounts and dates are not.
 fn has_link(s: &str) -> bool {
     let low = s.to_lowercase();
     if low.contains("://") || low.contains("www.") || low.contains("mailto:") {
         return true;
     }
     let host_char = |c: char| c.is_alphanumeric() || c == '-' || c == '.';
-    low.match_indices('/').any(|(i, _)| {
+    // Start of the whitespace-delimited word around byte `i`, and its end.
+    let word_of = |i: usize| {
+        let start = low[..i].rfind(char::is_whitespace).map_or(0, |k| k + low[k..].chars().next().map_or(1, char::len_utf8));
+        let end = low[i..].find(char::is_whitespace).map_or(low.len(), |k| i + k);
+        &low[start..end]
+    };
+    low.match_indices(['/', '?', '#']).any(|(i, _)| {
         let start = low[..i].char_indices().rev().take_while(|&(_, c)| host_char(c)).last().map_or(i, |(k, _)| k);
         let labels: Vec<&str> = low[start..i].split('.').collect();
-        let tld = labels.last().copied().unwrap_or("");
-        labels.len() >= 2 && !labels[0].is_empty() && tld.chars().count() >= 2 && tld.chars().all(char::is_alphabetic)
+        if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+            return false;
+        }
+        let tld = labels[labels.len() - 1];
+        if LINK_TLDS.contains(&tld) {
+            return true;
+        }
+        let word = word_of(i);
+        let dotted_word = tld.chars().any(char::is_alphabetic) || labels.iter().any(|l| l.chars().any(char::is_alphabetic));
+        dotted_word && !placeholders_in(&word.to_uppercase()).is_empty()
     })
 }
 

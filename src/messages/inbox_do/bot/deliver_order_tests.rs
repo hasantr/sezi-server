@@ -58,16 +58,21 @@ impl Sim {
 
     /// One tick's webhook round, as `bot_deliver_webhooks` drives it.
     fn round(&self) {
+        self.round_within(WEBHOOK_BATCH);
+    }
+
+    /// The same, with `max_posts` of the tick's purse.
+    fn round_within(&self, max_posts: i64) -> (bool, i64) {
         let c = &self.db.0;
-        let main = rows(c, HOOK_DUE, &[WEBHOOK_BATCH]);
+        let main = rows(c, HOOK_DUE, &[max_posts]);
         let now = self.clock.get();
         let aside = |limit: i64| rows(c, ASIDE_DUE, &[now, limit]);
-        block_on(hook_round(&self.db, main, aside, || self.clock.get(), |id, json| {
+        block_on(hook_round(&self.db, main, aside, max_posts, || self.clock.get(), |id, json| {
             assert!(json.contains(&format!("\"update_id\":{id}")), "the POST names its update");
             let taken = !(self.refuse)(id);
             self.posts.borrow_mut().push((self.clock.get(), id, taken));
             std::future::ready(taken)
-        }));
+        }))
     }
 
     /// Run the alarm until `end`: each tick at the time the queue asks for.
@@ -106,6 +111,29 @@ impl Sim {
     fn aside(&self) -> i64 {
         self.db.int(ASIDE_COUNT, &[]).unwrap()
     }
+}
+
+/// The round makes no more POSTs than the tick's purse handed it — the queue's and the set-aside
+/// ones' together — and says how many it made, which the tick counts (review 2026-10-27, #13).
+#[test]
+fn a_round_posts_no_more_than_its_share_of_the_purse() {
+    let sim = Sim::new(|id| id == 1);
+    for _ in 0..8 {
+        sim.push();
+    }
+    // Fail the head into a set-aside: five rounds, each one POST.
+    for _ in 0..ASIDE_AFTER {
+        sim.clock.set(sim.clock.get() + 3_600_000);
+        sim.round_within(1);
+    }
+    assert_eq!(sim.posts.borrow().len(), ASIDE_AFTER as usize, "one POST a round");
+    sim.clock.set(sim.clock.get() + 3_600_000);
+    assert_eq!(sim.round_within(3), (true, 3), "the head's fifth failure, its probe, one more");
+    assert_eq!(sim.round_within(0), (false, 0), "no share: no POST");
+    sim.clock.set(sim.clock.get() + 3_600_000);
+    let (_, posts) = sim.round_within(WEBHOOK_BATCH);
+    assert!(posts <= WEBHOOK_BATCH);
+    assert_eq!(sim.posts.borrow().len() as i64, ASIDE_AFTER + 3 + posts);
 }
 
 /// One update the program always refuses used to hold every later one for its whole 24 hours.

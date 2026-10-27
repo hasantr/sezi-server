@@ -158,3 +158,25 @@ fn a_held_webhook_queue_waits_for_the_hold_and_an_empty_one_arms_nothing() {
     assert_eq!(webhook_next(Some(0), Some(9_000)), Some(9_000), "off: not a hot loop");
     assert_eq!(webhook_next(Some(20_000), Some(9_000)), Some(20_000), "a back-off past the hold");
 }
+
+/// `setWebhook` wrote the URL and answered 204, arming nothing: a backlog left from polling was
+/// not POSTed until the next member's frame woke the inbox, and could expire at 24 h first
+/// (review 2026-10-27, #4). Every door that creates work arms the alarm; this one too.
+#[test]
+fn setting_a_webhook_or_its_renewed_secret_arms_the_alarm() {
+    let code = include_str!("deliver.rs").split("#[cfg(test)]").next().unwrap();
+    let set = fn_body(code, "bot_set_webhook");
+    let stored = set.find("kv_put(\"webhook_url\"").expect("the URL is stored");
+    let arm = set.find("arm_alarm_within(0)").expect("setWebhook arms no alarm");
+    assert!(stored < arm, "armed before the URL is in place");
+    let renew = fn_body(code, "bot_set_webhook_secret");
+    let stored = renew.find("kv_put(\"webhook_secret\"").expect("the secret is stored");
+    let arm = renew.find("arm_alarm_within(0)").expect("a renewed secret arms no alarm");
+    assert!(stored < arm, "armed before the secret is in place");
+    // The routes await them: an alarm armed inside a future nobody polls is never armed.
+    let routes = include_str!("mod.rs");
+    for f in ["bot_set_webhook(", "bot_set_webhook_secret("] {
+        let at = routes.find(&format!("self.{f}")).expect(f);
+        assert!(routes[at..at + 80].contains(".await"), "{f} is not awaited");
+    }
+}

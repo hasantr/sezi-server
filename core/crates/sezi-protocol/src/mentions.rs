@@ -162,7 +162,7 @@ mod tests {
         let body = "Ödevimi gönderdim @Ayşe Demir bakar mısınız?";
         let at = utf16_len("Ödevimi gönderdim ");
         let span = MentionSpan::user("u-ayse", at, utf16_len("@Ayşe Demir"));
-        assert_eq!(vet(body, &[span.clone()]), vec![span]);
+        assert_eq!(vet(body, std::slice::from_ref(&span)), vec![span]);
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
         // The party popper is one char, two UTF-16 units: the `@` is at 3, not 2.
         assert_eq!(vet(body, &[MentionSpan::user("u-can", 2, 4)]), vec![]);
         let ok = MentionSpan::user("u-can", 3, 4);
-        assert_eq!(vet(body, &[ok.clone()]), vec![ok]);
+        assert_eq!(vet(body, std::slice::from_ref(&ok)), vec![ok]);
     }
 
     #[test]

@@ -63,6 +63,7 @@ mod ingest;
 mod outbox;
 mod room;
 mod room_asks;
+mod room_order;
 mod room_plan;
 mod room_send;
 mod room_store;
@@ -174,8 +175,8 @@ impl UserInbox {
             }
             (Method::Post, "/bot/budget") => self.bot_take_call(),
             (Method::Get, "/bot/state") => self.bot_state(),
-            (Method::Post, "/bot/webhook") => self.bot_set_webhook(req.json().await?),
-            (Method::Post, "/bot/webhook-secret") => self.bot_set_webhook_secret(req.json().await?),
+            (Method::Post, "/bot/webhook") => self.bot_set_webhook(req.json().await?).await,
+            (Method::Post, "/bot/webhook-secret") => self.bot_set_webhook_secret(req.json().await?).await,
             (Method::Post, "/bot/ping") => {
                 let body: serde_json::Value = req.json().await?;
                 self.bot_ping(body.get("who").cloned().unwrap_or_default()).await
@@ -283,6 +284,10 @@ impl UserInbox {
             "webhook": s.kv_get("webhook_url").is_some(),
             // Set, but its URL fails the outbound rule now: delivered nothing (`deliver::Hook`).
             "webhook_refused": self.bot_webhook() == deliver::Hook::Refused,
+            // At its 2,000: nobody's new message is queued (`backlog.rs`) — most often a program
+            // that polls and never confirms, which `unconfirmed` counts.
+            "backlog_full": backlog::backlog_full(&s.db),
+            "unconfirmed": backlog::unconfirmed(&s.db),
         });
         if let (Some(m), serde_json::Value::Object(b)) = (state.as_object_mut(), self.builtin_state()) {
             m.extend(b);

@@ -348,7 +348,7 @@ impl DurableObject for UserInbox {
             (Method::Post, "/forward-delivery-failed") => {
                 let body: ForwardIdsBody = req.json().await?;
                 if self.is_bot().await {
-                    return self.bot_delivery_failed(&body.from).await;
+                    return self.bot_delivery_failed(&body.from, body.device_for_forward(), &body.ids).await;
                 }
                 self.forward_signal(
                     "delivery_failed",

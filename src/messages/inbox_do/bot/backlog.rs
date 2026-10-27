@@ -65,10 +65,25 @@ pub(super) enum Verdict {
     Refused { code: &'static str, tell: bool },
 }
 
+/// Updates handed to the program by a poll that it has not confirmed with `offset` yet.
+pub(super) const UNCONFIRMED: &str = "SELECT COUNT(*) FROM bot_updates WHERE delivered_at IS NOT NULL";
+
+/// Is the bot's queue at [`PER_BOT`], so that nobody's new message is queued? The owner sees it
+/// (`/bot/state`, `GET /admin/bots`): a program that polls and never sends `offset` fills it with
+/// what it was handed while it looks alive, and members are told the program is busy.
+pub(super) fn backlog_full<E: Exec>(db: &E) -> bool {
+    db.int(STORED, &[]).unwrap_or(0) >= PER_BOT
+}
+
+/// How many stored updates the program has been handed but never confirmed ([`UNCONFIRMED`]).
+pub(super) fn unconfirmed<E: Exec>(db: &E) -> i64 {
+    db.int(UNCONFIRMED, &[]).unwrap_or(-1)
+}
+
 /// Judge `from`'s next update, and take the notice when it is refused and `may_tell`.
 /// Synchronous: it runs inside the frame's block.
 pub(super) fn admit<E: Exec>(db: &E, from: &str, now: i64, may_tell: bool) -> Verdict {
-    let code = if db.int(STORED, &[]).unwrap_or(0) >= PER_BOT {
+    let code = if backlog_full(db) {
         "bot/queue-full"
     } else if db.int(WAITING_FROM, &[Arg::T(from)]).unwrap_or(0) >= PER_SENDER {
         "bot/sender-backlog"

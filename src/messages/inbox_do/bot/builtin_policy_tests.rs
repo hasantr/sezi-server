@@ -10,12 +10,78 @@ fn no_round_and_drain_together_pass_the_tick_purse() {
     let worst_round = ROUND_BUDGET + MAX_CLAIMS_COST;
     assert!(worst_round <= TICK_PURSE, "{worst_round} > {TICK_PURSE}");
     for spent in 0..=worst_round {
-        assert!(spent + drain_budget(spent) <= TICK_PURSE, "spent {spent}");
+        assert!(spent + drain_budget(TICK_PURSE, spent) <= TICK_PURSE, "spent {spent}");
     }
-    assert_eq!(drain_budget(0), DRAIN_CEILING, "a program bot's tick drains as before");
+    assert_eq!(drain_budget(TICK_PURSE, 0), DRAIN_CEILING, "a program bot's tick drains as before");
     assert_eq!(DRAIN_CEILING, super::super::outbox::DRAIN_BUDGET);
     // With the tick's own fixed work, inside the 50 `messages/budget.rs` assumes.
-    assert!(TICK_PURSE as usize + 5 <= crate::messages::budget::FREE_PLAN_SUBREQUESTS);
+    assert!(TICK_PURSE + TICK_FIXED <= crate::messages::budget::FREE_PLAN_SUBREQUESTS as u32);
+}
+
+/// The purse was a fixed 45 whatever the relay's ceiling, so an owner who raised
+/// `SUBREQUEST_BUDGET` (a paid plan, a self-hosted relay) bought the bots nothing (review
+/// 2026-10-27, #13). It follows the ceiling up; below the free plan's it stays the free plan's,
+/// which every plan has and the arithmetic here needs.
+#[test]
+fn the_tick_purse_follows_the_relays_subrequest_ceiling() {
+    use crate::messages::budget::{FREE_PLAN_SUBREQUESTS, MAX_BUDGET};
+    assert_eq!(tick_purse(FREE_PLAN_SUBREQUESTS), TICK_PURSE);
+    assert_eq!(tick_purse(100), 100 - TICK_FIXED);
+    assert_eq!(tick_purse(20), TICK_PURSE, "the floor");
+    assert_eq!(tick_purse(MAX_BUDGET), MAX_BUDGET as u32 - TICK_FIXED);
+    let big = tick_purse(200);
+    assert!(drain_budget(big, 0) > DRAIN_CEILING, "a bigger purse drains more");
+    assert!(super::super::room::room_budget(big, 0) > super::super::room::ROOM_ROUND_MAX);
+}
+
+/// Webhook POSTs and re-pairs were spent before the purse was counted, so a busy tick on the
+/// free plan's 50 could overrun it (review 2026-10-27, #13). Every step at its worst, in the
+/// tick's order, fits the ceiling.
+#[test]
+fn every_step_of_a_tick_at_its_worst_fits_the_ceiling() {
+    use super::super::deliver_order::{webhook_posts, WEBHOOK_OVERHEAD};
+    use super::super::room::{room_budget, DRAIN_FLOOR};
+    for budget in [crate::messages::budget::FREE_PLAN_SUBREQUESTS, 64, 100, 300, 900] {
+        let purse = tick_purse(budget);
+        let mut spent = 0;
+        let mut repairs = 0;
+        while may_repair(purse, spent) {
+            spent += REPAIR_BASE;
+            repairs += 1;
+        }
+        assert!(repairs >= 1, "budget {budget}: a re-pair always fits a fresh tick");
+        let hooks = before_drain(purse, spent);
+        let posts = webhook_posts(hooks);
+        if posts > 0 {
+            spent += WEBHOOK_OVERHEAD + posts as u32;
+        }
+        if may_start_round(purse, spent) {
+            spent += ROUND_BUDGET + MAX_CLAIMS_COST;
+        }
+        spent += room_budget(purse, spent);
+        let drain = drain_budget(purse, spent);
+        assert!(drain >= DRAIN_FLOOR, "budget {budget}: the drain is left its floor");
+        spent += drain;
+        assert!(spent + TICK_FIXED <= budget as u32, "budget {budget}: {spent} + {TICK_FIXED}");
+    }
+    // A fresh tick with nothing before it: the webhook takes its whole batch, the round starts.
+    assert_eq!(webhook_posts(before_drain(TICK_PURSE, 0)), super::super::deliver_order::WEBHOOK_BATCH);
+    assert!(may_start_round(TICK_PURSE, 0));
+    assert_eq!(webhook_posts(WEBHOOK_OVERHEAD), 0, "no room for a POST: none is made");
+}
+
+#[test]
+fn the_tick_counts_what_its_webhooks_and_repairs_spend() {
+    let tick = include_str!("ingest.rs");
+    let tick = &tick[tick.find("async fn bot_tick_inner(").unwrap()..];
+    let tick = &tick[..tick.find("\n    }\n").unwrap()];
+    assert!(tick.contains("tick_purse(crate::messages::budget::resolve_budget(&self.env))"));
+    for step in ["self.bot_owed_repairs(", "self.bot_say_busy(", "self.bot_deliver_webhooks("] {
+        let at = tick.find(step).unwrap_or_else(|| panic!("{step}"));
+        assert!(tick[..at].ends_with("spent += "), "{step} is not counted");
+    }
+    let src = include_str!("deliver.rs");
+    assert!(src.contains("async fn bot_deliver_webhooks(&self, ctx: &BotCtx, budget: u32) -> u32"));
 }
 
 #[test]
@@ -231,6 +297,74 @@ fn a_sheet_bot_takes_a_bounded_number_of_rows_from_one_member_a_day() {
     let queue = body.find("builtin_queue_row(").expect("and queues the row");
     assert!(ask < queue, "the cap is asked before the row is queued");
     assert!(body.contains("SHEET_USAGE_BUMP"), "every row is counted");
+}
+
+/// The sheet's rows ran only after the members' updates and only while a row's worst case still
+/// fit, so a steady stream of messages to an AI or hearings bot held them indefinitely (review
+/// 2026-10-27, #14). While both are due they take turns going first, with the round's whole
+/// budget.
+#[test]
+fn updates_and_sheet_rows_take_turns_while_both_are_due() {
+    let mut turn = false;
+    let mut firsts = Vec::new();
+    for _ in 0..4 {
+        firsts.push(jobs_go_first(true, true, turn));
+        turn = next_jobs_turn(true, true, turn);
+    }
+    assert_eq!(firsts, [false, true, false, true], "turn about");
+    // The round's whole budget is enough for a row, so the row going first is written.
+    assert!(fits(1, JOB_BASE), "after the gate's read");
+    // Only one due: it goes first, and the turn stays where it was.
+    assert!(jobs_go_first(false, true, false));
+    assert!(!jobs_go_first(true, false, true));
+    assert!(next_jobs_turn(false, true, true) && !next_jobs_turn(true, false, false));
+}
+
+/// `bot_builtin_next` answered 0 while anything was due, so a part that could not move its due
+/// work (a sheet whose address or secret is gone, say) re-armed the alarm at once on every tick
+/// for as long as the work was there (review 2026-10-27, #14). It now waits on the outbox's
+/// ladder, and only that part waits.
+#[test]
+fn a_part_that_cannot_move_its_due_work_backs_off_and_progress_resets_it() {
+    let mut stalls = 0;
+    let mut waits = Vec::new();
+    for _ in 0..6 {
+        let (s, wait) = after_part(stalls, true, true, false);
+        stalls = s;
+        waits.push(wait.expect("a stall always waits"));
+    }
+    assert_eq!(waits, [5_000, 30_000, 120_000, 600_000, 3_600_000, 3_600_000]);
+    assert_eq!(after_part(stalls, true, true, true), (0, None), "it moved: back to at once");
+    assert_eq!(after_part(3, true, false, false), (3, None), "not given its turn: no stall");
+    assert_eq!(after_part(3, false, true, false), (3, None), "nothing was due");
+}
+
+#[test]
+fn the_round_holds_each_part_on_its_own() {
+    let src = include_str!("builtin.rs");
+    let body = |name: &str| {
+        let f = &src[src.find(&format!("fn {name}(")).unwrap()..];
+        &f[..f.find("\n    }\n").unwrap()]
+    };
+    assert!(body("bot_builtin_next").contains("self.builtin_parts_next()"));
+    for k in ["KV_UPDATES_HOLD", "KV_JOBS_HOLD"] {
+        assert!(body("builtin_parts_next").contains(k), "the alarm ignores {k}");
+    }
+    let round = include_str!("builtin_run.rs");
+    let round = &round[round.find("async fn bot_builtin_round(").unwrap()..];
+    let round = &round[..round.find("\n    }\n").unwrap()];
+    for f in ["jobs_go_first(", "next_jobs_turn(", "after_part("] {
+        assert!(round.contains(f), "the round does not ask {f}");
+    }
+    // `/bot/wake` and an owner's set (the owner's own actions) end both waits at once.
+    assert!(body("bot_wake").contains("PART_WAITS"));
+    let set = body("bot_builtin_set");
+    assert!(set.find("bs::GEN_BUMP").unwrap() < set.find("PART_WAITS").unwrap());
+    let waits = &src[src.find("const PART_WAITS").unwrap()..];
+    let waits = &waits[..waits.find("];").unwrap()];
+    for k in ["KV_UPDATES_HOLD", "KV_UPDATES_STALLS", "KV_JOBS_HOLD", "KV_JOBS_STALLS"] {
+        assert!(waits.contains(k), "{k} outlives the owner's action");
+    }
 }
 
 #[test]

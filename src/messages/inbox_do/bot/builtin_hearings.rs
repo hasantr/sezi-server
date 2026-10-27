@@ -10,7 +10,11 @@
 //!    other text is taken as pasted minutes.
 //! 3. **The bytes**: a file through `bot_file_bytes` (its uploader, scope, bot and size checked
 //!    on the relay's own record), the first file of a message only; pasted text as it is.
-//! 4. **`read`**: refused → its line; else rule-only or ONE model call with the masked text.
+//! 4. **`read`**: refused → its line; else rule-only or ONE model call with the masked text. A
+//!    passing failure (429, 502/503/529, no answer in time) is not answered yet: the update waits
+//!    and is read again, three tries in all as the AI kind's (`hearings_pipeline::after_call`),
+//!    and the member's daily count is spent only on an outcome no retry changes — never on a
+//!    passing failure, the last one included.
 //! 5. **`finish`**: the answer to the lawyer (names restored), the role-only row proposed
 //!    ("Tabloya yazayım mı?"), the audit row (counts and codes only).
 //!
@@ -38,7 +42,7 @@ use super::builtin_sheet::Upsert;
 use super::builtin_store as bs;
 use super::hearings_answer::messages;
 use super::hearings_audit::{self as audit, AuditRecord, SheetOutcome};
-use super::hearings_pipeline::{finish, gates_of, read, Context, Gates, Input, ModelStep, Step};
+use super::hearings_pipeline::{after_call, finish, gates_of, read, AfterCall, Context, Gates, Input, ModelStep, Step, MODEL_ATTEMPTS};
 use super::hearings_prompt::{self as prompt, CALL_TIMEOUT_MS};
 use super::store::{Arg, Exec};
 use super::*;
@@ -133,7 +137,7 @@ impl UserInbox {
             self.hearings_done();
             return Handled::Done;
         }
-        let handled = self.hearings_record(ctx, run, h, update, &from, now, spent).await;
+        let handled = self.hearings_record(ctx, run, h, update_id, update, &from, now, spent).await;
         if !matches!(handled, Handled::NoRoom) {
             self.hearings_done();
         }
@@ -147,6 +151,7 @@ impl UserInbox {
         ctx: &BotCtx,
         run: &Run,
         h: &HearingsConfig,
+        update_id: i64,
         update: &serde_json::Value,
         from: &str,
         now: i64,
@@ -201,18 +206,28 @@ impl UserInbox {
             }
             Step::RuleOnly { reading, why } => (reading, ModelStep::Skipped(why)),
             Step::Model { reading, body } => {
-                store.db.run(bs::USAGE_BUMP, &[Arg::T(from), Arg::I(day)]);
                 let key = self.builtin_api_key().unwrap_or_default();
-                let answered = match outbound_url(&prompt::endpoint(h), run.allow_lan) {
-                    None => Err("ai/unreachable"),
-                    Some(url) => {
-                        super::builtin_ai::post_json(url.as_str(), &prompt::headers(h, &key), &body.to_string(), CALL_TIMEOUT_MS)
-                            .await
-                    }
-                };
+                let answered = model_call(h, &key, &body, run.allow_lan).await;
                 *spent += 1;
                 if !self.builtin_current(run) {
                     return Handled::Abandon; // answered on settings that are gone: nothing is kept
+                }
+                // An update whose tries cannot be read is on its last: no retry loop on a store
+                // that does not answer.
+                let attempts = store.db.int(UPDATE_ATTEMPTS, &[Arg::I(update_id)]).unwrap_or(MODEL_ATTEMPTS);
+                match after_call(&answered, attempts) {
+                    AfterCall::Retry => {
+                        let status = answered.as_ref().map_or(0, |(s, _)| *s);
+                        let code = super::builtin_ai::http_failure(status).unwrap_or("ai/unreachable");
+                        console_log!("[bot] hearings model retry {code}");
+                        self.builtin_note(Err(code), now);
+                        // Not a CPU death: the mark goes before the update waits, so the tries
+                        // left for a heavy record are not spent on a provider's bad minute.
+                        self.hearings_done();
+                        return Handled::Retry;
+                    }
+                    AfterCall::Keep { counted: true } => store.db.run(bs::USAGE_BUMP, &[Arg::T(from), Arg::I(day)]),
+                    AfterCall::Keep { counted: false } => {}
                 }
                 (reading, ModelStep::Answered(answered))
             }
@@ -365,13 +380,7 @@ impl UserInbox {
             Step::RuleOnly { reading, why } => (reading, ModelStep::Skipped(why)),
             Step::Model { reading, body } => {
                 let key = self.builtin_api_key().unwrap_or_default();
-                let answered = match outbound_url(&prompt::endpoint(h), allow_lan) {
-                    None => Err("ai/unreachable"),
-                    Some(url) => {
-                        super::builtin_ai::post_json(url.as_str(), &prompt::headers(h, &key), &body.to_string(), CALL_TIMEOUT_MS)
-                            .await
-                    }
-                };
+                let answered = model_call(h, &key, &body, allow_lan).await;
                 (reading, ModelStep::Answered(answered))
             }
         };
@@ -439,6 +448,29 @@ impl UserInbox {
     }
 }
 
+/// The one model call, to an address judged now (`outbound_url`): the HTTP answer (status 0 =
+/// none in time), or `ai/unreachable` for an address refused before any call. A request the
+/// provider refused (4xx) logs the kind of refusal it names (`builtin_ai::error_type`), never
+/// its message — it could echo the record.
+async fn model_call(
+    h: &HearingsConfig,
+    key: &str,
+    body: &serde_json::Value,
+    allow_lan: bool,
+) -> std::result::Result<(u16, String), &'static str> {
+    let url = outbound_url(&prompt::endpoint(h), allow_lan).ok_or("ai/unreachable")?;
+    let answered = super::builtin_ai::post_json(url.as_str(), &prompt::headers(h, key), &body.to_string(), CALL_TIMEOUT_MS).await;
+    if let Ok((status, text)) = &answered {
+        if (400..500).contains(status) {
+            let code = super::builtin_ai::error_type(text);
+            console_log!("[bot] hearings model refused the request {code}");
+        }
+    }
+    answered
+}
+
+/// An update's tries so far (0 on the first). Bind: update_id.
+const UPDATE_ATTEMPTS: &str = "SELECT attempts FROM bot_updates WHERE update_id = ?";
 /// Bind: user, pending id (the member inbox's id of one device's copy).
 pub(super) const SENT_BLANK: &str = "UPDATE bot_sent SET payload_json = '' WHERE user_id = ? AND pending_id = ?";
 /// Bind: cutoff.

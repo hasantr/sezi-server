@@ -294,7 +294,11 @@ impl UserInbox {
         let store = self.bot_store();
         use super::store::Exec;
         let pending = store.db.int("SELECT COUNT(*) AS n FROM pending", &[]).unwrap_or(1);
-        if pending > 0 {
+        // Re-pairs a tick's purse could not cover: the next tick, with a fresh purse, pays them.
+        let owed = [super::ingest::KV_OWED_RESENDS, super::ingest::KV_OWED_REPAIRS]
+            .iter()
+            .any(|k| store.kv_get(k).is_some());
+        if pending > 0 || owed {
             self.arm_alarm_within(0).await;
             return;
         }

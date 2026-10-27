@@ -16,7 +16,12 @@
 use super::store::{Arg, Exec, SqlBotStore};
 use sezi_bot_engine::{RoomSession, RoomShare, RoomStore};
 
-pub(super) const TABLES: [&str; 6] = [
+pub(super) const TABLES: [&str; 7] = [
+    // A post whose round failed (`room_order.rs`): how often, when it is tried again once it is
+    // set aside, and whether it is. Gone with its post.
+    "CREATE TABLE IF NOT EXISTS bot_room_post_fail (
+        post_id INTEGER PRIMARY KEY, attempts INTEGER NOT NULL,
+        next_at INTEGER NOT NULL, aside INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS bot_room_asks (
         room_id TEXT NOT NULL, user_id TEXT NOT NULL, session_id TEXT, at INTEGER NOT NULL,
         PRIMARY KEY (room_id, user_id))",
@@ -71,9 +76,13 @@ pub(super) const REQUEST_PUT: &str = "INSERT INTO bot_megolm_requests (room_id, 
 /// Bind: room, payload_json, created_at.
 pub(super) const POST_PUSH: &str =
     "INSERT INTO bot_room_posts (room_id, payload_json, skipped, created_at) VALUES (?, ?, '[]', ?)";
-/// The oldest waiting post. Bind: none.
-pub(super) const POST_NEXT: &str =
-    "SELECT id, room_id, payload_json, skipped, created_at FROM bot_room_posts ORDER BY id LIMIT 1";
+/// The oldest post the round may try now: in order, then the set-aside ones that are due
+/// (`room_order.rs`), none of those already tried this round. Bind: now, tried (a JSON array).
+pub(super) const POST_NEXT: &str = "SELECT p.id, p.room_id, p.payload_json, p.skipped, p.created_at
+      FROM bot_room_posts p LEFT JOIN bot_room_post_fail f ON f.post_id = p.id
+     WHERE (COALESCE(f.aside, 0) = 0 OR f.next_at <= ?1)
+       AND p.id NOT IN (SELECT value FROM json_each(?2))
+     ORDER BY COALESCE(f.aside, 0), p.id LIMIT 1";
 /// Bind: skipped, id.
 pub(super) const POST_SKIPPED: &str = "UPDATE bot_room_posts SET skipped = ? WHERE id = ?";
 /// Bind: id.
@@ -82,9 +91,15 @@ pub(super) const POST_DONE: &str = "DELETE FROM bot_room_posts WHERE id = ?";
 pub(super) const POSTS_DROP_ROOM: &str = "DELETE FROM bot_room_posts WHERE room_id = ?";
 /// Bind: cutoff.
 pub(super) const POSTS_EXPIRE: &str = "DELETE FROM bot_room_posts WHERE created_at < ?";
-/// Room work waiting: posts and unanswered key requests.
-pub(super) const POSTS_WAITING: &str =
-    "SELECT (SELECT COUNT(*) FROM bot_room_posts) + (SELECT COUNT(*) FROM bot_room_asks) AS n";
+/// Room work waiting now: posts (a set-aside one only once it is due) and unanswered key
+/// requests. Bind: now.
+pub(super) const POSTS_WAITING: &str = "SELECT (SELECT COUNT(*) FROM bot_room_posts p
+        LEFT JOIN bot_room_post_fail f ON f.post_id = p.id
+       WHERE COALESCE(f.aside, 0) = 0 OR f.next_at <= ?1)
+      + (SELECT COUNT(*) FROM bot_room_asks) AS n";
+/// When the earliest set-aside post is tried again (ms), NULL when none is.
+pub(super) const ASIDE_NEXT: &str = "SELECT MIN(f.next_at) FROM bot_room_post_fail f
+      JOIN bot_room_posts p ON p.id = f.post_id WHERE f.aside = 1";
 
 /// A member asked again (the newest ask replaces an older one). Bind: room, user, session_id, at.
 pub(super) const ASK_PUT: &str = "INSERT OR REPLACE INTO bot_room_asks (room_id, user_id, session_id, at)

@@ -15,7 +15,10 @@
 //! not), `webhook_refused` (set, but its URL fails the outbound rule at delivery, so nothing is
 //! sent to it — one stored before the rule existed) and `program_silent` — "Programından haber yok": an update has waited 10 minutes and
 //! the program has not been seen in that time (BOTS_BUILD §5, R9 decision 4). Otherwise the
-//! page shows "last seen". A built-in bot (`builtin` = `sheet` / `ai`) is never silent — the relay
+//! page shows "last seen". `backlog_full` says the bot holds its 2,000 updates, so nobody's new
+//! message is queued and members are told the program is busy, and `unconfirmed` how many of
+//! them the program was handed by a poll and never confirmed with `offset` — a program that
+//! polls and never confirms is alive, so `program_silent` cannot say it. A built-in bot (`builtin` = `sheet` / `ai`) is never silent — the relay
 //! is its program — and carries `ai_provider`, `ai_model`, `last_ok_at` (ms) and `last_error`
 //! (a typed code) instead; no secret and no instructions are listed. Every bot also carries
 //! `rooms` (`[{room_id, name}]`), the rooms it is in — read-only here, since a room's admins
@@ -188,6 +191,10 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         #[serde(default)]
         webhook_refused: bool,
         #[serde(default)]
+        backlog_full: bool,
+        #[serde(default)]
+        unconfirmed: Option<i64>,
+        #[serde(default)]
         ai_model: Option<String>,
         #[serde(default)]
         last_ok_at: Option<i64>,
@@ -209,6 +216,8 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         v["waiting_since"] = state.waiting_since.into();
         v["webhook"] = state.webhook.into();
         v["webhook_refused"] = state.webhook_refused.into();
+        v["backlog_full"] = state.backlog_full.into();
+        v["unconfirmed"] = state.unconfirmed.into();
         let silent = row.builtin.is_none() && program_silent(state.waiting_since, row.program_seen_at, now);
         v["program_silent"] = silent.into();
         v["ai_model"] = state.ai_model.into();
@@ -415,13 +424,24 @@ pub async fn test(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .bind(&[d1_text(&bot_id)])?
         .first(None)
         .await?;
-    let path = match builtin.and_then(|b| b.builtin).as_deref() {
-        Some("sheet" | "ai") => "/bot/builtin-test",
-        _ => "/bot/ping",
-    };
+    let path = test_path(builtin.and_then(|b| b.builtin).as_deref());
     let call = serde_json::json!({ "who": who });
     let resp = super::bot_inbox(&ctx.env, &bot_id, Method::Post, path, Some(call.to_string())).await?;
     crate::respond::passthrough(resp).await
+}
+
+/// Where "Dene" goes for a bot whose `bots.builtin` is `builtin`: every built-in kind to its
+/// runner's measured test, a program bot a `ping`. The kind is read by `Kind`'s own
+/// deserializer, so a kind added there is routed here without a second list to forget.
+pub(crate) fn test_path(builtin: Option<&str>) -> &'static str {
+    let builtin_kind = builtin.is_some_and(|b| {
+        serde_json::from_value::<super::builtin_rules::Kind>(serde_json::Value::String(b.to_owned())).is_ok()
+    });
+    if builtin_kind {
+        "/bot/builtin-test"
+    } else {
+        "/bot/ping"
+    }
 }
 
 pub async fn delete(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -491,6 +511,22 @@ mod tests {
         let refuse = body.find("inbox_unavailable").expect("refusal");
         let revoke = body.find("REVOKE_TOKENS_SQL").expect("revoke");
         assert!(push < refuse && refuse < revoke, "push, refuse, then revoke");
+    }
+
+    #[test]
+    fn every_builtin_kind_is_tested_by_its_runner_and_a_program_is_pinged() {
+        // Until 2026-10-27 the hearings kind was pinged: its own test was unreachable, and the
+        // core read the ping's answer as `outcome: "sent"`, so the app never marked the rung tried.
+        use super::super::builtin_rules::Kind;
+        for kind in [Kind::Sheet, Kind::Ai, Kind::Hearings] {
+            // Exhaustive on purpose: a new kind does not compile until it is in the list above.
+            match kind {
+                Kind::Sheet | Kind::Ai | Kind::Hearings => {}
+            }
+            assert_eq!(super::test_path(Some(kind.as_str())), "/bot/builtin-test", "{kind:?}");
+        }
+        assert_eq!(super::test_path(None), "/bot/ping", "a program bot");
+        assert_eq!(super::test_path(Some("gone")), "/bot/ping", "a kind this relay does not know");
     }
 
     #[test]

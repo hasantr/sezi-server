@@ -67,9 +67,12 @@ pub(super) fn row_id(bot_id: &str, job_id: i64) -> String {
 }
 
 impl UserInbox {
-    pub(super) async fn builtin_jobs(&self, ctx: &BotCtx, run: &Run, spent: &mut u32) {
+    /// The rows' part of the round: whether it moved any row (wrote it, backed it off, gave up on
+    /// it) — a part that moved none while one was due waits (`policy::after_part`).
+    pub(super) async fn builtin_jobs(&self, ctx: &BotCtx, run: &Run, spent: &mut u32) -> bool {
+        let mut moved = false;
         let (Some(url), Some(secret)) = (run.cfg.sheet_url.as_deref(), self.builtin_sheet_secret()) else {
-            return;
+            return moved;
         };
         let sql = self.state.storage().sql();
         let jobs: Vec<DueJob> = match sql
@@ -79,7 +82,7 @@ impl UserInbox {
             Ok(r) => r,
             Err(e) => {
                 console_log!("[bot] sheet queue read failed: {e:?}");
-                return;
+                return moved;
             }
         };
         let store = self.bot_store();
@@ -89,14 +92,14 @@ impl UserInbox {
             let room = RoomRef::parse(job.room_json.as_deref());
             let now = (now_secs() * 1000) as i64;
             if !self.builtin_current(run) {
-                return;
+                return moved;
             }
             if job.next_at > now {
                 // The head is waiting out a back-off: whoever queued behind it hears why.
                 if job.attempts > 0 {
                     self.builtin_tell_queued(ctx, run, job.id, spent).await;
                 }
-                return;
+                return moved;
             }
             // A hearings bot's row is an upsert (v2) with the audit row it settles.
             let upsert = hearings.then(|| job.row_json.as_deref().and_then(Upsert::parse)).flatten();
@@ -108,15 +111,16 @@ impl UserInbox {
             };
             if now - job.created_at >= bs::JOB_GIVE_UP_MS {
                 if !policy::fits(*spent, policy::SAY_BASE) {
-                    return;
+                    return moved;
                 }
                 settle(SheetOutcome::Failed);
                 store.db.run(bs::JOB_DONE, &[Arg::I(job.id)]);
+                moved = true;
                 self.builtin_reply(ctx, &job.user_id, room.as_ref(), &job.text, line(run.lang, Line::SheetGaveUp), spent).await;
                 continue;
             }
             if !policy::fits(*spent, policy::JOB_BASE) {
-                return;
+                return moved;
             }
             let id = row_id(&ctx.bot_id, job.id);
             let (outcome, landed, hops) = match (hearings, upsert.as_ref()) {
@@ -128,6 +132,7 @@ impl UserInbox {
                 // A hearings job that does not read back as an upsert is never sent as a v1 row.
                 (true, None) => {
                     store.db.run(bs::JOB_DONE, &[Arg::I(job.id)]);
+                    moved = true;
                     continue;
                 }
                 (false, _) => {
@@ -149,9 +154,11 @@ impl UserInbox {
             };
             *spent += hops;
             if !self.builtin_current(run) {
-                return; // sent on a configuration that is gone; `row_id` makes a re-send safe
+                return moved; // sent on a configuration that is gone; `row_id` makes a re-send safe
             }
             self.builtin_note(outcome, now);
+            // Written, or backed off: either way the row is no longer due now.
+            moved = true;
             if outcome.is_err() {
                 store.db.run(bs::JOB_RETRY, &[Arg::I(now + retry_delay_ms(job.attempts)), Arg::I(job.id)]);
                 if job.attempts == 0 && job.told == 0 {
@@ -159,7 +166,7 @@ impl UserInbox {
                     self.builtin_reply(ctx, &job.user_id, room.as_ref(), &job.text, line(run.lang, Line::SheetRetrying), spent).await;
                 }
                 self.builtin_tell_queued(ctx, run, job.id, spent).await;
-                return;
+                return moved;
             }
             store.db.run(bs::JOB_DONE, &[Arg::I(job.id)]);
             let late = job.attempts > 0 || job.told != 0;
@@ -185,6 +192,7 @@ impl UserInbox {
                 self.builtin_reply(ctx, &job.user_id, room.as_ref(), &job.text, line(run.lang, l), spent).await;
             }
         }
+        moved
     }
 
     /// Tell the authors of rows waiting behind the failing head (`head`) — once each — that the

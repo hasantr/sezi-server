@@ -27,7 +27,7 @@
 //! applies: a stored URL that fails it now is POSTed nothing and holds the queue (`Hook::Refused`).
 
 use super::builtin_policy::{round_gate, Gate};
-use super::deliver_order::{hook_round, Due, ASIDE_DUE, WEBHOOK_BATCH};
+use super::deliver_order::{hook_round, webhook_posts, Due, ASIDE_DUE};
 use super::outbox::OutKind;
 use super::store::{Arg, Exec};
 use super::*;
@@ -185,8 +185,10 @@ impl UserInbox {
     }
 
     /// `/bot/webhook`: set or clear the webhook (the Worker checked the URL and derived the
-    /// secret from the program's key).
-    pub(super) fn bot_set_webhook(&self, body: WebhookBody) -> Result<Response> {
+    /// secret from the program's key). Setting one arms the alarm now: updates left waiting by
+    /// polling are owed to it at once, not at the next member's frame (which may never come
+    /// before their 24 h end).
+    pub(super) async fn bot_set_webhook(&self, body: WebhookBody) -> Result<Response> {
         let store = self.bot_store();
         match (body.url, body.secret) {
             // A built-in runner is the queue's one reader; the owner turns it off first.
@@ -196,6 +198,7 @@ impl UserInbox {
             (Some(url), Some(secret)) => {
                 store.kv_put("webhook_url", &url);
                 store.kv_put("webhook_secret", &secret);
+                self.arm_alarm_within(0).await;
             }
             (None, _) => {
                 store.db.run("DELETE FROM bot_kv WHERE k IN ('webhook_url', 'webhook_secret')", &[]);
@@ -206,11 +209,13 @@ impl UserInbox {
     }
 
     /// `/bot/webhook-secret`: a renewed key's secret, for a webhook already set. Without one
-    /// there is nothing to sign, and the next `setWebhook` derives it anyway.
-    pub(super) fn bot_set_webhook_secret(&self, body: WebhookBody) -> Result<Response> {
+    /// there is nothing to sign, and the next `setWebhook` derives it anyway. The alarm is armed
+    /// as `setWebhook` arms it, so whatever is due goes out signed with the new secret.
+    pub(super) async fn bot_set_webhook_secret(&self, body: WebhookBody) -> Result<Response> {
         let store = self.bot_store();
         if let (Some(secret), Some(_)) = (body.secret, store.kv_get("webhook_url")) {
             store.kv_put("webhook_secret", &secret);
+            self.arm_alarm_within(0).await;
         }
         Response::empty().map(|r| r.with_status(204))
     }
@@ -232,39 +237,42 @@ impl UserInbox {
         Response::from_json(&serde_json::json!({ "ok": true, "update_id": update_id }))
     }
 
-    /// The tick's webhook round. Errors are logged; the alarm re-arms from `HOOK_NEXT`.
-    pub(super) async fn bot_deliver_webhooks(&self, ctx: &BotCtx) {
+    /// The tick's webhook round, within `budget` subrequests of the tick's purse: what it spent.
+    /// Errors are logged; the alarm re-arms from `HOOK_NEXT`, so what the share did not cover
+    /// goes on the next tick.
+    pub(super) async fn bot_deliver_webhooks(&self, ctx: &BotCtx, budget: u32) -> u32 {
         let store = self.bot_store();
         let (url, secret) = match self.bot_webhook() {
             Hook::Live(url, secret) => (url, secret),
             Hook::Refused => {
                 // Only reached on a tick something else armed: `bot_webhook_next` arms nothing.
                 console_log!("[bot] webhook not delivered: {WEBHOOK_REFUSED}");
-                return;
+                return 0;
             }
-            Hook::None => return,
+            Hook::None => return 0,
         };
         let start = (now_secs() * 1000) as i64;
-        if self.bot_webhook_next().is_none_or(|t| t > start) {
-            return; // nothing due, or held while the bot is off: no D1 read
+        let max_posts = webhook_posts(budget);
+        if max_posts == 0 || self.bot_webhook_next().is_none_or(|t| t > start) {
+            return 0; // no share left, nothing due, or held while the bot is off: no D1 read
         }
         // Off, deleted or D1 silent: nothing is POSTed and nothing reads as taken.
         match round_gate(self.builtin_bot_row().await) {
             Gate::Run(_) => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[Arg::T(KV_WEBHOOK_HOLD)]),
             Gate::Hold(ms) => {
                 store.kv_put(KV_WEBHOOK_HOLD, &(start + ms).to_string());
-                return;
+                return 1;
             }
         }
         let sql = self.state.storage().sql();
         let main: Vec<Due> = match sql
-            .exec_raw(HOOK_DUE, Some(vec![JsValue::from_f64(WEBHOOK_BATCH as f64)]))
+            .exec_raw(HOOK_DUE, Some(vec![JsValue::from_f64(max_posts as f64)]))
             .and_then(|c| c.to_array())
         {
             Ok(r) => r,
             Err(e) => {
                 console_log!("[bot] webhook queue read failed: {e:?}");
-                return;
+                return 1;
             }
         };
         let aside = |limit: i64| -> Vec<Due> {
@@ -292,11 +300,12 @@ impl UserInbox {
             taken
         };
         // In order, a poison update set aside, the set-aside ones on their own (`deliver_order.rs`).
-        let took_any = hook_round(&store.db, main, aside, clock, post).await;
+        let (took_any, posts) = hook_round(&store.db, main, aside, max_posts, clock, post).await;
         // The forward-reads it queued go out with this tick's outbox drain, which runs next.
         if took_any {
             crate::bots::mark_program_seen(&self.env, &ctx.bot_id).await;
         }
+        1 + posts as u32 + u32::from(took_any)
     }
 
     /// When the webhook's queue next needs the alarm, if a webhook is set and anything waits.

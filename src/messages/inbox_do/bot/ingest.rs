@@ -8,6 +8,8 @@
 
 use super::super::ack::{group_acks, AckRow};
 use super::backlog::admit_member_update;
+use super::builtin_policy as policy;
+use super::store::Exec;
 use super::outbox::OutKind;
 use super::room::BotRooms;
 use super::updates::{call_update, message_update, CallRoom, Who};
@@ -21,6 +23,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 const TICK_BATCH: i64 = 20;
 /// When a failed tick tries again.
 const TICK_RETRY_MS: i64 = 5_000;
+/// `bot_kv`: members owed a resend (`KV_OWED_RESENDS`) or a re-pair (`KV_OWED_REPAIRS`) that a
+/// tick's purse could not cover, as a JSON list; the next tick starts with them. Absent when none.
+pub(super) const KV_OWED_RESENDS: &str = "owed_resends";
+pub(super) const KV_OWED_REPAIRS: &str = "owed_repairs";
 
 /// Senders' device keys and profiles, read from D1 before the synchronous block.
 struct Prefetch {
@@ -72,26 +78,64 @@ impl UserInbox {
             let pre = self.bot_prefetch(&ctx, &rows).await?;
             self.bot_open_frames(&ctx, rows, &pre, &mut owed)?;
         }
-        // A member's pair-ack was already answered by the engine (its Deliver is queued): only
-        // what that member could not read goes again. A repair is the bot's own pair-ack first.
-        for user in &owed.pair_acks {
-            self.bot_resend_failed(&ctx, user).await;
-        }
-        for user in owed.repairs.difference(&owed.pair_acks) {
-            self.bot_repair(&ctx, user).await;
-        }
+        // Every step below comes out of one purse, each handed what the steps before left, and
+        // the drain is always left its floor (`builtin_policy`'s budget section).
+        let purse = policy::tick_purse(crate::messages::budget::resolve_budget(&self.env));
+        let mut spent = 0u32;
+        spent += self.bot_owed_repairs(&ctx, &owed, purse).await;
         // A member the queue refused hears it from the bot; it goes out with the drain below.
-        let said = self.bot_say_busy(&ctx, &owed.busy).await;
-        self.bot_deliver_webhooks(&ctx).await;
+        spent += self.bot_say_busy(&ctx, &owed.busy).await;
+        spent += self.bot_deliver_webhooks(&ctx, policy::before_drain(purse, spent)).await;
         // A built-in bot answers here; its replies go out with the drain below. Then the room
-        // round shares keys and encrypts what waits for a room. The three share the tick's purse:
-        // each gets what the one before left (`builtin_policy`, `room::room_budget`). A program
-        // bot has no built-in round: its notices above take that share.
-        let round = said + self.bot_builtin_round(&ctx).await;
-        let room = self.bot_room_round(&ctx, super::room::room_budget(round)).await;
-        self.bot_drain_outbox_within(&ctx, super::builtin_policy::drain_budget(round + room)).await;
+        // round shares keys and encrypts what waits for a room. A program bot has no built-in
+        // round: its notices above take that share. A round that could not start waits for the
+        // next tick, which its due work arms at once.
+        if policy::may_start_round(purse, spent) {
+            spent += self.bot_builtin_round(&ctx).await;
+        }
+        spent += self.bot_room_round(&ctx, super::room::room_budget(purse, spent)).await;
+        self.bot_drain_outbox_within(&ctx, policy::drain_budget(purse, spent)).await;
         self.bot_housekeeping(&ctx).await;
         Ok(())
+    }
+
+    /// The re-pairs and resends owed — this tick's frames' and what earlier ticks' purses could
+    /// not cover — each started only while it fits (`policy::may_repair`); the rest is kept for
+    /// the next tick (`KV_OWED_*`, which `bot_rearm` arms the alarm for at once). What it spent.
+    async fn bot_owed_repairs(&self, ctx: &BotCtx, owed: &Owed, purse: u32) -> u32 {
+        let store = self.bot_store();
+        let carried = |k: &str| -> BTreeSet<String> {
+            store.kv_get(k).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+        };
+        // A member's pair-ack was already answered by the engine (its Deliver is queued): only
+        // what that member could not read goes again. A repair is the bot's own pair-ack first.
+        let mut resends = carried(KV_OWED_RESENDS);
+        resends.extend(owed.pair_acks.iter().cloned());
+        let mut repairs = carried(KV_OWED_REPAIRS);
+        repairs.extend(owed.repairs.iter().cloned());
+        repairs.retain(|u| !resends.contains(u));
+        let (mut spent, mut left_resends, mut left_repairs) = (0u32, BTreeSet::new(), BTreeSet::new());
+        for user in resends {
+            if policy::may_repair(purse, spent) {
+                spent += self.bot_resend_failed(ctx, &user).await;
+            } else {
+                left_resends.insert(user);
+            }
+        }
+        for user in repairs {
+            if policy::may_repair(purse, spent) {
+                spent += self.bot_repair(ctx, &user).await;
+            } else {
+                left_repairs.insert(user);
+            }
+        }
+        for (k, left) in [(KV_OWED_RESENDS, left_resends), (KV_OWED_REPAIRS, left_repairs)] {
+            match left.is_empty() {
+                true => store.db.run("DELETE FROM bot_kv WHERE k = ?", &[super::store::Arg::T(k)]),
+                false => store.kv_put(k, &serde_json::to_string(&left).unwrap_or_default()),
+            }
+        }
+        spent
     }
 
     async fn bot_prefetch(&self, ctx: &BotCtx, rows: &[PendingRow]) -> Result<Prefetch> {

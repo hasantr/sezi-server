@@ -125,6 +125,31 @@ fn openai_answers_are_read_like_the_cores() {
 }
 
 #[test]
+fn a_refused_request_is_its_own_code_and_says_only_its_type() {
+    // A 400 (a schema the model rejects, a parameter it no longer takes) is not an unreadable
+    // answer: the owner is told the request was refused, and the log says which kind.
+    for p in [Provider::Anthropic, Provider::Openai] {
+        for s in [400u16, 402, 405, 409, 413, 422] {
+            assert_eq!(parse_response(p, s, "{}"), Err("ai/bad-request"), "{s}");
+        }
+    }
+    assert!(!transient("ai/bad-request"));
+    // Anthropic's error body and the OpenAI dialect's carry `error.type`.
+    let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error","message":"output_config.format: Ayşe Yılmaz"}}"#;
+    assert_eq!(error_type(anthropic), "invalid_request_error");
+    let openai = r#"{"error":{"message":"Unsupported value","type":"invalid_request_error","param":"max_tokens","code":null}}"#;
+    assert_eq!(error_type(openai), "invalid_request_error");
+    assert_eq!(error_type(r#"{"type":"error","error":{"type":"request_too_large"}}"#), "request_too_large");
+    assert_eq!(error_type(r#"{"type":"error","error":{"type":"billing_error"}}"#), "billing_error");
+    // Never the message, never a type it does not know (which could be anything the provider
+    // echoed), never a body that is not one.
+    assert_eq!(error_type(r#"{"error":{"type":"Ayşe Yılmaz'ın zabtı"}}"#), "other");
+    assert_eq!(error_type(r#"{"error":{"message":"invalid_request_error"}}"#), "none");
+    assert_eq!(error_type("<html>Bad Request</html>"), "none");
+    assert_eq!(error_type(""), "none");
+}
+
+#[test]
 fn only_passing_failures_are_tried_again() {
     for c in ["ai/unreachable", "ai/overloaded", "ai/rate-limited"] {
         assert!(transient(c), "{c}");

@@ -35,9 +35,10 @@ const AUDIT_DAYS: std::ops::RangeInclusive<u32> = 1..=730;
 /// The bot's model calls a day, every member together, when the owner says nothing.
 ///
 /// Without it the owner's spend grew with the office: 50 calls a member a day, each up to ~60k
-/// tokens in and 16k out (`hearings_prompt::MAX_OUTPUT_TOKENS`). 300 covers an office of 20–30
+/// tokens in and up to 32k out, thinking included (`hearings_prompt::ANTHROPIC_MAX_OUTPUT_TOKENS`;
+/// a ceiling — at `medium` effort a call uses a fraction of it). 300 covers an office of 20–30
 /// lawyers each reading ten or so records a working day, and bounds the worst day at about 18M
-/// tokens in and 4.8M out, whatever the number of members.
+/// tokens in and 9.6M out, whatever the number of members.
 pub(crate) const DEFAULT_DAILY_CALLS: u32 = 300;
 /// What the owner may set it to. Past 2,000 (forty members at their own 50) the bound means
 /// little, and a typed 30000 is likelier a slip than a plan.

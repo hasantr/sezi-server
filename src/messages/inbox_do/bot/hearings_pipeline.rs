@@ -22,6 +22,7 @@ use super::builtin_copy::Line;
 use super::builtin_sheet::Upsert;
 use super::hearings_answer::{one_to_one, sheet_row, View};
 use super::hearings_audit::AuditRecord;
+use super::builtin_ai::{http_failure, transient};
 use super::hearings_prompt::{parse_response, request_body, user_message, ModelReply};
 use super::hearings_validate::validate;
 use crate::bots::builtin_hearings_rules::{Columns, HearingsConfig};
@@ -177,6 +178,36 @@ pub(super) enum ModelStep {
     Skipped(&'static str),
     /// The HTTP answer (status 0 = none), or the transport's code.
     Answered(Result<(u16, String), &'static str>),
+}
+
+/// A passing model failure is tried this many times in all, as the AI kind's (`builtin_run.rs`).
+pub(super) const MODEL_ATTEMPTS: i64 = 3;
+
+/// What the round does with a model call's transport answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AfterCall {
+    /// A passing failure (a rate limit, an overload, a gateway, no answer in time) with tries
+    /// left: the update waits and is read again; nothing is said, kept or counted.
+    Retry,
+    /// Go on to [`finish`] with it. `counted`: the member's and the bot's daily count is spent —
+    /// only when the provider answered with something no retry changes (an answer, a bad key, a
+    /// bad request). A passing failure on the last try, or an address refused before any call,
+    /// answers rule-only and spends nothing.
+    Keep { counted: bool },
+}
+
+/// [`AfterCall`] for `answered` (the HTTP answer, status 0 = none; `Err` = no request made) on
+/// the update's try `attempts` (0 = the first).
+pub(super) fn after_call(answered: &Result<(u16, String), &'static str>, attempts: i64) -> AfterCall {
+    let Ok((status, _)) = answered else {
+        return AfterCall::Keep { counted: false };
+    };
+    let passing = http_failure(*status).is_some_and(transient);
+    match (passing, attempts + 1 < MODEL_ATTEMPTS) {
+        (true, true) => AfterCall::Retry,
+        (true, false) => AfterCall::Keep { counted: false },
+        (false, _) => AfterCall::Keep { counted: true },
+    }
 }
 
 /// The round's result.

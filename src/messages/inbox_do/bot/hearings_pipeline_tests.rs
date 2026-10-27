@@ -373,3 +373,24 @@ fn the_stub_sheet_gets_the_upsert_and_its_answer_names_the_row() {
     let ankara: Vec<String> = ["Selin", "DEMİRKOL", "KORKMAZEL", "ARSLANCI", "Örnektepe", "104477", "Kızılırmak"].map(String::from).to_vec();
     assert_none_of(&body, &ankara, "the sheet POST");
 }
+
+#[test]
+fn a_passing_model_failure_is_tried_again_and_only_an_outcome_is_counted() {
+    let status = |s: u16| -> Result<(u16, String), &'static str> { Ok((s, String::new())) };
+    // A rate limit, an overload, a gateway error or no answer at all (status 0, the timeout):
+    // tried again, and the member's daily count is not spent on it.
+    for s in [0u16, 429, 502, 503, 529] {
+        for attempts in 0..MODEL_ATTEMPTS - 1 {
+            assert_eq!(after_call(&status(s), attempts), AfterCall::Retry, "{s} after {attempts}");
+        }
+        // The last try answers rule-only — still not counted: no model answer came of it.
+        assert_eq!(after_call(&status(s), MODEL_ATTEMPTS - 1), AfterCall::Keep { counted: false }, "{s}");
+    }
+    // An answer, or a failure no retry mends (a bad key, a bad request, an unknown model): kept
+    // at once, and counted.
+    for s in [200u16, 400, 401, 404] {
+        assert_eq!(after_call(&status(s), 0), AfterCall::Keep { counted: true }, "{s}");
+    }
+    // An address refused before any call: nothing was asked, nothing is counted or retried.
+    assert_eq!(after_call(&Err("ai/unreachable"), 0), AfterCall::Keep { counted: false });
+}

@@ -34,6 +34,15 @@ use std::future::Future;
 pub(super) const ASIDE_AFTER: i64 = 5;
 /// Webhook POSTs one round may make, the queue's and the set-aside ones' together.
 pub(super) const WEBHOOK_BATCH: i64 = 10;
+/// What a round spends besides its POSTs: the D1 read of whether the bot is on, and the
+/// `program_seen_at` write when something was taken.
+pub(super) const WEBHOOK_OVERHEAD: u32 = 2;
+
+/// The POSTs a round may make when `budget` subrequests are its share of the tick: none when
+/// that does not cover its overhead and one POST.
+pub(super) fn webhook_posts(budget: u32) -> i64 {
+    (budget.saturating_sub(WEBHOOK_OVERHEAD) as i64).min(WEBHOOK_BATCH)
+}
 
 pub(super) const TABLES: [&str; 1] = [
     // An update the program kept refusing while it took a later one: off the queue's order,
@@ -74,8 +83,15 @@ fn with_id(row: &Due) -> Option<String> {
 
 /// One round: the queue in order (`main`, oldest first), then the set-aside updates that are due
 /// (`aside(limit)`). `post(update_id, update_json)` is one POST — true when the program took it.
-/// Whether anything was taken.
-pub(super) async fn hook_round<E, A, P, F>(db: &E, main: Vec<Due>, aside: A, now: impl Fn() -> i64, mut post: P) -> bool
+/// At most `max_posts` POSTs (`webhook_posts`). Whether anything was taken, and the POSTs made.
+pub(super) async fn hook_round<E, A, P, F>(
+    db: &E,
+    main: Vec<Due>,
+    aside: A,
+    max_posts: i64,
+    now: impl Fn() -> i64,
+    mut post: P,
+) -> (bool, i64)
 where
     E: Exec,
     A: FnOnce(i64) -> Vec<Due>,
@@ -89,8 +105,8 @@ where
     let mut probing: Vec<i64> = Vec::new();
     for row in main {
         let t = now();
-        if row.next_at.is_some_and(|n| n > t) {
-            break; // the head waits on its back-off, and the queue behind it with it
+        if row.next_at.is_some_and(|n| n > t) || posts >= max_posts {
+            break; // the head waits on its back-off (the queue behind it with it), or the purse is spent
         }
         let Some(json) = with_id(&row) else {
             db.run(HOOK_DONE, &[Arg::I(row.update_id)]);
@@ -114,12 +130,15 @@ where
         break; // an ordinary failure — or the probe failed too: the endpoint, not one update
     }
     // Each set-aside update on its own ladder, in what the queue left of the round's POSTs.
-    for row in aside(WEBHOOK_BATCH - posts) {
+    let left = max_posts - posts;
+    let set_aside = if left > 0 { aside(left) } else { Vec::new() };
+    for row in set_aside {
         let t = now();
         let Some(json) = with_id(&row) else {
             db.run(HOOK_DONE, &[Arg::I(row.update_id)]);
             continue;
         };
+        posts += 1;
         if post(row.update_id, json).await {
             db.run(HOOK_DONE, &[Arg::I(row.update_id)]);
             db.run(ASIDE_DROP, &[Arg::I(row.update_id)]);
@@ -128,7 +147,7 @@ where
             db.run(HOOK_RETRY, &[Arg::I(t + retry_delay_ms(row.attempts)), Arg::I(row.update_id)]);
         }
     }
-    took_any
+    (took_any, posts)
 }
 
 #[cfg(test)]
