@@ -1,0 +1,31 @@
+T.C.
+[MAHKEME] AİLE MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO          : [ESAS] Esas
+CELSE NO         : 2
+DURUŞMA TARİHİ   : 03/10/2026
+
+HAKİM            : [KISI_1] [SICIL_1]
+KATİP            : [KISI_2] [SICIL_2]
+
+DAVACI           : [KISI_3] - [ADRES_1]
+VEKİLİ           : Av. [KISI_4]
+DAVALI           : [KISI_5] - [ADRES_2]
+VEKİLİ           : Av. [KISI_6]
+MÜŞTEREK ÇOCUK   : [KISI_7]
+DAVA             : Boşanma (Evlilik Birliğinin Temelinden Sarsılması)
+
+Belirlenen gün ve saatte celseye başlandı. Davacı asil [KISI_3] ve vekili Av. [KISI_4] geldi. Davalı asil gelmedi, vekili Av. [KISI_6] geldi.
+Davacı asil beyanında: Eşim [KISI_8] ile 2019 yılından beri sürekli tartışıyoruz, kızımız [KISI_9]'nin velayetinin bana verilmesini istiyorum dedi.
+Davalı vekili: Müvekkil barışmak istemektedir, velayet talebine karşıyız dedi.
+Sosyal çalışmacı raporu okundu, rapora karşı beyanlar alındı.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalı vekiline sosyal inceleme raporuna karşı beyanda bulunması için iki haftalık süre verilmesine,
+2-Tedbir nafakasının aylık 7.500,00 TL olarak devamına,
+3-Taraflarca bildirilen tanıkların bir sonraki celsede dinlenmesine, tanık gider avansının bir hafta içinde yatırılmasına,
+4-Duruşmanın 21/12/2026 günü saat 11:20'ye bırakılmasına,
+Dair, davacı asil ve taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 03/10/2026
+
+Katip [SICIL_2]                 Hakim [SICIL_1]
+¸e-imzalıdır                 ¸e-imzalıdır

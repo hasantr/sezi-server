@@ -1,0 +1,25 @@
+T.C.
+[MAHKEME] AİLE MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 4
+DURUŞMA TARİHİ : 15/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+DAVACI : [KISI_3] - [ADRES_1]
+VEKİLİ : Av. [KISI_4]
+DAVALI : [KISI_5] - [ADRES_2]
+VEKİLİ : Av. [KISI_6]
+DAVA : Katkı Payı Alacağı (Mal Rejiminin Tasfiyesi)
+
+Belirlenen gün ve saatte celseye başlandı. Taraf vekilleri Av. [KISI_4] ve Av. [KISI_6] geldi.
+Davacı vekili: Evlilik birliği içinde edinilen [PLAKA_1] plakalı araç ile Talas'taki daire müvekkilin katkısıyla alınmıştır; davalı [KISI_5] bunu kabul etmektedir dedi.
+Davalı vekili: Dairenin bedeli müvekkilin babası [KISI_7] tarafından ödenmiştir dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Taşınmazın edinme tarihindeki değerinin tespiti için gayrimenkul değerleme bilirkişisinden rapor alınmasına,
+2-[PLAKA_1] plakalı aracın satış bedeline ilişkin kayıtların noterlikten celbine,
+3-Duruşmanın 22/12/2026 günü saat 13:10'a bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 15/10/2026
+
+Katip [SICIL_2]               Hakim [SICIL_1]
+¸e-imzalıdır               ¸e-imzalıdır

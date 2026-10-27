@@ -309,7 +309,7 @@ fn setting_a_built_in_kind_lists_it_with_its_provider_and_drops_the_webhook() {
     let db = setup();
     provision(&db);
     db.execute("UPDATE bots SET webhook_url = 'https://example.com/hook' WHERE bot_id = ?1", [BOT]).unwrap();
-    db.execute(SET_BUILTIN_SQL, params![BOT, "ai", "anthropic"]).unwrap();
+    db.execute(SET_BUILTIN_SQL, params![BOT, "ai", "anthropic", Option::<String>::None]).unwrap();
     let listed: (String, Option<String>, Option<String>) = db
         .query_row(LIST_SQL, [], |r| Ok((r.get("bot_id")?, r.get("builtin")?, r.get("ai_provider")?)))
         .unwrap();
@@ -317,10 +317,18 @@ fn setting_a_built_in_kind_lists_it_with_its_provider_and_drops_the_webhook() {
     let hook: Option<String> =
         db.query_row("SELECT webhook_url FROM bots WHERE bot_id = ?1", [BOT], |r| r.get(0)).unwrap();
     assert_eq!(hook, None, "one queue, one reader");
-    db.execute(SET_BUILTIN_SQL, params![BOT, Option::<String>::None, Option::<String>::None]).unwrap();
-    let back: (Option<String>, Option<String>) =
-        db.query_row(LIST_SQL, [], |r| Ok((r.get("builtin")?, r.get("ai_provider")?))).unwrap();
-    assert_eq!(back, (None, None), "program mode again");
+    // A hearing bot's members are told where its model runs, too (§8.3: "(Anthropic, ABD)").
+    db.execute(SET_BUILTIN_SQL, params![BOT, "hearings", "anthropic", "us"]).unwrap();
+    let geo: Option<String> = db.query_row(LIST_SQL, [], |r| r.get("ai_geo")).unwrap();
+    assert_eq!(geo.as_deref(), Some("us"));
+    db.execute(
+        SET_BUILTIN_SQL,
+        params![BOT, Option::<String>::None, Option::<String>::None, Option::<String>::None],
+    )
+    .unwrap();
+    let back: (Option<String>, Option<String>, Option<String>) =
+        db.query_row(LIST_SQL, [], |r| Ok((r.get("builtin")?, r.get("ai_provider")?, r.get("ai_geo")?))).unwrap();
+    assert_eq!(back, (None, None, None), "program mode again");
 }
 
 #[test]

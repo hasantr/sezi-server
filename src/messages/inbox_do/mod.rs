@@ -318,6 +318,10 @@ impl DurableObject for UserInbox {
             // devices and the aggregation happens client-side, keyed by remote_id.
             (Method::Post, "/forward-delivered") => {
                 let body: ForwardIdsBody = req.json().await?;
+                // A hearings bot forgets what it sent a device once that device has it (§8.2).
+                if self.is_bot().await {
+                    self.bot_hearings_delivered(&body.from, &body.ids);
+                }
                 self.apply_receipt(
                     "delivered",
                     &body.from,

@@ -1,0 +1,33 @@
+T.C.
+[MAHKEME] AİLE MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO          : [ESAS]
+CELSE NO         : 4
+DURUŞMA TARİHİ   : 22/10/2026
+
+HAKİM            : [KISI_1] [SICIL_1]
+KATİP            : [KISI_2] [SICIL_2]
+
+DAVACI           : [KISI_3] - [ADRES_1]
+DAVACI VEKİLİ    : Av. [KISI_4] ([EPOSTA_1])
+DAVALI           : [KISI_5] - [ADRES_2]
+DAVALI VEKİLİ    : Av. [KISI_6]
+ÇOCUK            : [KISI_7] ([DOGUM_1] doğumlu, T.C. Kimlik No: [TCKN_1])
+DAVA             : Babalık (Soybağının Kurulması) ve İştirak Nafakası
+
+Belirlenen gün ve saatte celse açıldı. Davacı vekili Av. [KISI_4] ve davalı vekili Av. [KISI_6] geldi. Davacı [KISI_3] de geldi. Açık yargılamaya devam olundu.
+Adli Tıp Kurumu Samsun Grup Başkanlığından gelen [DOSYA_1] karar numaralı DNA raporunun okunduğu, raporda davalı [KISI_5]'ın çocuk [KISI_8]'nın biyolojik babası olduğunun %99,99 olasılıkla tespit edildiği görüldü.
+Davacı söz alarak: Davalı ile 2022-2023 yıllarında birlikte yaşadık, hamile kaldığımı öğrenince beni terk etti, [KISI_9] çocuğu bir kez bile görmeye gelmedi dedi.
+Davalı vekili söz alarak: Rapora bir diyeceğimiz yoktur, ancak müvekkil [KISI_9] işsizdir, nafaka talebinin düşük tutulmasını isteriz dedi.
+Davacı vekili: Davalının babası [KISI_10]'a ait işletmede çalıştığı bilinmektedir, SGK kayıtlarının celbini talep ederiz dedi.
+UYAP sisteminden alınan rapor doğrulama kodu: [KOD_1] olarak dosyaya kaydedildi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalının SGK hizmet dökümünün ve tapu, araç kayıtlarının celbine,
+2-Taraflar hakkında sosyal ve ekonomik durum araştırması yapılması için kolluğa müzekkere yazılmasına,
+3-Çocuk için tedbiren aylık 3.500,00 TL iştirak nafakasının dava tarihinden itibaren davalıdan alınmasına,
+4-Duruşmanın 26/01/2027 günü saat 09:30'a bırakılmasına,
+Dair, davacı ve taraf vekillerinin yüzüne karşı, açıkça okunup anlatıldı. 22/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

@@ -1,0 +1,38 @@
+# Reading a Turkish hearing record (duruşma zaptı) by rules: the text out of a PDF's text layer
+# (or pasted text), whether that text is usable, and the header and interim decisions parsed into
+# typed data. Pure — no I/O, no clock, no async — because the relay's bot inbox runs it inside a
+# Durable Object (docs/HEARINGS_BOT_PLAN.md §1.1, §3, phase H2).
+[package]
+name = "sezi-hearings"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Rule-based reading of Turkish hearing minutes: PDF text layer, usability check, header and interim decisions."
+
+[lints]
+workspace = true
+
+[dependencies]
+# No default features: `chrono-clock` reads the system clock (it panics on wasm32) and `rayon`
+# spawns threads. What is left parses, decompresses (with the caps in `limits.rs`) and decrypts.
+lopdf = { version = "0.45", default-features = false }
+# Only the Unicode classes the rules use (`\b`, `\s`, `\p{L}`), but WITH the speed-ups: without
+# `perf` the wasm is 0.26 MB smaller (1.83 vs 2.09 MB, opt-z + LTO) and parsing is eight times
+# slower (0.08 → 0.66 ms for one page; 20 pages 10.3 → 21.3 ms; native, measured 2026-10-27), and
+# CPU, not size, is the Workers limit that bites (10 ms on Free; size is 64 MiB on both plans).
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-gencat"] }
+serde = { workspace = true }
+
+# lopdf reaches getrandom 0.4 (its PDF *encryption* path, which this crate never calls), and that
+# refuses wasm32-unknown-unknown without a backend. `wasm_js` is lopdf's switch for it; native
+# builds do not need it, so it is turned on for wasm only.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+lopdf = { version = "0.45", default-features = false, features = ["wasm_js"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+# The H0 probe (docs/HEARINGS_BOT_PLAN.md §3.2): structure of a real PDF, never its text.
+# `cargo run --release -p sezi-hearings --example probe -- zabit.pdf`
+[[example]]
+name = "probe"

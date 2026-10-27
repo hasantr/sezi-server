@@ -1,0 +1,86 @@
+{
+  "court": "Ankara Batı 4. Asliye Ceza Mahkemesi",
+  "court_kind": "criminal_general",
+  "criminal": true,
+  "case_no": "2026/1188",
+  "decision_no": null,
+  "session_no": 2,
+  "hearing_date": "2026-10-08",
+  "hearing_time": null,
+  "next_hearing": {
+    "date": "2027-02-12",
+    "time": "09:00"
+  },
+  "decisions": [
+    {
+      "n": 1,
+      "text": "Müştekinin bir sonraki celse dinlenmek üzere zorla getirilmesine",
+      "first_role": "complainant",
+      "deadlines": [],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 2,
+      "text": "Adli Tıp Kurumundan kesin rapor alınmasına, raporun 30 gün içinde gönderilmesinin istenmesine",
+      "first_role": null,
+      "deadlines": [
+        "30 gün içinde"
+      ],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 3,
+      "text": "Duruşmanın 12.02.2027 tarihine saat 09:00'a talikine",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": true
+    }
+  ],
+  "attendance": [
+    {
+      "role": "accused",
+      "present": true
+    },
+    {
+      "role": "defence_counsel",
+      "of": "accused",
+      "present": true
+    },
+    {
+      "role": "complainant",
+      "present": false
+    },
+    {
+      "role": "prosecutor",
+      "present": true
+    }
+  ],
+  "roles": [
+    {
+      "role": "accused",
+      "count": 1
+    },
+    {
+      "role": "defence_counsel",
+      "of": "accused",
+      "count": 1
+    },
+    {
+      "role": "complainant",
+      "count": 1
+    },
+    {
+      "role": "judge",
+      "count": 1
+    },
+    {
+      "role": "clerk",
+      "count": 1
+    },
+    {
+      "role": "prosecutor",
+      "count": 1
+    }
+  ],
+  "missing": []
+}

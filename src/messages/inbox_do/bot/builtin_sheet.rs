@@ -60,23 +60,20 @@ impl Row {
     /// a boolean as its text, anything else dropped; names and cells cut to their caps. `None`
     /// when the text is not an object or nothing is left.
     pub(crate) fn parse(json: &str) -> Option<Row> {
-        struct V;
-        impl<'de> serde::de::Visitor<'de> for V {
-            type Value = Vec<(String, serde_json::Value)>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a JSON object")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> std::result::Result<Self::Value, A::Error> {
-                let mut out = Vec::new();
-                while let Some(e) = a.next_entry::<String, serde_json::Value>()? {
-                    out.push(e);
-                }
-                Ok(out)
-            }
-        }
+        Self::parse_capped(json, MAX_CELL_CHARS)
+    }
+
+    /// [`Row::parse`] with another cap on a cell (the hearings bot's decisions cell is longer
+    /// than a model-proposed row's).
+    pub(crate) fn parse_capped(json: &str, max_cell: usize) -> Option<Row> {
         let mut de = serde_json::Deserializer::from_str(json);
-        let members = serde::Deserializer::deserialize_map(&mut de, V).ok()?;
+        let members = <Members as serde::Deserialize>::deserialize(&mut de).ok()?;
         de.end().ok()?;
+        Self::from_members(members, max_cell)
+    }
+
+    /// An object's members, in order, as a row under the caps (`None` when nothing is left).
+    fn from_members(Members(members): Members, max_cell: usize) -> Option<Row> {
         let cut = |s: &str, n: usize| s.trim().chars().take(n).collect::<String>();
         let mut row = Vec::new();
         for (k, v) in members {
@@ -90,7 +87,7 @@ impl Row {
             if k.is_empty() || row.iter().any(|(n, _)| *n == k) {
                 continue;
             }
-            row.push((k, cut(&value, MAX_CELL_CHARS)));
+            row.push((k, cut(&value, max_cell)));
             if row.len() == MAX_COLUMNS {
                 break;
             }
@@ -100,6 +97,29 @@ impl Row {
 
     pub(crate) fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
+    }
+}
+
+/// A JSON object's members in their written order (`serde_json::Value` would sort them).
+struct Members(Vec<(String, serde_json::Value)>);
+
+impl<'de> serde::Deserialize<'de> for Members {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Members;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> std::result::Result<Members, A::Error> {
+                let mut out = Vec::new();
+                while let Some(e) = a.next_entry::<String, serde_json::Value>()? {
+                    out.push(e);
+                }
+                Ok(Members(out))
+            }
+        }
+        d.deserialize_map(V)
     }
 }
 
@@ -146,6 +166,110 @@ pub(crate) fn body_json(
 ) -> String {
     let b = Body { v: 1, secret, test, row_id, at, who: Who { user_id, name }, room, text, row };
     serde_json::to_string(&b).unwrap_or_default()
+}
+
+/// Version 2 of the POST: the hearings bot's upsert (docs/HEARINGS_BOT_PLAN.md §6.3, H5).
+///
+/// ```json
+/// {"v": 2, "secret": "…", "test": false, "op": "upsert", "row_id": "<bot>-<job>" | null, "at": …,
+///  "who": {"user_id": "…", "name": "…"}, "room": null,
+///  "key": {"Mahkeme": "…", "Esas No": "2024/123"}, "row": {"Duruşma Tarihi": "…", …}}
+/// ```
+///
+/// There is no `text`: the minutes never go to Google, only the row. The script finds the
+/// first row whose key columns match (trimmed, case-folded, `2024/123 Esas` = `2024/123 E.` =
+/// `2024/123`), writes only the columns in `row`, or appends one, and answers
+/// `{"ok":true,"matched":true|false,"row":<n>}`. `v: 1` is unchanged for the other kinds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Upsert {
+    /// The match key: court, esas no (the office's own sheet needs them to find the row).
+    pub(crate) key: Row,
+    /// The role-only fields written.
+    pub(crate) row: Row,
+}
+
+/// A hearings row's cells, at most (characters): the decisions cell is the long one.
+pub(crate) const MAX_UPSERT_CELL_CHARS: usize = 2000;
+
+impl Upsert {
+    /// How a proposal or a job keeps it (`row_json`), with the audit row it answers to.
+    pub(crate) fn to_json(&self, audit_id: Option<i64>) -> String {
+        #[derive(serde::Serialize)]
+        struct S<'a> {
+            key: &'a Row,
+            row: &'a Row,
+            audit: Option<i64>,
+        }
+        serde_json::to_string(&S { key: &self.key, row: &self.row, audit: audit_id }).unwrap_or_default()
+    }
+
+    /// The stored form back: the upsert and its audit row id.
+    pub(crate) fn parse(json: &str) -> Option<(Upsert, Option<i64>)> {
+        #[derive(serde::Deserialize)]
+        struct S {
+            key: Members,
+            #[serde(default)]
+            row: Option<Members>,
+            #[serde(default)]
+            audit: Option<i64>,
+        }
+        let s: S = serde_json::from_str(json).ok()?;
+        let key = Row::from_members(s.key, MAX_UPSERT_CELL_CHARS)?;
+        let row = s.row.and_then(|r| Row::from_members(r, MAX_UPSERT_CELL_CHARS)).unwrap_or_default();
+        Some((Upsert { key, row }, s.audit))
+    }
+}
+
+#[derive(serde::Serialize)]
+struct BodyV2<'a> {
+    v: u32,
+    secret: &'a str,
+    test: bool,
+    op: &'static str,
+    row_id: Option<&'a str>,
+    at: i64,
+    who: Who<'a>,
+    room: Option<SheetRoom<'a>>,
+    key: &'a Row,
+    row: &'a Row,
+}
+
+/// The upsert's body, exactly as sent (the shared vector `VECTOR_UPSERT`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn body_v2_json(
+    secret: &str,
+    test: bool,
+    row_id: Option<&str>,
+    at: i64,
+    user_id: &str,
+    name: &str,
+    room: Option<SheetRoom<'_>>,
+    upsert: &Upsert,
+) -> String {
+    let who = Who { user_id, name };
+    let b = BodyV2 { v: 2, secret, test, op: "upsert", row_id, at, who, room, key: &upsert.key, row: &upsert.row };
+    serde_json::to_string(&b).unwrap_or_default()
+}
+
+/// What an upsert landed as: the row it updated, or the row it added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Landed {
+    Updated(i64),
+    Appended(i64),
+    /// `{"ok":true}` without a row (a test; a script that does not say).
+    Unknown,
+}
+
+/// An upsert's final answer: [`judge`]'s codes, and where the row went.
+pub(crate) fn judge_upsert(status: u16, body: &str) -> std::result::Result<Landed, &'static str> {
+    judge(status, body)?;
+    let json: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or_default();
+    let row = json.get("row").and_then(|r| r.as_i64()).filter(|r| *r > 0);
+    Ok(match (json.get("matched").and_then(|m| m.as_bool()), row) {
+        (Some(true), Some(r)) => Landed::Updated(r),
+        (Some(false), Some(r)) => Landed::Appended(r),
+        _ => Landed::Unknown,
+    })
 }
 
 /// What a final answer means: `Ok` for `{"ok": true}`, else the typed code.
@@ -220,6 +344,18 @@ pub(crate) fn first_hop(url: &str, allow_lan: bool) -> std::result::Result<Strin
 
 /// Write one body to the sheet: the outcome, and the subrequests it took.
 pub(crate) async fn post(url: &str, body: &str, allow_lan: bool) -> (std::result::Result<(), &'static str>, u32) {
+    let (answer, spent) = post_answer(url, body, allow_lan).await;
+    (answer.and_then(|(status, text)| judge(status, &text)), spent)
+}
+
+/// Write one upsert to the sheet: where it landed, and the subrequests it took.
+pub(crate) async fn post_upsert(url: &str, body: &str, allow_lan: bool) -> (std::result::Result<Landed, &'static str>, u32) {
+    let (answer, spent) = post_answer(url, body, allow_lan).await;
+    (answer.and_then(|(status, text)| judge_upsert(status, &text)), spent)
+}
+
+/// The POST and its hops: the final status and body, or the transport's code.
+async fn post_answer(url: &str, body: &str, allow_lan: bool) -> (std::result::Result<(u16, String), &'static str>, u32) {
     let Ok(first) = first_hop(url, allow_lan) else {
         return (Err("bot/sheet-unreachable"), 0);
     };
@@ -252,7 +388,7 @@ pub(crate) async fn post(url: &str, body: &str, allow_lan: bool) -> (std::result
             }
         }
         let text = resp.text().await.unwrap_or_default();
-        return (judge(status, &text), spent);
+        return (Ok((status, text)), spent);
     }
     (Err("bot/sheet-redirects"), spent)
 }

@@ -1,0 +1,28 @@
+T.C.
+[MAHKEME] AĞIR CEZA MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 2
+DURUŞMA TARİHİ : 25/10/2026
+BAŞKAN : [KISI_1] [SICIL_1]
+ÜYE : [KISI_2] [SICIL_2]
+ÜYE : [KISI_3] [SICIL_3]
+C. SAVCISI : [KISI_4] [SICIL_4]
+KATİP : [KISI_5] [SICIL_5]
+KATILAN : [KISI_6]
+SANIK : [KISI_7] [KISI_8], TC Kimlik No [TCKN_1]
+MÜDAFİİ : Av. [KISI_9]
+SUÇ : Nitelikli Dolandırıcılık (Bilişim Sistemlerinin Araç Olarak Kullanılması Suretiyle)
+
+Belirlenen gün ve saatte duruşmaya başlandı. Katılan [KISI_6] geldi. Tutuklu sanık [KISI_8] ile bağlandı, müdafii Av. [KISI_9] hazır.
+Katılan beyanında: Kendisini banka görevlisi olarak tanıtan kişi [TEL_1] numarasından aradı, [KART_1] numaralı kartımın bilgilerini aldı, ardından [IBAN_1] hesabına 96.000,00 TL gönderildi; bana [EPOSTA_1] adresinden e-posta gelmişti dedi.
+Sanık savunmasında: Hesabı arkadaşım [KISI_10]'ya kiraladım, olaydan haberim yoktu dedi.
+Cumhuriyet Savcısı: Bursa Cumhuriyet Başsavcılığının [DOSYA_1] Soruşturma sayılı dosyasının birleştirilmesini talep ederim dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-[DOSYA_1] Soruşturma sayılı dosya hakkında görevsizlik/birleştirme yönünden yazı yazılmasına,
+2-Sanığın tutukluluk halinin devamına, oybirliğiyle,
+3-Duruşmanın 17/12/2026 günü saat 09:40'a bırakılmasına,
+Dair, C. Savcısının mütalaasına uygun olarak, hazır bulunanların yüzüne karşı verilen karar açıkça okunup anlatıldı. 25/10/2026
+
+Başkan [SICIL_1]   Üye [SICIL_2]   Üye [SICIL_3]   Katip [SICIL_5]
+¸e-imzalıdır   ¸e-imzalıdır   ¸e-imzalıdır   ¸e-imzalıdır

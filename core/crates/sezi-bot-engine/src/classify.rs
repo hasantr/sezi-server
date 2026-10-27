@@ -1,13 +1,18 @@
 //! What a decrypted 1:1 payload means to a bot.
 //!
-//! A bot program sees text and nothing else in Phase 1. Everything a member's kernel sends a
-//! contact on its own — capability announcements, state digests, an avatar, typing, the receipts
-//! of a file — is read, acked and dropped, exactly as a kernel treats a kind it does not know
-//! (`InnerMessage::Unknown`, acked so it does not pile up in the relay's retries).
+//! A bot program sees text and, since H3 (docs/HEARINGS_BOT_PLAN.md §1.2), the manifest of a file
+//! a member sent it 1:1. Everything a member's kernel sends a contact on its own — capability
+//! announcements, state digests, an avatar, typing, the receipts of a file — is read, acked and
+//! dropped, exactly as a kernel treats a kind it does not know (`InnerMessage::Unknown`, acked so
+//! it does not pile up in the relay's retries).
 
-use sezi_protocol::inner::{ChatPayload, InnerMessage};
+use sezi_protocol::inner::{ChatPayload, FileManifest, InnerMessage};
 
 use crate::Inbound;
+
+/// Files one message may hand a bot: an album's whole grid, and no more. A `FileGroup` past it is
+/// read as its first [`MAX_FILES_PER_MESSAGE`] — the sender's kernel never sends a bigger one.
+pub const MAX_FILES_PER_MESSAGE: usize = 16;
 
 /// The body of the pairing/self-heal marker (`messaging_core::kernel::PAIR_ACK_MARKER`, mirrored
 /// here because this crate cannot depend on the kernel; the wire scenarios assert the two agree).
@@ -41,6 +46,12 @@ pub(crate) fn classify(payload: &ChatPayload, from: &str, device: &str, was_prek
             Inbound::Ignored("system_marker")
         }
         InnerMessage::Text { body } => text(body),
+        // A file, or an album of them: the manifests as sent (each `media_id` with the key that
+        // opens it). The engine only reads them — whether the relay may open a blob is the host's
+        // question, asked of its own records, never of the manifest (§8.1: a member could quote
+        // another chat's `media_id`).
+        InnerMessage::File(manifest) => file(payload, from, device, std::slice::from_ref(manifest)),
+        InnerMessage::FileGroup { manifests } => file(payload, from, device, manifests),
         // A formatted message reaches the program as its plain words: the delta is a UI format.
         InnerMessage::RichText { plain_text, .. } => text(plain_text),
         InnerMessage::RoomKeyRequest { room_id, session_id } => Inbound::RoomKeyRequest {
@@ -76,6 +87,29 @@ pub(crate) fn classify(payload: &ChatPayload, from: &str, device: &str, was_prek
         InnerMessage::Unknown => Inbound::Ignored("unknown"),
         inner if inner.is_local_only() => Inbound::Ignored("local_only"),
         _ => Inbound::Ignored("unsupported"),
+    }
+}
+
+/// [`Inbound::File`] for these manifests; a group with none (never sent) is dropped.
+fn file(payload: &ChatPayload, from: &str, device: &str, manifests: &[FileManifest]) -> Inbound {
+    let manifests: Vec<FileManifest> = manifests
+        .iter()
+        // A P2P offer's manifest names no relay blob; only a store-and-forward one reaches here,
+        // but an empty id is nothing the host could fetch either way.
+        .filter(|m| !m.media_id.is_empty())
+        .take(MAX_FILES_PER_MESSAGE)
+        .cloned()
+        .collect();
+    if manifests.is_empty() {
+        return Inbound::Ignored("empty_file");
+    }
+    Inbound::File {
+        from: from.to_owned(),
+        device: device.to_owned(),
+        msg_uid: payload.msg_uid.clone(),
+        manifests,
+        caption: payload.caption(),
+        ext: payload.ext.clone(),
     }
 }
 

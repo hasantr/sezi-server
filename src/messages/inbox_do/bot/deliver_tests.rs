@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    for t in TABLES {
+    for t in TABLES.iter().chain(super::super::deliver_order::TABLES.iter()) {
         c.execute_batch(t).unwrap();
     }
     c
@@ -110,7 +110,8 @@ fn a_bot_turned_off_is_posted_nothing_and_marks_nothing_read() {
     }
     // A program that never answers fails its POST after a bound instead of holding the tick (and
     // the replies and room posts that drain after this round).
-    assert!(round.contains("with_timeout(\n                crate::bots::webhook::post("), "an unbounded webhook POST");
+    let post = round.find("crate::bots::webhook::post(").expect("the POST");
+    assert!(round[post..].contains("with_timeout(post, WEBHOOK_TIMEOUT_MS)"), "an unbounded webhook POST");
     // `/bot/wake` (the owner turning it back on) ends the hold at once.
     assert!(fn_body(include_str!("builtin.rs"), "bot_wake").contains("KV_WEBHOOK_HOLD"));
 }

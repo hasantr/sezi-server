@@ -1,0 +1,38 @@
+# The file crypto layer: chunked XChaCha20-Poly1305 STREAM, and nothing else. No kernel state, no
+# database, no bridge — it takes a path or a buffer and a key, and it reports progress through
+# `sezi-transfer`.
+#
+# It is a crate of its own rather than part of `sezi-protocol` because the direction of the dependency
+# matters: `FileManifest` is a WIRE type that travels inside `InnerMessage`, so the protocol defines it
+# and this layer consumes it. The other way round would make the wire format inherit tokio and a global
+# cancellation registry, which a protocol module must never carry.
+[package]
+name = "sezi-file"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Chunked file encryption (XChaCha20-Poly1305 STREAM)."
+
+[lints]
+workspace = true
+
+[dependencies]
+sezi-error = { path = "../sezi-error" }
+sezi-protocol = { path = "../sezi-protocol" }
+sezi-transfer = { path = "../sezi-transfer" }
+chacha20poly1305 = { workspace = true }
+rand = { workspace = true }
+# NOT for Olm — this layer does no session crypto. `vodozemac::base64_encode/decode` is where the
+# manifest's key/nonce encoding comes from, and it has to stay that encoding (unpadded, Matrix-style)
+# because the manifest travels on the wire and old messages must still open. Swapping in the `base64`
+# crate would be a wire change disguised as a dependency cleanup.
+vodozemac = { workspace = true }
+# `CancellationToken` in the chunk loops. Unconditional, not native-only: the wasm green island
+# compiles this layer too, and root has carried tokio-util unconditionally for the same reason.
+tokio-util = { workspace = true }
+log = "0.4"
+# The group library's per-part key derivation (`part.rs`): HKDF-SHA256 over the part index. Both
+# were already in the lock — the root crate and `sezi-backup` derive their backup keys the same
+# way — and both are pure Rust, so the wasm island is unaffected.
+hkdf = "0.12"
+sha2 = "0.10"

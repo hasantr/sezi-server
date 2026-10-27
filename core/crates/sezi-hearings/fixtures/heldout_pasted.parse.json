@@ -1,0 +1,59 @@
+{
+  "court": "Kocaeli 1. Kadastro Mahkemesi",
+  "court_kind": "cadastre",
+  "criminal": false,
+  "case_no": "2026/33",
+  "decision_no": null,
+  "session_no": null,
+  "hearing_date": "2026-11-03",
+  "hearing_time": "10:20",
+  "next_hearing": {
+    "date": "2027-01-21",
+    "time": "13:30"
+  },
+  "decisions": [
+    {
+      "n": 1,
+      "text": "taşınmaz başında keşif yapılmasına, keşif gideri olarak 6.000 TL'nin davacı tarafça 2 hafta içinde yatırılmasına",
+      "first_role": "plaintiff",
+      "deadlines": [
+        "2 hafta içinde"
+      ],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 2,
+      "text": "duruşmanın 21 ocak 2027 günü saat 13:30'a bırakılmasına",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": true
+    }
+  ],
+  "attendance": [
+    {
+      "role": "counsel",
+      "of": "plaintiff",
+      "present": true
+    },
+    {
+      "role": "defendant",
+      "present": false
+    }
+  ],
+  "roles": [
+    {
+      "role": "plaintiff",
+      "count": 1
+    },
+    {
+      "role": "defendant",
+      "count": 1
+    },
+    {
+      "role": "counsel",
+      "of": "plaintiff",
+      "count": 1
+    }
+  ],
+  "missing": []
+}

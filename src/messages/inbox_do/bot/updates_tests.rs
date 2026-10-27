@@ -16,6 +16,44 @@ fn a_command_is_a_slash_name_at_the_very_start() {
     assert_eq!(parse_command(&format!("/{}", "x".repeat(33))), None, "at most 32");
 }
 
+/// H3: a file is its own kind, so a program that switches on `kind` and reads `message.text`
+/// never takes a file's empty text for a message; what it reads names the file by `file_id` and
+/// never carries the key or the `media_id`.
+#[test]
+fn a_file_update_names_each_file_and_carries_no_key() {
+    let m = sezi_protocol::inner::FileManifest {
+        v: 1,
+        media_id: "media-secret-id".into(),
+        key_b64: "KEY-MUST-NOT-LEAK".into(),
+        nonce_b64: "NONCE-MUST-NOT-LEAK".into(),
+        chunk_size: 65_536,
+        size: 12_345,
+        content_type: "application/pdf".into(),
+        filename: format!("{}.pdf", "z".repeat(300)),
+    };
+    let files = [("f-1".to_string(), &m)];
+    let u = file_update(7, "alice", None, Some("m-9"), Some("the minutes"), &serde_json::Value::Null, &files);
+    let name: String = format!("{}.pdf", "z".repeat(300)).chars().take(MAX_FILE_NAME_CHARS).collect();
+    assert_eq!(
+        u,
+        serde_json::json!({
+            "kind": "file",
+            "at": 7,
+            "chat": { "type": "direct", "user_id": "alice" },
+            "message": { "message_id": "m-9", "caption": "the minutes", "reply_to": null },
+            "files": [{ "file_id": "f-1", "name": name, "mime": "application/pdf", "size": 12_345 }],
+            "who": { "user_id": "alice" },
+        })
+    );
+    let text = u.to_string();
+    for secret in ["KEY-MUST-NOT-LEAK", "NONCE-MUST-NOT-LEAK", "media-secret-id"] {
+        assert!(!text.contains(secret), "the update carries {secret}");
+    }
+    // A caption starting with a slash is not a command: a file is not a text.
+    let u = file_update(7, "alice", None, None, Some("/durusma"), &serde_json::Value::Null, &files);
+    assert!(u.get("command").is_none());
+}
+
 #[test]
 fn a_message_update_carries_the_relays_who_and_never_the_senders() {
     let who = Who {

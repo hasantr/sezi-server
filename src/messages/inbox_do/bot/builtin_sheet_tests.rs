@@ -22,7 +22,63 @@ pub(super) const VECTOR_ROOM: &str = concat!(
     r#""text":"Yarın 10:00 duruşma, Ankara 3. Asliye","row":null}"#,
 );
 
+/// The hearings bot's upsert (v2, docs/HEARINGS_BOT_PLAN.md §6.3; job 19): the key, the
+/// role-only row, and no `text`. The core's script is tested against these bytes too.
+pub(super) const VECTOR_UPSERT: &str = concat!(
+    r#"{"v":2,"secret":"s3cr3t-sheet","test":false,"op":"upsert","row_id":"b0000000-0000-4000-8000-000000000002-19","at":1761200000000,"#,
+    r#""who":{"user_id":"a0000000-0000-4000-8000-000000000001","name":"Ayşe"},"room":null,"#,
+    r#""key":{"Mahkeme":"Ankara 3. Asliye Hukuk Mahkemesi","Esas No":"2024/123"},"#,
+    r#""row":{"Duruşma Tarihi":"14.10.2026","Sonraki Duruşma":"09.12.2026 10:30","#,
+    r#""Ara Karar":"1. Davacı: bilirkişi ücreti 3.000 TL — iki haftalık kesin süre","Avukat":"Ayşe","Güncelleme":"27.10.2026"}}"#,
+);
+/// The hearings bot's "Dene": a v2 test, nothing written.
+pub(super) const VECTOR_UPSERT_TEST: &str = concat!(
+    r#"{"v":2,"secret":"s3cr3t-sheet","test":true,"op":"upsert","row_id":null,"at":1761200000000,"#,
+    r#""who":{"user_id":"a0000000-0000-4000-8000-000000000001","name":"Ayşe"},"room":null,"key":{},"row":{}}"#,
+);
+
 const WHO: &str = "a0000000-0000-4000-8000-000000000001";
+
+fn upsert_vector() -> Upsert {
+    let r = |pairs: &[(&str, &str)]| Row(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+    Upsert {
+        key: r(&[("Mahkeme", "Ankara 3. Asliye Hukuk Mahkemesi"), ("Esas No", "2024/123")]),
+        row: r(&[
+            ("Duruşma Tarihi", "14.10.2026"),
+            ("Sonraki Duruşma", "09.12.2026 10:30"),
+            ("Ara Karar", "1. Davacı: bilirkişi ücreti 3.000 TL — iki haftalık kesin süre"),
+            ("Avukat", "Ayşe"),
+            ("Güncelleme", "27.10.2026"),
+        ]),
+    }
+}
+
+#[test]
+fn the_upsert_is_the_shared_vector_byte_for_byte_and_carries_no_text() {
+    let row_id = "b0000000-0000-4000-8000-000000000002-19";
+    let body = body_v2_json("s3cr3t-sheet", false, Some(row_id), 1_761_200_000_000, WHO, "Ayşe", None, &upsert_vector());
+    assert_eq!(body, VECTOR_UPSERT);
+    assert!(!body.contains("\"text\""));
+    let test = body_v2_json("s3cr3t-sheet", true, None, 1_761_200_000_000, WHO, "Ayşe", None, &Upsert::default());
+    assert_eq!(test, VECTOR_UPSERT_TEST);
+    // What a proposal or a job keeps reads back the same, in order, with its audit row.
+    let u = upsert_vector();
+    assert_eq!(Upsert::parse(&u.to_json(Some(4))), Some((u.clone(), Some(4))));
+    assert_eq!(Upsert::parse(&u.to_json(None)), Some((u, None)));
+    assert_eq!(Upsert::parse(r#"{"row":{"a":"b"}}"#), None, "no key, no upsert");
+    let long = format!(r#"{{"key":{{"k":"v"}},"row":{{"Ara Karar":"{}"}}}}"#, "ü".repeat(3000));
+    assert_eq!(Upsert::parse(&long).unwrap().0.row.0[0].1.chars().count(), MAX_UPSERT_CELL_CHARS);
+}
+
+#[test]
+fn the_upserts_answer_names_the_row() {
+    assert_eq!(judge_upsert(200, r#"{"ok":true,"matched":true,"row":17}"#), Ok(Landed::Updated(17)));
+    assert_eq!(judge_upsert(200, r#"{"ok":true,"matched":false,"row":42}"#), Ok(Landed::Appended(42)));
+    assert_eq!(judge_upsert(200, r#"{"ok":true}"#), Ok(Landed::Unknown));
+    assert_eq!(judge_upsert(200, r#"{"ok":true,"matched":true,"row":0}"#), Ok(Landed::Unknown));
+    assert_eq!(judge_upsert(200, r#"{"ok":false,"error":"secret"}"#), Err("bot/sheet-secret"));
+    assert_eq!(judge_upsert(200, r#"{"ok":false,"error":"no-key"}"#), Err("bot/sheet-refused"));
+}
 
 #[test]
 fn a_call_from_a_room_names_the_room_after_who() {

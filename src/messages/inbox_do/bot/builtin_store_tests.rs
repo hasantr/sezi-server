@@ -67,6 +67,20 @@ fn usage_counts_per_member_per_day() {
     assert_eq!(day_of(1_761_200_000_000), 20_384);
 }
 
+#[test]
+fn the_bots_own_day_of_model_calls_is_every_members_together() {
+    let c = db();
+    let total = |d: i64| -> i64 { c.query_row(USAGE_DAY_TOTAL, params![d], |r| r.get(0)).unwrap() };
+    assert_eq!(total(7), 0, "no row is a zero, not a missing answer");
+    for (u, n) in [("alice", 3), ("bob", 2)] {
+        for _ in 0..n {
+            c.execute(USAGE_BUMP, params![u, 7]).unwrap();
+        }
+    }
+    c.execute(USAGE_BUMP, params!["alice", 8]).unwrap();
+    assert_eq!((total(7), total(8), total(9)), (5, 1, 0));
+}
+
 /// An inbox made before rooms gains the columns; on a fresh one the upgrade is a harmless error.
 #[test]
 fn the_room_columns_reach_old_and_new_tables() {
@@ -146,6 +160,30 @@ fn leaving_ai_mode_forgets_every_member() {
         .query_row(
             "SELECT (SELECT COUNT(*) FROM bot_ai_turns) + (SELECT COUNT(*) FROM bot_ai_proposals)
                   + (SELECT COUNT(*) FROM bot_ai_usage)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn leaving_hearings_mode_empties_the_queue_and_its_files() {
+    let c = db();
+    for t in super::super::files::TABLES.iter().chain(super::super::deliver_order::TABLES.iter()) {
+        c.execute_batch(t).unwrap();
+    }
+    c.execute(super::super::updates::UPDATE_PUSH.trim_end_matches(" RETURNING update_id"), params!["{\"message\":{\"text\":\"minutes\"}}", 5]).unwrap();
+    c.execute(super::super::files::FILE_PUT, params!["f-1", 1, "alice", "{\"key\":\"k\"}", 5]).unwrap();
+    c.execute("INSERT INTO bot_update_src (update_id, from_user, remote_id) VALUES (1, 'alice', 7)", []).unwrap();
+    c.execute(super::super::deliver_order::ASIDE_PUT, [1]).unwrap();
+    for q in HEARINGS_QUEUE_FORGET {
+        c.execute(q, []).unwrap();
+    }
+    let n: i64 = c
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM bot_updates) + (SELECT COUNT(*) FROM bot_files)
+                  + (SELECT COUNT(*) FROM bot_update_src) + (SELECT COUNT(*) FROM bot_update_aside)",
             [],
             |r| r.get(0),
         )

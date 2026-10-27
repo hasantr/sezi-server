@@ -1,0 +1,29 @@
+T.C.
+[MAHKEME] SULH HUKUK MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO         : [ESAS] Esas
+CELSE NO        : 2
+DURUŞMA TARİHİ  : 21/10/2026
+
+HAKİM           : [KISI_1] [SICIL_1]
+KATİP           : [KISI_2] [SICIL_2]
+
+DAVACI          : [KISI_3] - [ADRES_1]
+VEKİLİ          : Av. [KISI_4] (İzmir Barosu Sicil No: [SICIL_3]) - [ADRES_2]
+DAVALI          : [KISI_5] - [ADRES_3]
+DAVA            : Kiralananın Tahliyesi ve Kira Alacağı
+DAVA TARİHİ     : 03/06/2025
+
+Belirlenen gün ve saatte celse açıldı. Davacı vekili Av. [KISI_4] geldi. Davalı [KISI_5] gelmedi, usulüne uygun tebligata rağmen mazeret de bildirmedi. Yokluğunda duruşmaya devam olundu.
+Önceki celse ara kararı gereği [DOSYA_1] Esas sayılı icra takip dosyasının dosyamız arasına alındığı görüldü.
+Davacı vekili söz alarak: Müvekkilim [KISI_3] ile davalı arasında 01/09/2022 başlangıçlı yazılı kira sözleşmesi bulunmaktadır, davalı Mart 2025'ten beri kirayı ödememektedir, iki haklı ihtar çekilmiştir. Davalıya [TEL_1] numaralı telefonundan da ulaşılamamaktadır. Binanın yöneticisi [KISI_6] de davalının taşınmazı kullanmaya devam ettiğini bilmektedir. Tahliyeye karar verilmesini talep ederiz dedi.
+Dosya incelendi, davalı [KISI_5]'ın cevap dilekçesi vermediği, delil de bildirmediği anlaşıldı.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalı tarafından ödenmeyen kira bedellerinin davacı [KISI_3]'nun [IBAN_1] IBAN numaralı hesabına yatırılıp yatırılmadığının bankaya müzekkere yazılarak sorulmasına,
+2-Davalıya HMK 128. maddesi uyarınca inkar etmiş sayılacağı hususunun ihtarına,
+3-Duruşmanın 25/11/2026 günü saat 09:40'a bırakılmasına,
+Dair, davacı vekilinin yüzüne karşı, davalının yokluğunda açıkça okunup anlatıldı. 21/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

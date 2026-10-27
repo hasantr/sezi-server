@@ -13,6 +13,7 @@
 //! and allows `http`, so the E2E lab can point a bot at a stand-in endpoint on its own network.
 //! It is off unless set to exactly `1`; no deployed relay sets it.
 
+pub(crate) use super::builtin_hearings_rules::{HearingsConfig, HearingsIn};
 use serde::{Deserialize, Serialize};
 use worker::Url;
 
@@ -35,6 +36,9 @@ pub(crate) enum Kind {
     Sheet,
     /// Answers with the owner's model and instructions.
     Ai,
+    /// Reads hearing minutes, masks them, summarises them and writes the office's row
+    /// (docs/HEARINGS_BOT_PLAN.md; its rules are `builtin_hearings_rules.rs`).
+    Hearings,
 }
 
 impl Kind {
@@ -43,6 +47,7 @@ impl Kind {
         match self {
             Kind::Sheet => "sheet",
             Kind::Ai => "ai",
+            Kind::Hearings => "hearings",
         }
     }
 }
@@ -108,6 +113,8 @@ pub(crate) struct PutBody {
     pub(crate) sheet: Option<SheetIn>,
     #[serde(default)]
     pub(crate) ai: Option<AiIn>,
+    #[serde(default)]
+    pub(crate) hearings: Option<HearingsIn>,
 }
 
 #[derive(Deserialize, Default)]
@@ -144,6 +151,8 @@ pub(crate) struct Config {
     pub(crate) sheet_url: Option<String>,
     #[serde(default)]
     pub(crate) ai: Option<AiConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hearings: Option<HearingsConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -163,7 +172,57 @@ impl Config {
     /// sheet is connected: the helper hands the script (with the secret) over first, and the
     /// `/exec` address exists only once the owner has deployed it.
     pub(crate) fn wants_sheet(&self) -> bool {
-        self.kind == Kind::Sheet || self.ai.as_ref().is_some_and(|a| a.sheet_tool)
+        matches!(self.kind, Kind::Sheet | Kind::Hearings) || self.ai.as_ref().is_some_and(|a| a.sheet_tool)
+    }
+
+    /// The service a stored key belongs to (provider, address): the AI bot's, or the hearings
+    /// bot's whether or not its model is on. `None` for a kind that holds no key.
+    pub(crate) fn key_service(&self) -> Option<(Provider, Option<&str>)> {
+        match self.kind {
+            Kind::Ai => self.ai.as_ref().map(|a| (a.provider, a.base_url.as_deref())),
+            Kind::Hearings => self.hearings.as_ref().map(|h| (h.provider, h.base_url.as_deref())),
+            Kind::Sheet => None,
+        }
+    }
+
+    /// The provider members' words (masked, for the hearings kind) go to, when a model is
+    /// called at all: `bots.ai_provider`, the members' disclosure chip.
+    pub(crate) fn model_provider(&self) -> Option<Provider> {
+        match self.kind {
+            Kind::Ai => self.ai.as_ref().map(|a| a.provider),
+            Kind::Hearings => self.hearings.as_ref().filter(|h| h.ai).map(|h| h.provider),
+            Kind::Sheet => None,
+        }
+    }
+
+    /// Where that provider runs the model, when the bot says so: a hearings bot calling
+    /// Anthropic sends `inference_geo` (`us` / `global`) — `bots.ai_geo`, so its members' line
+    /// reads "(Anthropic, ABD)" (docs/HEARINGS_BOT_PLAN.md §8.3). `None` for the OpenAI dialect,
+    /// which sends no such field, for an AI bot, and whenever no model is called.
+    pub(crate) fn model_geo(&self) -> Option<super::builtin_hearings_rules::Geo> {
+        match self.kind {
+            Kind::Hearings => self
+                .hearings
+                .as_ref()
+                .filter(|h| h.ai && h.provider == Provider::Anthropic)
+                .map(|h| h.inference_geo),
+            Kind::Ai | Kind::Sheet => None,
+        }
+    }
+
+    /// The model, for the owner's list.
+    pub(crate) fn model_name(&self) -> Option<&str> {
+        match self.kind {
+            Kind::Ai => self.ai.as_ref().map(|a| a.model.as_str()),
+            Kind::Hearings => self.hearings.as_ref().filter(|h| h.ai).map(|h| h.model.as_str()),
+            Kind::Sheet => None,
+        }
+    }
+
+    /// Does this configuration need a stored key to work (an AI bot; a hearings bot with its
+    /// model on)?
+    pub(crate) fn needs_key(&self) -> bool {
+        self.model_provider().is_some()
     }
 
     /// Does this bot write to a sheet NOW — meant to, and its address set?
@@ -178,7 +237,7 @@ impl Config {
 
     /// The configuration as the owner's `GET /admin/bots/:id/builtin` answers it.
     pub(crate) fn to_owner_json(&self, has_api_key: bool) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "kind": self.kind,
             "lang": self.lang,
             "sheet": self.wants_sheet().then(|| serde_json::json!({ "url": self.sheet_url })),
@@ -190,7 +249,12 @@ impl Config {
                 "sheet_tool": a.sheet_tool,
             })),
             "has_api_key": has_api_key,
-        })
+        });
+        // Only a hearings bot's answer has the field: the other kinds' GET is unchanged.
+        if let Some(h) = &self.hearings {
+            v["hearings"] = h.to_owner_json();
+        }
+        v
     }
 }
 
@@ -216,8 +280,13 @@ pub(crate) fn validate(body: PutBody, allow_lan: bool) -> Result<Checked, &'stat
     match kind {
         Kind::Sheet => {
             // No address yet is "not connected": the secret comes first (`wants_sheet`).
-            let config = Config { kind, lang, sheet_url, ai: None };
+            let config = Config { kind, lang, sheet_url, ai: None, hearings: None };
             Ok(Checked { config: Some(config), api_key: None })
+        }
+        Kind::Hearings => {
+            let h = super::builtin_hearings_rules::validate(body.hearings, body.sheet, lang, allow_lan)?;
+            let config = Config { kind, lang, sheet_url: h.sheet_url, ai: None, hearings: Some(h.config) };
+            Ok(Checked { config: Some(config), api_key: h.api_key })
         }
         Kind::Ai => {
             let ai = body.ai.ok_or("builtin/ai")?;
@@ -261,6 +330,7 @@ pub(crate) fn validate(body: PutBody, allow_lan: bool) -> Result<Checked, &'stat
                     instructions: instructions.to_string(),
                     sheet_tool: ai.sheet_tool,
                 }),
+                hearings: None,
             };
             Ok(Checked { config: Some(config), api_key })
         }
@@ -268,7 +338,7 @@ pub(crate) fn validate(body: PutBody, allow_lan: bool) -> Result<Checked, &'stat
 }
 
 /// A key that can travel in a header: printable ASCII, no spaces, at most 512.
-fn key_ok(k: &str) -> bool {
+pub(crate) fn key_ok(k: &str) -> bool {
     !k.is_empty() && k.len() <= MAX_KEY_CHARS && k.bytes().all(|b| (0x21..0x7f).contains(&b))
 }
 
@@ -287,9 +357,10 @@ const PRIVATE_SUFFIXES: [&str; 9] =
     [".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain", ".box", ".corp", ".home"];
 
 /// Does a stored key still belong with `new`? Only while the provider and address it was given
-/// for are unchanged: otherwise a key for one service would be sent to another.
-pub(crate) fn key_follows(old: Option<&AiConfig>, new: &AiConfig) -> bool {
-    old.is_some_and(|o| o.provider == new.provider && o.base_url == new.base_url)
+/// for are unchanged: otherwise a key for one service would be sent to another. The AI bot's and
+/// the hearings bot's key are one slot (`Config::key_service`), so this holds across those kinds.
+pub(crate) fn service_follows(old: Option<&Config>, new: &Config) -> bool {
+    matches!((old.and_then(Config::key_service), new.key_service()), (Some(o), Some(n)) if o == n)
 }
 
 /// The URL, when a built-in bot may send a request to it; else `None`.

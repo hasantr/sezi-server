@@ -1,0 +1,32 @@
+T.C.
+[MAHKEME] ASLİYE CEZA MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO          : [ESAS] Esas
+CELSE NO         : 2
+DURUŞMA TARİHİ   : 14/10/2026
+
+HAKİM            : [KISI_1] [SICIL_1]
+C. SAVCISI       : [KISI_2] [SICIL_2]
+KATİP            : [KISI_3] [SICIL_3]
+
+KATILAN          : [KISI_4] - [ADRES_1]
+KATILAN VEKİLİ   : Av. [KISI_5]
+SANIK            : [KISI_6], [KISI_7] ve [KISI_8] oğlu, [DOGUM_1] Toroslar doğumlu, TC: [TCKN_1], [ADRES_2] adresinde oturur. Tutuksuz.
+MÜDAFİİ          : Av. [KISI_9] (Mersin Barosu [SICIL_4])
+SUÇ              : Hırsızlık (TCK 142/1-b)
+
+Belirlenen gün ve saatte celse açıldı. C. Savcısı [KISI_2] katıldı. Katılan [KISI_4] ve vekili, sanık [KISI_6] ve müdafii Av. [KISI_9] geldi. Açık duruşmaya devam olundu.
+İşyeri güvenlik kamerası görüntülerine ilişkin bilirkişi raporu okundu; görüntülerde [PLAKA_1] plakalı motosikletten inen bir şahsın katılanın dükkanına girdiği görüldü.
+Katılan söz alarak: Dükkanımdan iki cep telefonu ve kasadaki 27.000,00 TL çalındı, kameradaki kişi sanıktır, şikayetçiyim dedi.
+Sanık [KISI_6] savunmasında: Olay saatinde dayımın düğünündeydim, motosiklet bana ait değildir, arkadaşım [KISI_10]'e aittir, ben suçsuzum dedi.
+Sanık müdafii: Motosiklet sahibinin tanık olarak dinlenmesini, sanığın düğün fotoğraflarının incelenmesini talep ederiz, müvekkil [KISI_11] hakkında tespit yalnızca kamera görüntüsüne dayanmaktadır dedi.
+C. Savcısından soruldu: Talebe katılmıyoruz, ancak motosiklet ruhsat sahibinin tespitine yönelik talebe muhalefetimiz yoktur dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-[PLAKA_1] plakalı motosikletin ruhsat sahibinin Emniyet Trafik Tescil Şube Müdürlüğünden sorulmasına, ruhsat sahibinin tanık olarak duruşmaya çağrılmasına,
+2-Sanık müdafiine düğün fotoğraflarını sunması için bir haftalık süre verilmesine,
+3-Duruşmanın 02/12/2026 günü saat 09:10'a bırakılmasına,
+Dair, C. Savcısının, katılan ve vekilinin, sanık ve müdafiinin yüzüne karşı, açıkça okunup anlatıldı. 14/10/2026
+
+Katip [SICIL_3]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

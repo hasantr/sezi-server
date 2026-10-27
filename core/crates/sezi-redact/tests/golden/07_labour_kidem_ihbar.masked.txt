@@ -1,0 +1,26 @@
+T.C.
+[MAHKEME] İŞ MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 5
+DURUŞMA TARİHİ : 29/09/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+DAVACI : [KISI_3] - [ADRES_1]
+VEKİLİ : Av. [KISI_4] - [ADRES_2]
+DAVALI : [SIRKET_1] - [ADRES_3]
+VEKİLİ : Av. [KISI_5]
+BİLİRKİŞİ : Mali Müşavir [KISI_6]
+DAVA : Kıdem ve İhbar Tazminatı, Fazla Mesai Alacağı
+
+Belirli gün ve saatte duruşmaya başlandı. Davacı vekili Av. [KISI_4] ile davalı vekili Av. [KISI_5] geldi.
+Bilirkişi [KISI_6] tarafından düzenlenen 14/08/2026 tarihli rapor okundu.
+Davacı vekili: Rapora itirazımız yoktur, müvekkil [KISI_3]'e ulaşılması için cep telefonu [TEL_1] dosyaya bildirilmiştir dedi.
+Davalı vekili: Rapordaki fazla mesai hesabına itiraz ediyoruz, puantaj kayıtları dikkate alınmamıştır dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalı vekilinin itirazları doğrultusunda bilirkişiden ek rapor alınmasına, ek rapor için 1.500,00 TL ücretin davalı tarafından bir hafta içinde yatırılmasına,
+2-Duruşmanın 26/11/2026 günü saat 09:30'a bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 29/09/2026
+
+Katip [SICIL_2]             Hakim [SICIL_1]
+¸e-imzalıdır             ¸e-imzalıdır

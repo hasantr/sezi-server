@@ -140,7 +140,7 @@ fn the_api_hands_the_program_no_raw_inbox_answer() {
     let api = include_str!("api.rs");
     assert!(!api.contains("passthrough("), "a raw inbox answer can reach the program");
     let calls = api.matches("super::bot_inbox(").count();
-    assert_eq!(calls, 4, "getUpdates, setWebhook, and the two sends");
+    assert_eq!(calls, 6, "the call budget, getUpdates, setWebhook, the two sends, and getFile");
     assert!(api.matches("inbox_answer(").count() >= calls, "each one is judged");
 }
 
@@ -151,7 +151,27 @@ fn the_api_reads_its_body_only_through_this_module() {
     for lax in [".json().await", "unwrap_or(serde_json::json!({}))", "v.as_i64()", "v.as_str()"] {
         assert!(!api.contains(lax), "api.rs reads a field past api_input: {lax}");
     }
-    for door in ["input::parse_body(", "input::parse_updates(", "input::parse_send(", "input::parse_webhook("] {
+    let doors = ["input::parse_body(", "input::parse_updates(", "input::parse_send(", "input::parse_webhook(", "input::parse_get_file("];
+    for door in doors {
         assert!(api.contains(door), "api.rs no longer calls {door}");
+    }
+}
+
+/// `getFile {file_id}`: the id an update named, of the inbox's spelling; a missing, wrong-typed,
+/// empty, over-long or oddly spelled one is refused before the inbox is asked.
+#[test]
+fn get_file_takes_one_file_id() {
+    let id = "f-3f0a1c2e-0000-4000-8000-000000000001";
+    assert_eq!(parse_get_file(&json!({ "file_id": id })), Ok(id));
+    for bad in [
+        json!({}),
+        json!({ "file_id": null }),
+        json!({ "file_id": 5 }),
+        json!({ "file_id": "" }),
+        json!({ "file_id": "x".repeat(MAX_FILE_ID_LEN + 1) }),
+        json!({ "file_id": "media/abc" }),
+        json!({ "file_id": "f 1" }),
+    ] {
+        assert_eq!(parse_get_file(&bad), Err((400, "bad-request")), "{bad}");
     }
 }

@@ -1,0 +1,32 @@
+T.C.
+[MAHKEME] AİLE MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO       : [ESAS] Esas
+CELSE NO      : 3
+DURUŞMA TARİHİ: 13/10/2026
+
+HAKİM         : [KISI_1] [SICIL_1]
+KATİP         : [KISI_2] [SICIL_2]
+
+DAVACI        : [KISI_3] - [ADRES_1]
+VEKİLİ        : Av. [KISI_4] (Antalya Barosu [SICIL_3])
+DAVALI        : [KISI_5] - [ADRES_2]
+VEKİLİ        : Av. [KISI_6]
+DAVA          : Boşanma (Çekişmeli)
+
+Belirlenen gün ve saatte celseye başlandı. Davacı [KISI_3] ile vekili Av. [KISI_4], davalı [KISI_5] ile vekili Av. [KISI_6] geldi. Açık yargılamaya devam olundu.
+Sosyal çalışmacı raporunun geldiği, ortak çocuk [KISI_7] [KISI_8]'in ([DOGUM_1]) annesi yanında kalmasının üstün yararına olduğunun belirtildiği görüldü.
+Davacı tanıkları hazır olduğundan usulen yeminleri yaptırılarak dinlendiler:
+TANIK: [KISI_9], [KISI_10] kızı, [DOGUM_2] doğumlu, emekli, [ADRES_3] adresinde oturur, taraflarla akrabalığı yok, davacının komşusuyum. Gece yarıları bağırma sesleri duyardık, bir keresinde [KISI_11] kapıma gelip yardım istedi, kolunda morluk vardı, [KISI_12] bey o gece evi terk etti dedi.
+TANIK: [KISI_13], [KISI_14] oğlu, [DOGUM_3] doğumlu, davacının ağabeyi, [ADRES_4] adresinde oturur. Kardeşim bana defalarca şikayet etti, davalı maaşının tamamını kumarda harcıyordu, bunu davalının iş arkadaşı Levent de bilir dedi.
+Davalı söz alarak: Tanıklar davacının yakınıdır, beyanlarını kabul etmiyorum, kızım [KISI_7] ile görüşmem engelleniyor, bana [TEL_1] numarasından ulaşılabilir dedi.
+Davalı vekili: Davalının aylık geliri asgari ücret düzeyindedir, talep edilen nafaka fahiştir dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalı tanıklarının bir sonraki celse hazır edilmesi için davalı vekiline süre verilmesine,
+2-Tedbir nafakasının şimdilik çocuk için aylık 4.000,00 TL olarak devamına,
+3-Duruşmanın 08/12/2026 günü saat 11:20'ye bırakılmasına,
+Dair, tarafların ve vekillerinin yüzüne karşı, açıkça okunup anlatıldı. 13/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

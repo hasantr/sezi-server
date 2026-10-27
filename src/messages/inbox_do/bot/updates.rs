@@ -93,6 +93,42 @@ pub(crate) fn message_update(
     update
 }
 
+/// The longest file name and type an update carries: the sender's words, cut, never refused.
+pub(crate) const MAX_FILE_NAME_CHARS: usize = 255;
+pub(crate) const MAX_FILE_MIME_CHARS: usize = 127;
+
+/// The update for a file (or an album) a member sent the bot 1:1 (H3): `kind: "file"`, its
+/// `message` the caption rather than a text, and `files` naming each by the `file_id` that
+/// `getFile` reads. Name, type and size are the member's own words from the manifest — what a
+/// program shows, never what it trusts; the key and the `media_id` stay in the inbox.
+pub(crate) fn file_update(
+    at_ms: i64,
+    from: &str,
+    who: Option<&Who>,
+    msg_uid: Option<&str>,
+    caption: Option<&str>,
+    ext: &serde_json::Value,
+    files: &[(String, &sezi_protocol::inner::FileManifest)],
+) -> serde_json::Value {
+    let mut update = message_update(at_ms, from, who, msg_uid, "", ext);
+    update["kind"] = "file".into();
+    let reply_to = update["message"]["reply_to"].take();
+    update["message"] = serde_json::json!({ "message_id": msg_uid, "caption": caption, "reply_to": reply_to });
+    let cut = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    update["files"] = files
+        .iter()
+        .map(|(file_id, m)| {
+            serde_json::json!({
+                "file_id": file_id,
+                "name": cut(&m.filename, MAX_FILE_NAME_CHARS),
+                "mime": cut(&m.content_type, MAX_FILE_MIME_CHARS),
+                "size": m.size,
+            })
+        })
+        .collect();
+    update
+}
+
 /// Where a room call came from, as the relay's own tables say (never the caller's word).
 pub(crate) struct CallRoom<'a> {
     pub(crate) id: &'a str,

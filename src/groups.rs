@@ -103,6 +103,11 @@ struct GroupRoleRow {
     role: String,
 }
 
+/// [`group_role`]'s statement (also the hearings bot's `allowed_room` gate, whose tests run it).
+/// Bind: group, user.
+pub(crate) const GROUP_ROLE_SQL: &str = "SELECT role FROM group_members
+             WHERE group_id = ? AND user_id = ? AND status = 'active' LIMIT 1";
+
 /// A user's in-group role ('owner' | 'admin' | 'member'), or None if they are not an ACTIVE
 /// member. Only `status='active'` counts: a 'pending' invitee is NOT a member and can neither
 /// receive messages, administer the group, nor see the member list. `pub(crate)` because the
@@ -113,10 +118,7 @@ pub(crate) async fn group_role(
     user_id: &str,
 ) -> Result<Option<String>> {
     let row: Option<GroupRoleRow> = db
-        .prepare(
-            "SELECT role FROM group_members
-             WHERE group_id = ? AND user_id = ? AND status = 'active' LIMIT 1",
-        )
+        .prepare(GROUP_ROLE_SQL)
         .bind(&[d1_text(group_id), d1_text(user_id)])?
         .first(None)
         .await?;

@@ -23,6 +23,9 @@ pub(crate) const MAX_REPLY_TO_LEN: usize = 128;
 /// A `client_id` (idempotent sending): 1..=64 of `A-Z a-z 0-9 . _ : -`.
 pub(crate) const MAX_CLIENT_ID_LEN: usize = 64;
 
+/// A `file_id` (`getFile`): the inbox mints `f-<uuid>`; 1..=64 of `A-Z a-z 0-9 -` is accepted.
+pub(crate) const MAX_FILE_ID_LEN: usize = 64;
+
 /// A refusal: the HTTP status and the code after `bot/`.
 pub(crate) type Refusal = (u16, &'static str);
 
@@ -87,6 +90,13 @@ pub(crate) fn parse_updates(body: &Value) -> Result<UpdatesQuery, Refusal> {
 /// Telegram's reading of an empty url). The URL rule itself is `webhook::clean_url`'s.
 pub(crate) fn parse_webhook(body: &Value) -> Result<Option<&str>, Refusal> {
     Ok(str_field(body, "url")?.filter(|u| !u.trim().is_empty()))
+}
+
+/// `getFile {file_id}`: the id a `kind: "file"` update named.
+pub(crate) fn parse_get_file(body: &Value) -> Result<&str, Refusal> {
+    let id = str_field(body, "file_id")?.ok_or(BAD_REQUEST)?;
+    let ok = (1..=MAX_FILE_ID_LEN).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    ok.then_some(id).ok_or(BAD_REQUEST)
 }
 
 /// Where a `sendMessage` goes.

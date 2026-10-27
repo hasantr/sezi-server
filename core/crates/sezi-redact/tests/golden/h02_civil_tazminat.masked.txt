@@ -1,0 +1,33 @@
+T.C.
+[MAHKEME] ASLİYE HUKUK MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO          : [ESAS]
+CELSE NO         : 5
+DURUŞMA TARİHİ   : 15/10/2026
+
+HAKİM            : [KISI_1] [SICIL_1]
+KATİP            : [KISI_2] [SICIL_2]
+
+DAVACI           : [KISI_3] - [ADRES_1]
+DAVACI VEKİLİ    : Av. [KISI_4] - [ADRES_2]
+DAVALILAR        : 1- [KISI_5] - [ADRES_3]
+                   2- [SIRKET_1] - [ADRES_4]
+DAVALILAR VEKİLİ : Av. [KISI_6]
+DAVA             : Tazminat (Trafik Kazasından Kaynaklanan Maddi ve Manevi)
+
+Belirlenen gün ve saatte celseye başlandı. Davacı vekili Av. [KISI_4] ile davalılar vekili Av. [KISI_6] geldi. Açık yargılamaya devam olundu.
+Tanık olarak dinlenmek üzere davacı tanığı hazır olduğundan usulen yemini yaptırılarak dinlendi:
+TANIK: [KISI_7], [KISI_8] oğlu, [DOGUM_1] doğumlu, [ADRES_5] adresinde oturur, taraflarla akrabalığı yok.
+Tanık beyanında: Olay günü kavşakta bekliyordum, [PLAKA_1] plakalı kamyonet kırmızı ışıkta geçerek [KISI_9] hanımın aracına çarptı, kamyoneti [KISI_10] bey kullanıyordu, kazadan sonra ambulansı ben aradım dedi.
+Davalılar vekili söz alarak: Kaza tespit tutanağında müvekkil [KISI_5] asli kusurlu değildir, [SIRKET_1] nezdindeki [NUMARA_1] numaralı trafik poliçesinin limiti aşılamaz dedi.
+Davacı vekili: Tanık beyanına itirazımız yoktur, müvekkilin tedavi giderleri belgelidir dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Dosyanın kusur ve tazminat hesabı yönünden aktüer ve trafik bilirkişisine tevdiine,
+2-Bilirkişi ücreti olarak 6.500,00 TL'nin davacı tarafça iki hafta içinde yatırılmasına,
+3-Davacının tedavi gördüğü hastaneden tüm tedavi evrakının celbine,
+4-Duruşmanın 21/01/2027 günü saat 11:00'e bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı, açıkça okunup anlatıldı. 15/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

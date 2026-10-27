@@ -1,0 +1,27 @@
+T.C.
+[MAHKEME] ASLİYE CEZA MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 2
+DURUŞMA TARİHİ : 16/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+C. SAVCISI : [KISI_2] [SICIL_2]
+KATİP : [KISI_3] [SICIL_3]
+MÜŞTEKİ : [KISI_4]
+SANIK : [KISI_5], [KISI_6] ve [KISI_7] oğlu, [DOGUM_1] doğumlu, [ADRES_1] nüfusuna kayıtlı, T.C. No: [TCKN_1], [ADRES_2] adresinde oturur.
+MÜDAFİİ : Av. [KISI_8]
+SUÇ : Kasten Yaralama
+SUÇ TARİHİ : 04/02/2026
+
+Belirlenen gün ve saatte duruşmaya başlandı. Sanık [KISI_5] tutuksuz olarak geldi, müdafii Av. [KISI_8] geldi. Müşteki [KISI_4] geldi.
+Müşteki beyanında: Sanık [KISI_5] olay günü otoparkta bana yumruk attı, şikayetçiyim dedi.
+Sanık savunmasında: Müştekiye vurmadım, kendimi korudum dedi.
+Cumhuriyet Savcısı esas hakkındaki mütalaasını sunmak için süre istedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Müştekinin Antalya Eğitim ve Araştırma Hastanesinden alınan adli raporunun aslının celbine,
+2-Olay yerine ait kamera kayıtlarının incelenmesi için bilirkişi incelemesi yaptırılmasına,
+3-Duruşmanın 04/12/2026 günü saat 10:10'a bırakılmasına,
+Dair, C. Savcısının mütalaasına uygun olarak, sanık ve müdafiinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 16/10/2026
+
+Katip [SICIL_3]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır

@@ -193,6 +193,9 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         last_ok_at: Option<i64>,
         #[serde(default)]
         last_error: Option<String>,
+        /// A hearings bot's audit as counts (`inbox_do/bot/hearings_audit.rs`).
+        #[serde(default)]
+        hearings: Option<serde_json::Value>,
     }
     let now = now_ms() as i64;
     let mut out = Vec::with_capacity(rows.len());
@@ -211,6 +214,9 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         v["ai_model"] = state.ai_model.into();
         v["last_ok_at"] = state.last_ok_at.into();
         v["last_error"] = state.last_error.into();
+        if let Some(h) = state.hearings {
+            v["hearings"] = h;
+        }
         v["rooms"] = bot_rooms(&db, &row.bot_id).await?.into();
         out.push(v);
     }

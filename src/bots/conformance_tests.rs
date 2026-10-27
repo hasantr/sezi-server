@@ -23,19 +23,22 @@ const BUILD_DOC: &str = include_str!("../../../docs/BOTS_BUILD.md");
 const README: &str = include_str!("../../../tools/bots/README.md");
 
 /// The methods a program can call today (Phases 1–3; Phase 4's are documented as not built).
-const METHODS: [&str; 5] = ["getMe", "getUpdates", "sendMessage", "setWebhook", "deleteWebhook"];
+const METHODS: [&str; 6] = ["getMe", "getUpdates", "sendMessage", "setWebhook", "deleteWebhook", "getFile"];
 
 /// Every source file on the program's path: the Worker's door and the bot inbox's answers to it.
 /// Not the owner's surface (`admin.rs`, `builtin.rs`: `not-builtin` is the owner page's own code).
-const PROGRAM_PATH: [(&str, &str); 8] = [
+const PROGRAM_PATH: [(&str, &str); 11] = [
     ("bots/api.rs", include_str!("api.rs")),
     ("bots/api_input.rs", include_str!("api_input.rs")),
+    ("bots/key_brake.rs", include_str!("key_brake.rs")),
+    ("inbox_do/bot/api_budget.rs", include_str!("../messages/inbox_do/bot/api_budget.rs")),
     ("inbox_do/bot/mod.rs", include_str!("../messages/inbox_do/bot/mod.rs")),
     ("inbox_do/bot/send.rs", include_str!("../messages/inbox_do/bot/send.rs")),
     ("inbox_do/bot/deliver.rs", include_str!("../messages/inbox_do/bot/deliver.rs")),
     ("inbox_do/bot/updates.rs", include_str!("../messages/inbox_do/bot/updates.rs")),
     ("inbox_do/bot/room.rs", include_str!("../messages/inbox_do/bot/room.rs")),
     ("inbox_do/bot/send_guard.rs", include_str!("../messages/inbox_do/bot/send_guard.rs")),
+    ("inbox_do/bot/files.rs", include_str!("../messages/inbox_do/bot/files.rs")),
 ];
 
 /// Every `(DDD, "code")` in `src`: `bot_err(403, "disabled")`, `Err((400, "bad-text"))`.
@@ -80,9 +83,12 @@ fn section_2_5() -> &'static str {
 fn source_codes() -> BTreeSet<(u16, String)> {
     let mut codes: BTreeSet<_> = PROGRAM_PATH.iter().flat_map(|(_, src)| code_pairs(src)).collect();
     // `rate-limited` is built with its `retry_after` (`api_answer::rate_limited`), not by
-    // `bot_err`: the status sits beside it in `send_guard.rs`.
+    // `bot_err`: the status sits beside it in `api.rs`'s one builder, which the send limits
+    // (`send_guard.rs`), the call budget and the wrong-key brake all answer with.
+    let api = PROGRAM_PATH.iter().find(|(f, _)| f.ends_with("bots/api.rs")).unwrap().1;
+    assert!(api.contains("api_answer::rate_limited(retry_after_s))?.with_status(429)"));
     let guard = PROGRAM_PATH.iter().find(|(f, _)| f.ends_with("send_guard.rs")).unwrap().1;
-    assert!(guard.contains("api_answer::rate_limited(retry_after_s))?.with_status(429)"));
+    assert!(guard.contains("crate::bots::api::rate_limited(retry_after_s)"));
     codes.insert((429, "rate-limited".into()));
     codes
 }
@@ -140,6 +146,9 @@ fn the_key_then_disabled_then_the_body_then_the_method() {
     assert!(at("\"unauthorized\"") < at("\"disabled\""));
     assert!(at("\"disabled\"") < at("read_body("));
     assert!(at("read_body(") < at("match method.as_str()"));
+    // The wrong-key brake before the lookup; the call budget after `disabled`, before the body.
+    assert!(at("key_brake::check(") < at("token::authenticate("));
+    assert!(at("\"disabled\"") < at("take_call(") && at("take_call(") < at("read_body("));
 }
 
 #[test]
@@ -192,6 +201,42 @@ fn the_documented_limits_are_the_codes() {
     let replay = include_str!("../messages/inbox_do/bot/send_replay.rs");
     assert!(replay.contains("CLIENT_ID_TTL_MS: i64 = 24 * 3600 * 1000;"));
     assert!(replay.contains("WAIT_FOR_FIRST_MS: i64 = 10_000;"));
+    // Every call's budget, and the wrong-key brake.
+    let budget = include_str!("../messages/inbox_do/bot/api_budget.rs");
+    assert!(budget.contains("BURST: i64 = 60;") && budget.contains("PER_SECOND: i64 = 5;"));
+    let brake = include_str!("key_brake.rs");
+    assert!(brake.contains("MISSES_PER_MINUTE: u32 = 20;") && brake.contains("WINDOW_S: i64 = 60;"));
+    for doc in [section_2_5(), README] {
+        for promise in ["300 calls a minute", "burst of 60", "20 refused keys a minute"] {
+            assert!(doc.contains(promise), "the call budget {promise:?} is not stated");
+        }
+    }
+    // What one member, and everybody, may leave waiting in a program bot's queue.
+    let backlog = include_str!("../messages/inbox_do/bot/backlog.rs");
+    assert!(backlog.contains("PER_SENDER: i64 = 100;") && backlog.contains("PER_BOT: i64 = 2_000;"));
+    assert!(backlog.contains("NOTICE_EVERY_MS: i64 = 10 * 60_000;"));
+    for doc in [section_2_5(), README] {
+        for promise in ["100", "2,000", "10 minutes"] {
+            assert!(doc.contains(promise), "the queue cap {promise:?} is not stated");
+        }
+    }
+    // A poison update is set aside at its fifth failure, and the docs say so.
+    let order = include_str!("../messages/inbox_do/bot/deliver_order.rs");
+    assert!(order.contains("ASIDE_AFTER: i64 = 5;"));
+    for doc in [section_2_5(), README] {
+        assert!(doc.contains("failed 5 times") && doc.contains("arrive late"), "the set-aside rule is not stated");
+    }
+    // A member's file (H3): what a bot reads, for how long, and how often.
+    assert_eq!(crate::media::bot_access::MAX_BOT_FILE_BYTES, 10 * 1024 * 1024);
+    let files = include_str!("../messages/inbox_do/bot/files.rs");
+    assert!(files.contains("READS_PER_MINUTE: i64 = 20;"));
+    assert!(files.contains("FILE_EXPIRE") && files.contains("UPDATE_TTL_MS"));
+    assert_eq!(MAX_FILE_ID_LEN, 64);
+    for doc in [section_2_5(), README] {
+        for promise in ["10 MiB", "20 `getFile`s a minute", "24 h"] {
+            assert!(doc.contains(promise), "the file rule {promise:?} is not stated");
+        }
+    }
     for doc in [section_2_5(), README] {
         for promise in ["64 KiB", "4,000", "0..25", "1..100", "128 bytes", "60 `sendMessage`s a minute", "30"] {
             assert!(doc.contains(promise), "{promise:?} is not stated");
@@ -212,4 +257,26 @@ fn the_readme_verifies_the_webhook_the_way_the_relay_signs_it() {
     assert!(README.contains("function safeEqual_("), "a constant-time comparison");
     assert!(!README.contains("!== env.sig") && !README.contains("=== env.sig"), "never a plain compare");
     assert!(README.contains("5 * 60 * 1000"), "the 5-minute replay window");
+}
+
+/// `getFile` answers the file itself, never wrapped, and only from the inbox's 200: every other
+/// answer of the inbox goes through `inbox_answer`, so a refusal is the documented JSON.
+#[test]
+fn get_file_answers_bytes_only_on_success() {
+    let api = include_str!("api.rs");
+    let f = &api[api.find("async fn get_file(").expect("get_file")..];
+    let f = &f[..f.find("\n}\n").expect("end")];
+    assert!(f.contains("r.status_code() == 200 => r"));
+    assert!(f.contains("other => return inbox_answer(other).await"));
+    assert!(f.contains("\"application/octet-stream\"") && f.contains("no-store") && f.contains("nosniff"));
+    // The inbox's door: the built-in check, then the rate, then the one verified way in.
+    let files = include_str!("../messages/inbox_do/bot/files.rs");
+    let door = &files[files.find("async fn bot_get_file(").expect("bot_get_file")..];
+    let at = |s: &str| door.find(s).unwrap_or_else(|| panic!("{s}"));
+    assert!(at("\"builtin-active\"") < at("take_read(") && at("take_read(") < at("bot_file_bytes("));
+    // And that way checks the relay's record before it reads the store.
+    let open = &files[files.find("async fn bot_file_bytes(").expect("bot_file_bytes")..];
+    let at = |s: &str| open.find(s).unwrap_or_else(|| panic!("{s}"));
+    assert!(at("bot_access::check(") < at("router.get("));
+    assert!(at("router.get(") < at("decrypt_in_memory("));
 }

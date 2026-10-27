@@ -1,0 +1,28 @@
+T.C.
+[MAHKEME] İCRA HUKUK MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO: [ESAS]
+CELSE NO: 2
+DURUŞMA TARİHİ: 23/10/2026
+HAKİM: [KISI_1] [SICIL_1]
+KATİP: [KISI_2] [SICIL_2]
+
+ALACAKLI        : [SIRKET_1] - [ADRES_1]
+VEKİLİ          : Av. [KISI_3]
+BORÇLU          : [KISI_4] - [ADRES_2]
+VEKİLİ          : Av. [KISI_5] - [ADRES_3]
+
+Belirlenen gün ve saatte celse açıldı. Alacaklı vekili Av. [KISI_3] ve borçlu vekili Av. [KISI_5] geldi. Açık yargılamaya devam olundu.
+Kayseri 3. İcra Dairesinin [DOSYA_1] Esas sayılı kambiyo senetlerine dayalı takip dosyası ile [SIRKET_2] Talas şubesinden gelen çek fotokopisi incelendi; [NUMARA_1] seri numaralı, [NUMARA_2] hesap numaralı, 185.000,00 TL bedelli çekin keşidecisinin borçlu [KISI_4] olduğu görüldü.
+Borçlu vekili söz alarak: Çekteki imza müvekkile ait değildir, çek karnesi işyerinden çalınmıştır, imza incelemesi yapılmasını talep ederiz dedi.
+Alacaklı vekili söz alarak: Çek ticari ilişki gereği müvekkil şirkete bizzat [KISI_6] bey tarafından verilmiştir, malların teslim fişleri dosyadadır, ayrıca borçlu [KISI_4] borcun bir kısmını [KART_1] numaralı kredi kartıyla ödemiştir, itirazın kesin kaldırılmasını isteriz dedi.
+Borçlu [KISI_4] duruşmada hazır olup huzurda imza örnekleri alındı.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Borçlunun huzurda alınan imza örnekleri ile bankadaki imza sirkülerinin celbi ile dosyanın Adli Tıp Kurumu Fizik İhtisas Dairesine gönderilmesine,
+2-İnceleme masrafı olan 2.800,00 TL'nin borçlu tarafından yatırılmasına, masrafın alacaklı vekilinin bildirdiği [IBAN_1] IBAN'a iadesi talebinin karar aşamasında değerlendirilmesine,
+3-Duruşmanın 22/01/2027 günü saat 11:40'a bırakılmasına,
+Dair, taraf vekillerinin ve borçlunun yüzüne karşı, açıkça okunup anlatıldı. 23/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

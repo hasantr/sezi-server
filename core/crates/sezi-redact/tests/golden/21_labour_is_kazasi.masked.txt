@@ -1,0 +1,28 @@
+T.C.
+[MAHKEME] İŞ MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO          : [ESAS] Esas
+CELSE NO         : 8
+DURUŞMA TARİHİ   : 30/09/2026
+HAKİM            : [KISI_1] [SICIL_1]
+KATİP            : [KISI_2] [SICIL_2]
+DAVACILAR        : 1- [KISI_3]
+                   2- [KISI_4]
+VEKİLİ           : Av. [KISI_5]
+DAVALI           : [SIRKET_1]
+VEKİLİ           : Av. [KISI_6]
+BİLİRKİŞİLER     : Prof. Dr. [KISI_7], İş Güvenliği Uzmanı [KISI_8]
+DAVA             : Maddi ve Manevi Tazminat (İş Kazası)
+
+Belirlenen gün ve saatte duruşmaya başlandı. Davacılar vekili Av. [KISI_5] ve davalı vekili Av. [KISI_6] geldi.
+Kusur raporu okundu. Rapora göre işverenin %70, kazalı işçi [KISI_3]'nun %30 oranında kusurlu olduğu belirtilmiştir.
+Davacılar vekili: Müvekkilin eşi [KISI_9] hanımın bakım giderleri de hesaba katılmalıdır; bilirkişi Prof. Dr. [KISI_7]'in raporuna itiraz ediyoruz dedi.
+Davalı vekili: Kusur oranları yerindedir dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davacının Zonguldak Atatürk Devlet Hastanesindeki tedavi evrakının celbine,
+2-Maluliyet oranının tespiti için Adli Tıp Kurumundan rapor alınmasına,
+3-Duruşmanın 16/12/2026 günü saat 09:15'e bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 30/09/2026
+
+Katip [SICIL_2]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır

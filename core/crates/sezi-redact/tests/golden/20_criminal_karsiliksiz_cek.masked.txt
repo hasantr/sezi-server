@@ -1,0 +1,25 @@
+T.C.
+[MAHKEME] ASLİYE CEZA MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 2
+DURUŞMA TARİHİ : 27/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+ŞİKAYETÇİ : [SIRKET_1]
+VEKİLİ : Av. [KISI_3]
+SANIK : [KISI_4], [KISI_5] oğlu, [DOGUM_1] doğumlu
+MÜDAFİİ : Av. [KISI_6]
+SUÇ : Karşılıksız Yararlanma (5941 sayılı Kanun md. 5)
+
+Belirlenen gün ve saatte duruşmaya başlandı. Sanık [KISI_4] ve müdafii Av. [KISI_6] geldi. Şikayetçi vekili Av. [KISI_3] geldi.
+Şikayetçi vekili: Sanığın yetkilisi olduğu şirket adına keşide ettiği [NUMARA_1] seri numaralı çek, [NUMARA_2] numaralı hesaptan karşılıksız çıkmıştır dedi.
+Sanık savunmasında: Çeki ortağım [KISI_7] doldurdu, ben yalnızca imzaladım dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Muhatap bankadan çek hesabına ilişkin kayıtların celbine,
+2-Şirketin ticaret sicil kayıtlarının istenmesine,
+3-Duruşmanın 22/12/2026 günü saat 10:50'ye bırakılmasına,
+Dair, sanık, müdafii ve şikayetçi vekilinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 27/10/2026
+
+Katip [SICIL_2]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır

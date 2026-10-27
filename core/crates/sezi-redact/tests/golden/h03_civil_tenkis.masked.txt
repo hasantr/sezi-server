@@ -1,0 +1,29 @@
+T.C.
+[MAHKEME] ASLİYE HUKUK MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO: [ESAS]   CELSE NO: 7   DURUŞMA TARİHİ: 08/10/2026
+
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+
+DAVACILAR     : 1- [KISI_3] - [ADRES_1]
+                2- [KISI_4] - [ADRES_2]
+VEKİLLERİ     : Av. [KISI_5] - [ADRES_3]
+DAVALI        : [KISI_6] (T.C. Kimlik No: [TCKN_1]) - [ADRES_4]
+VEKİLİ        : Av. [KISI_7]
+DAVA          : Tenkis, Muris Muvazaası Nedeniyle Tapu İptali ve Tescil
+
+Belirlenen gün ve saatte celse açıldı. Davacılar vekili Av. [KISI_5] ve davalı vekili Av. [KISI_7] geldi. Davacı [KISI_3] de geldi. Açık yargılamaya devam olundu.
+Konya 4. Sulh Hukuk Mahkemesinin [DOSYA_1] Esas, [DOSYA_2] Karar sayılı mirasçılık belgesi dosyası incelendi; muris [KISI_8]'in ([DOGUM_1] doğumlu) [DOGUM_2] tarihinde öldüğü, geride üç çocuğunun kaldığı görüldü.
+Tapu Müdürlüğünden gelen kayıtlara göre Meram ilçesi 412 ada 9 parsel sayılı taşınmazın 2019 yılında murisçe davalıya satış gösterilerek devredildiği anlaşıldı.
+Davacılar vekili söz alarak: Murisin gerçek amacı bağıştır, babaları [KISI_9] davalı oğlu [KISI_10]'ye diğer çocuklarından mal kaçırmıştır, satış bedeli hiç ödenmemiştir dedi.
+Davalı vekili söz alarak: Müvekkil [KISI_6] bedeli ödemiştir, banka kayıtları sunulacaktır, davanın reddini isteriz dedi.
+Davacı [KISI_11]'nın mazeret dilekçesi okundu, kabulüne karar verildi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalı vekiline satış bedelinin ödendiğine ilişkin banka kayıtlarını sunması için iki haftalık kesin süre verilmesine,
+2-Taşınmazın dava ve ölüm tarihindeki değerinin tespiti için keşif yapılmasına, keşif avansı olarak 9.000,00 TL'nin davacılarca yatırılmasına,
+3-Duruşmanın 17/12/2026 günü saat 14:00'e bırakılmasına,
+Dair, taraf vekillerinin ve davacı [KISI_12]'ın yüzüne karşı, açıkça okunup anlatıldı. 08/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

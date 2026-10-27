@@ -1,0 +1,32 @@
+T.C.
+[MAHKEME] İŞ MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO          : [ESAS]
+CELSE NO         : 6
+DURUŞMA TARİHİ   : 09/10/2026
+
+HAKİM            : [KISI_1] [SICIL_1]
+KATİP            : [KISI_2] [SICIL_2]
+
+DAVACI           : [KISI_3] (TC: [TCKN_1]) - [ADRES_1]
+DAVACI VEKİLİ    : Av. [KISI_4] - [ADRES_2]
+DAVALI           : [SIRKET_1] - [ADRES_3]
+DAVALI VEKİLİ    : Av. [KISI_5] ([EPOSTA_1])
+FER'İ MÜDAHİL    : Sosyal Güvenlik Kurumu Başkanlığı - vekili Av. [KISI_6]
+DAVA             : Tazminat (İş Kazasından Kaynaklanan)
+
+Belirlenen gün ve saatte celse açıldı. Davacı [KISI_3] ve vekili Av. [KISI_4], davalı vekili Av. [KISI_5] geldi. Fer'i müdahil vekili gelmedi. Açık yargılamaya devam olundu.
+Kusur bilirkişisi heyetinden Makine Mühendisi [KISI_7] hazır olup rapora yönelik itirazlar hakkında beyanı alındı:
+BİLİRKİŞİ: İplik makinesinin koruyucu kapağı sökülmüş halde çalıştırılıyordu, işveren %75, işçi [KISI_3] %25 oranında kusurludur, raporumu tekrar ederim dedi.
+Davacı söz alarak: Kapağı ustabaşı Rıfat söktürmüştü, üretim yavaşlıyor diye. Kazadan sonra işten çıkarıldım, bana [TEL_1] numarasından ulaşabilirsiniz dedi.
+Davalı vekili: Bilirkişi raporuna itirazlarımızı tekrar ederiz, davacıya iş güvenliği eğitimi verilmiştir, imzalı eğitim formları dosyadadır dedi.
+Davacı vekili: Raporun kusur oranlarına ilişkin kısmına itirazımız yoktur, maluliyet oranı için Adli Tıp Kurumundan rapor alınmasını talep ederiz dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davacının sürekli iş göremezlik oranının tespiti için Adli Tıp Kurumu ilgili ihtisas kuruluna sevkine,
+2-SGK'dan davacıya bağlanan gelirin peşin sermaye değerinin sorulmasına,
+3-Duruşmanın 18/02/2027 günü saat 13:30'a bırakılmasına,
+Dair, davacı ve hazır vekillerin yüzüne karşı, açıkça okunup anlatıldı. 09/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

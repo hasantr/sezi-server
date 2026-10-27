@@ -36,6 +36,14 @@ pub(super) const SAY_BASE: u32 = 1;
 pub(super) const AI_BASE: u32 = 1 + SAY_BASE;
 /// A sheet write at its worst (every hop, every GET re-asked) and the line said about it.
 pub(super) const JOB_BASE: u32 = builtin_sheet::MAX_SPEND + SAY_BASE;
+/// A hearings bot's `allowed_room` lookup in D1, asked before anything a member sends is read.
+pub(super) const ROOM_CHECK: u32 = 1;
+/// Before a hearings member's text is read at all: the room check, and the one line a refusal or
+/// a settled row says.
+pub(super) const HEARINGS_GATE_BASE: u32 = ROOM_CHECK + SAY_BASE;
+/// A hearing record: the room check, the file (its record, the store, the member's
+/// `MediaReceived` device read), one model call, and the answer — sent in up to two messages.
+pub(super) const HEARINGS_BASE: u32 = ROOM_CHECK + 3 + 1 + 2 * SAY_BASE;
 
 /// May an item whose base worst case is `base` start at `spent`?
 pub(super) fn fits(spent: u32, base: u32) -> bool {
@@ -176,15 +184,28 @@ pub(super) fn settled_exchange(lang: Lang, step: &ProposalStep) -> Option<(Optio
 /// Does the change from `old` to `new` leave rows and proposals owed to a sheet that is no longer
 /// written to — rows turned off, or a different address?
 pub(super) fn sheet_target_changed(old: Option<&Config>, new: Option<&Config>) -> bool {
-    let target = |c: Option<&Config>| c.filter(|c| c.writes_sheet()).and_then(|c| c.sheet_url.clone());
+    // The kind is part of the target: a hearings bot's rows are upserts (v2), another kind's are
+    // appends (v1), and neither may be sent as the other.
+    let target = |c: Option<&Config>| {
+        c.filter(|c| c.writes_sheet()).map(|c| (c.kind == crate::bots::builtin_rules::Kind::Hearings, c.sheet_url.clone()))
+    };
     target(old) != target(new)
+}
+
+/// Does the change leave hearings mode (to another kind, or to a program)? Then what members
+/// sent the hearings bot and it has not handled yet goes (`builtin_store::HEARINGS_QUEUE_FORGET`):
+/// minutes sent to be masked must not reach an AI bot's model raw, a sheet bot's row text, or a
+/// program's `getUpdates` / `getFile`.
+pub(super) fn drops_hearings_queue(old: Option<&Config>, new: Option<&Config>) -> bool {
+    let hearings = |c: Option<&Config>| c.is_some_and(|c| c.kind == crate::bots::builtin_rules::Kind::Hearings);
+    hearings(old) && !hearings(new)
 }
 
 /// Does a set change what the bot does — kind, sheet address, provider, address, model,
 /// instructions, rows on or off, or a new key? Then what was measured on the old settings
 /// (`last_ok_at`, `last_error`) is reset. The bot's language alone is not such a change.
 pub(super) fn changes_behaviour(old: Option<&Config>, new: Option<&Config>, new_key: bool) -> bool {
-    let what = |c: Option<&Config>| c.map(|c| (c.kind, c.sheet_url.clone(), c.ai.clone()));
+    let what = |c: Option<&Config>| c.map(|c| (c.kind, c.sheet_url.clone(), c.ai.clone(), c.hearings.clone()));
     new_key || what(old) != what(new)
 }
 

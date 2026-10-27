@@ -5,10 +5,12 @@
 //! two consumers of one queue would each see half of it.
 //!
 //! **Webhook delivery** runs in the alarm's tick, in update order: the oldest update not yet
-//! taken goes first, and a failure stops the round, so the program never sees a later update
-//! before an earlier one. A failure backs off on the outbox's ladder (5 s, 30 s, 2 min, 10 min,
-//! then hourly); the 24 h update window ends the attempts. A taken update is deleted at once:
-//! a webhook's 2xx/3xx is its confirmation.
+//! taken goes first, and a failure stops the round, so while the endpoint takes what it is sent
+//! the program sees updates in order. A failure backs off on the outbox's ladder (5 s, 30 s,
+//! 2 min, 10 min, then hourly); the 24 h update window ends the attempts. The one exception is
+//! a poison update — one that keeps failing while a later one is taken: it is set aside and
+//! retried on its own, and may arrive late (`deliver_order.rs`). A taken update is deleted at
+//! once: a webhook's 2xx/3xx is its confirmation.
 //!
 //! **Taken = read.** Whichever way, the moment the program has an update, the member's frame it
 //! came from gets a `forward-read` (queued in the outbox), so the member's blue tick means "the
@@ -25,12 +27,11 @@
 //! applies: a stored URL that fails it now is POSTed nothing and holds the queue (`Hook::Refused`).
 
 use super::builtin_policy::{round_gate, Gate};
-use super::outbox::{retry_delay_ms, OutKind};
+use super::deliver_order::{hook_round, Due, ASIDE_DUE, WEBHOOK_BATCH};
+use super::outbox::OutKind;
 use super::store::{Arg, Exec};
 use super::*;
 
-/// Webhook POSTs one tick may make.
-const WEBHOOK_BATCH: i64 = 10;
 /// How long one webhook POST may take before it counts as failed (and backs off on the ladder) —
 /// the sheet bot's own bound for one hop (`builtin_sheet::HOP_TIMEOUT_MS`). A program slower than
 /// that is retried, not waited on, so ten silent POSTs cannot hold a tick past five minutes.
@@ -54,12 +55,20 @@ pub(super) const SRC_DROP: &str = "DELETE FROM bot_update_src WHERE update_id >=
 /// Sources whose update is gone (confirmed by offset after being taken, or expired).
 pub(super) const SRC_ORPHANS: &str =
     "DELETE FROM bot_update_src WHERE update_id NOT IN (SELECT update_id FROM bot_updates)";
-/// What the webhook owes, oldest first. Bind: limit.
+/// What the webhook's queue owes, oldest first — not the updates set aside off its order
+/// (`deliver_order.rs`). Bind: limit.
 pub(super) const HOOK_DUE: &str = "SELECT update_id, json, attempts, next_at FROM bot_updates
-      WHERE delivered_at IS NULL ORDER BY update_id LIMIT ?";
-/// When the head of the webhook's queue is due (0 = now); NULL when nothing waits.
-pub(super) const HOOK_NEXT: &str = "SELECT COALESCE(next_at, 0) AS t FROM bot_updates
-      WHERE delivered_at IS NULL ORDER BY update_id LIMIT 1";
+      WHERE delivered_at IS NULL AND update_id NOT IN (SELECT update_id FROM bot_update_aside)
+      ORDER BY update_id LIMIT ?";
+/// When the webhook next needs the alarm (0 = now): the queue's head, or the earliest set-aside
+/// update, whichever is first; NULL when nothing waits.
+pub(super) const HOOK_NEXT: &str = "SELECT MIN(t) AS t FROM (
+        SELECT (SELECT COALESCE(next_at, 0) FROM bot_updates
+                 WHERE delivered_at IS NULL AND update_id NOT IN (SELECT update_id FROM bot_update_aside)
+                 ORDER BY update_id LIMIT 1) AS t
+        UNION ALL
+        SELECT COALESCE(u.next_at, 0) FROM bot_updates u
+          JOIN bot_update_aside a ON a.update_id = u.update_id WHERE u.delivered_at IS NULL)";
 /// Bind: next_at, update_id.
 pub(super) const HOOK_RETRY: &str =
     "UPDATE bot_updates SET attempts = attempts + 1, next_at = ? WHERE update_id = ?";
@@ -123,15 +132,6 @@ struct SrcRow {
     remote_id: i64,
     #[serde(default)]
     msg_uid: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DueRow {
-    update_id: i64,
-    json: String,
-    attempts: i64,
-    #[serde(default)]
-    next_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -257,7 +257,7 @@ impl UserInbox {
             }
         }
         let sql = self.state.storage().sql();
-        let due: Vec<DueRow> = match sql
+        let main: Vec<Due> = match sql
             .exec_raw(HOOK_DUE, Some(vec![JsValue::from_f64(WEBHOOK_BATCH as f64)]))
             .and_then(|c| c.to_array())
         {
@@ -267,40 +267,32 @@ impl UserInbox {
                 return;
             }
         };
-        let mut took_any = false;
-        for row in due {
+        let aside = |limit: i64| -> Vec<Due> {
             let now = (now_secs() * 1000) as i64;
-            if row.next_at.is_some_and(|t| t > now) {
-                break;
-            }
-            let Ok(mut update) = serde_json::from_str::<serde_json::Value>(&row.json) else {
-                let _ = sql.exec_raw(HOOK_DONE, Some(vec![JsValue::from_f64(row.update_id as f64)]));
-                continue;
-            };
-            update["update_id"] = row.update_id.into();
-            let update_json = update.to_string();
+            let args = vec![JsValue::from_f64(now as f64), JsValue::from_f64(limit as f64)];
+            sql.exec_raw(ASIDE_DUE, Some(args)).and_then(|c| c.to_array()).unwrap_or_default()
+        };
+        let clock = || (now_secs() * 1000) as i64;
+        let (url, secret) = (&url, &secret);
+        // One POST: true when the program took it, which is the member's `forward-read`.
+        let post = |update_id: i64, update_json: String| async move {
+            let now = (now_secs() * 1000) as i64;
             // Bounded: the round runs inside the tick, and the bot's replies and room posts drain
             // after it — a program that never answers must not hold them (or the next frames).
-            let status = super::builtin_ai::with_timeout(
-                crate::bots::webhook::post(&url, &secret, now, &update_json),
-                WEBHOOK_TIMEOUT_MS,
-            )
-            .await
-            .unwrap_or_else(|| Err(Error::RustError("webhook timed out".into())));
-            if matches!(status, Ok(s) if crate::bots::webhook::taken(s)) {
-                self.bot_updates_taken(ctx, row.update_id, row.update_id, now);
-                let _ = sql.exec_raw(HOOK_DONE, Some(vec![JsValue::from_f64(row.update_id as f64)]));
-                took_any = true;
-                continue;
+            let post = crate::bots::webhook::post(url, secret, now, &update_json);
+            let status = super::builtin_ai::with_timeout(post, WEBHOOK_TIMEOUT_MS)
+                .await
+                .unwrap_or_else(|| Err(Error::RustError("webhook timed out".into())));
+            let taken = matches!(status, Ok(s) if crate::bots::webhook::taken(s));
+            if taken {
+                self.bot_updates_taken(ctx, update_id, update_id, now);
+            } else {
+                console_log!("[bot] webhook attempt failed: {:?}", status.map_err(|e| e.to_string()));
             }
-            console_log!("[bot] webhook attempt {} failed: {:?}", row.attempts + 1, status.map_err(|e| e.to_string()));
-            let next = now + retry_delay_ms(row.attempts);
-            let _ = sql.exec_raw(
-                HOOK_RETRY,
-                Some(vec![JsValue::from_f64(next as f64), JsValue::from_f64(row.update_id as f64)]),
-            );
-            break;
-        }
+            taken
+        };
+        // In order, a poison update set aside, the set-aside ones on their own (`deliver_order.rs`).
+        let took_any = hook_round(&store.db, main, aside, clock, post).await;
         // The forward-reads it queued go out with this tick's outbox drain, which runs next.
         if took_any {
             crate::bots::mark_program_seen(&self.env, &ctx.bot_id).await;

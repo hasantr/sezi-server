@@ -1,0 +1,24 @@
+T.C.
+[MAHKEME] AİLE MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 1
+DURUŞMA TARİHİ : 05/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+DAVACI : [KISI_3] - [ADRES_1]
+VEKİLİ : Av. [KISI_4]
+DAVALI : [KISI_5]
+VEKİLİ : Av. [KISI_6]
+DAVA : Boşanma
+
+Belirlenen gün ve saatte celseye başlandı. Davacı vekili Av. [KISI_4] ve davalı vekili Av. [KISI_6] geldi.
+Davacı vekili: Davalı [KISI_7] müvekkile karşı şiddet uygulamıştır, uzaklaştırma kararı dosyaya sunulmuştur dedi.
+Davalı vekili: Müvekkil [KISI_8] şiddet iddialarını kabul etmemektedir dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Sakarya Cumhuriyet Başsavcılığının [DOSYA_1] Soruşturma sayılı dosyasının celbine,
+2-Duruşmanın 08/12/2026 günü saat 11:10'a bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 05/10/2026
+
+Katip [SICIL_2]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır

@@ -1,0 +1,116 @@
+{
+  "court": "İzmir 7. Ağır Ceza Mahkemesi",
+  "court_kind": "criminal_heavy",
+  "criminal": true,
+  "case_no": "2025/309",
+  "decision_no": null,
+  "session_no": 5,
+  "hearing_date": "2026-10-22",
+  "hearing_time": null,
+  "next_hearing": {
+    "date": "2027-01-15",
+    "time": "09:45"
+  },
+  "decisions": [
+    {
+      "n": 1,
+      "text": "Sanığın üzerine atılı suçun niteliği, mevcut delil durumu ve tutuklulukta geçen süre dikkate alınarak TUTUKLULUK HALİNİN DEVAMINA",
+      "first_role": "accused",
+      "deadlines": [],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 2,
+      "text": "Gelmeyen tanık Gülbahar ESENKALELİ'nin bir sonraki celse zorla getirilmesine",
+      "first_role": "witness",
+      "deadlines": [],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 3,
+      "text": "Katılan vekiline delil listesini sunması için 10 gün süre verilmesine",
+      "first_role": "counsel",
+      "first_role_of": "joined_party",
+      "deadlines": [
+        "10 gün süre"
+      ],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 4,
+      "text": "Duruşmanın 15 OCAK 2027 günü saat 09:45'e ertelenmesine",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": true
+    }
+  ],
+  "attendance": [
+    {
+      "role": "accused",
+      "present": true
+    },
+    {
+      "role": "defence_counsel",
+      "of": "accused",
+      "present": true
+    },
+    {
+      "role": "counsel",
+      "of": "joined_party",
+      "present": true
+    },
+    {
+      "role": "joined_party",
+      "present": false
+    },
+    {
+      "role": "prosecutor",
+      "present": true
+    },
+    {
+      "role": "witness",
+      "present": false
+    }
+  ],
+  "roles": [
+    {
+      "role": "counsel",
+      "of": "joined_party",
+      "count": 1
+    },
+    {
+      "role": "accused",
+      "count": 1
+    },
+    {
+      "role": "defence_counsel",
+      "of": "accused",
+      "count": 1
+    },
+    {
+      "role": "joined_party",
+      "count": 1
+    },
+    {
+      "role": "witness",
+      "count": 27
+    },
+    {
+      "role": "presiding_judge",
+      "count": 1
+    },
+    {
+      "role": "member_judge",
+      "count": 2
+    },
+    {
+      "role": "clerk",
+      "count": 1
+    },
+    {
+      "role": "prosecutor",
+      "count": 1
+    }
+  ],
+  "missing": []
+}

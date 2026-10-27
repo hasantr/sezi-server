@@ -1,0 +1,20 @@
+# Masks personal data in Turkish court hearing minutes (duruşma tutanağı) before any text goes to
+# an AI model: checksummed identifiers, patterns, role-anchored names, residual nets, a leak
+# check that refuses. Pure — no I/O, no clock, no async, no dependencies — so it builds for the
+# relay's bot inbox (wasm32) and for a device alike. docs/HEARINGS_BOT_PLAN.md §4.
+[package]
+name = "sezi-redact"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Turkish hearing-minutes PII masking with typed placeholders, an in-memory vault and a fail-closed leak check."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# Only the golden-set snapshots (`tests/golden/*.vault.json`) are JSON; the crate itself never
+# serializes a vault.
+serde_json = { workspace = true }

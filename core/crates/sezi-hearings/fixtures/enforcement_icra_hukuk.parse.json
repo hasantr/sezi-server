@@ -1,0 +1,88 @@
+{
+  "court": "Bursa 2. İcra Hukuk Mahkemesi",
+  "court_kind": "enforcement_civil",
+  "criminal": false,
+  "case_no": "2025/771",
+  "decision_no": null,
+  "session_no": 3,
+  "hearing_date": "2026-11-05",
+  "hearing_time": null,
+  "next_hearing": {
+    "date": "2026-12-17",
+    "time": "09:30"
+  },
+  "decisions": [
+    {
+      "n": 1,
+      "text": "Davacı borçluya imza ve yazı örneği vermek üzere duruşmaya gelmesi için meşruhatlı davetiye çıkarılmasına",
+      "first_role": "plaintiff",
+      "deadlines": [],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 2,
+      "text": "Bursa 7. İcra Dairesinin 2025/16632 Esas sayılı dosyasının aslının celbine",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 3,
+      "text": "Davalı alacaklı vekiline takip dayanağı senedin aslını ibraz etmesi için 7 günlük kesin süre verilmesine, aksi halde HMK hükümlerine göre karar verileceğinin ihtarına",
+      "first_role": "counsel",
+      "first_role_of": "defendant",
+      "deadlines": [
+        "7 günlük kesin süre"
+      ],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 4,
+      "text": "Duruşmanın 17/12/2026 tarihinde saat 09:30'a ertelenmesine",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": true
+    }
+  ],
+  "attendance": [
+    {
+      "role": "counsel",
+      "of": "plaintiff",
+      "present": true
+    },
+    {
+      "role": "counsel",
+      "of": "defendant",
+      "present": false
+    }
+  ],
+  "roles": [
+    {
+      "role": "plaintiff",
+      "count": 1
+    },
+    {
+      "role": "defendant",
+      "count": 1
+    },
+    {
+      "role": "counsel",
+      "of": "plaintiff",
+      "count": 1
+    },
+    {
+      "role": "counsel",
+      "of": "defendant",
+      "count": 1
+    },
+    {
+      "role": "judge",
+      "count": 1
+    },
+    {
+      "role": "clerk",
+      "count": 1
+    }
+  ],
+  "missing": []
+}

@@ -100,6 +100,7 @@ fn cfg(kind: Kind, url: Option<&str>, tool: bool) -> Config {
             instructions: "x".into(),
             sheet_tool: tool,
         }),
+        hearings: None,
     }
 }
 
@@ -115,6 +116,23 @@ fn what_was_owed_to_a_sheet_goes_when_the_sheet_does() {
     assert!(sheet_target_changed(Some(&a), Some(&off)), "rows turned off");
     assert!(sheet_target_changed(Some(&a), None), "program mode");
     assert!(!sheet_target_changed(None, Some(&off)), "nothing was owed");
+}
+
+#[test]
+fn records_sent_to_a_hearings_bot_never_reach_another_kind() {
+    // Minutes waiting for a hearings bot (held, out of budget, D1 down) were sent to be MASKED.
+    // Under an AI bot they would go to its model raw; under a sheet bot into a row's text; in
+    // program mode to the program, files and all.
+    let mut hearings = cfg(Kind::Sheet, Some("https://script.google.com/a/exec"), false);
+    hearings.kind = Kind::Hearings;
+    let ai = cfg(Kind::Ai, None, false);
+    let sheet = cfg(Kind::Sheet, Some("https://script.google.com/a/exec"), false);
+    assert!(drops_hearings_queue(Some(&hearings), Some(&ai)));
+    assert!(drops_hearings_queue(Some(&hearings), Some(&sheet)));
+    assert!(drops_hearings_queue(Some(&hearings), None), "program mode");
+    assert!(!drops_hearings_queue(Some(&hearings), Some(&hearings)), "a re-set of the same kind");
+    assert!(!drops_hearings_queue(Some(&ai), Some(&hearings)));
+    assert!(!drops_hearings_queue(None, Some(&ai)));
 }
 
 #[test]
@@ -213,4 +231,25 @@ fn a_sheet_bot_takes_a_bounded_number_of_rows_from_one_member_a_day() {
     let queue = body.find("builtin_queue_row(").expect("and queues the row");
     assert!(ask < queue, "the cap is asked before the row is queued");
     assert!(body.contains("SHEET_USAGE_BUMP"), "every row is counted");
+}
+
+#[test]
+fn a_hearings_member_is_let_in_before_any_text_of_theirs_settles_a_row() {
+    // Adversarial review 2026-10-27: an "evet" was read before `allowed_room`, so a member removed
+    // from the room could still confirm the row proposed to them in the 10-minute window.
+    let src = include_str!("builtin_hearings.rs");
+    let start = src.find("pub(super) async fn builtin_hearings(").expect("the round's entry");
+    let rest = &src[start..];
+    let body = &rest[..rest[1..].find("\n    /// ").map_or(rest.len(), |i| i + 1)];
+    let check = body.find("group_role(").expect("the round asks the room");
+    let settle = body.find("self.hearings_settle(").expect("and settles a waiting row");
+    assert!(check < settle, "membership is asked before a yes or no is read");
+    // A member turned away loses the row waiting for them, and hears the usual line.
+    let refused = &body[body.find("Ok(false) => {").expect("the refusal arm")..];
+    let refused = &refused[..refused.find("Ok(true)").unwrap()];
+    assert!(refused.contains("PROPOSAL_DROP"), "a refused member's proposal is dropped");
+    assert!(refused.contains("Line::HearingsNotAllowed"));
+    // The check and that line fit before the round commits to either.
+    assert_eq!(HEARINGS_GATE_BASE, ROOM_CHECK + SAY_BASE);
+    assert!(HEARINGS_GATE_BASE <= HEARINGS_BASE && fits(0, HEARINGS_BASE));
 }

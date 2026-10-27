@@ -1,0 +1,32 @@
+T.C.
+[MAHKEME] İŞ MAHKEMESİ
+DURUŞMA TUTANAĞI
+
+ESAS NO         : [ESAS] Esas
+CELSE NO        : 3
+DURUŞMA TARİHİ  : 20/10/2026
+
+HAKİM           : [KISI_1] [SICIL_1]
+KATİP           : [KISI_2] [SICIL_2]
+
+DAVACI          : [KISI_3] - [ADRES_1]
+VEKİLİ          : Av. [KISI_4] - [ADRES_2]
+DAVALI          : [SIRKET_1] - [ADRES_3]
+VEKİLİ          : Av. [KISI_5]
+DAVA            : Alacak (İşçilik Alacakları)
+
+Belirlenen gün ve saatte celseye başlandı. Davacı vekili Av. [KISI_4] ve davalı vekili Av. [KISI_5] geldi. Açık yargılamaya devam olundu.
+SGK İl Müdürlüğünden davacının [NUMARA_1] işyeri sicil numaralı işyerindeki hizmet dökümünün geldiği görüldü.
+TANIKLAR hazır olmakla usulen yeminleri yaptırılarak ayrı ayrı dinlendiler:
+DAVACI TANIĞI: [KISI_6], [KISI_7] oğlu, [DOGUM_1] doğumlu, [ADRES_4] adresinde oturur, taraflarla akrabalığı yok. Davacı ile birlikte [SIRKET_1]'te kaynak bölümünde çalıştık, hafta içi sabah 08:00'den akşam 20:00'ye kadar çalışırdık, cumartesileri de çalışırdık, [KISI_8] yıllık izin kullanmadı dedi.
+DAVALI TANIĞI: [KISI_9], [KISI_10] kızı, [DOGUM_2] doğumlu, davalı şirkette insan kaynakları uzmanı, [ADRES_5] adresinde oturur. Fazla çalışmalar bordroya yansıtılırdı, izinler sisteme işlenir, kayıtları [EPOSTA_1] adresinden mahkemeye gönderebilirim dedi.
+Davacı vekili: Tanık [KISI_9] davalının çalışanıdır, beyanlarına itibar edilmemesi gerekir dedi.
+Davalı vekili: Tanık [KISI_6] ile davacı arasında husumet vardır dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalı işyerinin 2021-2024 yıllarına ait puantaj kayıtları ve imzalı izin defterinin celbi için davalı vekiline iki haftalık kesin süre verilmesine,
+2-Kayıtlar geldikten sonra dosyanın hesap bilirkişisine tevdiine,
+3-Duruşmanın 12/01/2027 günü saat 10:15'e bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı, açıkça okunup anlatıldı. 20/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

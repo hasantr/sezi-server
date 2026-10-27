@@ -1,0 +1,90 @@
+{
+  "court": "Ankara 3. Asliye Hukuk Mahkemesi",
+  "court_kind": "civil_general",
+  "criminal": false,
+  "case_no": "2024/123",
+  "decision_no": null,
+  "session_no": 4,
+  "hearing_date": "2026-10-14",
+  "hearing_time": "10:30",
+  "next_hearing": {
+    "date": "2026-12-09",
+    "time": "10:30"
+  },
+  "decisions": [
+    {
+      "n": 1,
+      "text": "Davacı vekiline bilirkişi ücreti olan 3.000,00 TL'yi yatırması için 2 hafta kesin süre verilmesine, aksi halde HMK 324. maddesi uyarınca bilirkişi incelemesi talebinden vazgeçmiş sayılacağının ihtarına",
+      "first_role": "counsel",
+      "first_role_of": "plaintiff",
+      "deadlines": [
+        "2 hafta kesin süre"
+      ],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 2,
+      "text": "Davalı tarafa tanık listesini sunması için 1 haftalık süre verilmesine",
+      "first_role": "defendant",
+      "deadlines": [
+        "1 haftalık süre"
+      ],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 3,
+      "text": "Dosyanın ücretin yatırılmasından sonra bilirkişiye tevdiine",
+      "first_role": "expert",
+      "deadlines": [],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 4,
+      "text": "Duruşmanın 09/12/2026 günü saat 10:30'a bırakılmasına",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": true
+    }
+  ],
+  "attendance": [
+    {
+      "role": "counsel",
+      "of": "plaintiff",
+      "present": true
+    },
+    {
+      "role": "counsel",
+      "of": "defendant",
+      "present": false
+    }
+  ],
+  "roles": [
+    {
+      "role": "plaintiff",
+      "count": 1
+    },
+    {
+      "role": "defendant",
+      "count": 1
+    },
+    {
+      "role": "counsel",
+      "of": "plaintiff",
+      "count": 1
+    },
+    {
+      "role": "counsel",
+      "of": "defendant",
+      "count": 1
+    },
+    {
+      "role": "judge",
+      "count": 1
+    },
+    {
+      "role": "clerk",
+      "count": 1
+    }
+  ],
+  "missing": []
+}

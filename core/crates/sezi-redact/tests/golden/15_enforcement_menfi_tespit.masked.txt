@@ -1,0 +1,25 @@
+T.C.
+[MAHKEME] ASLİYE TİCARET MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 2
+DURUŞMA TARİHİ : 08/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+DAVACI : [KISI_3] - [ADRES_1]
+VEKİLİ : Av. [KISI_4] (İstanbul Barosu Sicil No: [SICIL_3]) - KEP: [EPOSTA_1]
+DAVALI : [SIRKET_1]
+VEKİLİ : Av. [KISI_5] - e-posta: [EPOSTA_2]
+DAVA : Menfi Tespit (Kambiyo Senedine Dayalı)
+
+Belirlenen gün ve saatte duruşmaya başlandı. Davacı vekili Av. [KISI_4] ve davalı vekili Av. [KISI_5] geldi.
+Davacı vekili: 01/02/2026 vadeli 250.000,00 TL bedelli bononun teminat amacıyla verildiğini, Kadıköy 3. İcra Dairesinin [DOSYA_1] Esas sayılı takibinin dayanağı olduğunu belirtti.
+Davalı vekili: Bono ticari ilişkiden doğmuştur, faturalar dosyaya sunulmuştur dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davacının ihtiyati tedbir talebinin teminat karşılığında kabulüne, teminat miktarının 37.500,00 TL olarak belirlenmesine,
+2-Tarafların ticari defterleri üzerinde bilirkişi incelemesi yaptırılmasına,
+3-Duruşmanın 01/12/2026 günü saat 10:20'ye bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 08/10/2026
+
+Katip [SICIL_2]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır

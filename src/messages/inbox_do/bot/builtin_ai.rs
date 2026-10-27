@@ -145,10 +145,29 @@ pub(super) fn today_line(now_ms: i64) -> String {
 
 /// The full URL to POST to (`ai::endpoint`).
 pub(super) fn endpoint(ai: &AiConfig) -> String {
-    let base = ai.base_url.as_deref().unwrap_or(ai.provider.default_base_url()).trim_end_matches('/');
-    match ai.provider {
+    endpoint_for(ai.provider, ai.base_url.as_deref())
+}
+
+/// The full URL for a provider at an address (`None` = its default).
+pub(super) fn endpoint_for(provider: Provider, base_url: Option<&str>) -> String {
+    let base = base_url.unwrap_or(provider.default_base_url()).trim_end_matches('/');
+    match provider {
         Provider::Anthropic => format!("{base}/v1/messages"),
         Provider::Openai => format!("{base}/chat/completions"),
+    }
+}
+
+/// What an HTTP status means for a model call, when it is a failure (`ai::parse_response`'s
+/// codes); `None` for a 2xx. `status` 0 = nothing answered.
+pub(super) fn http_failure(status: u16) -> Option<&'static str> {
+    match status {
+        0 => Some("ai/unreachable"),
+        401 | 403 => Some("ai/bad-key"),
+        404 => Some("ai/bad-model"),
+        429 => Some("ai/rate-limited"),
+        502 | 503 | 529 => Some("ai/overloaded"),
+        s if !(200..300).contains(&s) => Some("ai/bad-response"),
+        _ => None,
     }
 }
 
@@ -190,14 +209,8 @@ pub(super) fn request_body(ai: &AiConfig, system: &str, history: &[Turn], user: 
 /// answered. A cut-off answer (the token ceiling) is kept and marked with "…": in a chat a
 /// truncated answer still says something, unlike the card the core's parser guards.
 pub(super) fn parse_response(provider: Provider, status: u16, body: &str) -> std::result::Result<String, &'static str> {
-    match status {
-        0 => return Err("ai/unreachable"),
-        401 | 403 => return Err("ai/bad-key"),
-        404 => return Err("ai/bad-model"),
-        429 => return Err("ai/rate-limited"),
-        502 | 503 | 529 => return Err("ai/overloaded"),
-        s if !(200..300).contains(&s) => return Err("ai/bad-response"),
-        _ => {}
+    if let Some(code) = http_failure(status) {
+        return Err(code);
     }
     let json: serde_json::Value = serde_json::from_str(body).map_err(|_| "ai/bad-response")?;
     let (text, cut_off) = match provider {
@@ -319,24 +332,37 @@ pub(super) async fn call(
     allow_lan: bool,
 ) -> std::result::Result<String, &'static str> {
     let url = call_url(ai, allow_lan)?;
+    let (status, text) = post_json(&url, &auth_headers(ai.provider, key), &body.to_string(), CALL_TIMEOUT_MS).await?;
+    parse_response(ai.provider, status, &text)
+}
+
+/// One JSON POST to an address the caller has judged (`outbound_url`), redirects not followed:
+/// the status and the body (0 and nothing when it did not answer in `timeout_ms`). Nothing about
+/// the request or the answer is logged.
+pub(super) async fn post_json(
+    url: &str,
+    auth: &[(&'static str, String)],
+    body: &str,
+    timeout_ms: u64,
+) -> std::result::Result<(u16, String), &'static str> {
     let headers = Headers::new();
     let set = |k: &str, v: &str| headers.set(k, v).map_err(|_| "ai/bad-key");
     set("content-type", "application/json")?;
-    for (k, v) in auth_headers(ai.provider, key) {
-        set(k, &v)?;
+    for (k, v) in auth {
+        set(k, v)?;
     }
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_redirect(RequestRedirect::Manual)
-        .with_body(Some(body.to_string().into()));
-    let req = Request::new_with_init(&url, &init).map_err(|_| "ai/bad-response")?;
-    let Some(Ok(mut resp)) = with_timeout(Fetch::Request(req).send(), CALL_TIMEOUT_MS).await else {
-        return Err("ai/unreachable");
+        .with_body(Some(body.into()));
+    let req = Request::new_with_init(url, &init).map_err(|_| "ai/bad-response")?;
+    let Some(Ok(mut resp)) = with_timeout(Fetch::Request(req).send(), timeout_ms).await else {
+        return Ok((0, String::new()));
     };
     let status = resp.status_code();
     let text = resp.text().await.unwrap_or_default();
-    parse_response(ai.provider, status, &text)
+    Ok((status, text))
 }
 
 #[cfg(test)]

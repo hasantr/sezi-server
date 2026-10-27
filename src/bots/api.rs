@@ -7,6 +7,7 @@
 //! | `sendMessage` | `{chat:{user_id}\|{room_id}, text ≤4000, reply_to?, client_id?}` | `{ok, message_id}` (`b-<uuid>`); a repeated `client_id` answers the first send's `message_id` with `duplicate: true` |
 //! | `setWebhook` | `{url}` (https; `""` or `null` clears) | `{ok, webhook_secret}` |
 //! | `deleteWebhook` | `{}` | `{ok}` |
+//! | `getFile` | `{file_id}` | the file's DECRYPTED bytes (`application/octet-stream`); an error is the usual JSON |
 //!
 //! Every body is a JSON object of at most 64 KiB whose fields have their documented types
 //! (`api_input.rs`); anything else is refused before a lookup.
@@ -47,14 +48,46 @@ pub(crate) fn bot_err(status: u16, code: &str) -> Result<Response> {
     Ok(Response::from_json(&super::api_answer::error(code))?.with_status(status))
 }
 
+/// `bot/rate-limited`, with `retry_after` in the body (an Apps Script program reads no headers)
+/// and in `Retry-After` — the send limits', the call budget's and the wrong-key brake's answer.
+pub(crate) fn rate_limited(retry_after_s: u64) -> Result<Response> {
+    let mut resp = Response::from_json(&super::api_answer::rate_limited(retry_after_s))?.with_status(429);
+    resp.headers_mut().set("Retry-After", &retry_after_s.to_string())?;
+    Ok(resp)
+}
+
 pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let method = ctx.param("method").cloned().unwrap_or_default();
+    // An address that keeps sending keys that open no bot waits before its next lookup
+    // (`key_brake.rs`): no D1 read for it, and no write anywhere. Only a well-formed key costs a
+    // lookup, so only one is braked or counted; a key this isolate saw open a bot passes.
+    let addr = crate::ratelimit::door_address(&crate::ratelimit::client_ip(&req, &ctx.env));
+    let now_s = crate::utils::now_secs() as i64;
+    let key_hash = crate::auth::middleware::extract_bearer(&req)
+        .filter(|k| token::parse(k).is_some())
+        .map(|k| token::hash(&k));
+    if let Some(h) = &key_hash {
+        if let Err(retry_after_s) = super::key_brake::check(&addr, h, now_s) {
+            return rate_limited(retry_after_s);
+        }
+    }
     let db = ctx.env.d1("DB")?;
     let Some(bot) = token::authenticate(&req, &db).await? else {
+        if let Some(h) = &key_hash {
+            super::key_brake::miss(&addr, h, now_s);
+        }
         return bot_err(401, "unauthorized");
     };
+    if let Some(h) = &key_hash {
+        super::key_brake::good(h, now_s);
+    }
     if bot.disabled_at.is_some() {
         return bot_err(403, "disabled");
+    }
+    // Every call, whatever its method, takes one from the bot's budget before any of its work
+    // (`inbox_do/bot/api_budget.rs`: 300 a minute, a burst of 60).
+    if let Some(refused) = take_call(&ctx.env, &bot.bot_id).await {
+        return refused;
     }
     // "When did the program last show up" (the owner's "no word from it" line).
     super::mark_program_seen(&ctx.env, &bot.bot_id).await;
@@ -79,7 +112,25 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
             set_webhook(&ctx.env, &db, &bot, url, &token).await
         }
         "deleteWebhook" => set_webhook(&ctx.env, &db, &bot, "", "").await,
+        "getFile" => match input::parse_get_file(&body) {
+            Ok(file_id) => get_file(&ctx.env, &bot, file_id).await,
+            Err((status, code)) => bot_err(status, code),
+        },
         _ => bot_err(404, "unknown-method"),
+    }
+}
+
+/// One call from the bot's budget, counted in its inbox: `Some(answer)` when it is refused. An
+/// inbox that does not answer lets the call through — the budget bounds a program, not the
+/// inbox's own availability, and the call that follows meets the same inbox anyway.
+async fn take_call(env: &Env, bot_id: &str) -> Option<Result<Response>> {
+    match super::bot_inbox(env, bot_id, Method::Post, "/bot/budget", None).await {
+        Ok(r) if r.status_code() == 204 => None,
+        Ok(r) if r.status_code() == 429 => Some(inbox_answer(Ok(r)).await),
+        other => {
+            console_log!("[bot] call budget not counted: {:?}", other.map(|r| r.status_code()).map_err(|e| e.to_string()));
+            None
+        }
     }
 }
 
@@ -125,6 +176,27 @@ async fn get_updates(env: &Env, bot: &BotAuth, body: &serde_json::Value) -> Resu
     };
     let q = serde_json::json!({ "offset": q.offset, "timeout": q.timeout, "limit": q.limit });
     inbox_answer(super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/updates", Some(q.to_string())).await).await
+}
+
+/// `getFile`: a member's file, opened by the bot's inbox (`inbox_do/bot/files.rs`) after the
+/// relay's record of its blob said the member uploaded it for this bot — the bytes, decrypted, or
+/// the inbox's `{ok:false}` answer. The program never sees a key or a `media_id`, and a `file_id`
+/// is looked up in this bot's own inbox, so no other bot's key reaches it.
+async fn get_file(env: &Env, bot: &BotAuth, file_id: &str) -> Result<Response> {
+    let call = serde_json::json!({ "file_id": file_id });
+    let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/file", Some(call.to_string())).await;
+    let mut resp = match resp {
+        Ok(r) if r.status_code() == 200 => r,
+        other => return inbox_answer(other).await,
+    };
+    let bytes = resp.bytes().await?;
+    // A fresh response: one that came out of `fetch` has immutable headers.
+    let mut out = Response::from_bytes(bytes)?;
+    let h = out.headers_mut();
+    h.set("content-type", "application/octet-stream")?;
+    h.set("cache-control", "private, no-store")?;
+    h.set("x-content-type-options", "nosniff")?;
+    Ok(out)
 }
 
 /// Set (`url` non-empty) or clear the webhook. The secret is derived from the key the program

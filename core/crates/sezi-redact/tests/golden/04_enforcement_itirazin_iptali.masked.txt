@@ -1,0 +1,25 @@
+T.C.
+[MAHKEME] İCRA HUKUK MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 1
+DURUŞMA TARİHİ : 07/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+ALACAKLI : [SIRKET_1] VKN: [VKN_1] - [ADRES_1]
+VEKİLİ : Av. [KISI_3]
+BORÇLU : [KISI_4] - [ADRES_2]
+VEKİLİ : Av. [KISI_5]
+DAVA : İtirazın İptali (İcra)
+
+Belirlenen gün ve saatte duruşmaya başlandı. Alacaklı vekili Av. [KISI_3] ile borçlu vekili Av. [KISI_5] geldi.
+Alacaklı vekili: Bursa 5. İcra Dairesi'nin [DOSYA_1] Esas sayılı dosyasında borçlunun itirazının iptalini ve icra inkar tazminatına hükmedilmesini talep ederiz dedi.
+Borçlu vekili: Müvekkil [KISI_4] faturaları almamıştır, borca itiraz ederiz dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-[DOSYA_1] Esas sayılı icra dosyasının onaylı suretinin celbine,
+2-Alacaklı vekiline ticari defterlerin ibrazı için iki haftalık kesin süre verilmesine,
+3-Duruşmanın 25/11/2026 günü saat 14:00'e bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 07/10/2026
+
+Katip [SICIL_2]               Hakim [SICIL_1]
+¸e-imzalıdır               ¸e-imzalıdır

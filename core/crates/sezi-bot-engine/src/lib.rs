@@ -14,6 +14,12 @@
 //! share, rotate, post, answer a key request), `store.rs` (the host's storage traits), `mem.rs` (a
 //! HashMap store for tests).
 //!
+//! ## H3 (files, 2026-10-27) — for the relay track
+//!
+//! A 1:1 `File` / `FileGroup` is [`Inbound::File`] now, where it was `Ignored("unsupported")`
+//! and dropped after its ack (the member saw "delivered" and nothing happened). It carries each
+//! manifest's key: the host must keep that out of every update a program reads.
+//!
 //! ## Phase 3 (rooms, 2026-10-26) — for the relay track
 //!
 //! [`RoomStore`] (a supertrait of [`BotStore`]) holds the room state; a 1:1-only host needs none of
@@ -64,7 +70,7 @@ mod store;
 #[cfg(test)]
 mod testutil;
 
-pub use classify::{PAIR_ACK_MARKER, SYSTEM_MARKER_PREFIX};
+pub use classify::{MAX_FILES_PER_MESSAGE, PAIR_ACK_MARKER, SYSTEM_MARKER_PREFIX};
 pub use direct::text_payload;
 pub use heal::REPAIR_WINDOW_MS;
 pub use identity::{DEVICE_LABEL, SPK_PREKEY_ID};
@@ -75,7 +81,7 @@ pub use room::{
 pub use store::{BotStore, RoomSession, RoomShare, RoomStore};
 
 use sezi_error::Result;
-use sezi_protocol::inner::ChatPayload;
+use sezi_protocol::inner::{ChatPayload, FileManifest};
 
 /// One device of a user, as the relay's `devices` table and signed list give it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +129,19 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inbound {
     Text { from: String, device: String, msg_uid: Option<String>, body: String, ext: serde_json::Value },
+    /// A file (or an album of files) a member sent the bot 1:1 (H3): the manifests as the member's
+    /// kernel sealed them — `media_id`, the key and nonce that open the blob, size, type, name —
+    /// and the message's caption. The KEY is here: the host keeps it out of anything a program
+    /// reads, and opens a blob only after its own records say this sender uploaded it, for this
+    /// bot (docs/HEARINGS_BOT_PLAN.md §1.2, §8.1).
+    File {
+        from: String,
+        device: String,
+        msg_uid: Option<String>,
+        manifests: Vec<FileManifest>,
+        caption: Option<String>,
+        ext: serde_json::Value,
+    },
     /// A pair-ack opened a fresh session: the host resends this user's failed `bot_sent` rows.
     PairAck { from: String },
     /// A group message that called the bot, copied to it 1:1 (Phase 3).

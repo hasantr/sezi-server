@@ -7,12 +7,14 @@
 //! answers, pair-acks) is queued in it and sent after.
 
 use super::super::ack::{group_acks, AckRow};
+use super::backlog::admit_member_update;
 use super::outbox::OutKind;
 use super::room::BotRooms;
 use super::updates::{call_update, message_update, CallRoom, Who};
 use super::*;
+use crate::bots::builtin_rules::Lang;
 use sezi_bot_engine::{on_envelope, Effect, Envelope, Inbound};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Frames opened per tick. A PreKey costs an account unpickle; the tick re-arms at once while
 /// more are waiting, so this bounds one invocation's CPU, not the throughput.
@@ -34,6 +36,8 @@ struct Prefetch {
 struct Owed {
     repairs: BTreeSet<String>,
     pair_acks: BTreeSet<String>,
+    /// Members whose message the queue refused, to be told so (`backlog.rs`), and their language.
+    busy: BTreeMap<String, Option<Lang>>,
 }
 
 impl UserInbox {
@@ -76,11 +80,14 @@ impl UserInbox {
         for user in owed.repairs.difference(&owed.pair_acks) {
             self.bot_repair(&ctx, user).await;
         }
+        // A member the queue refused hears it from the bot; it goes out with the drain below.
+        let said = self.bot_say_busy(&ctx, &owed.busy).await;
         self.bot_deliver_webhooks(&ctx).await;
         // A built-in bot answers here; its replies go out with the drain below. Then the room
         // round shares keys and encrypts what waits for a room. The three share the tick's purse:
-        // each gets what the one before left (`builtin_policy`, `room::room_budget`).
-        let round = self.bot_builtin_round(&ctx).await;
+        // each gets what the one before left (`builtin_policy`, `room::room_budget`). A program
+        // bot has no built-in round: its notices above take that share.
+        let round = said + self.bot_builtin_round(&ctx).await;
         let room = self.bot_room_round(&ctx, super::room::room_budget(round)).await;
         self.bot_drain_outbox_within(&ctx, super::builtin_policy::drain_budget(round + room)).await;
         self.bot_housekeeping(&ctx).await;
@@ -136,6 +143,8 @@ impl UserInbox {
     ) -> Result<()> {
         let now = (now_secs() * 1000) as i64;
         let mut store = self.bot_store();
+        // A program bot's queue is capped per member (`backlog.rs`); a built-in bot has its own caps.
+        let capped = self.builtin_config().is_none();
         // (ids, uids) per outcome, parallel.
         let mut acked: [(Vec<i64>, Vec<String>); 2] = Default::default();
         for row in rows {
@@ -170,10 +179,27 @@ impl UserInbox {
                         if msg_uid.as_deref().is_some_and(|u| !store.first_sight(&from, u, now)) {
                             continue;
                         }
+                        // Too many of theirs (or everybody's) waiting: acked, never queued.
+                        if capped && !admit_member_update(&store.db, &from, None, now, &mut owed.busy) {
+                            continue;
+                        }
                         let update = message_update(now, &from, pre.who.get(&from), msg_uid.as_deref(), &body, &ext);
                         if let Some(id) = self.bot_push_update(&update, now) {
                             self.bot_note_update_src(id, &from, env.remote_id, msg_uid.as_deref());
                         }
+                    }
+                    // A file (H3): the update names it, its manifest waits in `bot_files`
+                    // (`files.rs`). The same dedup and per-member cap as a text.
+                    Effect::Update(Inbound::File { from, msg_uid, manifests, caption, ext, .. }) => {
+                        if msg_uid.as_deref().is_some_and(|u| !store.first_sight(&from, u, now)) {
+                            continue;
+                        }
+                        if capped && !admit_member_update(&store.db, &from, None, now, &mut owed.busy) {
+                            continue;
+                        }
+                        let who = pre.who.get(&from);
+                        let (uid, cap) = (msg_uid.as_deref(), caption.as_deref());
+                        self.bot_queue_file(&from, who, uid, &manifests, cap, &ext, env.remote_id, now);
                     }
                     Effect::Update(Inbound::PairAck { from }) => {
                         owed.pair_acks.insert(from);
@@ -185,6 +211,9 @@ impl UserInbox {
                             continue;
                         };
                         if !store.first_sight(&from, &format!("{room_id}/{msg_uid}"), now) {
+                            continue;
+                        }
+                        if capped && !admit_member_update(&store.db, &from, lang.as_deref(), now, &mut owed.busy) {
                             continue;
                         }
                         let room = CallRoom { id: &room_id, name, role };

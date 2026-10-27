@@ -1,0 +1,29 @@
+T.C.
+[MAHKEME] SULH CEZA HAKİMLİĞİ
+SORGU TUTANAĞI
+
+DEĞİŞİK İŞ NO    : [ESAS] D. İş
+SORUŞTURMA NO    : [DOSYA_1]
+SORGU TARİHİ     : 24/10/2026
+
+HAKİM            : [KISI_1] [SICIL_1]
+KATİP            : [KISI_2] [SICIL_2]
+
+ŞÜPHELİ          : [KISI_3], [KISI_4] ve [KISI_5] oğlu, [DOGUM_1] Ümraniye doğumlu, TC: [TCKN_1], [ADRES_1]
+MÜDAFİİ          : Av. [KISI_6] (İstanbul Barosu Sicil No: [SICIL_3])
+MÜŞTEKİ          : [KISI_7]
+SUÇ              : Nitelikli Dolandırıcılık (TCK 158/1-f)
+
+Şüpheli tutuklama talebiyle hakimliğimize sevk edilmekle, şüpheli ve müdafii hazır olduğu halde sorguya başlandı. Şüpheliye CMK 147. maddesindeki hakları hatırlatıldı.
+Sevk yazısı okundu; şüphelinin kendisini banka görevlisi olarak tanıtıp müşteki [KISI_7]'yi telefonla aradığı, kartı bloke edildi diyerek [KART_1] numaralı kredi kartının bilgilerini aldığı, toplam 248.500,00 TL'yi [IBAN_1] IBAN numaralı hesaba aktardığı iddia edilmektedir.
+Arama kayıtlarında müştekiyi [TEL_1] ve [TEL_2] numaralarından aradığı, mağdurlara [EPOSTA_1] adresinden e-posta gönderildiği tespit edilmiştir.
+Şüpheli savunmasında: Suçlamayı kabul etmiyorum, hesap bana ait değildir, kuzenim Batuhan hesabı benim adıma açtırdı, telefon hattı da onun kullanımındaydı dedi.
+Müdafii: Müvekkil [KISI_3]'nın sabit ikameti vardır, adli kontrol yeterlidir, tutuklama talebinin reddini isteriz dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Şüpheli [KISI_3]'nın üzerine atılı suçu işlediğine dair kuvvetli suç şüphesini gösteren somut delillerin varlığı, delilleri karartma şüphesi bulunması nedeniyle CMK 100. maddesi uyarınca TUTUKLANMASINA,
+2-[IBAN_1] IBAN numaralı hesaba CMK 128. maddesi uyarınca el konulmasına,
+3-Kararın bir örneğinin Cumhuriyet Başsavcılığına gönderilmesine,
+Dair, şüphelinin ve müdafiinin yüzüne karşı, tebliğden itibaren 7 gün içinde itiraz yolu açık olmak üzere verilen karar açıkça okunup anlatıldı. 24/10/2026
+
+Katip [SICIL_2]                     Hakim [SICIL_1]
+¸e-imzalıdır                     ¸e-imzalıdır

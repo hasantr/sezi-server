@@ -1,0 +1,68 @@
+{
+  "court": "Eskişehir 2. Sulh Hukuk Mahkemesi",
+  "court_kind": "civil_peace",
+  "criminal": false,
+  "case_no": "2026/915",
+  "decision_no": "2026/1402",
+  "session_no": 2,
+  "hearing_date": "2026-10-21",
+  "hearing_time": null,
+  "next_hearing": {
+    "date": "2026-12-02",
+    "time": "14:15"
+  },
+  "decisions": [
+    {
+      "n": 1,
+      "text": "Taşınmazın değerinin tespiti için mahallinde keşif yapılmasına, keşif için davacı tarafa keşif harcı ve bilirkişi ücretini yatırması için iki haftalık kesin süre verilmesine",
+      "first_role": "plaintiff",
+      "deadlines": [
+        "iki haftalık kesin süre"
+      ],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 2,
+      "text": "Keşfin 11/11/2026 günü saat 13:30'da yapılmasına",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": false
+    },
+    {
+      "n": 3,
+      "text": "Duruşmanın 02/12/2026 günü saat 14:15'e bırakılmasına",
+      "first_role": null,
+      "deadlines": [],
+      "sets_next_hearing": true
+    }
+  ],
+  "attendance": [
+    {
+      "role": "plaintiff",
+      "present": true
+    },
+    {
+      "role": "defendant",
+      "present": false
+    }
+  ],
+  "roles": [
+    {
+      "role": "plaintiff",
+      "count": 1
+    },
+    {
+      "role": "defendant",
+      "count": 2
+    },
+    {
+      "role": "judge",
+      "count": 1
+    },
+    {
+      "role": "clerk",
+      "count": 1
+    }
+  ],
+  "missing": []
+}

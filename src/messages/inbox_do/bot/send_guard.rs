@@ -98,12 +98,10 @@ pub(super) fn refund<E: Exec>(db: &E, slot: i64) {
     db.run(SEND_LOG_REFUND, &[Arg::I(slot)]);
 }
 
-/// `bot/rate-limited`, with `retry_after` in the body (an Apps Script program reads no headers)
-/// and in `Retry-After`.
+/// `bot/rate-limited`, with `retry_after` in the body and in `Retry-After` (`bots::api`'s one
+/// builder, which the call budget and the wrong-key brake answer with too).
 pub(crate) fn rate_limited(retry_after_s: u64) -> Result<Response> {
-    let mut resp = Response::from_json(&crate::bots::api_answer::rate_limited(retry_after_s))?.with_status(429);
-    resp.headers_mut().set("Retry-After", &retry_after_s.to_string())?;
-    Ok(resp)
+    crate::bots::api::rate_limited(retry_after_s)
 }
 
 #[cfg(test)]

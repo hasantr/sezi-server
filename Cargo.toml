@@ -53,6 +53,16 @@ wasm-bindgen = "0.2"
 # and a generated workspace root (`scripts/sync-template.sh`), which rewrites the paths.
 sezi-bot-engine = { path = "core/crates/sezi-bot-engine" }
 sezi-protocol = { path = "core/crates/sezi-protocol" }
+# A file a member sends a bot 1:1 (H3, docs/HEARINGS_BOT_PLAN.md §1.2): the bot's inbox opens the
+# blob in-process with `decrypt_in_memory`, the kernel's own STREAM decryptor. Its in-memory path
+# builds for wasm (the browser client runs it); nothing here touches its file-path I/O.
+sezi-file = { path = "core/crates/sezi-file" }
+# The hearing-minutes bot (docs/HEARINGS_BOT_PLAN.md, H4): its runner reads a record by rules
+# (`sezi-hearings`: a PDF's text layer through lopdf, the header, the decisions) and masks every
+# personal datum before anything leaves the relay (`sezi-redact`). Both are pure and build for
+# wasm32 on their own; the self-host template vendors them with the others.
+sezi-hearings = { path = "core/crates/sezi-hearings" }
+sezi-redact = { path = "core/crates/sezi-redact" }
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

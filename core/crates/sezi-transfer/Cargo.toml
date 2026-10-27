@@ -1,0 +1,29 @@
+[package]
+name = "sezi-transfer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Attachment transfer plumbing: byte-progress reporting and in-flight cancellation"
+
+[lints]
+workspace = true
+
+# The progress VOCABULARY (`TransferStep`/`TransferProgress`) is platform-free — the wasm crypto
+# island calls `emit_bytes` too — while the tokio channel that reaches the kernel is native-only.
+# Both come from the workspace so that `UnboundedSender` and `CancellationToken` mean the SAME type
+# on both sides of the crate boundary; these two types are the whole point of the crate, and two
+# declarations resolving differently would fail at the call sites rather than here.
+#
+# `tokio-util` came off the native-only list on 2026-08-24: `CancellationToken` is a mutex and an
+# atomic, and the browser needs it — a cancelled upload there kept spending someone's data plan.
+# `tokio` stays split because the progress channel is the native half and the workspace floor is
+# already what wasm gets.
+[dependencies]
+tokio-util = { workspace = true }
+# `phase.rs` hand-writes Serialize/Deserialize: the phase is stored as its snake_case DB string, which
+# is what keeps the value stable between the column and payload_json. A derive would emit the variant
+# names instead and silently change the persisted form.
+serde = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio      = { workspace = true }

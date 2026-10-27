@@ -1,0 +1,24 @@
+T.C.
+[MAHKEME] AİLE MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 1
+DURUŞMA TARİHİ : 02/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+DAVACI : [KISI_3]
+VEKİLİ : Av. [KISI_4]
+DAVALI : [KISI_5]
+DAVA : İştirak Nafakasının Artırılması
+
+Belirlenen gün ve saatte celseye başlandı. Davacı vekili av. [KISI_4] geldi. Davalı [KISI_5] geldi.
+Davacı vekili: Davalı [KISI_5] ayda 85.000,00 TL gelir elde etmektedir; mevcut 4.000,00 TL iştirak nafakasının 12.000,00 TL'ye artırılmasını talep ederiz dedi.
+Davalı [KISI_6] beyanında: Gelirim düştü, [KISI_7]'un talebi fahiştir dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Tarafların ekonomik ve sosyal durumlarının zabıta aracılığıyla araştırılmasına,
+2-Davalının SGK kayıtlarının celbine,
+3-Duruşmanın 27/11/2026 günü saat 10:30'a bırakılmasına,
+Dair, davacı vekili ve davalının yüzüne karşı verilen karar açıkça okunup anlatıldı. 02/10/2026
+
+Katip [SICIL_2]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır

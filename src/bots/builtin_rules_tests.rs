@@ -55,14 +55,16 @@ fn a_stored_key_follows_only_the_service_it_was_given_for() {
         instructions: "x".into(),
         sheet_tool: false,
     };
+    let c = |a: AiConfig| Config { kind: Kind::Ai, lang: Lang::Tr, sheet_url: None, ai: Some(a), hearings: None };
     let old = ai(Provider::Openai, Some("https://api.openai.com/v1"));
     let mut new = old.clone();
     new.model = "other".into();
     new.instructions = "changed".into();
-    assert!(key_follows(Some(&old), &new), "model and instructions are not the key's business");
-    assert!(!key_follows(Some(&old), &ai(Provider::Anthropic, Some("https://api.openai.com/v1"))));
-    assert!(!key_follows(Some(&old), &ai(Provider::Openai, None)), "another address");
-    assert!(!key_follows(None, &old), "nothing stored for an AI bot");
+    let follows = |o: Option<AiConfig>, n: AiConfig| service_follows(o.map(c).as_ref(), &c(n));
+    assert!(follows(Some(old.clone()), new), "model and instructions are not the key's business");
+    assert!(!follows(Some(old.clone()), ai(Provider::Anthropic, Some("https://api.openai.com/v1"))));
+    assert!(!follows(Some(old.clone()), ai(Provider::Openai, None)), "another address");
+    assert!(!follows(None, old), "nothing stored for an AI bot");
 }
 
 #[test]

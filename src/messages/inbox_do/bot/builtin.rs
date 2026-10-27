@@ -7,7 +7,8 @@
 //! `setWebhook` answer `bot/builtin-active` (409).
 //!
 //! **Secrets** (`bot_kv`, this inbox only — never D1, never logged): the provider key
-//! (`builtin_api_key`), kept only while the bot is an AI bot, and the sheet's shared secret
+//! (`builtin_api_key`), kept only while the bot is an AI or a hearings bot and only for the
+//! service it was given for (`builtin_rules::service_follows`), and the sheet's shared secret
 //! (`sheet_secret`), made the first time the bot is meant to write a sheet — before its address
 //! exists, since the helper hands the script over first — and kept for the life of the bot, so a
 //! script already pasted keeps working through a change of kind. No route ever returns the key;
@@ -22,7 +23,7 @@ use super::builtin_store as bs;
 use super::store::Exec;
 use super::*;
 use super::builtin_policy;
-use crate::bots::builtin_rules::{allow_lan, key_follows, Config, Kind};
+use crate::bots::builtin_rules::{allow_lan, service_follows, Config, Kind};
 
 const KV_CONFIG: &str = "builtin";
 /// A sheet bot (or a row-writing AI bot) whose `/exec` address is not set yet.
@@ -78,20 +79,22 @@ impl UserInbox {
     /// Every set bumps the configuration's generation, so a round in flight drops what it was
     /// doing on the old one (`builtin_run.rs`). What was owed to a sheet — waiting proposals and
     /// rows — goes when the bot stops writing to that sheet; a stored key goes with the service
-    /// it was given for (`builtin_rules::key_follows`).
+    /// it was given for (`builtin_rules::service_follows`).
     pub(super) async fn bot_builtin_set(&self, body: SetBody) -> Result<Response> {
         let store = self.bot_store();
         let old = self.builtin_config();
         let new = body.config;
         // Refused before anything changes: a key may not travel to another provider or address.
+        // The AI bot's and the hearings bot's key share one slot, kept only for the service
+        // (provider, address) it was given for (`service_follows`).
         let keep_key = match (&new, &body.api_key) {
-            (Some(c), None) if c.kind == Kind::Ai => {
-                let follows = c.ai.as_ref().is_some_and(|a| key_follows(old.as_ref().and_then(|o| o.ai.as_ref()), a));
-                if !(follows && store.kv_get(KV_API_KEY).is_some()) {
+            (Some(c), None) if c.key_service().is_some() => {
+                let follows = service_follows(old.as_ref(), c) && store.kv_get(KV_API_KEY).is_some();
+                if c.needs_key() && !follows {
                     let refusal = serde_json::json!({ "ok": false, "error": "ai/no-key" });
                     return Ok(Response::from_json(&refusal)?.with_status(400));
                 }
-                true
+                follows
             }
             _ => false,
         };
@@ -106,6 +109,11 @@ impl UserInbox {
             store.db.run(bs::PROPOSALS_FORGET, &[]);
             store.db.run(bs::JOBS_FORGET, &[]);
         }
+        if builtin_policy::drops_hearings_queue(old.as_ref(), new.as_ref()) {
+            for q in bs::HEARINGS_QUEUE_FORGET {
+                store.db.run(q, &[]);
+            }
+        }
         let Some(config) = new else {
             // Back to "program" mode: the key and what the AI remembered go; the sheet secret
             // stays (it is the script's, not a key to anything).
@@ -115,23 +123,35 @@ impl UserInbox {
             for q in bs::AI_FORGET {
                 store.db.run(q, &[]);
             }
+            if old.as_ref().is_some_and(|o| o.kind == Kind::Hearings) {
+                store.db.run(super::builtin_hearings::SENT_EXPIRE, &[super::store::Arg::I(i64::MAX)]);
+            }
             return Response::from_json(&serde_json::json!({ "ok": true }));
         };
-        let has_key = match (config.kind, body.api_key) {
-            (Kind::Ai, Some(key)) => {
+        let has_key = match (config.key_service(), body.api_key) {
+            (Some(_), Some(key)) => {
                 store.kv_put(KV_API_KEY, &key);
                 true
             }
-            (Kind::Ai, None) => keep_key,
-            (Kind::Sheet, _) => {
+            (Some(_), None) if keep_key => true,
+            _ => {
                 store.db.run("DELETE FROM bot_kv WHERE k = ?", &[super::store::Arg::T(KV_API_KEY)]);
                 false
             }
         };
-        if config.kind != Kind::Ai {
+        // What an AI bot remembered goes with the kind. A hearings bot keeps its own proposals
+        // and day counts (the same tables) across a re-set of the same kind: a set must not hand
+        // a member a fresh day of calls.
+        let old_kind = old.as_ref().map(|o| o.kind);
+        let keeps_own = config.kind == Kind::Ai || (config.kind == Kind::Hearings && old_kind == Some(Kind::Hearings));
+        if !keeps_own {
             for q in bs::AI_FORGET {
                 store.db.run(q, &[]);
             }
+        }
+        // A hearings bot's sent answers carry names (§8.2): they do not outlive its kind.
+        if old_kind == Some(Kind::Hearings) && config.kind != Kind::Hearings {
+            store.db.run(super::builtin_hearings::SENT_EXPIRE, &[super::store::Arg::I(i64::MAX)]);
         }
         // Made when the bot is MEANT to write a sheet, before its address exists: the helper
         // hands the script (with this secret) over first.
@@ -186,14 +206,18 @@ impl UserInbox {
     pub(super) fn builtin_state(&self) -> serde_json::Value {
         let store = self.bot_store();
         let c = self.builtin_config();
-        let ai = c.as_ref().and_then(|c| c.ai.as_ref());
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "builtin": c.as_ref().map(|c| c.kind),
-            "ai_provider": ai.map(|a| a.provider),
-            "ai_model": ai.map(|a| a.model.clone()),
+            "ai_provider": c.as_ref().and_then(Config::model_provider),
+            "ai_model": c.as_ref().and_then(Config::model_name),
             "last_ok_at": store.kv_get(KV_LAST_OK).and_then(|v| v.parse::<i64>().ok()),
             "last_error": store.kv_get(KV_LAST_ERROR),
-        })
+        });
+        // A hearings bot's audit, as counts (`hearings_audit.rs`): never a row of it.
+        if c.as_ref().is_some_and(|c| c.kind == Kind::Hearings) {
+            v["hearings"] = self.hearings_state((now_secs() * 1000) as i64);
+        }
+        v
     }
 
     /// `/bot/wake`: the bot was turned back on; whatever waits runs now.
@@ -240,6 +264,17 @@ impl UserInbox {
                 (builtin_policy::test_outcome(model, sheet), answer)
             }
             (Kind::Ai, None) => (Err("builtin/ai"), None),
+            (Kind::Hearings, _) => match cfg.hearings.as_ref() {
+                None => (Err("builtin/hearings"), None),
+                Some(h) => {
+                    let (model, answer) = self.hearings_test(cfg.lang, h, now, name).await;
+                    let sheet = match (model, cfg.writes_sheet()) {
+                        (Ok(()), true) => Some(self.builtin_sheet_test(&cfg, now, user_id, name, text).await),
+                        _ => None,
+                    };
+                    (builtin_policy::test_outcome(model, sheet), answer)
+                }
+            },
         };
         self.builtin_note(outcome, now);
         let mut v = serde_json::json!({
@@ -264,6 +299,12 @@ impl UserInbox {
     ) -> std::result::Result<(), &'static str> {
         match (cfg.sheet_url.as_deref(), self.builtin_sheet_secret()) {
             (None, _) => Err(NOT_CONNECTED),
+            // The hearings bot's script is tested in its own version (v2): a test upsert, nothing written.
+            (Some(url), Some(s)) if cfg.kind == Kind::Hearings => {
+                let empty = builtin_sheet::Upsert::default();
+                let body = builtin_sheet::body_v2_json(&s, true, None, now, user_id, name, None, &empty);
+                builtin_sheet::post_upsert(url, &body, allow_lan(&self.env)).await.0.map(|_| ())
+            }
             (Some(url), Some(s)) => {
                 let body = builtin_sheet::body_json(&s, true, None, now, user_id, name, None, text, None);
                 builtin_sheet::post(url, &body, allow_lan(&self.env)).await.0

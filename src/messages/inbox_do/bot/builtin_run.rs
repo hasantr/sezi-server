@@ -14,6 +14,10 @@
 //!   other message leaves it behind, and after 10 minutes it lapses. A passing failure
 //!   (unreachable, overloaded, rate-limited) is tried twice more (5 s, 30 s), then said; any
 //!   other failure is said at once.
+//! - a file, to either: one line saying the bot reads text only (`Line::TextOnly`), and its
+//!   manifest is deleted with the update (`files.rs`, docs/HEARINGS_BOT_PLAN.md §8.2).
+//! - `hearings`: a file or a text is a hearing record (or a yes/no to its row), handled by
+//!   `builtin_hearings.rs`; its row goes to the sheet as an upsert (`builtin_jobs.rs`).
 //!
 //! **Budget** (`builtin_policy`): an item starts only when its worst case fits what the round
 //! may still spend; the outbox drain after the round gets what the round left of the tick's
@@ -70,7 +74,7 @@ struct TurnRow {
 }
 
 /// What became of one update.
-enum Handled {
+pub(super) enum Handled {
     /// Done with: taken, deleted.
     Done,
     /// Try again later; the queue waits behind it.
@@ -161,8 +165,14 @@ impl UserInbox {
             }
             let update: serde_json::Value = serde_json::from_str(&row.json).unwrap_or_default();
             let handled = match update.get("kind").and_then(|k| k.as_str()) {
+                // The hearing-minutes bot reads files and texts its own way (`builtin_hearings.rs`).
+                Some("message" | "call" | "file") if run.cfg.kind == Kind::Hearings => {
+                    self.builtin_hearings(ctx, run, row.update_id, &update, now, spent).await
+                }
                 // A room call is a message whose answer goes to the room (`builtin_room.rs`).
                 Some("message" | "call") => self.builtin_message(ctx, run, &update, row.attempts, now, spent).await,
+                // A file (H3): the sheet and AI kinds read text only, and say so once.
+                Some("file") => self.builtin_file(ctx, run, &update, spent).await,
                 // `added` / `removed`, a `ping` from program mode, or a kind this build does not
                 // handle: nothing to answer.
                 _ => Handled::Done,
@@ -171,6 +181,8 @@ impl UserInbox {
             match handled {
                 Handled::Done => {
                     self.bot_updates_taken(ctx, row.update_id, row.update_id, now);
+                    // A file's manifest, key and all, goes with its handled update (§8.2).
+                    let _ = sql.exec_raw(super::files::FILES_OF_UPDATE_DROP, Some(vec![id.clone()]));
                     let _ = sql.exec_raw(super::deliver::HOOK_DONE, Some(vec![id]));
                 }
                 Handled::Retry => {
@@ -216,7 +228,23 @@ impl UserInbox {
             Kind::Sheet => self.builtin_sheet_row(ctx, run, &ask, at, now, spent).await,
             Kind::Ai if !policy::fits(*spent, policy::AI_BASE) => Handled::NoRoom,
             Kind::Ai => self.builtin_ai_turn(ctx, run, &ask, attempts, now, spent).await,
+            // Handled before this (`builtin_updates`).
+            Kind::Hearings => Handled::Done,
         }
+    }
+
+    /// A file sent 1:1 to a kind that reads text only: one line back, nothing queued, nothing
+    /// retried. The hearing-minutes kind (H4) is where `bot_file_bytes` is called instead.
+    async fn builtin_file(&self, ctx: &BotCtx, run: &Run, update: &serde_json::Value, spent: &mut u32) -> Handled {
+        let from = update.pointer("/chat/user_id").and_then(|v| v.as_str()).unwrap_or("");
+        if from.is_empty() {
+            return Handled::Done;
+        }
+        if !policy::fits(*spent, policy::SAY_BASE) {
+            return Handled::NoRoom;
+        }
+        self.builtin_say(ctx, from, line(run.lang, Line::TextOnly), spent).await;
+        Handled::Done
     }
 
     /// A connected sheet bot's message: a row owed to the sheet while the member is under the
@@ -463,5 +491,13 @@ impl UserInbox {
         db.run(bs::PROPOSAL_EXPIRE, &[Arg::I(now - bs::PROPOSAL_KEEP_MS)]);
         db.run(bs::USAGE_EXPIRE, &[Arg::I(bs::day_of(now) - 1)]);
         db.run(bs::SHEET_USAGE_EXPIRE, &[Arg::I(bs::day_of(now) - 1)]);
+        match self.builtin_config().and_then(|c| c.hearings) {
+            Some(h) => self.builtin_hearings_retention(&h, now),
+            // A bot that was a hearings bot keeps its audit for the default term, no longer.
+            None => {
+                let days = i64::from(crate::bots::builtin_hearings_rules::DEFAULT_AUDIT_DAYS);
+                db.run(super::hearings_audit::AUDIT_EXPIRE, &[Arg::I(now - days * 86_400_000)]);
+            }
+        }
     }
 }

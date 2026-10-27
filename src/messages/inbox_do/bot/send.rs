@@ -120,16 +120,21 @@ impl UserInbox {
     /// Encrypt `text` to every device of `to` as `msg_uid` and queue the envelopes: the
     /// subrequests spent, or `None` when `to` has no device.
     async fn bot_encrypt_text(&self, ctx: &BotCtx, to: &str, text: &str, msg_uid: &str) -> Result<Option<u32>> {
+        self.bot_encrypt_payload(ctx, to, &text_payload(text, msg_uid)).await
+    }
+
+    /// Encrypt any payload to every device of `to` and queue the envelopes (one with a `msg_uid`
+    /// is remembered for a resend): the subrequests spent, or `None` when `to` has no device.
+    pub(super) async fn bot_encrypt_payload(&self, ctx: &BotCtx, to: &str, payload: &ChatPayload) -> Result<Option<u32>> {
         let devices = self.bot_member_devices(to).await?;
         if devices.is_empty() {
             return Ok(None);
         }
         let need = devices_without_session(&self.bot_store(), to, &devices);
         let claimed = self.bot_claim_keys(to, &need).await?;
-        let payload = text_payload(text, msg_uid);
-        let payload_json = serde_json::to_string(&payload).map_err(|e| Error::RustError(e.to_string()))?;
+        let payload_json = serde_json::to_string(payload).map_err(|e| Error::RustError(e.to_string()))?;
         let now = (now_secs() * 1000) as i64;
-        let effects = send_direct(&mut self.bot_store(), &ctx.key, to, &devices, &claimed, &payload)
+        let effects = send_direct(&mut self.bot_store(), &ctx.key, to, &devices, &claimed, payload)
             .map_err(|e| Error::RustError(format!("bot send: {e}")))?;
         self.bot_queue_effects(effects, Some(&payload_json), now);
         // `build_device_bundle` is at most six D1 calls per claimed device (`keys/bundle_slot.rs`).
@@ -229,10 +234,15 @@ impl UserInbox {
         let sql = self.state.storage().sql();
         let cutoff = |ttl: i64| Some(vec![JsValue::from_f64((now - ttl) as f64)]);
         let _ = sql.exec_raw(super::updates::UPDATE_EXPIRE, cutoff(super::updates::UPDATE_TTL_MS));
+        // A member's file, key and all, goes with its updates' 24 h (`files.rs`).
+        let _ = sql.exec_raw(super::files::FILE_EXPIRE, cutoff(super::updates::UPDATE_TTL_MS));
+        let _ = sql.exec_raw(super::files::READS_PRUNE, cutoff(super::files::READ_WINDOW_MS));
         let _ = sql.exec_raw("DELETE FROM bot_sent WHERE created_at < ?", cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::store::SEEN_EXPIRE, cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::send_replay::CLIENT_EXPIRE, cutoff(super::send_replay::CLIENT_ID_TTL_MS));
         let _ = sql.exec_raw(super::deliver::SRC_ORPHANS, sql_no_args());
+        let _ = sql.exec_raw(super::deliver_order::ASIDE_ORPHANS, sql_no_args());
+        let _ = sql.exec_raw(super::backlog::NOTICE_EXPIRE, cutoff(super::backlog::NOTICE_EVERY_MS));
         self.builtin_housekeeping(now);
         self.bot_room_housekeeping(now);
         let store = self.bot_store();

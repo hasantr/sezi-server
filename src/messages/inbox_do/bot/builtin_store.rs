@@ -6,7 +6,7 @@
 //! | Table | Holds | Kept |
 //! |---|---|---|
 //! | `bot_ai_turns` | a member's conversation with an AI bot, message by message | 24 h, the last 10 turns |
-//! | `bot_ai_usage` | model calls per member per (UTC) day | 2 days |
+//! | `bot_ai_usage` | model calls per member per (UTC) day; summed, the bot's own day | 2 days |
 //! | `bot_ai_proposals` | the row an AI bot asked a member to confirm | waits 10 min, kept 24 h to say it lapsed |
 //! | `bot_sheet_jobs` | rows owed to the sheet, in order | until written, or 23 h |
 //! | `bot_sheet_usage` | a sheet bot's rows per member per (UTC) day | 2 days |
@@ -94,6 +94,9 @@ pub(super) const USAGE_GET: &str = "SELECT n FROM bot_ai_usage WHERE user_id = ?
 /// Bind: user, day.
 pub(super) const USAGE_BUMP: &str = "INSERT INTO bot_ai_usage (user_id, day, n) VALUES (?, ?, 1)
       ON CONFLICT(user_id, day) DO UPDATE SET n = n + 1";
+/// The bot's model calls on a day, every member together (a hearings bot's `daily_calls`).
+/// Bind: day.
+pub(super) const USAGE_DAY_TOTAL: &str = "SELECT COALESCE(SUM(n), 0) AS n FROM bot_ai_usage WHERE day = ?";
 /// Bind: the oldest day kept.
 pub(super) const USAGE_EXPIRE: &str = "DELETE FROM bot_ai_usage WHERE day < ?";
 
@@ -158,6 +161,16 @@ pub(super) const AI_FORGET: [&str; 3] =
     ["DELETE FROM bot_ai_turns", "DELETE FROM bot_ai_proposals", "DELETE FROM bot_ai_usage"];
 /// Rows owed to a sheet the bot no longer writes to.
 pub(super) const JOBS_FORGET: &str = "DELETE FROM bot_sheet_jobs";
+/// What members sent a hearings bot and it has not handled yet — pasted minutes, files and
+/// their keys — for leaving hearings mode (`builtin_policy::drops_hearings_queue`): sent to be
+/// masked, never to be read raw by the kind or the program that comes next.
+pub(super) const HEARINGS_QUEUE_FORGET: [&str; 5] = [
+    "DELETE FROM bot_updates",
+    "DELETE FROM bot_update_src",
+    "DELETE FROM bot_update_aside",
+    "DELETE FROM bot_files",
+    "DELETE FROM bot_kv WHERE k = 'hearings_inflight'",
+];
 
 #[cfg(test)]
 #[path = "builtin_store_tests.rs"]

@@ -1,0 +1,25 @@
+T.C.
+[MAHKEME] ASLİYE TİCARET MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 5
+DURUŞMA TARİHİ : 21/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+DAVACI : [SIRKET_1] VKN [VKN_1] - [ADRES_1]
+VEKİLİ : Av. [KISI_3] - KEP: [EPOSTA_1]
+DAVALI : [SIRKET_2] VKN [VKN_2]
+VEKİLİ : Av. [KISI_4]
+DAVA : Alacak (Cari Hesap)
+
+Belirlenen gün ve saatte duruşmaya başlandı. Davacı vekili Av. [KISI_3] ve davalı vekili Av. [KISI_4] geldi.
+Bilirkişi heyeti raporu okundu. Rapora göre [SIRKET_1]'un [SIRKET_2]'dan 412.350,00 TL alacaklı olduğu tespit edilmiştir.
+Davacı vekili: [IBAN_1] numaralı hesaba yapılması gerekirken yapılmadığı sabittir dedi.
+Davalı vekili: Rapordaki faiz hesabına itiraz ediyoruz dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Davalı vekilinin itirazları yönünden bilirkişi heyetinden ek rapor alınmasına,
+2-Duruşmanın 13/01/2027 günü saat 14:30'a bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 21/10/2026
+
+Katip [SICIL_2]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır

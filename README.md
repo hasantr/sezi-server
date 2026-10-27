@@ -95,6 +95,30 @@ first takes one "miss" from its sender's budget, and a real invite gives it back
   page is refused (403). The invite page answers a used or unknown code with the same status
   (200) as a good one, so another site cannot test codes through its visitors' browsers.
 
+## Bots: an optional Cloudflare rate-limiting rule
+
+A bot's program calls `POST /bot/v1/<method>` with its key. The server already bounds that on its
+own, with no setting: 300 calls a minute per bot across every method (a burst of 60), the send
+limits on top, and 20 refused keys a minute per address (an IPv4 address or an IPv6 /64). Those
+work the same on Cloudflare and on your own machine; nothing below is needed for correctness.
+(Behind a tunnel or proxy, set `SEZI_TRUSTED_PROXY_HEADER` so the server sees each caller's own
+address; otherwise every caller shares one address for the wrong-key brake.)
+
+On Cloudflare the per-address brake is kept in each Worker instance's memory, so it is
+approximate there. If you want an exact edge bound as well — it stops a looping caller before the
+Worker runs at all — add a rule under **Security → WAF → Rate limiting rules** of the zone that
+serves your server:
+
+- **If incoming requests match:** URI Path starts with `/bot/v1/`
+- **With the same characteristics:** IP
+- **When rate exceeds:** 300 requests per 1 minute
+- **Then:** Block, for 1 minute
+
+On the free plan the dashboard offers only a 10-second period and a 10-second block (check what
+yours lists): 50 requests per 10 seconds is the same bound. Keep the rate at or above the server's
+own 300 a minute, so a working program never meets the edge rule first. On a self-hosted relay (workerd behind cloudflared or caddy)
+there is no edge rule to add, and none is needed: the server's own limits are exact there.
+
 ## Push notifications (Android): what you can and cannot do
 
 A push from your server is only a **doorbell**: a contentless `{"type":"wake"}` that tells a

@@ -10,28 +10,38 @@
 //! | `ingest.rs` | the alarm's tick: open stored frames in one synchronous block, ack, queue |
 //! | `send.rs` | `sendMessage`, pair-acks (repair and reply), resends after a re-pair |
 //! | `send_guard.rs` | what a program's sends are held to: 60 a minute, 30 into one chat |
+//! | `api_budget.rs` | every API call of a program: 300 a minute, a burst of 60 |
 //! | `send_replay.rs` | idempotent sending: a repeated `client_id` answers the first `message_id` |
+//! | `backlog.rs` | what one member (100) and everybody (2,000) may leave waiting; the refused are told |
 //! | `outbox.rs` | what the tick owes the network, drained under a subrequest budget |
 //! | `updates.rs` | the update JSON and `getUpdates`' long poll |
+//! | `files.rs` | a member's 1:1 file: its manifest kept from the program, the one verified way to its bytes, `getFile` |
 //! | `deliver.rs` | the webhook round, the owner's ping, and "taken" → the member's `forward-read` |
+//! | `deliver_order.rs` | the webhook queue's order, and a poison update set aside off it |
 //! | `builtin.rs` | a built-in bot (sheet, AI): its configuration and secrets, the owner's test |
 //! | `builtin_run.rs` · `builtin_jobs.rs` | the built-in runner's round: members' updates · rows owed to the sheet |
 //! | `builtin_room.rs` | a built-in bot called in a room: answers into the room, proposals 1:1 |
 //! | `builtin_policy.rs` | the round's pure decisions: budget, a pending row, a proposal's text |
 //! | `builtin_ai.rs` · `builtin_sheet.rs` | the model call (two dialects) · the sheet's POST |
 //! | `builtin_store.rs` · `builtin_copy.rs` | the built-in tables · every line the bot says itself |
+//! | `builtin_hearings.rs` | the hearing-minutes bot's round: who may ask, the bytes, the model call, the row, retention |
+//! | `hearings_pipeline.rs` · `hearings_prompt.rs` · `hearings_validate.rs` | its pure steps: read+mask+decide · the request and the reply · the checks on the reply |
+//! | `hearings_answer.rs` · `hearings_audit.rs` · `hearings_sample.rs` | the answer and the row · the audit table (counts only) · the fake record "Dene" runs |
 //! | `room.rs` · `room_send.rs` · `room_asks.rs` | the bot in its rooms: calls it believes, posts and their key shares · a post's chunks · key requests |
 //! | `room_plan.rs` · `room_store.rs` | the room round's pure decisions · the room tables |
 //!
 //! Internal routes (a DO stub is not public; only the Worker calls them):
-//! `/bot/init`, `/bot/updates`, `/bot/api`, `/bot/state`, `/bot/webhook`, `/bot/webhook-secret`,
-//! `/bot/ping`, `/bot/builtin`, `/bot/builtin-test`, `/bot/wake`, `/bot/room-event`.
+//! `/bot/init`, `/bot/budget`, `/bot/updates`, `/bot/api`, `/bot/file`, `/bot/state`, `/bot/webhook`,
+//! `/bot/webhook-secret`, `/bot/ping`, `/bot/builtin`, `/bot/builtin-test`, `/bot/wake`, `/bot/room-event`.
 
 use super::*;
 
+mod api_budget;
+mod backlog;
 mod builtin;
 mod builtin_ai;
 mod builtin_copy;
+mod builtin_hearings;
 mod builtin_jobs;
 mod builtin_policy;
 mod builtin_room;
@@ -39,6 +49,16 @@ mod builtin_run;
 mod builtin_sheet;
 mod builtin_store;
 mod deliver;
+mod deliver_order;
+mod files;
+mod hearings_answer;
+mod hearings_audit;
+#[cfg(test)]
+mod hearings_log_tests;
+mod hearings_pipeline;
+mod hearings_prompt;
+mod hearings_sample;
+mod hearings_validate;
 mod ingest;
 mod outbox;
 mod room;
@@ -92,7 +112,9 @@ impl UserInbox {
     fn bot_tables(&self) -> Result<()> {
         let sql = self.state.storage().sql();
         let tables = store::TABLES.iter().chain(builtin_store::TABLES.iter()).chain(room_store::TABLES.iter());
-        for t in tables.chain(send_guard::TABLES.iter()).chain(send_replay::TABLES.iter()) {
+        let tables = tables.chain(send_guard::TABLES.iter()).chain(send_replay::TABLES.iter());
+        let tables = tables.chain(files::TABLES.iter()).chain(hearings_audit::TABLES.iter());
+        for t in tables.chain(deliver_order::TABLES.iter()).chain(backlog::TABLES.iter()) {
             sql.exec_raw(t, sql_no_args())?;
         }
         // Columns added since an older inbox made its tables: each once, its failure on a table
@@ -146,6 +168,11 @@ impl UserInbox {
                 let body: serde_json::Value = req.json().await?;
                 self.bot_api(&body).await
             }
+            (Method::Post, "/bot/file") => {
+                let body: serde_json::Value = req.json().await?;
+                self.bot_get_file(&body).await
+            }
+            (Method::Post, "/bot/budget") => self.bot_take_call(),
             (Method::Get, "/bot/state") => self.bot_state(),
             (Method::Post, "/bot/webhook") => self.bot_set_webhook(req.json().await?),
             (Method::Post, "/bot/webhook-secret") => self.bot_set_webhook_secret(req.json().await?),
@@ -247,9 +274,12 @@ impl UserInbox {
             "outbox": count("bot_outbox"),
             "sent": count("bot_sent"),
             "sheet_jobs": count("bot_sheet_jobs"),
+            "files": count("bot_files"),
             "room_posts": count("bot_room_posts"),
             "rooms_keyed": count("bot_megolm"),
             "waiting_since": count_opt(deliver::WAITING_SINCE),
+            // Updates the webhook kept refusing while it took later ones (`deliver_order.rs`).
+            "webhook_aside": count_opt(deliver_order::ASIDE_COUNT),
             "webhook": s.kv_get("webhook_url").is_some(),
             // Set, but its URL fails the outbound rule now: delivered nothing (`deliver::Hook`).
             "webhook_refused": self.bot_webhook() == deliver::Hook::Refused,

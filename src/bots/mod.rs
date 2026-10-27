@@ -9,13 +9,14 @@
 //! |---|---|
 //! | `admin.rs` | the owner's `/admin/bots` surface: create (key shown once), list, change, renew, delete |
 //! | `builtin.rs` · `builtin_rules.rs` | a built-in bot (sheet, AI): the owner's routes · its rules, limits and URL rule |
-//! | `api.rs` | `/bot/v1/:method` — `getMe`, `getUpdates`, `sendMessage`, `setWebhook`, `deleteWebhook` |
+//! | `api.rs` | `/bot/v1/:method` — `getMe`, `getUpdates`, `sendMessage`, `setWebhook`, `deleteWebhook`, `getFile` |
 //! | `api_input.rs` | what a program may send it: body size, JSON shape, every field's type and bound |
 //! | `api_answer.rs` | every answer body it can read, Worker's and inbox's alike |
 //! | `conformance_tests.rs` | §2.5's tables (methods, errors) held against the code and the program's README |
 //! | `webhook.rs` | the webhook's derived secret, its signature and envelope, one POST |
 //! | `listing.rs` | `GET /bots` — the enabled bots, for any active member |
 //! | `token.rs` | the key's shape, its hash, the lookup |
+//! | `key_brake.rs` | 20 refused keys a minute per address, in isolate memory, before the lookup |
 //! | `provision.rs` | every D1 statement a bot's account, device, keys and grants take |
 //!
 //! A bot is never a group member (`groups.rs` refuses it), never in the directory, never in the
@@ -26,7 +27,9 @@ pub mod api;
 pub(crate) mod api_answer;
 pub(crate) mod api_input;
 pub mod builtin;
+pub(crate) mod builtin_hearings_rules;
 pub(crate) mod builtin_rules;
+pub(crate) mod key_brake;
 pub mod listing;
 pub(crate) mod provision;
 pub(crate) mod token;

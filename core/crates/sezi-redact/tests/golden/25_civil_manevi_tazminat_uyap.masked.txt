@@ -1,0 +1,28 @@
+T.C.
+[MAHKEME] ASLİYE HUKUK MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO : [ESAS] Esas
+CELSE NO : 4
+DURUŞMA TARİHİ : 18/10/2026
+HAKİM : [KISI_1] [SICIL_1]
+KATİP : [KISI_2] [SICIL_2]
+DAVACI : [KISI_3] - [ADRES_1]
+VEKİLİ : Av. [KISI_4]
+DAVALI : [KISI_5]
+VEKİLİ : Av. [KISI_6]
+DAVA : Manevi Tazminat (Kişilik Haklarına Saldırı)
+
+Belirlenen gün ve saatte duruşmaya başlandı. Taraf vekilleri Av. [KISI_4] ve Av. [KISI_6] geldi.
+Davacı vekili: Davalı [KISI_5]'nin sosyal medyada müvekkil hakkında paylaştığı iletiler dosyaya sunulmuştur dedi.
+Davalı vekili: Paylaşımlar ifade özgürlüğü kapsamındadır dedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Paylaşımlara ilişkin ekran görüntülerinin bilirkişi tarafından incelenmesine,
+2-Duruşmanın 15/01/2027 günü saat 10:00'a bırakılmasına,
+Dair, taraf vekillerinin yüzüne karşı verilen karar açıkça okunup anlatıldı. 18/10/2026
+
+Katip [SICIL_2]              Hakim [SICIL_1]
+¸e-imzalıdır              ¸e-imzalıdır
+
+Bu belge 5070 sayılı Elektronik İmza Kanunu gereğince güvenli elektronik imza ile imzalanmıştır.
+UYAP Bilişim Sistemindeki bu dokümana https://vatandas.uyap.gov.tr adresinden [KOD_1] ile erişebilirsiniz.
+Doğrulama kodu: [KOD_2]   Barkod: [KOD_3]

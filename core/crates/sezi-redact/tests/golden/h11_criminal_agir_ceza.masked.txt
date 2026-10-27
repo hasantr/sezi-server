@@ -1,0 +1,31 @@
+T.C.
+[MAHKEME] AĞIR CEZA MAHKEMESİ
+DURUŞMA TUTANAĞI
+ESAS NO: [ESAS]      CELSE NO: 3      DURUŞMA TARİHİ: 19/10/2026
+BAŞKAN   : [KISI_1] [SICIL_1]
+ÜYE      : [KISI_2] [SICIL_2]
+ÜYE      : [KISI_3] [SICIL_3]
+C. SAVCISI: [KISI_4] [SICIL_4]
+KATİP    : [KISI_5] [SICIL_5]
+KATILAN  : [KISI_6] - [ADRES_1]
+SANIKLAR : 1- [KISI_7] [KISI_8], [KISI_9] oğlu, [DOGUM_1] doğumlu, TC: [TCKN_1] (Tutuklu - Diyarbakır T Tipi Kapalı Ceza İnfaz Kurumu)
+           2- [KISI_10], [KISI_11] oğlu, [DOGUM_2] doğumlu, TC: [TCKN_2] (Tutuksuz)
+MÜDAFİLERİ: Av. [KISI_12] (S.1 müdafii), Av. [KISI_13] (S.2 müdafii)
+SUÇ      : Nitelikli Yağma
+
+Belirlenen gün ve saatte celse açıldı. Tutuklu sanık [KISI_8] ile bağlandı, tutuksuz sanık [KISI_10] ve müdafileri, katılan [KISI_6] geldi. Diyarbakır Cumhuriyet Başsavcılığının [DOSYA_1] soruşturma sayılı dosyası dosyamız arasındadır.
+TANIKLAR [KISI_14], [KISI_15] ve [KISI_16] hazır olup usulen yeminleri yaptırılarak dinlendiler:
+Tanık [KISI_14]: Bakkalımın önünde iki kişinin katılanı bıçakla tehdit edip telefonunu aldığını gördüm, uzun boylu olanı [KISI_7] idi, onu mahalleden tanırım dedi.
+Tanık [KISI_15]: Olayı balkondan gördüm, polisi [TEL_1] numaralı telefonumdan aradım, yüzlerini net göremedim dedi.
+Tanık [KISI_16]: Sanık [KISI_10]'yı olaydan önce kahvede gördüm, olay anında orada değildim dedi.
+Sanık [KISI_8] beyanında: Tanık [KISI_17] ile aramızda eski bir alacak meselesi var, bu yüzden aleyhime konuşuyor dedi.
+Katılan: Telefonumu alan kişiler bu iki sanıktır, şikayetçiyim dedi.
+C. Savcısı mütalaa için süre istedi.
+GEREĞİ DÜŞÜNÜLDÜ:
+1-Tutuklu sanık [KISI_7] [KISI_8]'nun tutukluluk halinin devamına, kuvvetli suç şüphesinin varlığı ve kaçma şüphesi gözetilerek,
+2-C. Savcılığına esas hakkındaki mütalaasını hazırlaması için süre verilmesine,
+3-Duruşmanın 30/11/2026 günü saat 10:30'a bırakılmasına,
+Dair, C. Savcısının huzurunda, hazır olanların yüzüne karşı, açıkça okunup anlatıldı. 19/10/2026
+
+Katip [SICIL_5]     Üye [SICIL_3]     Üye [SICIL_2]     Başkan [SICIL_1]
+¸e-imzalıdır     ¸e-imzalıdır     ¸e-imzalıdır     ¸e-imzalıdır

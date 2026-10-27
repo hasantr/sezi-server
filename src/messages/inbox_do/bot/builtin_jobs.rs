@@ -7,6 +7,10 @@
 //! on, and said. Every POST carries the row's stable `row_id` (`<bot>-<job>`), so a row sent
 //! again after its answer was lost is skipped by the script, not written twice.
 //!
+//! A hearings bot's rows are upserts (`builtin_sheet::body_v2_json`, H5): no `text` goes out,
+//! the script answers which row it updated or added, and the lawyer hears that number; the
+//! row's audit entry is settled (`updated` / `appended` / `failed`).
+//!
 //! Like the updates' part (`builtin_run.rs`), an item starts only when its worst case fits the
 //! round's budget, and the round ends where it is when the configuration changed under an
 //! `await`: a job is then neither marked nor deleted.
@@ -15,7 +19,9 @@ use super::builtin_copy::{line, Line};
 use super::builtin_policy as policy;
 use super::builtin_room::RoomRef;
 use super::builtin_run::Run;
-use super::builtin_sheet::{self, Row};
+use super::builtin_sheet::{self, Landed, Row, Upsert};
+use super::hearings_audit::SheetOutcome;
+use crate::bots::builtin_rules::Kind;
 use super::builtin_store as bs;
 use super::outbox::retry_delay_ms;
 use super::store::{Arg, Exec};
@@ -77,6 +83,7 @@ impl UserInbox {
             }
         };
         let store = self.bot_store();
+        let hearings = run.cfg.kind == Kind::Hearings;
         let mut landed_said: HashSet<String> = HashSet::new();
         for job in jobs {
             let room = RoomRef::parse(job.room_json.as_deref());
@@ -91,10 +98,19 @@ impl UserInbox {
                 }
                 return;
             }
+            // A hearings bot's row is an upsert (v2) with the audit row it settles.
+            let upsert = hearings.then(|| job.row_json.as_deref().and_then(Upsert::parse)).flatten();
+            let audit_id = upsert.as_ref().and_then(|(_, a)| *a);
+            let settle = |o: SheetOutcome| {
+                if let Some(id) = audit_id {
+                    store.db.run(super::hearings_audit::AUDIT_SHEET, &[Arg::T(o.as_str()), Arg::I(id)]);
+                }
+            };
             if now - job.created_at >= bs::JOB_GIVE_UP_MS {
                 if !policy::fits(*spent, policy::SAY_BASE) {
                     return;
                 }
+                settle(SheetOutcome::Failed);
                 store.db.run(bs::JOB_DONE, &[Arg::I(job.id)]);
                 self.builtin_reply(ctx, &job.user_id, room.as_ref(), &job.text, line(run.lang, Line::SheetGaveUp), spent).await;
                 continue;
@@ -102,20 +118,35 @@ impl UserInbox {
             if !policy::fits(*spent, policy::JOB_BASE) {
                 return;
             }
-            let row = job.row_json.as_deref().and_then(Row::parse);
             let id = row_id(&ctx.bot_id, job.id);
-            let body = builtin_sheet::body_json(
-                &secret,
-                false,
-                Some(&id),
-                job.at,
-                &job.user_id,
-                &job.name,
-                room.as_ref().map(RoomRef::sheet),
-                &job.text,
-                row.as_ref(),
-            );
-            let (outcome, hops) = builtin_sheet::post(url, &body, run.allow_lan).await;
+            let (outcome, landed, hops) = match (hearings, upsert.as_ref()) {
+                (true, Some((u, _))) => {
+                    let body = builtin_sheet::body_v2_json(&secret, false, Some(&id), job.at, &job.user_id, &job.name, None, u);
+                    let (o, hops) = builtin_sheet::post_upsert(url, &body, run.allow_lan).await;
+                    (o.map(|_| ()), o.ok(), hops)
+                }
+                // A hearings job that does not read back as an upsert is never sent as a v1 row.
+                (true, None) => {
+                    store.db.run(bs::JOB_DONE, &[Arg::I(job.id)]);
+                    continue;
+                }
+                (false, _) => {
+                    let row = job.row_json.as_deref().and_then(Row::parse);
+                    let body = builtin_sheet::body_json(
+                        &secret,
+                        false,
+                        Some(&id),
+                        job.at,
+                        &job.user_id,
+                        &job.name,
+                        room.as_ref().map(RoomRef::sheet),
+                        &job.text,
+                        row.as_ref(),
+                    );
+                    let (o, hops) = builtin_sheet::post(url, &body, run.allow_lan).await;
+                    (o, None, hops)
+                }
+            };
             *spent += hops;
             if !self.builtin_current(run) {
                 return; // sent on a configuration that is gone; `row_id` makes a re-send safe
@@ -132,6 +163,17 @@ impl UserInbox {
             }
             store.db.run(bs::JOB_DONE, &[Arg::I(job.id)]);
             let late = job.attempts > 0 || job.told != 0;
+            // Where a hearings row went, said with its number ("satır 17 güncellendi").
+            if let Some(l) = landed {
+                let (o, said) = match l {
+                    Landed::Updated(n) => (SheetOutcome::Updated, line(run.lang, Line::HearingsRowUpdated).replace("{row}", &n.to_string())),
+                    Landed::Appended(n) => (SheetOutcome::Appended, line(run.lang, Line::HearingsRowAppended).replace("{row}", &n.to_string())),
+                    Landed::Unknown => (SheetOutcome::Written, line(run.lang, Line::RowSaved).to_string()),
+                };
+                settle(o);
+                self.builtin_say(ctx, &job.user_id, &said, spent).await;
+                continue;
+            }
             let said = match (late, job.confirm != 0) {
                 // One "written (late)" per author per round, however many of their rows land.
                 (true, _) if landed_said.insert(job.user_id.clone()) => Some(Line::SheetLandedLate),
