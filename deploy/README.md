@@ -52,8 +52,12 @@ checks the tarball's sha512 against the lock **before** unpacking it, and instal
 `/var/lib/sezi/.local/sezi-workerd/<version>/`, with `current` pointing at it. A download that
 does not match is not installed. Nothing system-wide is touched.
 
-> **An update is a `git pull`.** When the pull changes `workerd/WORKERD.lock`, run
-> `fetch-workerd.sh` again and restart the relay; the old version stays beside the new one, so
+> **An update is `sudo bash /opt/sezi-server/deploy/update.sh`.** It pulls and, when
+> `workerd/WORKERD.lock` changed, fetches the new workerd while the relay still runs; then it stops
+> the relay only to back up `state/` and start it again (about two seconds of downtime — clients
+> reconnect and resend what was not acked), checks that it is healthy on the new build, and rolls
+> code, workerd and data back if it is not. By hand it is the same steps: `git pull`,
+> `fetch-workerd.sh` if the lock changed, restart; the old workerd stays beside the new one, so
 > going back is moving `current`.
 
 ---

@@ -59,6 +59,11 @@ ExecStart=/var/lib/sezi/.local/sezi-workerd/current/workerd serve --experimental
 
 Restart=always
 RestartSec=5
+# A stop waits at most this long for workerd to finish, then kills it. workerd can hold a stop
+# open on a socket that never closes (measured 2026-10-25: the whole 90 s default, an update's
+# entire outage); its stores are SQLite in WAL mode, so a kill loses no committed write. An
+# update (deploy/update.sh) is then a second or two of downtime, not a minute and a half.
+TimeoutStopSec=10
 
 # ── systemd hardening ───────────────────────────────────────────────────────────────────────
 NoNewPrivileges=true
