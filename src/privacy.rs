@@ -106,7 +106,8 @@ const BODY_TR: &str = r#"
 <h2>Yedekler</h2>
 <p>Bir yedek oluşturursanız, yedek kendi anahtarınızla şifrelenir ve yalnızca sizin seçtiğiniz yere kaydedilir.</p>
 <h2>Saklama ve silme</h2>
-<p>Teslim edilen mesajlar sunucudan silinir. Bir sunucudan ayrıldığınızda o sunucudaki hesabınız ve cihazınızdaki o sunucuya ait veriler silinir. Uygulamayı kaldırmak cihazdaki tüm verileri siler. Silme talepleri için sunucunuzun işletmecisine ya da yukarıdaki adrese yazabilirsiniz.</p>
+<p>Teslim edilen mesajlar sunucudan silinir. Uygulamayı kaldırmak cihazdaki tüm verileri siler.</p>
+<p id="hesap-silme"><strong>Hesabınızı silmek için:</strong> Sezi'de <em>Sunucular</em> sekmesini açın, sunucunun adına dokunun ve açılan sayfanın altındaki <em>Sunucudan ayrıl</em> düğmesine basıp onaylayın. O sunucudaki hesabınız hemen silinir: görünen adınız, profil fotoğrafınız, grup üyelikleriniz, kişi bağlantılarınız, cihaz kayıtlarınız, bildirim belirteciniz, yüklediğiniz şifreli dosyalar ve teslim edilmemiş mesajlarınız. Dosyaların depolamadaki kopyaları birkaç dakika içinde kaldırılır. Cihazınızdaki o sunucuya ait mesajlar, kişiler ve oturumlar da silinir; sunucuda hiçbir veriniz saklanmaz. Uygulamaya erişemiyorsanız silme talebinizi sunucunuzun işletmecisine ya da yukarıdaki adrese yazabilirsiniz.</p>
 <h2>Çocuklar</h2>
 <p>Sezi 13 yaşından küçükler için tasarlanmamıştır.</p>
 <h2>Değişiklikler</h2>
@@ -146,7 +147,8 @@ const BODY_EN: &str = r#"
 <h2>Backups</h2>
 <p>A backup you create is encrypted with your own key and saved only where you choose.</p>
 <h2>Retention and deletion</h2>
-<p>Delivered messages are deleted from the server. Leaving a server deletes your account there and that server's data on your device. Uninstalling the app deletes all data on the device. For deletion requests, write to your server's operator or to the address above.</p>
+<p>Delivered messages are deleted from the server. Uninstalling the app deletes all data on the device.</p>
+<p id="delete-account"><strong>To delete your account:</strong> in Sezi, open the <em>Servers</em> tab, tap the server's name, press <em>Leave server</em> at the bottom of the page that opens, and confirm. Your account on that server is deleted at once: display name, profile photo, group memberships, contact links, device records, push token, the encrypted files you uploaded and your undelivered messages. The files' stored copies are removed within minutes. That server's messages, contacts and sessions on your device are deleted too; the server keeps none of your data. If you cannot reach the app, send your deletion request to your server's operator or to the address above.</p>
 <h2>Children</h2>
 <p>Sezi is not designed for children under 13.</p>
 <h2>Changes</h2>
