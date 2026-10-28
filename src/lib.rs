@@ -43,6 +43,7 @@ mod turn;
 mod usage;
 mod utils;
 mod welcome;
+mod privacy;
 
 pub use messages::inbox_do::UserInbox;
 pub use plugin_log::PluginRoomLog;
@@ -117,6 +118,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // ready" plus copy-the-address instructions instead of an alarming 404).
         // The API surface is untouched.
         .get_async("/", welcome::welcome)
+        // The app's privacy policy, for Google Play's listing (`privacy.rs`).
+        .get_async("/gizlilik", privacy::gizlilik)
+        .get_async("/privacy", privacy::privacy)
         // The projector URL `<base>/<CODE>`: a page for a browser, JSON for the app, one rate
         // limit for both (`invite_page`). One segment deep, so every static one-segment route
         // here still wins — `invite_page/route_tests.rs` inserts this whole table to prove it.

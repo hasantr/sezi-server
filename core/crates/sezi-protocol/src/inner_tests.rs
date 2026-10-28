@@ -1235,3 +1235,67 @@ fn an_older_build_reads_a_library_card_as_unknown() {
     let old: OlderInner = serde_json::from_slice(&wire).expect("an older build still decodes it");
     assert!(matches!(old, OlderInner::Unknown), "got {old:?}");
 }
+
+/// A reaction inside a payload: its fields survive the flatten beside the payload's own
+/// `msg_uid`, a removal leaves `emoji` off the wire, and only my own devices' copy says
+/// `conversation`.
+#[test]
+fn a_reaction_round_trips_beside_the_payloads_msg_uid() {
+    let r = InnerMessage::Reaction {
+        target_uid: "loc-1".into(),
+        target_by: "u-mert".into(),
+        emoji: Some("👍".into()),
+        at_ms: 1_790_000_000_000,
+        conversation: None,
+    };
+    let p = ChatPayload::new(None, None, r).with_msg_uid("rx-1");
+    let json = String::from_utf8(p.encode()).unwrap();
+    assert!(json.contains(r#""kind":"reaction""#), "{json}");
+    assert!(!json.contains("conversation"), "{json}");
+    let back = ChatPayload::decode(json.as_bytes()).unwrap();
+    assert_eq!(back.msg_uid.as_deref(), Some("rx-1"));
+    match back.inner {
+        InnerMessage::Reaction { target_uid, target_by, emoji, at_ms, conversation } => {
+            assert_eq!(target_uid, "loc-1");
+            assert_eq!(target_by, "u-mert");
+            assert_eq!(emoji.as_deref(), Some("👍"));
+            assert_eq!(at_ms, 1_790_000_000_000);
+            assert_eq!(conversation, None);
+        }
+        other => panic!("expected Reaction, got {other:?}"),
+    }
+    let removal = InnerMessage::Reaction {
+        target_uid: "loc-1".into(),
+        target_by: "u-mert".into(),
+        emoji: None,
+        at_ms: 2,
+        conversation: Some("room-1".into()),
+    };
+    let json = String::from_utf8(removal.encode()).unwrap();
+    assert!(!json.contains("emoji"), "{json}");
+    assert!(json.contains(r#""conversation":"room-1""#), "{json}");
+}
+
+/// An older build lands a reaction in its catch-all — no decode failure that would stall the
+/// conversation (what it then shows is that build's `Unknown` row).
+#[test]
+fn an_older_build_reads_a_reaction_as_unknown() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum OlderInner {
+        Text { body: String },
+        #[serde(other)]
+        Unknown,
+    }
+    let wire = InnerMessage::Reaction {
+        target_uid: "u".into(),
+        target_by: "b".into(),
+        emoji: Some("❤️".into()),
+        at_ms: 1,
+        conversation: None,
+    }
+    .encode();
+    let old: OlderInner = serde_json::from_slice(&wire).expect("an older build still decodes it");
+    assert!(matches!(old, OlderInner::Unknown), "got {old:?}");
+}

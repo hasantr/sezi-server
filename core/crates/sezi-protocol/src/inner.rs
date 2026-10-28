@@ -812,6 +812,27 @@ pub enum InnerMessage {
         msg_uid: String,
         action_id: String,
     },
+    /// A reaction: one emoji the sender puts on a message, or takes back (`emoji: None`) —
+    /// `crate::reaction`. Invisible control (NO UI row), a durable op that must arrive. It names
+    /// its target as a reply does: the target's `msg_uid` and its author, so each device finds its
+    /// own copy. Last writer wins per (message, reactor) by `at_ms`, the reactor's clock.
+    ///
+    /// It travels in the target's conversation: Megolm in a group, Olm to every device of the peer
+    /// in a 1:1, and self-Olm to my own other devices — the one copy that says `conversation`
+    /// (the peer or the room), since nothing else on that lane does. From anyone but my own user
+    /// the field is ignored. An older build decodes it as `Unknown`.
+    ///
+    /// Not `msg_uid` for the target's id: `ChatPayload.msg_uid` shadows a variant field of that
+    /// name under `flatten` (the `GroupOutboundCopy::origin_local_id` hazard).
+    Reaction {
+        target_uid: String,
+        target_by: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+        at_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
     /// Forward-compatibility catch-all — messages carrying an unknown `kind` tag land here.
     /// Thanks to `#[serde(other)]` the payload of any unrecognized tag is silently
     /// swallowed; the decrypt chain does not collapse.

@@ -354,6 +354,15 @@ impl ChatPayload {
         crate::reply::read(&self.ext)
     }
 
+    /// The sticker this payload is, believed: a TEXT whose body is exactly the emoji its
+    /// `ext.sticker` spells (`crate::sticker::believed`). Anything else is no sticker.
+    pub fn sticker(&self) -> Option<crate::sticker::StickerRef> {
+        match &self.inner {
+            InnerMessage::Text { body } => crate::sticker::believed(body, &self.ext),
+            _ => None,
+        }
+    }
+
     /// The mentions this payload's `ext` carries, NOT vetted against the body — the receiving
     /// kernel vets them ([`crate::mentions::vet`]) and decides who may say `@herkes`.
     pub fn mentions(&self) -> Vec<crate::mentions::MentionSpan> {

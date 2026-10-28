@@ -547,6 +547,8 @@ pub fn decrypt_from_peer(
         // A batch of co-presence events is sent only to a kernel that said it reads batches,
         // and this path never says so (its single events carry `reads_batch: false`).
         InnerMessage::ActivityBatch { .. } => ("control".to_string(), String::new()),
+        // A reaction is invisible: the kernel applies it to its message; it is never a row.
+        InnerMessage::Reaction { .. } => ("control".to_string(), String::new()),
         // Same shape as CallLog, and here the swallow is a security property rather than
         // defensiveness. A room-access notice is written locally by each member's own device
         // from its own view of the membership; one that arrives over the wire is by definition
