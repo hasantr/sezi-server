@@ -169,7 +169,10 @@ const WIPE_TABLES: &[&str] = &[
     "contact_tombstones",
     "directory_revisions",
     "directory_tombstones",
-    // Keys, sessions, devices.
+    // Keys, sessions, devices. The takeover escrow first: both reference `users`, and a share
+    // must never outlive the device it was made for.
+    "takeover_requests",
+    "device_escrow",
     "one_time_prekeys",
     "signed_prekeys",
     "device_lists",

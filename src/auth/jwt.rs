@@ -143,10 +143,6 @@ fn verified_claims(env: &Env, token: &str) -> Result<JwtClaims> {
     Ok(claims)
 }
 
-pub fn verify_access_token(env: &Env, token: &str) -> Result<String> {
-    Ok(verified_claims(env, token)?.sub)
-}
-
 /// The verified `(user_id, device_id)` pair a token asserts.
 ///
 /// Callers that need both take them from ONE verification. The device is always present: a

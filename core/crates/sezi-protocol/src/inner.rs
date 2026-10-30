@@ -872,6 +872,21 @@ pub enum InnerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
     },
+    /// The PRIMARY's Olm account, escrowed to one of my linked devices
+    /// (`docs/PRIMARY_DEVICE_LOSS_PLAN.md` §4.1): `copy_b64` is the account sealed under a random
+    /// secret `R` (`sezi_backup::escrow`), and `R` itself is on the relay, bound to this device,
+    /// released only after a server admin approves a takeover. So this copy opens nothing alone,
+    /// and the relay, which carries it, cannot read it (it travels over self-Olm,
+    /// `SendSelfState` to that one device).
+    ///
+    /// FAIL-CLOSED: accepted only from my own user, and only when the account inside is the ROOT
+    /// of my verified signed list — its Ed key is the list's primary key (`kernel/takeover/hold.rs`).
+    /// Invisible; an older build drops it silently (`invisible: true`).
+    EscrowCopy { escrow_id: String, copy_b64: String },
+    /// "A linked device of mine asked to become the primary" (§4.3), to all my other devices:
+    /// the primary, if it is alive, shows a refuse prompt. `request_id` names the relay's request,
+    /// which the receiver reads back from the relay before it believes any of it. Invisible.
+    TakeoverNotice { request_id: String },
     /// Forward-compatibility catch-all — messages carrying an unknown `kind` tag land here.
     /// Thanks to `#[serde(other)]` the payload of any unrecognized tag is silently
     /// swallowed; the decrypt chain does not collapse.
@@ -1034,6 +1049,8 @@ impl InnerMessage {
             InnerMessage::Reaction { .. }
                 | InnerMessage::RoomDelete { .. }
                 | InnerMessage::MessageEdit { .. }
+                | InnerMessage::EscrowCopy { .. }
+                | InnerMessage::TakeoverNotice { .. }
         )
     }
 

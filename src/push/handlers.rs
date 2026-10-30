@@ -1,4 +1,4 @@
-use crate::auth::middleware::{device_revoked, require_auth, require_auth_device};
+use crate::auth::middleware::{device_revoked, require_auth_device};
 use crate::d1util::{d1_int, d1_text};
 use crate::respond::{json_err, no_content};
 use crate::utils::now_secs;
@@ -110,8 +110,8 @@ struct UnregisterBody {
 }
 
 pub async fn unregister(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_id = match require_auth(&req, &ctx.env) {
-        Ok(uid) => uid,
+    let (user_id, claim_dev) = match require_auth_device(&req, &ctx.env) {
+        Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
     let body: UnregisterBody = match req.json().await {
@@ -121,10 +121,47 @@ pub async fn unregister(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
     if body.device_id.is_empty() || body.device_id.len() > 128 {
         return json_err(400, "bad_request");
     }
+    // A device unregisters ITS OWN token, as `register` registers its own. Bound to the user
+    // alone, a linked device could delete the PRIMARY's token and silence both the relay's urgent
+    // takeover nudge and the drain's alert for the whole six-hour hold
+    // (docs/PRIMARY_DEVICE_LOSS_PLAN.md §7).
+    if !may_unregister(&claim_dev, &body.device_id) {
+        return json_err(403, "device_mismatch");
+    }
     let db = ctx.env.d1("DB")?;
     db.prepare("DELETE FROM push_tokens WHERE user_id = ? AND device_id = ?")
         .bind(&[d1_text(&user_id), d1_text(&body.device_id)])?
         .run()
         .await?;
     no_content()
+}
+
+/// May the device the token names unregister `body_device`'s push token? Only its own.
+pub(crate) fn may_unregister(claim_dev: &str, body_device: &str) -> bool {
+    !claim_dev.is_empty() && claim_dev == body_device
+}
+
+#[cfg(test)]
+mod unregister_tests {
+    use super::may_unregister;
+
+    #[test]
+    fn a_device_unregisters_its_own_token_and_no_other() {
+        assert!(may_unregister("dev-l", "dev-l"), "its own");
+        assert!(!may_unregister("dev-l", "dev-p"), "a linked device cannot silence the primary");
+        assert!(!may_unregister("", ""), "no claim, nothing");
+    }
+
+    /// The handler takes the token's device claim and checks it before the DELETE.
+    #[test]
+    fn unregister_checks_the_device_claim_before_deleting() {
+        let src = include_str!("handlers.rs");
+        let start = src.find(concat!("pub async fn ", "unregister(")).unwrap();
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains(concat!("require_auth_", "device(")));
+        let check = body.find(concat!("may_", "unregister(&claim")).expect("the claim check");
+        let delete = body.find(concat!("DELETE FROM ", "push_tokens")).expect("the delete");
+        assert!(check < delete);
+    }
 }

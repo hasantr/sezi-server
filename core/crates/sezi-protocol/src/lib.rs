@@ -13,4 +13,5 @@ pub mod mentions;
 pub mod reaction;
 pub mod reply;
 pub mod sticker;
+pub mod takeover;
 pub mod plugin_log;

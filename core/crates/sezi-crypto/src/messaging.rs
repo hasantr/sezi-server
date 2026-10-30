@@ -697,6 +697,8 @@ pub fn decrypt_from_peer(
         | InnerMessage::DeleteSelfSync { .. }
         | InnerMessage::OwnFileRequest { .. }
         | InnerMessage::OwnFileOffer { .. }
+        | InnerMessage::EscrowCopy { .. }
+        | InnerMessage::TakeoverNotice { .. }
         | InnerMessage::RoomKeyGossip { .. }
         | InnerMessage::RoomKeyRequest { .. }
         | InnerMessage::GroupOutboundCopy { .. }

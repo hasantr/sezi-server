@@ -12,6 +12,7 @@ mod member_notify;
 mod message;
 mod receipt;
 mod self_read;
+mod takeover_nudge;
 mod wake_gate;
 mod ws;
 
@@ -266,6 +267,9 @@ impl DurableObject for UserInbox {
                 let _ = socket.send_with_str(r#"{"type":"group_update"}"#);
             }
             return Response::empty().map(|r| r.with_status(204));
+        }
+        if method == Method::Post && path == "/takeover-nudge" { // takeover_nudge.rs
+            return self.takeover_nudge(req).await;
         }
         if method == Method::Post && path == "/upkeep" { // lazy upkeep, own invocation (maintenance.rs)
             crate::maintenance::run_upkeep(&self.env).await;

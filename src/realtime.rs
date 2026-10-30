@@ -76,6 +76,16 @@ pub(crate) async fn purge_account_inbox(env: &Env, user_id: &str) -> Result<()> 
     send_control(env, user_id, "/purge-account", "{}".into()).await
 }
 
+/// A takeover was filed or approved on `user_id`'s account: its inbox pokes every open socket
+/// (`takeover_update`) and wakes `device_id` — the primary — URGENTLY, past the coalescing gate
+/// (`inbox_do/takeover_nudge.rs`). Carries nothing; the client reads the authoritative list back.
+pub(crate) async fn nudge_takeover_best_effort(env: &Env, user_id: &str, device_id: &str) {
+    let body = serde_json::json!({ "user_id": user_id, "device_id": device_id }).to_string();
+    if let Err(error) = send_control(env, user_id, "/takeover-nudge", body).await {
+        console_warn!("takeover nudge failed user={user_id}: {error:?}");
+    }
+}
+
 /// Live nudges are not authoritative: log them visibly without affecting handler success.
 pub(crate) async fn nudge_contact_update_best_effort(env: &Env, user_id: &str) {
     if let Err(error) = nudge_contact_update(env, user_id).await {

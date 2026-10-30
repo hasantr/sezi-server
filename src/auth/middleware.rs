@@ -1,4 +1,4 @@
-use crate::auth::jwt::{token_identity, verify_access_token};
+use crate::auth::jwt::token_identity;
 use crate::d1util::d1_text;
 use crate::respond::json_err;
 use serde::Deserialize;
@@ -280,19 +280,6 @@ pub async fn require_active_auth(
     let token =
         extract_bearer(req).ok_or_else(|| json_err(401, "unauthorized").unwrap())?;
     validate_active_token(env, &token).await
-}
-
-/// Authentication required. Returns the user_id on success, or a ready-made
-/// Response on failure.
-pub fn require_auth(req: &Request, env: &Env) -> std::result::Result<String, Response> {
-    let token = match extract_bearer(req) {
-        Some(t) => t,
-        None => return Err(json_err(401, "unauthorized").unwrap()),
-    };
-    match verify_access_token(env, &token) {
-        Ok(uid) => Ok(uid),
-        Err(_) => Err(json_err(401, "invalid_token").unwrap()),
-    }
 }
 
 /// Authentication that also yields the device the token is bound to.

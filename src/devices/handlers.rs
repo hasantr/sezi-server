@@ -480,6 +480,22 @@ pub(crate) async fn validate_and_store_signed_list(
     );
     stmts.push(db.prepare(&del_push_sql).bind(&del_binds)?);
 
+    // 4d) A removed device's escrow share goes with it, and any takeover it had open ends: R must
+    //     never be released to a device that is no longer the account's
+    //     (docs/PRIMARY_DEVICE_LOSS_PLAN.md §4.1, `takeover.rs`).
+    let del_escrow_sql = format!(
+        "DELETE FROM device_escrow
+         WHERE user_id = ? AND device_id NOT IN ({placeholders})
+           AND (SELECT doc_json FROM device_lists WHERE user_id = ?) = ?"
+    );
+    stmts.push(db.prepare(&del_escrow_sql).bind(&del_binds)?);
+    let end_takeover_sql = format!(
+        "UPDATE takeover_requests SET state = 'cancelled', decided_at = {now_ms_v}
+         WHERE user_id = ? AND state IN ('pending', 'approved') AND device_id NOT IN ({placeholders})
+           AND (SELECT doc_json FROM device_lists WHERE user_id = ?) = ?"
+    );
+    stmts.push(db.prepare(&end_takeover_sql).bind(&del_binds)?);
+
     // 5) Advance the rev HIGH-WATER mark. MAX keeps it monotonic; it lives on `users` so it
     //    outlives the device_lists row; and the doc_json gate means only the WINNING writer
     //    advances it.

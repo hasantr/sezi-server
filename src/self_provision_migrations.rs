@@ -189,4 +189,5 @@ pub(super) const MIGRATIONS: &[(&str, &str)] = &[
     ("0052_bot_builtin", include_str!("../migrations/0052_bot_builtin.sql")),
     ("0053_group_bots", include_str!("../migrations/0053_group_bots.sql")),
     ("0054_bot_ai_geo", include_str!("../migrations/0054_bot_ai_geo.sql")),
+    ("0055_device_takeover", include_str!("../migrations/0055_device_takeover.sql")),
 ];

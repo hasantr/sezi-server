@@ -277,6 +277,16 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/devices/link-start", devices::link::link_start)
         .post_async("/devices/link-approve", devices::link::link_approve)
         .post_async("/devices/link-status", devices::link::link_status)
+        // The escrowed root: a linked device takes over a lost primary only with an admin's coded
+        // approval (devices/takeover.rs, docs/PRIMARY_DEVICE_LOSS_PLAN.md).
+        .put_async("/devices/escrow", devices::takeover::put_escrow)
+        .post_async("/devices/takeover", devices::takeover::request_takeover)
+        .get_async("/devices/takeover", devices::takeover::takeover_status)
+        .delete_async("/devices/takeover", devices::takeover::cancel_takeover)
+        .get_async("/devices/takeover/against-me", devices::takeover::takeovers_against_me)
+        .post_async("/devices/takeover/refuse", devices::takeover::refuse_takeover)
+        .get_async("/admin/takeovers", devices::takeover_admin::list_takeovers)
+        .post_async("/admin/takeovers/:id/approve", devices::takeover_admin::approve_takeover)
         .get_async("/keys/:user_id/bundle", keys::handlers::bundle)
         .post_async("/keys/otks/replenish", keys::handlers::replenish)
         // Diagnostic: the caller's OWN unconsumed pool depth. `bundle` claims an OTK

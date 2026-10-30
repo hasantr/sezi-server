@@ -1388,3 +1388,24 @@ fn an_unknown_invisible_kind_drops_silently_and_a_visible_one_does_not() {
     let delete = InnerMessage::RoomDelete { target_uid: "u".into(), target_by: "b".into() };
     assert!(ChatPayload::new(None, None, delete).invisible);
 }
+
+/// The two takeover controls (`docs/PRIMARY_DEVICE_LOSS_PLAN.md`) round-trip and carry the
+/// invisible mark, so a build that predates them drops them instead of drawing junk.
+#[test]
+fn the_takeover_controls_are_invisible_and_round_trip() {
+    let copy = InnerMessage::EscrowCopy { escrow_id: "esc-1".into(), copy_b64: "U1pHQg".into() };
+    let json = String::from_utf8(ChatPayload::new(None, None, copy).encode()).unwrap();
+    assert!(json.contains(r#""kind":"escrow_copy""#) && json.contains(r#""invisible":true"#), "{json}");
+    match ChatPayload::decode(json.as_bytes()).unwrap().inner {
+        InnerMessage::EscrowCopy { escrow_id, copy_b64 } => {
+            assert_eq!((escrow_id.as_str(), copy_b64.as_str()), ("esc-1", "U1pHQg"));
+        }
+        other => panic!("expected EscrowCopy, got {other:?}"),
+    }
+    let notice = InnerMessage::TakeoverNotice { request_id: "tko-1".into() };
+    let json = String::from_utf8(ChatPayload::new(None, None, notice).encode()).unwrap();
+    assert!(json.contains(r#""kind":"takeover_notice""#) && json.contains(r#""invisible":true"#), "{json}");
+    // What a build that does not know them sees: an invisible unknown, dropped silently.
+    let older = json.replace("takeover_notice", "some_kind_this_build_lacks");
+    assert!(ChatPayload::decode(older.as_bytes()).unwrap().drops_silently());
+}
