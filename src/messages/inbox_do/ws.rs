@@ -1,4 +1,5 @@
 use super::*;
+use crate::push::coalesce::WakeIntent;
 
 impl UserInbox {
     /// WS frame handler — `DurableObject::websocket_message` delegates here.
@@ -346,9 +347,7 @@ impl UserInbox {
                     #[serde(default)]
                     delivered_live: bool,
                 }
-                // D1 handle for the FCM wake (1:1 WS-send path — a content-less wake when the
-                // recipient is offline).
-                let push_db = self.env.d1("DB").ok();
+                let wake = ws_send_wake(&value);
                 let mut acks: Vec<serde_json::Value> = Vec::with_capacity(env_items.len());
                 for (dev, env_b64) in &env_items {
                     // This loop is its own per-device delivery path and does NOT go through
@@ -363,21 +362,14 @@ impl UserInbox {
                             continue;
                         }
                     }
-                    let payload = serde_json::json!({
-                        "sender_id": sender_id,
-                        "sender_device_id": sender_device_id,
-                        "recipient_device_id": dev,
-                        // notify_inner persists this so the alarm can FCM-wake stuck pending rows;
-                        // an offline DO has no other way to know its own user.
-                        "recipient_id": recipient_id,
-                        "envelope_b64": env_b64,
-                        "group_id": group_id,
-                        // No `silent`, deliberately: this is the hot fan-out for CONTENT, and
-                        // control traffic reaches the server over `send_one_via_http` instead. If
-                        // control sends are ever routed over WS, the frame must start carrying
-                        // the flag or their wakes come back.
-                    })
-                    .to_string();
+                    let payload = ws_notify_payload(
+                        &sender_id,
+                        &sender_device_id,
+                        recipient_id,
+                        dev.as_deref(),
+                        env_b64,
+                        wake,
+                    );
                     let mut init = RequestInit::new();
                     init.with_method(Method::Post);
                     init.with_body(Some(payload.into()));
@@ -397,14 +389,21 @@ impl UserInbox {
                     // PARTIAL FAILURE: a successful device joins acks, a failed one DROPS OUT.
                     if let Some(id) = resp_id {
                         acks.push(serde_json::json!({ "device_id": dev, "id": id }));
-                        // Recipient is OFFLINE on that device (no live socket) → content-less
-                        // FCM wake.
+                        // Recipient is OFFLINE on that device (no live socket): the recipient's
+                        // inbox sends the content-less wake itself, through its coalescing gate
+                        // (`wake_gate.rs`) — or none, for silent control traffic. These lines
+                        // only say that the WS path asked, apart from the HTTP one.
                         if !live {
-                            if let Some(db) = &push_db {
-                                crate::push::wake::maybe_push_wake(
-                                    &self.env, db, recipient_id, dev.as_deref(),
-                                )
-                                .await;
+                            match wake {
+                                WakeIntent::Silent => console_log!(
+                                    "[push] skipped (silent ws) 1:1 user={recipient_id} dev={dev:?}"
+                                ),
+                                WakeIntent::Ordinary => console_log!(
+                                    "[push] waking ws 1:1 user={recipient_id} dev={dev:?}"
+                                ),
+                                WakeIntent::Urgent => console_log!(
+                                    "[push] waking ws (urgent) 1:1 user={recipient_id} dev={dev:?}"
+                                ),
                             }
                         }
                     }
@@ -526,3 +525,45 @@ impl UserInbox {
         Ok(())
     }
 }
+
+/// What the sender asked of the wake. The core sends 1:1 control traffic — state digests,
+/// receipts, typing, reactions, edits, caps, pair-ack fan-outs — over the warm socket first, so
+/// the WS `send` frame carries `"silent": true` for it; and `"urgent": true` for a call signal
+/// that starts or stops a ring (both emitted only when true). Absent, or anything but a JSON
+/// `true` (an older client), is an ordinary wake, which is what every WS send was before the
+/// fields: until 2026-10-30 this path ignored `silent`, and every silent kind woke the
+/// recipient whenever the sender's socket happened to be warm.
+pub(super) fn ws_send_wake(frame: &serde_json::Value) -> WakeIntent {
+    let flag = |k: &str| frame.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    WakeIntent::from_flags(flag("silent"), flag("urgent"))
+}
+
+/// The recipient inbox's `/notify` body for one device of a WS `send` — the HTTP path's twin
+/// (`handlers::build_notify_payload`). 1:1 only: a group never comes this way (`group_via_http`).
+/// `silent` is persisted on the pending row, so the backstop alarm stays quiet about it too, and
+/// the recipient's inbox sends no wake for it; `urgent` takes its wake past the coalescing gate.
+pub(super) fn ws_notify_payload(
+    sender_id: &str,
+    sender_device_id: &str,
+    recipient_id: &str,
+    recipient_device_id: Option<&str>,
+    envelope_b64: &str,
+    wake: WakeIntent,
+) -> String {
+    serde_json::json!({
+        "sender_id": sender_id,
+        "sender_device_id": sender_device_id,
+        "recipient_device_id": recipient_device_id,
+        // notify_inner persists this so the alarm can FCM-wake stuck pending rows; an offline DO
+        // has no other way to know its own user.
+        "recipient_id": recipient_id,
+        "envelope_b64": envelope_b64,
+        "silent": wake.silent(),
+        "urgent": wake.urgent(),
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+#[path = "ws_send_tests.rs"]
+mod send_tests;

@@ -123,6 +123,8 @@ impl RetryRow {
             envelope_b64: self.envelope_b64.clone(),
             group_id: self.group_id.clone(),
             silent: self.silent != 0,
+            // Not kept by the queue (see `GroupMessage::urgent`): a retry is an ordinary wake.
+            urgent: false,
         }
     }
 }

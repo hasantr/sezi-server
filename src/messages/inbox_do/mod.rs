@@ -12,6 +12,7 @@ mod member_notify;
 mod message;
 mod receipt;
 mod self_read;
+mod wake_gate;
 mod ws;
 
 const FLUSH_INTERVAL_MS: i64 = 90 * 1000;
@@ -97,6 +98,10 @@ struct NotifyBody {
     /// The sender asked for no FCM wake (control traffic). Absent reads as false, i.e. wake.
     #[serde(default)]
     silent: bool,
+    /// The sender flagged it as a ring starting or stopping: its wake goes past the coalescing
+    /// gate (`push::coalesce`). Absent reads as false, i.e. an ordinary wake.
+    #[serde(default)]
+    urgent: bool,
 }
 
 #[derive(Deserialize)]
@@ -290,7 +295,9 @@ impl DurableObject for UserInbox {
             (Method::Post, "/fanout") => self.fanout_hop(req).await,
             (Method::Post, "/notify") => {
                 let body: NotifyBody = req.json().await?;
-                let (id, delivered_live, _) = self
+                // Before the envelope is stored: what its wake must cover (`push::coalesce`).
+                let covers_ms = crate::utils::now_ms() as i64;
+                let (id, delivered_live, deduped) = self
                     .notify_inner(
                         &body.sender_id,
                         body.sender_device_id.as_deref(),
@@ -308,6 +315,13 @@ impl DurableObject for UserInbox {
                 // earlier transient error, so a recipient who never reconnects over WS still
                 // gets the FCM backstop.
                 self.ensure_alarm().await;
+                // No socket took it → the wake, from HERE (`wake_gate.rs`): the caller no longer
+                // sends one. Silent control traffic wakes nobody (its row says so for the
+                // backstop too), and a dedup hit was woken by the call that stored it.
+                if !delivered_live && !deduped && !body.silent {
+                    let ask = crate::push::coalesce::WakeAsk { covers_ms, urgent: body.urgent };
+                    self.wake_after_notify(body.recipient_id, body.recipient_device_id, ask);
+                }
                 Response::from_json(
                     &serde_json::json!({ "id": id, "delivered_live": delivered_live }),
                 )
@@ -628,6 +642,8 @@ impl UserInbox {
             "DELETE FROM forward_queue WHERE kind IN ('delivered', 'read')",
             sql_no_args(),
         );
+        // The wake coalescing gate (`wake_gate.rs`).
+        storage.sql().exec_raw(wake_gate::WAKE_GATE_TABLE_SQL, sql_no_args())?;
         // The initial arm goes through `ensure_alarm` (3 bounded retries, logs on failure) rather
         // than a single swallowed `set_alarm`: if the first arm fails and no WS reconnect ever
         // happens, the backstop never runs.
@@ -665,6 +681,11 @@ impl UserInbox {
         // "OR device_id IS NULL", so it still gets its queue.
         let stale = self.state.get_websockets();
         self.state.accept_web_socket(&server);
+        // This device is here: its next envelope after this connection wakes it at once, and the
+        // queue flushed below is what any outstanding wake was for (`push::coalesce`).
+        // Milliseconds from the same clock as every `covers_ms`: a whole-second stamp would put a
+        // connection a moment AFTER a wake's moment before it.
+        self.note_device_seen(attach_device, crate::utils::now_ms() as i64);
         for old in stale {
             let old_dev = old
                 .deserialize_attachment::<Attachment>()

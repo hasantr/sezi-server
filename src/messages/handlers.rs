@@ -10,6 +10,7 @@ const W4B_INITIAL_BACKOFF_SECS: i64 = 30; // delay from enqueue to the first dra
 const W4B_LEASE_SECS: i64 = 600;
 const W4B_BACKOFF_BASE_SECS: i64 = 120; // 120→240→…→cap
 const W4B_MAX_BACKOFF_SECS: i64 = 3600; // a long outage retries hourly and is NEVER deleted
+use crate::push::coalesce::WakeIntent;
 use crate::respond::{json_err, no_content, passthrough};
 use crate::utils::now_secs;
 use serde::Deserialize;
@@ -90,6 +91,11 @@ struct SendBody {
     /// wakes and three full queue drains for one desktop launch, delivering nothing visible.
     #[serde(default)]
     silent: bool,
+    /// The sender flagged a ring starting or stopping (the core's waking call signals): an
+    /// asleep device's wake goes past the coalescing gate (`push::coalesce`). Sent only when
+    /// true; absent = an ordinary wake, as for every client before it.
+    #[serde(default)]
+    urgent: bool,
 }
 
 #[derive(Deserialize)]
@@ -108,7 +114,7 @@ fn build_notify_payload(
     recipient_device_id: Option<&str>,
     envelope_b64: &str,
     group_id: Option<&str>,
-    silent: bool,
+    wake: WakeIntent,
 ) -> String {
     serde_json::json!({
         "sender_id": sender_id,
@@ -120,7 +126,9 @@ fn build_notify_payload(
         "group_id": group_id,
         // Persisted on the pending row, so the backstop alarm does not wake the device later for
         // a message the immediate path deliberately stayed quiet about.
-        "silent": silent,
+        "silent": wake.silent(),
+        // Read by the inbox's wake: past the coalescing gate.
+        "urgent": wake.urgent(),
     })
     .to_string()
 }
@@ -165,7 +173,7 @@ pub(crate) async fn notify_recipient(
     recipient_device_id: Option<&str>,
     envelope_b64: &str,
     group_id: Option<&str>,
-    silent: bool,
+    wake: WakeIntent,
 ) -> Result<(i64, bool)> {
     let payload = build_notify_payload(
         recipient_id,
@@ -174,7 +182,7 @@ pub(crate) async fn notify_recipient(
         recipient_device_id,
         envelope_b64,
         group_id,
-        silent,
+        wake,
     );
     // A bounded in-request retry for a transient DO 5xx / overload / routing error. The DO's own
     // 60s dedup absorbs "it succeeded but the response was lost", so no duplicate pending row
@@ -277,6 +285,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Err(_) => return json_err(503, "authorization_unavailable"),
     };
     let namespace = ctx.env.durable_object("USER_INBOX")?;
+    let wake = WakeIntent::from_flags(body.silent, body.urgent);
 
     // ---- GROUP path: one call per member, the wake sent by the member's inbox (D8) ----
     if let Some(group_id) = body.group_id.as_deref() {
@@ -290,7 +299,8 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             sender_device_id: body.sender_device_id.clone(),
             envelope_b64: body.envelopes[0].envelope_b64.clone(),
             group_id: group_id.to_string(),
-            silent: body.silent,
+            silent: wake.silent(),
+            urgent: wake.urgent(),
         };
         return crate::messages::group_fanout::send_group(&ctx.env, &db, &namespace, msg).await;
     }
@@ -400,7 +410,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             e.device_id.as_deref(),
             &e.envelope_b64,
             None,
-            body.silent,
+            wake,
         )
         .await
         {
@@ -409,20 +419,25 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
                     "device_id": e.device_id,
                     "id": id,
                 }));
-                // Offline on that device → a content-less FCM wake, unless the message is silent
-                // control traffic, which is stored and delivered on the next connect instead.
-                if !delivered_live && body.silent {
-                    console_log!(
-                        "[push] skipped (silent) 1:1 user={recipient_id} dev={:?}",
-                        e.device_id
-                    );
-                }
-                if !delivered_live && !body.silent {
-                    console_log!("[push] waking 1:1 user={recipient_id} dev={:?}", e.device_id);
-                    crate::push::wake::maybe_push_wake(
-                        &ctx.env, &db, recipient_id, e.device_id.as_deref(),
-                    )
-                    .await;
+                // Offline on that device → the recipient's inbox sends the content-less wake
+                // itself, through its coalescing gate (`inbox_do/wake_gate.rs`), unless the
+                // message is silent control traffic, which is stored and delivered on the next
+                // connect instead. These lines only say which path asked.
+                if !delivered_live {
+                    match wake {
+                        WakeIntent::Silent => console_log!(
+                            "[push] skipped (silent) 1:1 user={recipient_id} dev={:?}",
+                            e.device_id
+                        ),
+                        WakeIntent::Ordinary => console_log!(
+                            "[push] waking 1:1 user={recipient_id} dev={:?}",
+                            e.device_id
+                        ),
+                        WakeIntent::Urgent => console_log!(
+                            "[push] waking (urgent) 1:1 user={recipient_id} dev={:?}",
+                            e.device_id
+                        ),
+                    }
                 }
             }
             Err(_) => { /* per-device failure → drops out of the ack list (visibly) */ }

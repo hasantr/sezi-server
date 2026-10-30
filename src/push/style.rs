@@ -102,6 +102,17 @@ impl WakeStyle {
 /// A data wake is the message every device got before visible wakes existed, byte for byte
 /// (`style_tests.rs` holds it to that). data-ONLY is what makes Android hand a terminated app its
 /// `onBackgroundMessage`; `priority: high` takes it out of doze.
+///
+/// **No `android.collapse_key`, deliberately** (weighed 2026-10-30, after the ZH wake storm). It
+/// would let FCM keep only the latest undelivered wake for an offline device, but it makes the
+/// data wake COLLAPSIBLE, and Google throttles collapsible messages to "a burst of 20 messages per
+/// app per device, with a refill of 1 message every 3 minutes" — delayed, not dropped
+/// (firebase.google.com/docs/cloud-messaging/throttling-and-quotas). A chat recipient who connects
+/// and leaves between messages legitimately gets more than 20 wakes, and past that each one would
+/// wait minutes. Google's own guidance keeps chat non-collapsible. Repeated wakes are cut where
+/// they start instead: one per unseen device per window (`coalesce.rs`). A visible wake is a
+/// notification message, which FCM always treats as collapsible and whose `collapse_key` it
+/// ignores; its `tag` already collapses what the user sees.
 pub(crate) fn fcm_message(token: &str, style: WakeStyle) -> Value {
     match style {
         WakeStyle::Data => json!({

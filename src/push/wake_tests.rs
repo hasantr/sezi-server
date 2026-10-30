@@ -59,6 +59,7 @@ fn a_blind_wake_reads_the_newest_live_tokens() {
 
 // ---- The loop, against a fake port ----
 
+use super::super::coalesce::WakeMark;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 
@@ -86,9 +87,45 @@ pub(crate) struct FakeWake {
     pub(crate) calls: RefCell<Vec<String>>,
     pub(crate) spent: Cell<usize>,
     minted: Cell<bool>,
+    /// The inbox's gate (`coalesce.rs`) and its clock — no subrequest, so never charged.
+    pub(crate) marks: FakeMarks,
+    pub(crate) clock_ms: Cell<i64>,
+    pub(crate) logs: RefCell<Vec<String>>,
+    /// At each push, how many keys held a mark — what an envelope arriving mid-send would read.
+    pub(crate) marked_at_send: RefCell<Vec<usize>>,
 }
 
 pub(crate) const MINT: usize = 3;
+
+/// The gate's table, as `inbox_do/wake_gate.rs`'s SQL keeps it (that SQL is checked against
+/// SQLite in `wake_gate_tests.rs`).
+#[derive(Default)]
+pub(crate) struct FakeMarks(RefCell<std::collections::HashMap<String, WakeMark>>);
+
+impl FakeMarks {
+    /// A connection of `device` at `at_ms` (`UserInbox::note_device_seen`).
+    pub(crate) fn seen(&self, device: &str, at_ms: i64) {
+        for key in [device, BLIND_KEY] {
+            self.0.borrow_mut().entry(key.to_string()).or_default().seen_ms = Some(at_ms);
+        }
+    }
+    pub(crate) fn get(&self, key: &str) -> WakeMark {
+        self.0.borrow().get(key).copied().unwrap_or_default()
+    }
+}
+
+impl WakeMarks for FakeMarks {
+    fn read(&self, keys: &[String]) -> Vec<WakeMark> {
+        keys.iter().map(|k| self.get(k)).collect()
+    }
+    fn mark(&self, keys: &[String], covers_ms: i64) {
+        for k in keys {
+            let mut map = self.0.borrow_mut();
+            let m = map.entry(k.clone()).or_default();
+            m.woke_for_ms = Some(m.woke_for_ms.map_or(covers_ms, |w| w.max(covers_ms)));
+        }
+    }
+}
 
 impl FakeWake {
     /// A server with its own project set, `n` devices `d0..` with tokens `t0..`, Google answering
@@ -117,11 +154,39 @@ impl FakeWake {
             calls: RefCell::new(Vec::new()),
             spent: Cell::new(0),
             minted: Cell::new(false),
+            marks: FakeMarks::default(),
+            clock_ms: Cell::new(1_700_000_000_000),
+            logs: RefCell::new(Vec::new()),
+            marked_at_send: RefCell::new(Vec::new()),
         }
     }
+    fn note_send(&self) {
+        let marked = self.marks.0.borrow().values().filter(|m| m.woke_for_ms.is_some()).count();
+        self.marked_at_send.borrow_mut().push(marked);
+    }
+    /// A device-blind wake, each one a separate event past the coalescing window — what every
+    /// test of the send loop wants. The gate's own tests use `wake_devices`.
     pub(crate) fn wake(&self) -> WakeTally {
+        self.advance(super::super::coalesce::WAKE_COALESCE_MS);
         self.calls.borrow_mut().clear();
-        block_on(wake_with(self, "u", None))
+        block_on(wake_with(self, "u", None, WakeAsk::ordinary(self.clock_ms.get())))
+    }
+    /// An ordinary wake to `devices` now, covering from now (the envelope is stored this instant).
+    pub(crate) fn wake_devices(&self, devices: &[&str]) -> WakeTally {
+        self.wake_asked(devices, false)
+    }
+    /// The same, flagged by the sender as a ring starting or stopping.
+    pub(crate) fn wake_urgent(&self, devices: &[&str]) -> WakeTally {
+        self.wake_asked(devices, true)
+    }
+    fn wake_asked(&self, devices: &[&str], urgent: bool) -> WakeTally {
+        self.calls.borrow_mut().clear();
+        let devices: Vec<String> = devices.iter().map(|d| d.to_string()).collect();
+        let ask = WakeAsk { covers_ms: self.clock_ms.get(), urgent };
+        block_on(wake_with(self, "u", Some(&devices), ask))
+    }
+    pub(crate) fn advance(&self, ms: i64) {
+        self.clock_ms.set(self.clock_ms.get() + ms);
     }
     fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
@@ -140,20 +205,27 @@ impl WakePort for FakeWake {
         self.spent.set(self.spent.get() + 1);
         Some(self.cfg.borrow().clone())
     }
-    async fn tokens(&self, _devices: Option<&[String]>) -> Result<Vec<TokenRow>> {
+    async fn tokens(&self, devices: Option<&[String]>) -> Result<Vec<TokenRow>> {
         self.spent.set(self.spent.get() + 1);
-        Ok(self.tokens.borrow().clone())
+        let rows = self.tokens.borrow().clone();
+        // As `DEVICE_TOKEN_SQL` does for one device; several are filtered by the loop itself.
+        Ok(match devices {
+            Some([d]) => rows.into_iter().filter(|r| &r.device_id == d).collect(),
+            _ => rows,
+        })
     }
     async fn direct(&self, project_id: &str, _sa: &str, token: &str, style: WakeStyle) -> DirectSend {
         assert_eq!(project_id, "owner-proj");
         if !self.minted.replace(true) {
             self.spent.set(self.spent.get() + MINT);
         }
+        self.note_send();
         self.tick(format!("direct:{token}{}", style_mark(style)));
         (self.direct_answer)(token)
     }
     async fn relay(&self, url: &str, token: &str, style: WakeStyle) -> Result<bool> {
         assert_eq!(url, "https://relay");
+        self.note_send();
         self.tick(format!("relay:{token}{}", style_mark(style)));
         (self.relay_answer)(token)
     }
@@ -176,7 +248,15 @@ impl WakePort for FakeWake {
     fn now(&self) -> i64 {
         1_700_000_000
     }
-    fn log(&self, _line: String) {}
+    fn marks(&self) -> &dyn WakeMarks {
+        &self.marks
+    }
+    fn now_ms(&self) -> i64 {
+        self.clock_ms.get()
+    }
+    fn log(&self, line: String) {
+        self.logs.borrow_mut().push(line);
+    }
 }
 
 /// A data wake is logged as before; a visible one says so, so a test sees which style was sent.
@@ -472,4 +552,187 @@ fn each_token_is_woken_in_its_own_style() {
     f.cfg.borrow_mut().service_account = None;
     f.wake();
     assert_eq!(f.calls(), ["relay:t0", "relay:t1:visible-en"]);
+}
+
+// ---- The coalescing gate (`coalesce.rs`), through the real loop ----
+
+/// A relay server with one device per id — the shape of the field report (ZH, relay mode).
+fn relay_fleet(n: usize) -> FakeWake {
+    let f = FakeWake::own(n, sent, relay_ok);
+    f.cfg.borrow_mut().project_id = None;
+    f
+}
+
+/// The field burst: 13 envelopes to one asleep device in 6 s (ZH, 20:43) were 13 pushes. Now the
+/// first one wakes and the twelve behind it — the device still not connected — cost nothing: no
+/// D1 read, no fetch, one log line each.
+#[test]
+fn a_burst_to_an_unseen_device_is_one_push() {
+    let f = relay_fleet(1);
+    let mut pushes = 0;
+    for i in 0..13 {
+        let spent = f.spent.get();
+        let t = f.wake_devices(&["d0"]);
+        pushes += t.woke.len();
+        if i > 0 {
+            assert_eq!(t.coalesced, ["d0"]);
+            assert_eq!(f.spent.get(), spent, "a coalesced wake spends no subrequest");
+            assert!(f.calls().is_empty());
+        }
+        f.advance(500);
+    }
+    assert_eq!(pushes, 1);
+    let skipped = f.logs.borrow().iter().filter(|l| l.starts_with("[push] coalesced")).count();
+    assert_eq!(skipped, 12, "every skipped wake is one line the field can count");
+}
+
+/// The bug that removed the first debounce: a follow-up just after the drain must wake. A
+/// connection after the wake's moment means that wake was fetched.
+#[test]
+fn a_device_seen_after_the_wake_is_woken_by_the_next_envelope() {
+    let f = relay_fleet(1);
+    f.wake_devices(&["d0"]);
+    f.advance(2_000);
+    f.marks.seen("d0", f.clock_ms.get()); // the wake's drain connects, fetches, leaves
+    f.advance(1_000);
+    let t = f.wake_devices(&["d0"]);
+    assert_eq!((t.woke.as_slice(), t.coalesced.len()), (&["d0".to_string()][..], 0));
+}
+
+/// A connection BEFORE the wake's moment fetched nothing it was for: still coalesced.
+#[test]
+fn a_connection_before_the_wakes_moment_does_not_count() {
+    let f = relay_fleet(1);
+    f.marks.seen("d0", f.clock_ms.get() - 1);
+    f.wake_devices(&["d0"]);
+    f.advance(1_000);
+    assert_eq!(f.wake_devices(&["d0"]).coalesced, ["d0"]);
+}
+
+/// A lost push is retried: past the window the next envelope wakes, seen or not.
+#[test]
+fn past_the_window_an_unseen_device_is_woken_again() {
+    let f = relay_fleet(1);
+    f.wake_devices(&["d0"]);
+    f.advance(super::super::coalesce::WAKE_COALESCE_MS - 1);
+    assert_eq!(f.wake_devices(&["d0"]).coalesced, ["d0"]);
+    f.advance(1);
+    assert_eq!(f.wake_devices(&["d0"]).woke, ["d0"]);
+}
+
+/// One device's outstanding wake says nothing about another's.
+#[test]
+fn devices_are_coalesced_independently() {
+    let f = relay_fleet(2);
+    f.wake_devices(&["d0"]);
+    f.advance(1_000);
+    let t = f.wake_devices(&["d1"]);
+    assert_eq!(t.woke, ["d1"]);
+    // A member with both asleep (`/notify-member`): only the one still waiting is skipped, and
+    // the other goes out through the narrow one-device read.
+    f.advance(1_000);
+    f.marks.seen("d1", f.clock_ms.get());
+    f.advance(1_000);
+    let t = f.wake_devices(&["d0", "d1"]);
+    assert_eq!((t.coalesced, t.woke), (vec!["d0".to_string()], vec!["d1".to_string()]));
+}
+
+/// A wake that reached nobody never stands in for the next one: the shared relay's 429, a
+/// revoked device whose token is gone, push switched off — the next envelope tries again.
+#[test]
+fn a_wake_that_reached_nobody_leaves_no_mark() {
+    fn rate_limited(_: &str) -> Result<bool> {
+        Err(worker::Error::RustError("relay 429".into()))
+    }
+    let f = FakeWake::own(1, sent, rate_limited);
+    f.cfg.borrow_mut().project_id = None;
+    assert_eq!(f.wake_devices(&["d0"]).failed, 1);
+    assert_eq!(f.marks.get("d0").woke_for_ms, None);
+    f.advance(500);
+    assert_eq!(f.wake_devices(&["d0"]).coalesced.len(), 0, "tried again at once");
+
+    // A revoked device (no token any more) beside a live one: the live one is woken and keeps its
+    // mark, the revoked one keeps none and coalesces nothing.
+    let f = relay_fleet(1);
+    let t = f.wake_devices(&["d0", "gone"]);
+    assert_eq!(t.woke, ["d0"]);
+    assert!(f.marks.get("d0").woke_for_ms.is_some());
+    assert_eq!(f.marks.get("gone").woke_for_ms, None);
+
+    let f = relay_fleet(1);
+    f.cfg.borrow_mut().relay_url = None; // push off
+    f.wake_devices(&["d0"]);
+    assert_eq!(f.marks.get("d0").woke_for_ms, None);
+}
+
+/// The reviewer's LOW #2: a wake still in flight marks nothing, so an envelope arriving while it
+/// is in flight is not silenced by a send that may yet fail. The mark appears only once the push
+/// went out.
+#[test]
+fn a_wake_in_flight_marks_nothing() {
+    let f = relay_fleet(1);
+    f.wake_devices(&["d0"]);
+    assert_eq!(*f.marked_at_send.borrow(), [0], "no mark existed while the push was in flight");
+    assert!(f.marks.get("d0").woke_for_ms.is_some(), "marked once it went out");
+}
+
+/// Two wakes finishing out of order leave the later moment (`MARK_SQL`'s `MAX`).
+#[test]
+fn a_mark_never_moves_back() {
+    let m = FakeMarks::default();
+    let keys = ["d0".to_string()];
+    m.mark(&keys, 200);
+    m.mark(&keys, 100);
+    assert_eq!(m.get("d0").woke_for_ms, Some(200));
+}
+
+/// The ring behind an earlier wake that produced no connection (the OS refused the background
+/// start): an urgent envelope inside that wake's window still wakes, and says so.
+#[test]
+fn an_urgent_wake_goes_past_an_unfetched_wake() {
+    let f = relay_fleet(1);
+    f.wake_devices(&["d0"]);
+    f.advance(5_000);
+    assert_eq!(f.wake_devices(&["d0"]).coalesced, ["d0"], "an ordinary one waits");
+    f.advance(1_000);
+    let t = f.wake_urgent(&["d0"]);
+    assert_eq!((t.woke.as_slice(), t.coalesced.len()), (&["d0".to_string()][..], 0));
+    assert!(f.logs.borrow().iter().any(|l| l.starts_with("[push] urgent user=u device=d0")));
+}
+
+/// An urgent wake marks like any other: the ordinary envelope right behind it coalesces.
+#[test]
+fn an_ordinary_wake_right_after_an_urgent_one_coalesces() {
+    let f = relay_fleet(1);
+    assert_eq!(f.wake_urgent(&["d0"]).woke, ["d0"]);
+    f.advance(300);
+    assert_eq!(f.wake_devices(&["d0"]).coalesced, ["d0"]);
+    // An urgent wake with nothing outstanding is an ordinary send: no "past the gate" line.
+    assert!(!f.logs.borrow().iter().any(|l| l.starts_with("[push] urgent")));
+}
+
+/// Old clients send neither flag: both doors read an ordinary wake, and urgency implies a wake.
+#[test]
+fn the_send_flags_read_conservatively() {
+    use super::super::coalesce::WakeIntent;
+    assert_eq!(WakeIntent::from_flags(false, false), WakeIntent::Ordinary);
+    assert_eq!(WakeIntent::from_flags(true, false), WakeIntent::Silent);
+    assert_eq!(WakeIntent::from_flags(false, true), WakeIntent::Urgent);
+    assert_eq!(WakeIntent::from_flags(true, true), WakeIntent::Urgent);
+}
+
+/// A device-blind wake (a row from before device addressing) is gated by its own key, and any
+/// device's connection counts as seen for it.
+#[test]
+fn a_blind_wake_is_coalesced_until_any_device_connects() {
+    let f = relay_fleet(2);
+    let now = |f: &FakeWake| WakeAsk::ordinary(f.clock_ms.get());
+    block_on(wake_with(&f, "u", None, now(&f)));
+    f.advance(1_000);
+    let t = block_on(wake_with(&f, "u", None, now(&f)));
+    assert_eq!(t.coalesced, [BLIND_KEY]);
+    f.marks.seen("d1", f.clock_ms.get());
+    f.advance(1);
+    let t = block_on(wake_with(&f, "u", None, now(&f)));
+    assert_eq!(t.woke, ["d0", "d1"]);
 }

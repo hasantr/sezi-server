@@ -544,11 +544,15 @@ pub fn decrypt_from_peer(
         // CallLog is a local call-history record ONLY — never sent, never decrypted; it must
         // not appear on this legacy decrypt path (defensive: if it does, swallow as control).
         InnerMessage::CallLog { .. } => ("control".to_string(), String::new()),
+        // An edit is invisible: the kernel rewrites its message's words; it is never a row.
+        InnerMessage::MessageEdit { .. } => ("control".to_string(), String::new()),
         // A batch of co-presence events is sent only to a kernel that said it reads batches,
         // and this path never says so (its single events carry `reads_batch: false`).
         InnerMessage::ActivityBatch { .. } => ("control".to_string(), String::new()),
         // A reaction is invisible: the kernel applies it to its message; it is never a row.
         InnerMessage::Reaction { .. } => ("control".to_string(), String::new()),
+        // A room delete is invisible: the kernel applies it to its message; it is never a row.
+        InnerMessage::RoomDelete { .. } => ("control".to_string(), String::new()),
         // Same shape as CallLog, and here the swallow is a security property rather than
         // defensiveness. A room-access notice is written locally by each member's own device
         // from its own view of the membership; one that arrives over the wire is by definition

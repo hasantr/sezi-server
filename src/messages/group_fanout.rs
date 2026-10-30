@@ -48,6 +48,12 @@ pub(crate) struct GroupMessage {
     pub(crate) group_id: String,
     /// No wake for an asleep device (control traffic). The inbox persists it on the pending row.
     pub(crate) silent: bool,
+    /// A ring starting or stopping: the member's wake goes past the coalescing gate
+    /// (`push::coalesce`). Not kept by the durable retry queue (`fanout_retry`): its first retry
+    /// is 30 s after the send, when a 45 s ring has little left to save, and an ordinary wake
+    /// still goes out for it. Absent (an older hop body) reads as false.
+    #[serde(default)]
+    pub(crate) urgent: bool,
 }
 
 /// One device's answer from `/notify-member`.
@@ -526,6 +532,7 @@ mod tests {
                 envelope_b64: "e".into(),
                 group_id: "g".into(),
                 silent: false,
+                urgent: true,
             },
             recipient_id: "r".into(),
             recipient_device_ids: None,
@@ -534,6 +541,13 @@ mod tests {
         assert_eq!(v["sender_id"], "s");
         assert_eq!(v["group_id"], "g");
         assert!(v["recipient_device_ids"].is_null());
+        // A ring's flag reaches the member's inbox; a body without it (an older hop) is ordinary.
+        assert_eq!(v["urgent"], true);
+        let back: MemberNotifyBody = serde_json::from_value(v.clone()).unwrap();
+        assert!(back.message.urgent);
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("urgent");
+        assert!(!serde_json::from_value::<MemberNotifyBody>(old).unwrap().message.urgent);
     }
 
     /// The rate limit's weight: a pending row per device, one for a device-blind member.

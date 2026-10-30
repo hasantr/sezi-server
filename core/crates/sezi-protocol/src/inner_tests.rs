@@ -169,6 +169,11 @@ fn requires_device_fanout_classification() {
             ticket_hash: "h".into(),
             device: None,
         },
+        // The room session asked for is the outbound session of whichever device sent it.
+        InnerMessage::RoomKeyRequest {
+            room_id: "r".into(),
+            session_id: None,
+        },
     ];
     for m in &fanout_true {
         assert!(
@@ -186,10 +191,6 @@ fn requires_device_fanout_classification() {
     // 1:1 / request-pull / self-state / content → stays primary-only (no fan-out).
     let fanout_false: Vec<InnerMessage> = vec![
         InnerMessage::Text { body: "hi".into() },
-        InnerMessage::RoomKeyRequest {
-            room_id: "r".into(),
-            session_id: None,
-        },
         InnerMessage::PluginSnapshotRequest { room: "r".into() },
         InnerMessage::PluginInstallRequest { room: "r".into() },
         InnerMessage::CallSignal {
@@ -1298,4 +1299,92 @@ fn an_older_build_reads_a_reaction_as_unknown() {
     .encode();
     let old: OlderInner = serde_json::from_slice(&wire).expect("an older build still decodes it");
     assert!(matches!(old, OlderInner::Unknown), "got {old:?}");
+}
+
+/// A room delete keeps its target's two names beside the payload's own `msg_uid`, and an older
+/// build lands it in its catch-all rather than failing the decrypt chain.
+#[test]
+fn a_room_delete_round_trips_and_an_older_build_reads_unknown() {
+    let d = InnerMessage::RoomDelete { target_uid: "loc-1".into(), target_by: "u-mert".into() };
+    let p = ChatPayload::new(None, None, d).with_msg_uid("del-1");
+    let json = String::from_utf8(p.encode()).unwrap();
+    assert!(json.contains(r#""kind":"room_delete""#), "{json}");
+    let back = ChatPayload::decode(json.as_bytes()).unwrap();
+    assert_eq!(back.msg_uid.as_deref(), Some("del-1"));
+    match back.inner {
+        InnerMessage::RoomDelete { target_uid, target_by } => {
+            assert_eq!(target_uid, "loc-1");
+            assert_eq!(target_by, "u-mert");
+        }
+        other => panic!("expected RoomDelete, got {other:?}"),
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum OlderInner {
+        Text { body: String },
+        #[serde(other)]
+        Unknown,
+    }
+    let old: OlderInner = serde_json::from_str(&json).expect("an older build still decodes it");
+    assert!(matches!(old, OlderInner::Unknown), "got {old:?}");
+}
+
+/// An edit carries its whole new content nested under its own `kind`, beside the payload's own
+/// `msg_uid`, and only the self-copy says `conversation`.
+#[test]
+fn an_edit_round_trips_with_its_content_nested() {
+    let e = InnerMessage::MessageEdit {
+        target_uid: "loc-1".into(),
+        target_by: "u-mert".into(),
+        content: Box::new(InnerMessage::Text { body: "fixed".into() }),
+        mentions: Vec::new(),
+        at_ms: 1_790_000_000_000,
+        conversation: None,
+    };
+    let p = ChatPayload::new(None, None, e).with_msg_uid("ed-1");
+    let json = String::from_utf8(p.encode()).unwrap();
+    assert!(json.contains(r#""kind":"message_edit""#), "{json}");
+    assert!(json.contains(r#""content":{"kind":"text","body":"fixed"}"#), "{json}");
+    assert!(json.contains(r#""invisible":true"#), "{json}");
+    assert!(!json.contains("mentions") && !json.contains("conversation"), "{json}");
+    let back = ChatPayload::decode(json.as_bytes()).unwrap();
+    assert_eq!(back.msg_uid.as_deref(), Some("ed-1"));
+    assert!(back.invisible && !back.drops_silently(), "a build that knows it reads it");
+    match back.inner {
+        InnerMessage::MessageEdit { target_uid, target_by, content, at_ms, conversation, .. } => {
+            assert_eq!((target_uid.as_str(), target_by.as_str()), ("loc-1", "u-mert"));
+            assert!(matches!(*content, InnerMessage::Text { ref body } if body == "fixed"));
+            assert_eq!(at_ms, 1_790_000_000_000);
+            assert_eq!(conversation, None);
+        }
+        other => panic!("expected MessageEdit, got {other:?}"),
+    }
+}
+
+/// A kind this build does not know, sent by a build that marked it invisible, is dropped
+/// silently; an unknown kind without the mark is still the "Unsupported message" row it was.
+/// A visible message never carries the mark, so its payload is byte for byte what it was.
+#[test]
+fn an_unknown_invisible_kind_drops_silently_and_a_visible_one_does_not() {
+    let marked = br#"{"kind":"some_later_control","invisible":true,"x":1}"#;
+    let p = ChatPayload::decode(marked).unwrap();
+    assert!(matches!(p.inner, InnerMessage::Unknown));
+    assert!(p.drops_silently());
+    let unmarked = br#"{"kind":"some_later_card","x":1}"#;
+    assert!(!ChatPayload::decode(unmarked).unwrap().drops_silently());
+    let text = ChatPayload::new(None, None, InnerMessage::Text { body: "hi".into() });
+    let json = String::from_utf8(text.encode()).unwrap();
+    assert!(!json.contains("invisible"), "{json}");
+    assert!(ChatPayload::new(None, None, InnerMessage::Reaction {
+        target_uid: "u".into(),
+        target_by: "b".into(),
+        emoji: None,
+        at_ms: 1,
+        conversation: None,
+    })
+    .invisible);
+    let delete = InnerMessage::RoomDelete { target_uid: "u".into(), target_by: "b".into() };
+    assert!(ChatPayload::new(None, None, delete).invisible);
 }

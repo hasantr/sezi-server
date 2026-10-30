@@ -72,6 +72,7 @@ impl UserInbox {
             envelope_b64: row.envelope_b64.clone(),
             group_id: row.room_id.clone(),
             silent: false,
+            urgent: false,
         };
         let mut purse = SubrequestBudget::new(budget as usize, 2);
         let outcomes = group_fanout::notify_members(&DoCalls { ns: &ns }, &msg, &owed, &mut purse, false).await;

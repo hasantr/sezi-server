@@ -147,18 +147,30 @@ impl UserInbox {
             rows.len(),
             uid
         );
+        // Through the same gate as every wake (`push::coalesce`): a device with a wake still to be
+        // fetched is skipped, and its rows are NOT stamped below, so the next alarm — past the
+        // window by then — wakes them if that wake brought no drain.
+        let marks = self.wake_marks();
+        // Never urgent: a ring is long over by the time a row is stale.
+        let ask = crate::push::coalesce::WakeAsk::ordinary(crate::utils::now_ms() as i64);
+        let mut coalesced: Vec<String> = Vec::new();
         for r in &rows {
-            crate::push::wake::maybe_push_wake(&self.env, &db, &uid, r.device_id.as_deref()).await;
+            let t = crate::push::wake::maybe_push_wake(
+                &self.env,
+                &db,
+                &marks,
+                &uid,
+                r.device_id.as_deref(),
+                ask,
+            )
+            .await;
+            coalesced.extend(t.coalesced);
         }
         // Stamp the rows so the next alarm does not re-push them (best-effort; if the error is
         // swallowed the worst case is another wake on the next alarm = a harmless extra push).
-        let _ = storage.sql().exec_raw(
-            "UPDATE pending SET push_wake_at = ? WHERE push_wake_at IS NULL AND created_at < ?",
-            Some(vec![
-                JsValue::from_f64((now * 1000) as f64),
-                JsValue::from_f64(cutoff as f64),
-            ]),
-        );
+        let mut args = vec![JsValue::from_f64((now * 1000) as f64), JsValue::from_f64(cutoff as f64)];
+        args.extend(coalesced.iter().map(|k| JsValue::from_str(k)));
+        let _ = storage.sql().exec_raw(&backstop_stamp_sql(coalesced.len()), Some(args));
     }
 
     /// The whole periodic alarm: flush, forwards, the FCM backstop, the daily retention cleanup
@@ -250,5 +262,58 @@ impl UserInbox {
             self.arm_alarm_within(delay).await;
         }
         Response::empty()
+    }
+}
+
+/// The backstop's stamp: every stale row of the scan, except those of a device whose wake was
+/// coalesced (`coalesced` placeholders after the two fixed ones). A device-blind row is keyed as
+/// the gate keys it, `coalesce::BLIND_KEY`.
+fn backstop_stamp_sql(coalesced: usize) -> String {
+    let mut sql = String::from(
+        "UPDATE pending SET push_wake_at = ? WHERE push_wake_at IS NULL AND created_at < ?",
+    );
+    if coalesced > 0 {
+        let marks = vec!["?"; coalesced].join(", ");
+        sql.push_str(&format!(
+            " AND COALESCE(device_id, '{}') NOT IN ({marks})",
+            crate::push::coalesce::BLIND_KEY
+        ));
+    }
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backstop_stamp_sql;
+
+    fn stamped(coalesced: &[&str]) -> Vec<String> {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pending (id INTEGER PRIMARY KEY, device_id TEXT, created_at INTEGER,
+                                   push_wake_at INTEGER);
+             INSERT INTO pending (device_id, created_at)
+               VALUES ('d0', 1), ('d1', 1), (NULL, 1), ('d0', 99);",
+        )
+        .unwrap();
+        let mut args: Vec<rusqlite::types::Value> = vec![7.into(), 10.into()];
+        args.extend(coalesced.iter().map(|k| rusqlite::types::Value::from(k.to_string())));
+        db.execute(&backstop_stamp_sql(coalesced.len()), rusqlite::params_from_iter(args))
+            .unwrap();
+        let mut q = db
+            .prepare("SELECT COALESCE(device_id, '*') FROM pending WHERE push_wake_at = 7 ORDER BY id")
+            .unwrap();
+        q.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn the_backstop_stamps_every_stale_row_when_nothing_was_coalesced() {
+        assert_eq!(stamped(&[]), ["d0", "d1", "*"]);
+    }
+
+    /// A coalesced device's rows stay unstamped, so the next alarm can still wake for them.
+    #[test]
+    fn a_coalesced_devices_rows_are_left_for_the_next_alarm() {
+        assert_eq!(stamped(&["d0"]), ["d1", "*"]);
+        assert_eq!(stamped(&["*", "d1"]), ["d0"]);
     }
 }

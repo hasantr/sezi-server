@@ -16,8 +16,9 @@ use super::*;
 
 /// Subrequests one drain may spend (less when a built-in round spent first: `builtin_policy`).
 pub(super) const DRAIN_BUDGET: u32 = 35;
-/// A `notify` at its worst: the call and the member's wake (`bot_send_notify`).
-pub(super) const NOTIFY_WORST: u32 = 5;
+/// A `notify` at its worst: the call and its in-request retry (`bot_send_notify`). The member's
+/// wake is their own inbox's, not this purse's.
+pub(super) const NOTIFY_WORST: u32 = 2;
 /// A row older than this is given up on.
 const OUTBOX_TTL_MS: i64 = 24 * 3600 * 1000;
 
@@ -225,7 +226,7 @@ impl UserInbox {
         }
     }
 
-    /// One `notify`, then the member's wake when no socket of theirs took it. (sent?, cost).
+    /// One `notify` (its inbox wakes the member when no socket of theirs took it). (sent?, cost).
     async fn bot_send_notify(&self, ctx: &BotCtx, body: &str) -> (bool, u32) {
         let Ok(n) = serde_json::from_str::<NotifyBody>(body) else {
             return (true, 0);
@@ -247,13 +248,15 @@ impl UserInbox {
             Some(&n.device_id),
             &n.envelope_b64,
             None,
-            silent,
+            crate::push::coalesce::WakeIntent::from_flags(silent, false),
         )
         .await;
-        let Ok((pending_id, delivered_live)) = sent else {
+        // The member's wake, when no socket of theirs took it, is sent by THEIR inbox (its
+        // `/notify` arm, through the coalescing gate) — not from here, and not out of this purse.
+        let Ok((pending_id, _delivered_live)) = sent else {
             return (false, 2);
         };
-        let mut cost = 2;
+        let cost = 2;
         if let Some(uid) = &n.msg_uid {
             let _ = self.state.storage().sql().exec_raw(
                 "UPDATE bot_sent SET pending_id = ? WHERE msg_uid = ? AND device_id = ?",
@@ -263,12 +266,6 @@ impl UserInbox {
                     JsValue::from_str(&n.device_id),
                 ]),
             );
-        }
-        if !delivered_live && !silent {
-            if let Ok(db) = self.env.d1("DB") {
-                crate::push::wake::maybe_push_wake(&self.env, &db, &n.user_id, Some(&n.device_id)).await;
-                cost += 3;
-            }
         }
         (true, cost)
     }

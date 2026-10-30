@@ -81,6 +81,13 @@ pub enum Error {
     #[error("delete-for-everyone/window-expired")]
     DeleteForEveryoneWindowExpired,
 
+    /// "Delete for everyone" was sent and did not reach the relay: its op ran out of attempts.
+    /// The local copy is gone, the other side's is not YET — the kernel keeps sending it
+    /// periodically until it lands or the window closes (`kernel/delete_debt.rs`), and the
+    /// message's view says so meanwhile.
+    #[error("delete-for-everyone/not-delivered")]
+    DeleteForEveryoneNotDelivered,
+
     /// A scanned QR did not parse as a device-link payload — a photo of the wrong thing, a damaged
     /// code, or one from another app.
     #[error("qr/undecodable: {0}")]

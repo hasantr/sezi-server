@@ -1,3 +1,4 @@
+pub mod coalesce;
 pub mod config;
 pub mod fcm;
 pub mod handlers;

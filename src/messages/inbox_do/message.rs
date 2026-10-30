@@ -283,8 +283,8 @@ impl UserInbox {
                 }
             }
         }
-        // A zombie was caught and no other live socket took the delivery, so the caller wakes by
-        // FCM. How often this line appears in `wrangler tail` is the only measure of how much the
+        // A zombie was caught and no other live socket took the delivery, so the device is woken by
+        // FCM (from this inbox). How often this line appears in `wrangler tail` is the only measure of how much the
         // liveness window actually catches.
         if zombie_seen && !delivered_live {
             worker::console_log!(
@@ -292,11 +292,11 @@ impl UserInbox {
                 group_id.unwrap_or("1:1")
             );
         }
-        // `push_wake_at` is deliberately NOT stamped here. The caller wakes an offline row
-        // immediately, but marking the row "pushed" from here would break the WS-send path whose
-        // response is lost: no push happened, yet the backstop would skip it and NO wake would ever
-        // go out. Only the backstop stamps it, after its own push, so every row gets at most one
-        // backstop wake on top of the caller's immediate one.
+        // `push_wake_at` is deliberately NOT stamped here. This inbox's `/notify` or
+        // `/notify-member` arm wakes an offline row immediately (`wake_gate.rs`) — or coalesces
+        // that wake, or it fails — and a row stamped "pushed" from here would be skipped by the
+        // backstop even when no push went out. Only the backstop stamps it, after its own push, so
+        // every row gets at most one backstop wake on top of the immediate one.
         //
         // The dedup entry carries the REAL delivered_live and is written AFTER the send loop. There
         // is no await between them and the DO is single-threaded, so a retry finds the envelope

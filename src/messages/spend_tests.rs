@@ -283,6 +283,7 @@ fn message() -> GroupMessage {
         envelope_b64: "e".into(),
         group_id: "g".into(),
         silent: false,
+        urgent: false,
     }
 }
 

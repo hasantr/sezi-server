@@ -1,12 +1,15 @@
-//! One member's wake: read the send mode and the tokens, send to each, act on each verdict.
+//! One member's wake: pass the coalescing gate, read the send mode and the tokens, send to each,
+//! act on each verdict.
 //!
 //! The orchestration is `wake_with`, written against `WakePort` so the host tests run the REAL
 //! loop (`wake_tests.rs`, and the subrequest count in `messages/spend_tests.rs`); `D1Wake` is the
-//! production port.
+//! production port. Every wake is sent from the RECIPIENT's inbox Durable Object (`/notify`,
+//! `/notify-member`, the backstop alarm), which holds the gate's marks (`coalesce.rs`).
 
 use serde::Deserialize;
 use worker::*;
 
+use super::coalesce::{gate, Gate, WakeAsk, WakeMarks, BLIND_KEY};
 use super::config::{self, ProjectVerdict, PushConfig, SendMode, KEY_OWN_REACHED};
 use super::fcm::{send_wake, send_wake_relay, DirectSend};
 use super::style::WakeStyle;
@@ -16,16 +19,20 @@ use crate::utils::now_secs;
 /// Recipient is OFFLINE → a contentless wake to their registered push tokens.
 /// `recipient_device_id` Some → that device only; None → ALL of the user's devices.
 /// Best-effort: own config → direct FCM, else the shared relay, and with the relay `off` a silent
-/// no-op. A stale token is deleted from `push_tokens`.
+/// no-op. A stale token is deleted from `push_tokens`. `marks` and `ask` are the coalescing
+/// gate's (`coalesce.rs`); `ask.covers_ms` is taken BEFORE the envelope asking for this wake was
+/// stored.
 pub async fn maybe_push_wake(
     env: &Env,
     db: &D1Database,
+    marks: &dyn WakeMarks,
     recipient_id: &str,
     recipient_device_id: Option<&str>,
-) {
+    ask: WakeAsk,
+) -> WakeTally {
     match recipient_device_id {
-        Some(d) => push_wake_devices(env, db, recipient_id, Some(&[d.to_string()])).await,
-        None => push_wake_devices(env, db, recipient_id, None).await,
+        Some(d) => push_wake_devices(env, db, marks, recipient_id, Some(&[d.to_string()]), ask).await,
+        None => push_wake_devices(env, db, marks, recipient_id, None, ask).await,
     }
 }
 
@@ -74,7 +81,7 @@ impl TokenRow {
     }
 }
 
-/// Every subrequest a wake makes, behind one seam.
+/// Every subrequest a wake makes, behind one seam — plus the gate's marks, which are none.
 pub(crate) trait WakePort {
     /// The push config (one D1 query). None = D1 unreadable → no wake.
     async fn config(&self) -> Option<PushConfig>;
@@ -91,12 +98,16 @@ pub(crate) trait WakePort {
     /// Mark one token as relayed from now on ([`ROUTE_VIA_RELAY_SQL`]).
     async fn route_via_relay(&self, row: &TokenRow, project_id: &str);
     fn now(&self) -> i64;
+    /// The coalescing gate's marks, in the recipient's inbox (`coalesce.rs`). No subrequest.
+    fn marks(&self) -> &dyn WakeMarks;
+    /// Milliseconds, for the gate.
+    fn now_ms(&self) -> i64;
     /// A log line (the console is a JS import, absent from the host tests).
     fn log(&self, line: String);
 }
 
 /// What one wake came to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WakeTally {
     pub(crate) tokens: usize,
     pub(crate) ok: usize,
@@ -107,6 +118,11 @@ pub(crate) struct WakeTally {
     pub(crate) relayed: usize,
     /// Tokens this wake found refused for the own project and marked for the relay.
     pub(crate) routed: usize,
+    /// The gate's keys (device ids, or `coalesce::BLIND_KEY`) this wake skipped: a wake to them
+    /// is still to be fetched.
+    pub(crate) coalesced: Vec<String>,
+    /// The devices a push went out to.
+    pub(crate) woke: Vec<String>,
 }
 
 /// One member's offline devices → a contentless wake to each. The send mode is resolved ONCE and
@@ -117,31 +133,85 @@ pub(crate) struct WakeTally {
 pub async fn push_wake_devices(
     env: &Env,
     db: &D1Database,
+    marks: &dyn WakeMarks,
     recipient_id: &str,
     devices: Option<&[String]>,
-) {
-    let port = D1Wake { env, db, user: recipient_id };
-    wake_with(&port, recipient_id, devices).await;
+    ask: WakeAsk,
+) -> WakeTally {
+    let port = D1Wake { env, db, user: recipient_id, marks };
+    wake_with(&port, recipient_id, devices, ask).await
 }
 
-/// The wake itself. Every exit logs one verdict line: silence would make "push is switched off",
-/// "the device has no token", "the token was stale and was just deleted" and "it went out fine"
-/// indistinguishable from outside — which is why "notifications do not arrive when the app is
-/// closed" once had no answer. The mode is named because a server with no FCM configuration falls
-/// back to the shared relay, and its operator should not push through someone else's
-/// infrastructure unknowingly.
+/// The wake behind the gate (`coalesce.rs`). A device whose last wake is still to be fetched is
+/// skipped here, before any subrequest: a coalesced wake costs one local read and one log line.
+/// An urgent wake goes past it. A mark is written only for the devices a push actually reached,
+/// AFTER the send: a wake that failed (a 429 from the shared relay, a token query error, no
+/// token, push switched off) never stands in for the next one, and one still in flight silences
+/// nothing that arrives meanwhile.
 pub(crate) async fn wake_with<P: WakePort>(
     p: &P,
     user: &str,
     devices: Option<&[String]>,
+    ask: WakeAsk,
 ) -> WakeTally {
     let mut t = WakeTally::default();
     if devices.is_some_and(|d| d.is_empty()) {
         return t;
     }
+    let keys: Vec<String> = match devices {
+        Some(list) => list.to_vec(),
+        None => vec![BLIND_KEY.to_string()],
+    };
+    let now = p.now_ms();
+    let marks = p.marks().read(&keys);
+    let mut granted = Vec::with_capacity(keys.len());
+    for (i, key) in keys.into_iter().enumerate() {
+        match gate(marks.get(i).copied().unwrap_or_default(), now) {
+            Gate::Send => granted.push(key),
+            Gate::Coalesced { age_ms } if ask.urgent => {
+                p.log(format!(
+                    "[push] urgent user={user} device={key} -> sent past the gate (the wake of \
+                     {age_ms} ms ago is not fetched yet)"
+                ));
+                granted.push(key);
+            }
+            Gate::Coalesced { age_ms } => {
+                p.log(format!(
+                    "[push] coalesced user={user} device={key} -> skipped (the wake of {age_ms} ms \
+                     ago is not fetched yet: no connection since)"
+                ));
+                t.coalesced.push(key);
+            }
+        }
+    }
+    if granted.is_empty() {
+        return t;
+    }
+    let blind = devices.is_none();
+    send(p, user, if blind { None } else { Some(&granted) }, &mut t).await;
+    let reached: Vec<String> = if !blind {
+        t.woke.clone()
+    } else if t.woke.is_empty() {
+        Vec::new()
+    } else {
+        vec![BLIND_KEY.to_string()]
+    };
+    if !reached.is_empty() {
+        p.marks().mark(&reached, ask.covers_ms);
+    }
+    t
+}
+
+/// The send itself. Every exit logs one verdict line: silence would make "push is switched off",
+/// "the device has no token", "the token was stale and was just deleted" and "it went out fine"
+/// indistinguishable from outside — which is why "notifications do not arrive when the app is
+/// closed" once had no answer. The mode is named because a server with no FCM configuration falls
+/// back to the shared relay, and its operator should not push through someone else's
+/// infrastructure unknowingly.
+async fn send<P: WakePort>(p: &P, user: &str, devices: Option<&[String]>, t: &mut WakeTally) {
     let Some(mode) = p.config().await.and_then(|c| c.send_mode()) else {
         p.log(format!("[push] user={user} mode=off -> skipped (FCM not configured, or 'off')"));
-        return t;
+        return;
     };
     let mode_name = match &mode {
         SendMode::Direct { .. } => "direct",
@@ -151,7 +221,7 @@ pub(crate) async fn wake_with<P: WakePort>(
         Ok(r) => r,
         Err(e) => {
             p.log(format!("[push] user={user} mode={mode_name} token query FAIL: {e:?}"));
-            return t;
+            return;
         }
     };
     // One device: the narrow query. Several: the user's tokens, filtered here — still one query.
@@ -166,22 +236,21 @@ pub(crate) async fn wake_with<P: WakePort>(
         // Not an error, and the single most useful thing to know: this device never registered, or
         // its token was deleted as stale.
         p.log(format!("[push] user={user} mode={mode_name} token=0 -> not sent (no registered device)"));
-        return t;
+        return;
     }
     t.tokens = rows.len();
 
-    // NO wake debounce. A 20s per-recipient+device debounce suppressed legitimate follow-up
-    // messages arriving just after a drain finished — no wake, no delivery, a single tick and no
-    // notification. `delivered_live` (message.rs) already prevents wakes during a drain over an
-    // active WS, so a debounce is redundant as well as harmful. Every undelivered message gets its
-    // wake.
+    // No time-only debounce here. A 20s per-recipient+device debounce once suppressed legitimate
+    // follow-up messages arriving just after a drain finished — no wake, no delivery, a single
+    // tick and no notification. The gate in `wake_with` also asks whether the device connected
+    // since (`coalesce.rs`), which is the half that debounce lacked.
     //
     // `reached`: the own project has woken a device — recorded before, or earlier in this wake.
     let mut reached = matches!(mode, SendMode::Direct { reached: true, .. });
     for row in &rows {
         let (project_id, service_account, fallback) = match &mode {
             SendMode::Relay { url } => {
-                via_relay(p, user, url, row, &mut t).await;
+                via_relay(p, user, url, row, t).await;
                 continue;
             }
             SendMode::Direct { project_id, service_account, fallback, .. } => {
@@ -192,19 +261,20 @@ pub(crate) async fn wake_with<P: WakePort>(
         // relay, never direct again until the device registers another token (`handlers.rs`).
         // Every decision here is about one token: no wake moves any other device's route.
         if row.relay_project.as_deref() == Some(project_id.as_str()) {
-            relay_refused(p, user, fallback, row, &mut t).await;
+            relay_refused(p, user, fallback, row, t).await;
             continue;
         }
         match p.direct(project_id, service_account, &row.fcm_token, row.style()).await {
             DirectSend::Sent => {
                 t.ok += 1;
+                t.woke.push(row.device_id.clone());
                 if !reached {
                     reached = true;
                     let v = ProjectVerdict { at: p.now(), project: project_id.clone() };
                     p.record_reached(v).await;
                 }
             }
-            DirectSend::Stale => stale(p, user, row, &mut t).await,
+            DirectSend::Stale => stale(p, user, row, t).await,
             // K8: this token was minted by another Firebase project — the published app's, which
             // the shared relay serves. This wake is resent there so it is not lost, and the token
             // is marked so the next one goes there first. Marked after the relay's answer: a token
@@ -216,7 +286,7 @@ pub(crate) async fn wake_with<P: WakePort>(
                     row.device_id
                 ));
                 t.routed += 1;
-                if relay_refused(p, user, fallback, row, &mut t).await {
+                if relay_refused(p, user, fallback, row, t).await {
                     p.route_via_relay(row, project_id).await;
                 }
             }
@@ -227,10 +297,16 @@ pub(crate) async fn wake_with<P: WakePort>(
         }
     }
     p.log(format!(
-        "[push] user={user} mode={mode_name} token={} ok={} stale={} failed={} relayed={} routed={}",
-        t.tokens, t.ok, t.stale, t.failed, t.relayed, t.routed
+        "[push] user={user} mode={mode_name} token={} ok={} stale={} failed={} relayed={} routed={} \
+         coalesced={}",
+        t.tokens,
+        t.ok,
+        t.stale,
+        t.failed,
+        t.relayed,
+        t.routed,
+        t.coalesced.len()
     ));
-    t
 }
 
 /// A token the own project cannot reach, through the shared relay — or nowhere with the relay off.
@@ -257,7 +333,10 @@ async fn relay_refused<P: WakePort>(
 /// One token through the shared relay. Answers whether the token is still registered.
 async fn via_relay<P: WakePort>(p: &P, user: &str, url: &str, row: &TokenRow, t: &mut WakeTally) -> bool {
     match p.relay(url, &row.fcm_token, row.style()).await {
-        Ok(true) => t.ok += 1,
+        Ok(true) => {
+            t.ok += 1;
+            t.woke.push(row.device_id.clone());
+        }
         Ok(false) => {
             stale(p, user, row, t).await;
             return false;
@@ -283,11 +362,12 @@ async fn stale<P: WakePort>(p: &P, user: &str, row: &TokenRow, t: &mut WakeTally
     p.delete_token(&row.device_id).await;
 }
 
-/// The production port: D1, KV, Google and the relay.
+/// The production port: D1, KV, Google and the relay — and the inbox's own marks.
 struct D1Wake<'a> {
     env: &'a Env,
     db: &'a D1Database,
     user: &'a str,
+    marks: &'a dyn WakeMarks,
 }
 
 impl WakePort for D1Wake<'_> {
@@ -345,6 +425,14 @@ impl WakePort for D1Wake<'_> {
 
     fn now(&self) -> i64 {
         now_secs() as i64
+    }
+
+    fn marks(&self) -> &dyn WakeMarks {
+        self.marks
+    }
+
+    fn now_ms(&self) -> i64 {
+        crate::utils::now_ms() as i64
     }
 
     fn log(&self, line: String) {

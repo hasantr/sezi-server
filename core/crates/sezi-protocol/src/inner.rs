@@ -833,6 +833,45 @@ pub enum InnerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
     },
+    /// "Delete for everyone" in a ROOM: the author takes back a message of theirs. Invisible
+    /// control (NO UI row), a durable op over the room's Megolm. It names its target as a
+    /// reaction does — the target's `msg_uid` and its author — never the relay's `msg_id`, which
+    /// is per device. Each receiving device honours it only from that author, only for a copy it
+    /// holds, and only inside the server's delete window (`kernel/group_delete.rs`).
+    ///
+    /// A 1:1 keeps its older `delete-msg/v1:` text marker; this variant arriving over Olm is
+    /// dropped. My own other devices learn of the delete from `DeleteSelfSync`, as for any
+    /// delete. An older build decodes it as `Unknown`.
+    ///
+    /// Not `msg_uid` for the target's id: `ChatPayload.msg_uid` shadows a variant field of that
+    /// name under `flatten` (the `GroupOutboundCopy::origin_local_id` hazard).
+    RoomDelete {
+        target_uid: String,
+        target_by: String,
+    },
+    /// An edit: the author's new words for a text message of theirs — `crate::edit`. Invisible
+    /// control (NO UI row), a durable op that must arrive. It names its target as a reaction does
+    /// (the target's `msg_uid` and its author) and carries the whole new `content`, a `Text` or a
+    /// `RichText`; `mentions` are the new text's spans in a group, judged again on arrival.
+    /// Last writer wins per message by `at_ms`, the editor's clock.
+    ///
+    /// It travels as a reaction does: Megolm in a group, Olm to every device of the peer in a
+    /// 1:1, and self-Olm to my own other devices — the one copy that says `conversation`. An
+    /// older build decodes it as `Unknown`; one from 2026-10-29 on drops it silently, since the
+    /// payload says it is invisible ([`InnerMessage::is_invisible`]).
+    ///
+    /// Not `msg_uid` for the target's id, nor `ext` for the spans: `ChatPayload` shadows both
+    /// names under `flatten` (the `GroupOutboundCopy::origin_local_id` hazard).
+    MessageEdit {
+        target_uid: String,
+        target_by: String,
+        content: Box<InnerMessage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<crate::mentions::MentionSpan>,
+        at_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
     /// Forward-compatibility catch-all — messages carrying an unknown `kind` tag land here.
     /// Thanks to `#[serde(other)]` the payload of any unrecognized tag is silently
     /// swallowed; the decrypt chain does not collapse.
@@ -979,6 +1018,25 @@ impl InnerMessage {
         )
     }
 
+    /// Is this a kind that never becomes a row on any device — an invisible control — that a
+    /// build which does not know it must therefore drop silently rather than show as an
+    /// "Unsupported message"? `ChatPayload::new` writes the answer onto the wire
+    /// ([`ChatPayload::invisible`]); a receiver reads it only for a kind it decoded as `Unknown`.
+    ///
+    /// **Every invisible kind added from now on goes here**, or a build that predates it shows
+    /// junk for each one (reactions did, before this existed). Listing a kind every receiver
+    /// already knows changes nothing for them, so the older invisible kinds are not listed; a
+    /// visible kind listed here would vanish without a trace on an older build, so only list
+    /// what is never a row.
+    pub fn is_invisible(&self) -> bool {
+        matches!(
+            self,
+            InnerMessage::Reaction { .. }
+                | InnerMessage::RoomDelete { .. }
+                | InnerMessage::MessageEdit { .. }
+        )
+    }
+
     /// Is this inner a GROUP-oriented control message? `true` → it must be fanned out to ALL
     /// active devices of the recipient USER (`SendGroupFanout`) and must NEVER go primary-only
     /// (`SendControl`) — otherwise the recipient's sibling device CANNOT receive the group key
@@ -994,8 +1052,13 @@ impl InnerMessage {
     ///   device waiting for it is the one that SENT the file, which may be a linked one. Its
     ///   call sites send `SendGroupFanout`; listing it here redirects an ack row a build before
     ///   2026-10-15 queued as `SendControl`.
-    /// - EXCLUDED (stay primary-only): REQUEST/PULL triggers (`*Request` — idempotent, the
-    ///   requesting device simply asks again) + the self-state path
+    /// - A room key request (`RoomKeyRequest`) → fan out: the session it asks for is the outbound
+    ///   session of whichever device of the member sent the message, and a device that does not
+    ///   own it answers with its own current key or nothing. Asked of the primary alone, a linked
+    ///   device's lost key was never recovered (2026-10-30). Its call site sends
+    ///   `SendGroupFanout`; listing it here redirects a request row an older build queued.
+    /// - EXCLUDED (stay primary-only): the other REQUEST/PULL triggers (`*Request` — idempotent,
+    ///   the requesting device simply asks again) + the self-state path
     ///   (`RoomKeyGossip`/`*OutboundCopy`/`DeviceState*`/`ReadSelfSync` — these already reach
     ///   my own devices via `SendSelfState`) + 1:1 content (`Text`/`File`/...) + call
     ///   signaling (`CallSignal` — a separate real-time domain).
@@ -1014,6 +1077,7 @@ impl InnerMessage {
                 | InnerMessage::PluginInstall { room: Some(_), .. }
                 | InnerMessage::MediaReceived { .. }
                 | InnerMessage::P2pBlobReceived { .. }
+                | InnerMessage::RoomKeyRequest { .. }
         ) || matches!(self, InnerMessage::ActivityBatch { events }
             if events.iter().any(|e| e.scope.room_id().is_some()))
     }
@@ -1034,6 +1098,7 @@ impl InnerMessage {
             InnerMessage::PluginInstall { .. } => "PluginInstall",
             InnerMessage::MediaReceived { .. } => "MediaReceived",
             InnerMessage::P2pBlobReceived { .. } => "P2pBlobReceived",
+            InnerMessage::RoomKeyRequest { .. } => "RoomKeyRequest",
             _ => "other",
         }
     }

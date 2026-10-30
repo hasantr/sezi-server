@@ -34,6 +34,8 @@ impl UserInbox {
             Some(list) => list.iter().cloned().map(Some).collect(),
             None => vec![None],
         };
+        // Before anything is stored: what the wake must cover (`push::coalesce`).
+        let covers_ms = crate::utils::now_ms() as i64;
         let mut results = Vec::with_capacity(targets.len());
         let mut fresh_asleep: Vec<Option<String>> = Vec::new();
         let mut failure = None;
@@ -81,11 +83,20 @@ impl UserInbox {
                 );
                 let env = self.env.clone();
                 let user = body.recipient_id.clone();
+                let marks = self.wake_marks();
+                let ask = crate::push::coalesce::WakeAsk { covers_ms, urgent: msg.urgent };
                 // AFTER the answer: the caller does not wait for FCM, and this invocation pays.
                 self.state.wait_until(async move {
                     if let Ok(db) = env.d1("DB") {
-                        crate::push::wake::push_wake_devices(&env, &db, &user, devices.as_deref())
-                            .await;
+                        crate::push::wake::push_wake_devices(
+                            &env,
+                            &db,
+                            &marks,
+                            &user,
+                            devices.as_deref(),
+                            ask,
+                        )
+                        .await;
                     }
                 });
             }

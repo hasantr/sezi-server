@@ -198,6 +198,12 @@ pub struct ChatPayload {
     /// and keeps the JSON output clean.
     #[serde(default, skip_serializing_if = "is_default_ext")]
     pub ext: serde_json::Value,
+    /// The kind never becomes a row ([`InnerMessage::is_invisible`]), so a receiver that decodes
+    /// it as `Unknown` drops it silently instead of showing "Unsupported message"
+    /// ([`ChatPayload::drops_silently`]). Set by [`ChatPayload::new`]; absent (false) on every
+    /// visible message, whose payload stays byte for byte what it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invisible: bool,
     /// The actual message. Flattened at the JSON root (kind + variant fields).
     #[serde(flatten)]
     pub inner: InnerMessage,
@@ -215,8 +221,20 @@ impl ChatPayload {
             thread_title,
             msg_uid: None,
             ext: serde_json::Value::Null,
+            invisible: inner.is_invisible(),
             inner,
         }
+    }
+
+    /// A kind this build does not know, which its sender said is invisible: dropped and acked,
+    /// never a row.
+    pub fn drops_silently(&self) -> bool {
+        self.invisible && matches!(self.inner, InnerMessage::Unknown)
+    }
+
+    /// When the message was last edited (`crate::edit`), if it was.
+    pub fn edited_at(&self) -> Option<i64> {
+        crate::edit::edited_at(&self.ext)
     }
 
     /// Attach the group message correlation id — the sender calls this with `local_id` in
