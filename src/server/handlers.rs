@@ -102,6 +102,9 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         // With no env var — monorepo prod, or a manual deploy — 0 means "unknown" and the
         // client shows no badge. Keep this separate from `version`, the protocol version.
         "build": option_env!("SEZI_BUILD").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        // The other direction: the oldest APP this relay works with (`client_level.rs`). An app
+        // below it tells its person to update; raised only with the core's `CLIENT_LEVEL`.
+        "min_client_level": crate::server::client_level::MIN_CLIENT_LEVEL,
         "name": name,
         "server_fingerprint": server_instance_fingerprint(&ctx.env)?,
         "server_instance_fingerprint": server_instance_fingerprint(&ctx.env)?,

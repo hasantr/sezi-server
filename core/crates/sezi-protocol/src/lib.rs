@@ -2,6 +2,7 @@
 
 pub mod activity_batch;
 pub mod bots;
+pub mod client_level;
 pub mod devices;
 pub mod edit;
 pub mod envelope;

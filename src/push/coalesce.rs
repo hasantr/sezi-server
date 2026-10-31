@@ -43,7 +43,13 @@
 //! subrequest at all and a skipped wake costs nothing but a local read.
 
 /// How long one wake stands in for the next ones to the same, unseen device.
-pub(crate) const WAKE_COALESCE_MS: i64 = 30_000;
+///
+/// 10 s, not the 30 s it started at (field, 2026-10-31): Honor's battery manager drops every
+/// wake lock of a background app about 3 s after a push, so a drain that needs longer sleeps
+/// mid-connect until the next push — and 30 s of coalescing held that push back while the
+/// sender's texts and a photo waited. A drain that has not connected in 10 s is not coming.
+/// The floor is the shared relay's rate limit: six pushes a minute per token, one every 10 s.
+pub(crate) const WAKE_COALESCE_MS: i64 = 10_000;
 
 /// The mark of a device-blind wake (a row with no device, from before device addressing): every
 /// device's connection counts as seen for it.
