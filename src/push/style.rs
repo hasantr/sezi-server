@@ -1,7 +1,10 @@
 //! How a wake shows itself on the device it reaches — the one place its FCM message is built.
 //!
-//! **`data`** (every device, the default): `data:{type:"wake"}` and nothing else. The app's own
-//! process wakes, decrypts what is waiting and draws the real notification itself.
+//! **`data`** (every device, the default): `data:{type:"wake"}`, plus — when the wake is for one
+//! stored frame that fits, for a device that fetched its push key — that frame under `msg`, sealed
+//! to the device (`carry.rs`): the end-to-end encrypted envelope the relay already queues, never
+//! plaintext, and to Google an opaque blob. The app's own process wakes, decrypts what it was
+//! handed and what is waiting, and draws the real notification itself.
 //!
 //! **`visible`** (a device that told us it cannot be woken that way): the same data, plus an
 //! `android.notification` block the OS draws WITHOUT starting the app. It exists for Xiaomi's
@@ -17,6 +20,8 @@
 //! so ten messages are one notification, not ten.
 
 use serde_json::{json, Value};
+
+use super::carry::DATA_KEY;
 
 /// The notification channel the app creates (`fcm_service.dart`'s `_kMsgChannel`).
 pub(crate) const CHANNEL: &str = "sezgi_messages_v2";
@@ -97,10 +102,12 @@ impl WakeStyle {
     }
 }
 
-/// The FCM HTTP v1 `messages:send` body for one wake.
+/// The FCM HTTP v1 `messages:send` body for one wake. `carry` is the frame a data wake carries
+/// (`carry.rs`); a visible wake carries nothing, whatever it is handed — the OS draws it without
+/// starting the app, so a payload would reach nobody.
 ///
-/// A data wake is the message every device got before visible wakes existed, byte for byte
-/// (`style_tests.rs` holds it to that). data-ONLY is what makes Android hand a terminated app its
+/// A data wake with nothing to carry is the message every device got before visible wakes
+/// existed, byte for byte (`style_tests.rs` holds it to that). data-ONLY is what makes Android hand a terminated app its
 /// `onBackgroundMessage`; `priority: high` takes it out of doze.
 ///
 /// **No `android.collapse_key`, deliberately** (weighed 2026-10-30, after the ZH wake storm). It
@@ -113,12 +120,12 @@ impl WakeStyle {
 /// they start instead: one per unseen device per window (`coalesce.rs`). A visible wake is a
 /// notification message, which FCM always treats as collapsible and whose `collapse_key` it
 /// ignores; its `tag` already collapses what the user sees.
-pub(crate) fn fcm_message(token: &str, style: WakeStyle) -> Value {
+pub(crate) fn fcm_message(token: &str, style: WakeStyle, carry: Option<&str>) -> Value {
     match style {
         WakeStyle::Data => json!({
             "message": {
                 "token": token,
-                "data": { "type": "wake" },
+                "data": wake_data(carry),
                 "android": { "priority": "high" }
             }
         }),
@@ -145,13 +152,30 @@ pub(crate) fn fcm_message(token: &str, style: WakeStyle) -> Value {
     }
 }
 
-/// The shared push relay's `/wake` body (`push-relay/src/index.js`). A data wake sends what it
-/// always sent, `{token}`; a relay that predates visible wakes ignores the two extra fields and
-/// sends a data wake, which is what that device got before.
-pub(crate) fn relay_body(token: &str, style: WakeStyle) -> Value {
-    match style {
-        WakeStyle::Data => json!({ "token": token }),
-        WakeStyle::Visible(lang) => json!({ "token": token, "wake": "visible", "lang": lang.code() }),
+/// A data wake's `data` map: the wake, and the carried frame when there is one.
+fn wake_data(carry: Option<&str>) -> Value {
+    let mut data = json!({ "type": "wake" });
+    if let Some(frame) = carry {
+        data[DATA_KEY] = json!(frame);
+    }
+    data
+}
+
+/// The shared push relay's `/wake` body (`push-relay/src/index.js`). A data wake with nothing to
+/// carry sends what it always sent, `{token}`; one that carries a frame adds
+/// `data:{msg:<frame>}`. A relay that predates either ignores the fields it does not know and
+/// sends a plain data wake, which is what that device got before.
+pub(crate) fn relay_body(token: &str, style: WakeStyle, carry: Option<&str>) -> Value {
+    match (style, carry) {
+        (WakeStyle::Data, None) => json!({ "token": token }),
+        (WakeStyle::Data, Some(frame)) => {
+            let mut data = json!({});
+            data[DATA_KEY] = json!(frame);
+            json!({ "token": token, "data": data })
+        }
+        (WakeStyle::Visible(lang), _) => {
+            json!({ "token": token, "wake": "visible", "lang": lang.code() })
+        }
     }
 }
 

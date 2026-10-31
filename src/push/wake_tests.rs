@@ -93,6 +93,8 @@ pub(crate) struct FakeWake {
     pub(crate) logs: RefCell<Vec<String>>,
     /// At each push, how many keys held a mark — what an envelope arriving mid-send would read.
     pub(crate) marked_at_send: RefCell<Vec<usize>>,
+    /// The frames the next wake carries, per device (`carry.rs`).
+    pub(crate) carried: RefCell<Carried>,
 }
 
 pub(crate) const MINT: usize = 3;
@@ -158,6 +160,7 @@ impl FakeWake {
             clock_ms: Cell::new(1_700_000_000_000),
             logs: RefCell::new(Vec::new()),
             marked_at_send: RefCell::new(Vec::new()),
+            carried: RefCell::new(Carried::none()),
         }
     }
     fn note_send(&self) {
@@ -169,7 +172,8 @@ impl FakeWake {
     pub(crate) fn wake(&self) -> WakeTally {
         self.advance(super::super::coalesce::WAKE_COALESCE_MS);
         self.calls.borrow_mut().clear();
-        block_on(wake_with(self, "u", None, WakeAsk::ordinary(self.clock_ms.get())))
+        let carried = self.carried.borrow().clone();
+        block_on(wake_with(self, "u", None, WakeAsk::ordinary(self.clock_ms.get()), &carried))
     }
     /// An ordinary wake to `devices` now, covering from now (the envelope is stored this instant).
     pub(crate) fn wake_devices(&self, devices: &[&str]) -> WakeTally {
@@ -183,7 +187,8 @@ impl FakeWake {
         self.calls.borrow_mut().clear();
         let devices: Vec<String> = devices.iter().map(|d| d.to_string()).collect();
         let ask = WakeAsk { covers_ms: self.clock_ms.get(), urgent };
-        block_on(wake_with(self, "u", Some(&devices), ask))
+        let carried = self.carried.borrow().clone();
+        block_on(wake_with(self, "u", Some(&devices), ask, &carried))
     }
     pub(crate) fn advance(&self, ms: i64) {
         self.clock_ms.set(self.clock_ms.get() + ms);
@@ -214,19 +219,27 @@ impl WakePort for FakeWake {
             _ => rows,
         })
     }
-    async fn direct(&self, project_id: &str, _sa: &str, token: &str, style: WakeStyle) -> DirectSend {
+    async fn direct(
+        &self,
+        project_id: &str,
+        _sa: &str,
+        token: &str,
+        style: WakeStyle,
+        carry: Option<&str>,
+    ) -> DirectSend {
         assert_eq!(project_id, "owner-proj");
         if !self.minted.replace(true) {
             self.spent.set(self.spent.get() + MINT);
         }
         self.note_send();
-        self.tick(format!("direct:{token}{}", style_mark(style)));
+        self.tick(format!("direct:{token}{}{}", style_mark(style), carry_mark(carry)));
         (self.direct_answer)(token)
     }
-    async fn relay(&self, url: &str, token: &str, style: WakeStyle) -> Result<bool> {
+    async fn relay(&self, url: &str, token: &str, style: WakeStyle, carry: Option<&str>)
+        -> Result<bool> {
         assert_eq!(url, "https://relay");
         self.note_send();
-        self.tick(format!("relay:{token}{}", style_mark(style)));
+        self.tick(format!("relay:{token}{}{}", style_mark(style), carry_mark(carry)));
         (self.relay_answer)(token)
     }
     async fn delete_token(&self, device_id: &str) {
@@ -265,6 +278,20 @@ fn style_mark(style: WakeStyle) -> String {
         WakeStyle::Data => String::new(),
         WakeStyle::Visible(l) => format!(":visible-{}", l.code()),
     }
+}
+
+/// A carried frame shows its row id, so a test sees WHICH device's frame went with a token.
+fn carry_mark(carry: Option<&str>) -> String {
+    match carry {
+        None => String::new(),
+        Some(f) => format!(":carry-{}", SEALED_IDS.with(|m| m.borrow()[f])),
+    }
+}
+
+thread_local! {
+    /// Sealed frame → the row id sealed in it, as `carried_for` sealed them: what lets a call
+    /// line name WHICH row a token's wake carried.
+    static SEALED_IDS: RefCell<std::collections::HashMap<String, i64>> = RefCell::default();
 }
 
 /// FCM's answer for a token another project minted — what every published-app phone gets.
@@ -727,12 +754,80 @@ fn the_send_flags_read_conservatively() {
 fn a_blind_wake_is_coalesced_until_any_device_connects() {
     let f = relay_fleet(2);
     let now = |f: &FakeWake| WakeAsk::ordinary(f.clock_ms.get());
-    block_on(wake_with(&f, "u", None, now(&f)));
+    block_on(wake_with(&f, "u", None, now(&f), &Carried::none()));
     f.advance(1_000);
-    let t = block_on(wake_with(&f, "u", None, now(&f)));
+    let t = block_on(wake_with(&f, "u", None, now(&f), &Carried::none()));
     assert_eq!(t.coalesced, [BLIND_KEY]);
     f.marks.seen("d1", f.clock_ms.get());
     f.advance(1);
-    let t = block_on(wake_with(&f, "u", None, now(&f)));
+    let t = block_on(wake_with(&f, "u", None, now(&f), &Carried::none()));
     assert_eq!(t.woke, ["d0", "d1"]);
+}
+
+// ---- The frame a wake carries (`carry.rs`) ----
+
+fn carried_for(devices: &[(&str, i64)]) -> Carried {
+    let mut c = Carried::none();
+    let key = super::super::carry::PushKey { id: "k".into(), key: [1; 32] };
+    for (d, id) in devices {
+        let frame = serde_json::json!({ "type": "msg", "id": id, "envelope_b64": "ZW52" });
+        assert!(c.add(d, &frame, Some(&key)));
+        let sealed = c.for_device(d).unwrap().to_string();
+        SEALED_IDS.with(|m| m.borrow_mut().insert(sealed, *id));
+    }
+    c
+}
+
+/// Each data token carries its own device's frame, through Google and through the relay alike; a
+/// visible token carries nothing, and the tally counts what went out carried.
+#[test]
+fn each_device_carries_its_own_frame_and_a_visible_one_none() {
+    let f = FakeWake::own(3, first_own_build, relay_ok);
+    f.tokens.borrow_mut()[2].wake = Some("visible".into());
+    *f.carried.borrow_mut() = carried_for(&[("d0", 10), ("d1", 11), ("d2", 12)]);
+    let t = f.wake_devices(&["d0", "d1", "d2"]);
+    assert_eq!(
+        f.calls(),
+        [
+            "direct:t0:carry-10",
+            "record:reached",
+            "direct:t1:carry-11",
+            "relay:t1:carry-11",
+            "route:d1",
+            "direct:t2:visible-tr",
+            "relay:t2:visible-tr",
+            "route:d2"
+        ]
+    );
+    assert_eq!((t.ok, t.carried), (3, 2));
+}
+
+/// A device-blind wake names no one device's row: it carries nothing, whatever it is handed.
+#[test]
+fn a_blind_wake_carries_nothing() {
+    let f = relay_fleet(2);
+    *f.carried.borrow_mut() = carried_for(&[("d0", 10)]);
+    let t = f.wake();
+    assert_eq!(f.calls(), ["relay:t0", "relay:t1"]);
+    assert_eq!(t.carried, 0);
+}
+
+/// A carrying wake marks the gate like any other: the envelope right behind it, to the same
+/// unseen device, is coalesced — the drain the first one starts fetches it — and goes out in no
+/// push of its own. A connection since lets the next one through, carried.
+#[test]
+fn a_carrying_wake_marks_the_gate() {
+    let f = relay_fleet(1);
+    *f.carried.borrow_mut() = carried_for(&[("d0", 1)]);
+    assert_eq!(f.wake_devices(&["d0"]).carried, 1);
+    f.advance(500);
+    *f.carried.borrow_mut() = carried_for(&[("d0", 2)]);
+    let t = f.wake_devices(&["d0"]);
+    assert_eq!((t.coalesced, t.carried), (vec!["d0".to_string()], 0));
+    assert!(f.calls().is_empty());
+    f.marks.seen("d0", f.clock_ms.get());
+    f.advance(1);
+    *f.carried.borrow_mut() = carried_for(&[("d0", 3)]);
+    f.wake_devices(&["d0"]);
+    assert_eq!(f.calls(), ["relay:t0:carry-3"]);
 }

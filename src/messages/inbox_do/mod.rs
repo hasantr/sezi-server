@@ -11,6 +11,7 @@ mod forward;
 mod member_notify;
 mod message;
 mod receipt;
+mod push_keys;
 mod self_read;
 mod takeover_nudge;
 mod wake_gate;
@@ -301,7 +302,7 @@ impl DurableObject for UserInbox {
                 let body: NotifyBody = req.json().await?;
                 // Before the envelope is stored: what its wake must cover (`push::coalesce`).
                 let covers_ms = crate::utils::now_ms() as i64;
-                let (id, delivered_live, deduped) = self
+                let notified = self
                     .notify_inner(
                         &body.sender_id,
                         body.sender_device_id.as_deref(),
@@ -312,6 +313,7 @@ impl DurableObject for UserInbox {
                         body.silent,
                     )
                     .await?;
+                let (id, delivered_live) = (notified.id, notified.delivered_live);
                 if self.is_bot().await {
                     return self.bot_notified(id).await;
                 }
@@ -321,10 +323,15 @@ impl DurableObject for UserInbox {
                 self.ensure_alarm().await;
                 // No socket took it → the wake, from HERE (`wake_gate.rs`): the caller no longer
                 // sends one. Silent control traffic wakes nobody (its row says so for the
-                // backstop too), and a dedup hit was woken by the call that stored it.
-                if !delivered_live && !deduped && !body.silent {
+                // backstop too), and a dedup hit was woken by the call that stored it. The wake
+                // carries the frame it is for when that fits (`push::carry`).
+                if !delivered_live && !notified.deduped && !body.silent {
                     let ask = crate::push::coalesce::WakeAsk { covers_ms, urgent: body.urgent };
-                    self.wake_after_notify(body.recipient_id, body.recipient_device_id, ask);
+                    let mut carried = crate::push::carry::Carried::none();
+                    if let (Some(device), Some(frame)) = (&body.recipient_device_id, &notified.frame) {
+                        carried.add(device, frame, self.push_key(device).as_ref());
+                    }
+                    self.wake_after_notify(body.recipient_id, body.recipient_device_id, ask, carried);
                 }
                 Response::from_json(
                     &serde_json::json!({ "id": id, "delivered_live": delivered_live }),
@@ -648,6 +655,8 @@ impl UserInbox {
         );
         // The wake coalescing gate (`wake_gate.rs`).
         storage.sql().exec_raw(wake_gate::WAKE_GATE_TABLE_SQL, sql_no_args())?;
+        // Each device's push key (`push_keys.rs`).
+        storage.sql().exec_raw(push_keys::PUSH_KEYS_TABLE_SQL, sql_no_args())?;
         // The initial arm goes through `ensure_alarm` (3 bounded retries, logs on failure) rather
         // than a single swallowed `set_alarm`: if the first arm fails and no WS reconnect ever
         // happens, the backstop never runs.

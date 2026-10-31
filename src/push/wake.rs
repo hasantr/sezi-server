@@ -9,6 +9,7 @@
 use serde::Deserialize;
 use worker::*;
 
+use super::carry::Carried;
 use super::coalesce::{gate, Gate, WakeAsk, WakeMarks, BLIND_KEY};
 use super::config::{self, ProjectVerdict, PushConfig, SendMode, KEY_OWN_REACHED};
 use super::fcm::{send_wake, send_wake_relay, DirectSend};
@@ -16,7 +17,8 @@ use super::style::WakeStyle;
 use crate::d1util::d1_text;
 use crate::utils::now_secs;
 
-/// Recipient is OFFLINE → a contentless wake to their registered push tokens.
+/// Recipient is OFFLINE → a wake to their registered push tokens, carrying the frame it is for
+/// where `carried` has one for that device (`carry.rs`).
 /// `recipient_device_id` Some → that device only; None → ALL of the user's devices.
 /// Best-effort: own config → direct FCM, else the shared relay, and with the relay `off` a silent
 /// no-op. A stale token is deleted from `push_tokens`. `marks` and `ask` are the coalescing
@@ -29,10 +31,14 @@ pub async fn maybe_push_wake(
     recipient_id: &str,
     recipient_device_id: Option<&str>,
     ask: WakeAsk,
+    carried: &Carried,
 ) -> WakeTally {
     match recipient_device_id {
-        Some(d) => push_wake_devices(env, db, marks, recipient_id, Some(&[d.to_string()]), ask).await,
-        None => push_wake_devices(env, db, marks, recipient_id, None, ask).await,
+        Some(d) => {
+            let devices = [d.to_string()];
+            push_wake_devices(env, db, marks, recipient_id, Some(&devices), ask, carried).await
+        }
+        None => push_wake_devices(env, db, marks, recipient_id, None, ask, carried).await,
     }
 }
 
@@ -88,10 +94,18 @@ pub(crate) trait WakePort {
     /// One device's token (`devices` of one), or the user's newest tokens (one D1 query).
     async fn tokens(&self, devices: Option<&[String]>) -> Result<Vec<TokenRow>>;
     /// A send through the owner's own project (the OAuth mint, when due, rides on the first).
-    async fn direct(&self, project_id: &str, service_account: &str, token: &str, style: WakeStyle)
-        -> DirectSend;
+    /// `carry` is the frame this token's wake carries (`carry.rs`), if any.
+    async fn direct(
+        &self,
+        project_id: &str,
+        service_account: &str,
+        token: &str,
+        style: WakeStyle,
+        carry: Option<&str>,
+    ) -> DirectSend;
     /// A send through the shared relay: Ok(true) sent, Ok(false) stale, Err failed.
-    async fn relay(&self, url: &str, token: &str, style: WakeStyle) -> Result<bool>;
+    async fn relay(&self, url: &str, token: &str, style: WakeStyle, carry: Option<&str>)
+        -> Result<bool>;
     async fn delete_token(&self, device_id: &str);
     /// Record that the owner's own project has reached a device (`config::KEY_OWN_REACHED`).
     async fn record_reached(&self, verdict: ProjectVerdict);
@@ -123,12 +137,15 @@ pub(crate) struct WakeTally {
     pub(crate) coalesced: Vec<String>,
     /// The devices a push went out to.
     pub(crate) woke: Vec<String>,
+    /// Of the sends that went out, those carrying their frame (`carry.rs`).
+    pub(crate) carried: usize,
 }
 
-/// One member's offline devices → a contentless wake to each. The send mode is resolved ONCE and
-/// the tokens are read in ONE query however many devices are named, which is what lets a group
-/// member's whole wake cost a few D1 reads plus one fetch per token (D8: the recipient's inbox DO
-/// calls this for the devices of one `/notify-member`).
+/// One member's offline devices → a wake to each, carrying the frame `carried` holds for that
+/// device. The send mode is resolved ONCE and the tokens are read in ONE query however many
+/// devices are named, which is what lets a group member's whole wake cost a few D1 reads plus one
+/// fetch per token (D8: the recipient's inbox DO calls this for the devices of one
+/// `/notify-member`).
 /// `devices` Some → those devices only (an empty list wakes nobody); None → every device.
 pub async fn push_wake_devices(
     env: &Env,
@@ -137,9 +154,10 @@ pub async fn push_wake_devices(
     recipient_id: &str,
     devices: Option<&[String]>,
     ask: WakeAsk,
+    carried: &Carried,
 ) -> WakeTally {
     let port = D1Wake { env, db, user: recipient_id, marks };
-    wake_with(&port, recipient_id, devices, ask).await
+    wake_with(&port, recipient_id, devices, ask, carried).await
 }
 
 /// The wake behind the gate (`coalesce.rs`). A device whose last wake is still to be fetched is
@@ -148,11 +166,15 @@ pub async fn push_wake_devices(
 /// AFTER the send: a wake that failed (a 429 from the shared relay, a token query error, no
 /// token, push switched off) never stands in for the next one, and one still in flight silences
 /// nothing that arrives meanwhile.
+///
+/// A wake that carries its frame passes the gate and marks it like any other (`carry.rs` says
+/// why): the phone's drain still runs after reading it, and that connection clears the mark.
 pub(crate) async fn wake_with<P: WakePort>(
     p: &P,
     user: &str,
     devices: Option<&[String]>,
     ask: WakeAsk,
+    carried: &Carried,
 ) -> WakeTally {
     let mut t = WakeTally::default();
     if devices.is_some_and(|d| d.is_empty()) {
@@ -188,7 +210,10 @@ pub(crate) async fn wake_with<P: WakePort>(
         return t;
     }
     let blind = devices.is_none();
-    send(p, user, if blind { None } else { Some(&granted) }, &mut t).await;
+    // A device-blind wake names no row of one device, so it carries nothing.
+    let none = Carried::none();
+    let carried = if blind { &none } else { carried };
+    send(p, user, if blind { None } else { Some(&granted) }, &mut t, carried).await;
     let reached: Vec<String> = if !blind {
         t.woke.clone()
     } else if t.woke.is_empty() {
@@ -208,7 +233,13 @@ pub(crate) async fn wake_with<P: WakePort>(
 /// closed" once had no answer. The mode is named because a server with no FCM configuration falls
 /// back to the shared relay, and its operator should not push through someone else's
 /// infrastructure unknowingly.
-async fn send<P: WakePort>(p: &P, user: &str, devices: Option<&[String]>, t: &mut WakeTally) {
+async fn send<P: WakePort>(
+    p: &P,
+    user: &str,
+    devices: Option<&[String]>,
+    t: &mut WakeTally,
+    carried: &Carried,
+) {
     let Some(mode) = p.config().await.and_then(|c| c.send_mode()) else {
         p.log(format!("[push] user={user} mode=off -> skipped (FCM not configured, or 'off')"));
         return;
@@ -248,9 +279,15 @@ async fn send<P: WakePort>(p: &P, user: &str, devices: Option<&[String]>, t: &mu
     // `reached`: the own project has woken a device — recorded before, or earlier in this wake.
     let mut reached = matches!(mode, SendMode::Direct { reached: true, .. });
     for row in &rows {
+        // This device's own row, for a data wake only: a visible one is drawn by the OS without
+        // starting the app, so a payload would reach nobody (`style.rs`).
+        let carry = match row.style() {
+            WakeStyle::Data => carried.for_device(&row.device_id),
+            WakeStyle::Visible(_) => None,
+        };
         let (project_id, service_account, fallback) = match &mode {
             SendMode::Relay { url } => {
-                via_relay(p, user, url, row, t).await;
+                via_relay(p, user, url, row, t, carry).await;
                 continue;
             }
             SendMode::Direct { project_id, service_account, fallback, .. } => {
@@ -261,12 +298,13 @@ async fn send<P: WakePort>(p: &P, user: &str, devices: Option<&[String]>, t: &mu
         // relay, never direct again until the device registers another token (`handlers.rs`).
         // Every decision here is about one token: no wake moves any other device's route.
         if row.relay_project.as_deref() == Some(project_id.as_str()) {
-            relay_refused(p, user, fallback, row, t).await;
+            relay_refused(p, user, fallback, row, t, carry).await;
             continue;
         }
-        match p.direct(project_id, service_account, &row.fcm_token, row.style()).await {
+        match p.direct(project_id, service_account, &row.fcm_token, row.style(), carry).await {
             DirectSend::Sent => {
                 t.ok += 1;
+                t.carried += usize::from(carry.is_some());
                 t.woke.push(row.device_id.clone());
                 if !reached {
                     reached = true;
@@ -286,7 +324,7 @@ async fn send<P: WakePort>(p: &P, user: &str, devices: Option<&[String]>, t: &mu
                     row.device_id
                 ));
                 t.routed += 1;
-                if relay_refused(p, user, fallback, row, t).await {
+                if relay_refused(p, user, fallback, row, t, carry).await {
                     p.route_via_relay(row, project_id).await;
                 }
             }
@@ -298,14 +336,15 @@ async fn send<P: WakePort>(p: &P, user: &str, devices: Option<&[String]>, t: &mu
     }
     p.log(format!(
         "[push] user={user} mode={mode_name} token={} ok={} stale={} failed={} relayed={} routed={} \
-         coalesced={}",
+         coalesced={} carried={}",
         t.tokens,
         t.ok,
         t.stale,
         t.failed,
         t.relayed,
         t.routed,
-        t.coalesced.len()
+        t.coalesced.len(),
+        t.carried
     ));
 }
 
@@ -317,6 +356,7 @@ async fn relay_refused<P: WakePort>(
     fallback: Option<&str>,
     row: &TokenRow,
     t: &mut WakeTally,
+    carry: Option<&str>,
 ) -> bool {
     let Some(url) = fallback else {
         t.failed += 1;
@@ -327,14 +367,22 @@ async fn relay_refused<P: WakePort>(
         return true;
     };
     t.relayed += 1;
-    via_relay(p, user, url, row, t).await
+    via_relay(p, user, url, row, t, carry).await
 }
 
 /// One token through the shared relay. Answers whether the token is still registered.
-async fn via_relay<P: WakePort>(p: &P, user: &str, url: &str, row: &TokenRow, t: &mut WakeTally) -> bool {
-    match p.relay(url, &row.fcm_token, row.style()).await {
+async fn via_relay<P: WakePort>(
+    p: &P,
+    user: &str,
+    url: &str,
+    row: &TokenRow,
+    t: &mut WakeTally,
+    carry: Option<&str>,
+) -> bool {
+    match p.relay(url, &row.fcm_token, row.style(), carry).await {
         Ok(true) => {
             t.ok += 1;
+            t.carried += usize::from(carry.is_some());
             t.woke.push(row.device_id.clone());
         }
         Ok(false) => {
@@ -389,12 +437,14 @@ impl WakePort for D1Wake<'_> {
         service_account: &str,
         token: &str,
         style: WakeStyle,
+        carry: Option<&str>,
     ) -> DirectSend {
-        send_wake(self.env, service_account, token, project_id, style).await
+        send_wake(self.env, service_account, token, project_id, style, carry).await
     }
 
-    async fn relay(&self, url: &str, token: &str, style: WakeStyle) -> Result<bool> {
-        send_wake_relay(url, token, style).await
+    async fn relay(&self, url: &str, token: &str, style: WakeStyle, carry: Option<&str>)
+        -> Result<bool> {
+        send_wake_relay(url, token, style, carry).await
     }
 
     async fn delete_token(&self, device_id: &str) {

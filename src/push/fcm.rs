@@ -1,7 +1,8 @@
-//! FCM HTTP v1 — CONTENTLESS wake push (the Signal pattern). It carries NO message
-//! content, only `data:{type:"wake"}` — and, for a device that cannot be woken, a fixed generic
-//! notification (`style.rs`). All Google learns is "a push happened, at this
-//! time": E2E is preserved and the content is decrypted on the device. That matches the
+//! FCM HTTP v1 — the wake push. It carries NO plaintext: `data:{type:"wake"}`, the frame it is
+//! for when that fits (its end-to-end encrypted envelope, sealed again to the device, `carry.rs`)
+//! — and, for a device that cannot be woken, a fixed generic notification instead (`style.rs`).
+//! Google learns "a push happened, at this time" and, for a carried frame, an opaque blob and its
+//! size: E2E is preserved and the content is decrypted on the device. That matches the
 //! closed-to-the-outside philosophy.
 //!
 //! Flow: service account (env secret `FCM_SERVICE_ACCOUNT`, JSON) → RS256-signed JWT →
@@ -161,19 +162,33 @@ pub(crate) enum DirectSend {
     Failed(String),
 }
 
-/// Send one CONTENTLESS wake push to a device through the owner's own project.
+/// Send one wake push to a device through the owner's own project — carrying `carry`, the frame
+/// it is for, when it has one (`carry.rs`).
 pub(crate) async fn send_wake(
     env: &Env,
     service_account: &str,
     fcm_token: &str,
     project_id: &str,
     style: WakeStyle,
+    carry: Option<&str>,
 ) -> DirectSend {
-    match send_wake_inner(env, service_account, fcm_token, project_id, style).await {
+    match send_wake_inner(env, service_account, fcm_token, project_id, style, carry).await {
+        // A carried frame Google refused with an ambiguous 400 (a payload it counts larger than
+        // we do): the wake itself must not be lost for it, so it goes again as the plain doorbell
+        // it always was. The push relay does the same (`push-relay/src/index.js`).
+        Ok(DirectSend::Failed(e)) if carry.is_some() && e == CARRY_REFUSED => {
+            match send_wake_inner(env, service_account, fcm_token, project_id, style, None).await {
+                Ok(d) => d,
+                Err(e) => DirectSend::Failed(format!("{e:?}")),
+            }
+        }
         Ok(d) => d,
         Err(e) => DirectSend::Failed(format!("{e:?}")),
     }
 }
+
+/// What `send_wake_inner` answers for an ambiguous 400 to a CARRYING wake.
+const CARRY_REFUSED: &str = "fcm: send 400 (carrying)";
 
 async fn send_wake_inner(
     env: &Env,
@@ -181,12 +196,13 @@ async fn send_wake_inner(
     fcm_token: &str,
     project_id: &str,
     style: WakeStyle,
+    carry: Option<&str>,
 ) -> Result<DirectSend> {
     let access_token = get_access_token(env, service_account).await?;
     let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
-    // data-only, or data plus a generic notification for a device that cannot be woken
-    // (`style.rs`). Neither carries content.
-    let payload = fcm_message(fcm_token, style).to_string();
+    // data-only (with the carried ciphertext when there is one), or data plus a generic
+    // notification for a device that cannot be woken (`style.rs`). Neither carries plaintext.
+    let payload = fcm_message(fcm_token, style, carry).to_string();
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     init.with_body(Some(payload.into()));
@@ -209,6 +225,9 @@ async fn send_wake_inner(
         FcmSendOutcome::Sent => DirectSend::Sent,
         FcmSendOutcome::Stale => DirectSend::Stale,
         FcmSendOutcome::SenderMismatch => DirectSend::SenderMismatch,
+        FcmSendOutcome::Transient if code == 400 && carry.is_some() => {
+            DirectSend::Failed(CARRY_REFUSED.to_string())
+        }
         // A temporary failure, so the token is KEPT (the caller warns; the next message or
         // alarm retries).
         FcmSendOutcome::Transient => DirectSend::Failed(format!("fcm: send {code}")),
@@ -302,9 +321,14 @@ fn body_signals_bad_token(body: &str) -> bool {
 /// its own service account, and the resend of a wake Google refused for the owner's own project
 /// (K8). Ok(true) = sent, Ok(false) = STALE (the caller deletes it from push_tokens; the relay forwards FCM's
 /// UNREGISTERED signal as `stale:true`), Err = transient (429 / 5xx / network).
-pub(crate) async fn send_wake_relay(relay_url: &str, fcm_token: &str, style: WakeStyle) -> Result<bool> {
+pub(crate) async fn send_wake_relay(
+    relay_url: &str,
+    fcm_token: &str,
+    style: WakeStyle,
+    carry: Option<&str>,
+) -> Result<bool> {
     let url = format!("{}/wake", relay_url.trim_end_matches('/'));
-    let payload = relay_body(fcm_token, style).to_string();
+    let payload = relay_body(fcm_token, style, carry).to_string();
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     init.with_body(Some(payload.into()));

@@ -153,6 +153,9 @@ impl UserInbox {
         let marks = self.wake_marks();
         // Never urgent: a ring is long over by the time a row is stale.
         let ask = crate::push::coalesce::WakeAsk::ordinary(crate::utils::now_ms() as i64);
+        // Content-free: a backstop wake stands for every stuck row of a device, which its drain
+        // fetches together (`push::carry`).
+        let none = crate::push::carry::Carried::none();
         let mut coalesced: Vec<String> = Vec::new();
         for r in &rows {
             let t = crate::push::wake::maybe_push_wake(
@@ -162,6 +165,7 @@ impl UserInbox {
                 &uid,
                 r.device_id.as_deref(),
                 ask,
+                &none,
             )
             .await;
             coalesced.extend(t.coalesced);

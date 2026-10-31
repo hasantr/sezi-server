@@ -88,7 +88,7 @@ const BODY_TR: &str = r#"
 <li>bildirim almak için cihazınızın bildirim belirteci (push token).</li>
 </ul>
 <h2>Bildirimler (Google Firebase Cloud Messaging)</h2>
-<p>Uygulama kapalıyken yeni mesajlardan haberdar olmanız için sunucu, Google'ın FCM hizmeti üzerinden cihazınızı uyandırır. Bu uyandırma mesajı içerik taşımaz; mesaj cihazınızda indirilip çözülür. Google, bildirimi iletmek için cihaz belirtecini ve uyandırmanın zamanını işler.</p>
+<p>Uygulama kapalıyken yeni mesajlardan haberdar olmanız için sunucu, Google'ın FCM hizmeti üzerinden cihazınızı uyandırır. Sığdığında bu uyandırma, mesajın uçtan uca şifreli hâlini de taşır — sunucunun yalnızca cihazınızla paylaştığı bir anahtarla ayrıca mühürlenmiş, Google için anlamsız bir veri olarak; mesajı yalnızca cihazınız çözebilir, ne Google ne sunucu okuyabilir. Sığmadığında uyandırma içerik taşımaz ve mesaj cihazınızda indirilip çözülür. Google, bildirimi iletmek için cihaz belirtecini, uyandırmanın zamanını ve taşıdığı mühürlü verinin boyutunu işler.</p>
 <h2>İzinler ve ne için kullanıldıkları</h2>
 <ul>
 <li><b>Kamera:</b> fotoğraf, video, görüntülü arama, QR kod okuma.</li>
@@ -129,7 +129,7 @@ const BODY_EN: &str = r#"
 <li>your device's push token, to wake it for new messages.</li>
 </ul>
 <h2>Notifications (Google Firebase Cloud Messaging)</h2>
-<p>To tell you about new messages while the app is closed, the server wakes your device through Google's FCM. The wake-up carries no message content; the message is fetched and decrypted on your device. Google processes the device token and the time of the wake-up to deliver it.</p>
+<p>To tell you about new messages while the app is closed, the server wakes your device through Google's FCM. When it fits, the wake-up also carries the message in its end-to-end encrypted form, sealed again under a key the server shares only with your device, so that to Google it is an opaque blob; only your device can decrypt the message — neither Google nor the server can read it. When it does not fit, the wake-up carries no content and the message is fetched and decrypted on your device. Google processes the device token, the time of the wake-up and the size of the sealed data it carries to deliver it.</p>
 <h2>Permissions and what they are for</h2>
 <ul>
 <li><b>Camera:</b> photos, video, video calls, scanning QR codes.</li>
@@ -177,10 +177,17 @@ mod tests {
         }
     }
 
-    /// The page says the wake push carries no content; `push/fcm.rs` is what makes that true.
+    /// The page says the wake push carries at most the end-to-end encrypted message, never its
+    /// plaintext; `push/fcm.rs` and `push/carry.rs` are what make that true.
     #[test]
     fn the_claim_about_wake_pushes_matches_the_sender() {
         let fcm = include_str!("push/fcm.rs");
-        assert!(fcm.contains("CONTENTLESS wake push"));
+        assert!(fcm.contains("It carries NO plaintext"));
+        let carry = include_str!("push/carry.rs");
+        assert!(carry.contains("the frame\n//! travels SEALED"));
+        assert!(render(Policy::Tr).contains("uçtan uca şifreli hâlini"));
+        assert!(render(Policy::Tr).contains("mühürlü verinin boyutunu"));
+        assert!(render(Policy::En).contains("end-to-end encrypted form, sealed again"));
+        assert!(render(Policy::En).contains("the size of the sealed data"));
     }
 }

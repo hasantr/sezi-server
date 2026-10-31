@@ -31,6 +31,11 @@ hmac = "0.12"
 # (wasm32 SIMD-yok fallback) — default-features kapalı.
 blake3 = { version = "1", default-features = false }
 
+# Sealing the frame a wake carries to its device (`push/carry.rs`). The core's own AEAD, so the
+# two halves of the sealed form are one primitive; no default features (the nonce comes from
+# `getrandom` below).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+
 # Encoding
 base64 = "0.22"
 hex = "0.4"

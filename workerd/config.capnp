@@ -11,8 +11,8 @@ const config :Workerd.Config = ( services = [
             esModule = embed "modules/core_user_sezi-server--__mf_do_wrapper.js" ),
           ( name = "shim.js",
             esModule = embed "modules/core_user_sezi-server--shim.js" ),
-          ( name = "90abd915b2b62df3930d0320d833f4ecd0fdd1f2-index_bg.wasm",
-            wasm = embed "modules/core_user_sezi-server--90abd915b2b62df3930d0320d833f4ecd0fdd1f2-index_bg.wasm" ) ],
+          ( name = "fc153ad752720844f4bad640f7785bb734290c48-index_bg.wasm",
+            wasm = embed "modules/core_user_sezi-server--fc153ad752720844f4bad640f7785bb734290c48-index_bg.wasm" ) ],
         compatibilityDate = "2026-05-01",
         compatibilityFlags = ["nodejs_compat"],
         bindings = [

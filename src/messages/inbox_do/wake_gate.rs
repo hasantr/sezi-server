@@ -9,6 +9,7 @@
 //! would have been coalesced is sent.
 
 use super::{UserInbox, RECIPIENT_UID_KEY};
+use crate::push::carry::Carried;
 use crate::push::coalesce::{WakeAsk, WakeMark, WakeMarks, BLIND_KEY};
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
@@ -102,12 +103,14 @@ impl UserInbox {
     /// `/notify`'s wake for an envelope no socket took. Sent from here, after the answer and out
     /// of this invocation's own budget, like `/notify-member`'s — so the sender's request no
     /// longer pays for it, and every wake goes through this inbox's gate. `ask.covers_ms` was
-    /// taken before the envelope was stored.
+    /// taken before the envelope was stored; `carried` is the frame the wake may carry
+    /// (`push::carry` — empty for a takeover nudge).
     pub(super) fn wake_after_notify(
         &self,
         recipient_id: Option<String>,
         device: Option<String>,
         ask: WakeAsk,
+        carried: Carried,
     ) {
         let env = self.env.clone();
         let storage = self.state.storage();
@@ -121,7 +124,8 @@ impl UserInbox {
             };
             let Ok(db) = env.d1("DB") else { return };
             let marks = DoWakeMarks::new(storage);
-            crate::push::wake::maybe_push_wake(&env, &db, &marks, &user, device.as_deref(), ask)
+            let device = device.as_deref();
+            crate::push::wake::maybe_push_wake(&env, &db, &marks, &user, device, ask, &carried)
                 .await;
         });
     }

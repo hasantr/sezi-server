@@ -28,7 +28,9 @@ impl UserInbox {
             let _ = socket.send_with_str(TAKEOVER_UPDATE_FRAME);
         }
         let ask = crate::push::coalesce::WakeAsk { covers_ms: crate::utils::now_ms() as i64, urgent: true };
-        self.wake_after_notify(Some(body.user_id), Some(body.device_id), ask);
+        // It carries nothing: the drain asks the relay what is open (`push::carry`).
+        let none = crate::push::carry::Carried::none();
+        self.wake_after_notify(Some(body.user_id), Some(body.device_id), ask, none);
         Response::empty().map(|r| r.with_status(204))
     }
 }

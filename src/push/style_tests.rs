@@ -16,9 +16,9 @@ fn a_data_wake_is_byte_identical_to_the_old_message() {
         }
     })
     .to_string();
-    assert_eq!(fcm_message(TOKEN, WakeStyle::Data).to_string(), legacy);
+    assert_eq!(fcm_message(TOKEN, WakeStyle::Data, None).to_string(), legacy);
     assert_eq!(
-        relay_body(TOKEN, WakeStyle::Data).to_string(),
+        relay_body(TOKEN, WakeStyle::Data, None).to_string(),
         serde_json::json!({ "token": TOKEN }).to_string(),
         "the relay body of a data wake is the old {{token}}"
     );
@@ -26,7 +26,7 @@ fn a_data_wake_is_byte_identical_to_the_old_message() {
 
 #[test]
 fn a_visible_wake_carries_the_generic_notification() {
-    let m = fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr));
+    let m = fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr), None);
     let n = &m["message"]["android"]["notification"];
     assert_eq!(n["title"], "Sezi");
     assert_eq!(n["body"], "Yeni mesaj");
@@ -38,7 +38,7 @@ fn a_visible_wake_carries_the_generic_notification() {
     assert_eq!(m["message"]["token"], TOKEN);
     // The data part stays, so a tap opens the app and a started app drains.
     assert_eq!(m["message"]["data"], serde_json::json!({ "type": "wake" }));
-    let en = fcm_message(TOKEN, WakeStyle::Visible(Lang::En));
+    let en = fcm_message(TOKEN, WakeStyle::Visible(Lang::En), None);
     assert_eq!(en["message"]["android"]["notification"]["body"], "New message");
 }
 
@@ -46,7 +46,7 @@ fn a_visible_wake_carries_the_generic_notification() {
 /// no extra data key, no field a later edit could fill with something the server knows.
 #[test]
 fn a_visible_wake_says_nothing_else() {
-    let m = fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr));
+    let m = fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr), None);
     let msg = m["message"].as_object().unwrap();
     let mut keys: Vec<&str> = msg.keys().map(String::as_str).collect();
     keys.sort();
@@ -68,8 +68,34 @@ fn a_visible_wake_says_nothing_else() {
 #[test]
 fn the_relay_body_of_a_visible_wake_names_its_style_and_language() {
     assert_eq!(
-        relay_body(TOKEN, WakeStyle::Visible(Lang::En)),
+        relay_body(TOKEN, WakeStyle::Visible(Lang::En), None),
         serde_json::json!({ "token": TOKEN, "wake": "visible", "lang": "en" })
+    );
+}
+
+/// A data wake carries its frame under `msg`, beside `type` — and nothing else changes.
+#[test]
+fn a_data_wake_carries_its_frame_under_msg() {
+    let frame = r#"{"type":"msg","id":7,"rd":"d1"}"#;
+    let m = fcm_message(TOKEN, WakeStyle::Data, Some(frame));
+    assert_eq!(m["message"]["data"], serde_json::json!({ "type": "wake", "msg": frame }));
+    assert_eq!(m["message"]["android"], serde_json::json!({ "priority": "high" }));
+    assert_eq!(
+        relay_body(TOKEN, WakeStyle::Data, Some(frame)),
+        serde_json::json!({ "token": TOKEN, "data": { "msg": frame } })
+    );
+}
+
+/// A visible wake carries nothing, whatever it is handed: the OS draws it without starting the
+/// app, and the relay is told only its style and language, as before.
+#[test]
+fn a_visible_wake_carries_nothing() {
+    let frame = r#"{"type":"msg","id":7,"rd":"d1"}"#;
+    let m = fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr), Some(frame));
+    assert_eq!(m, fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr), None));
+    assert_eq!(
+        relay_body(TOKEN, WakeStyle::Visible(Lang::En), Some(frame)),
+        relay_body(TOKEN, WakeStyle::Visible(Lang::En), None)
     );
 }
 

@@ -26,6 +26,17 @@ const PENDING_MAX_ROWS: i64 = 10_000;
 /// thanks to AUTOINCREMENT.
 const PENDING_CAP_ENFORCE_EVERY: i64 = 512;
 
+/// The most older rows `older_queued` counts: the phone asks only whether there are any.
+const OLDER_QUEUED_CAP: i64 = 100;
+
+/// 1:1 rows older than `?4`, from the same sender device, waiting for device `?1` (or device-blind,
+/// from a build that predates device addressing) — capped.
+pub(crate) const OLDER_QUEUED_SQL: &str = "SELECT COUNT(*) AS n FROM (
+    SELECT 1 FROM pending
+    WHERE (device_id = ?1 OR device_id IS NULL) AND sender_id = ?2 AND sender_device_id IS ?3 AND group_id IS NULL
+      AND id < ?4
+    LIMIT 100)";
+
 /// `last_seen_ms` from the WS attachment, if present. `None` must NOT be treated as fresh — the
 /// socket may be a zombie, so let the wake fire; the field is filled in on the first ping.
 pub(crate) fn ws_last_seen_ms(ws: &WebSocket) -> Option<i64> {
@@ -83,6 +94,17 @@ pub(crate) fn pending_frame(r: &PendingRow) -> String {
     .to_string()
 }
 
+/// What `notify_inner` did with one envelope.
+pub(crate) struct Notified {
+    /// The pending row's id.
+    pub(crate) id: i64,
+    pub(crate) delivered_live: bool,
+    pub(crate) deduped: bool,
+    /// The `msg` frame this call stored and pushed — what its wake may carry (`push::carry`).
+    /// None on a dedup hit: nothing was stored this time, and the call that stored it woke.
+    pub(crate) frame: Option<serde_json::Value>,
+}
+
 impl UserInbox {
     /// `silent` = the sender asked for no FCM wake (control traffic; see the core's
     /// `needs_device_wake`). It is persisted on the pending row for ONE reason: the W1 backstop
@@ -98,8 +120,8 @@ impl UserInbox {
         envelope_b64: &str,
         group_id: Option<&str>,
         silent: bool,
-    ) -> Result<(i64, bool, bool)> {
-        // Returns (pending_id, delivered_live, deduped). `delivered_live` answers "did the push
+    ) -> Result<Notified> {
+        // Returns `Notified`. `delivered_live` answers "did the push
         // reach at least one matching, genuinely-live (W1) socket?" — false means the recipient is
         // offline and the caller must send an FCM wake. `deduped` = this envelope was already here
         // (the in-memory 60 s cache or a pending row): nothing was stored or pushed this time, and
@@ -141,7 +163,7 @@ impl UserInbox {
             // `true`: on an in-request retry the first attempt's cross-DO response may be lost, so
             // the caller never saw that decision, and answering `true` would silently suppress the
             // FCM wake for an offline recipient.
-            return Ok((cached_id, cached_live, true));
+            return Ok(Notified { id: cached_id, delivered_live: cached_live, deduped: true, frame: None });
         }
 
         let storage = self.state.storage();
@@ -206,7 +228,7 @@ impl UserInbox {
                     // Populate the in-memory dedup too, so a later retry within the same DO
                     // lifetime returns fast.
                     self.dedup_insert(sender_id.to_string(), envelope_hash, e.id, now, false);
-                    return Ok((e.id, false, true));
+                    return Ok(Notified { id: e.id, delivered_live: false, deduped: true, frame: None });
                 }
                 // Unexpected (a conflict but no row — a race or a purge in between) → fail-safe:
                 // signal "not delivered" to the caller instead of attempting a fresh INSERT; the
@@ -245,7 +267,7 @@ impl UserInbox {
             }
         }
 
-        let payload = serde_json::json!({
+        let frame = serde_json::json!({
             "type": "msg",
             "id": row.id,
             "sender_id": sender_id,
@@ -253,8 +275,8 @@ impl UserInbox {
             "envelope_b64": envelope_b64,
             "group_id": group_id,
             "ts": now,
-        })
-        .to_string();
+        });
+        let payload = frame.to_string();
         // M2-S2.2: push only to the TARGET device's socket. With recipient_device None (S2.3
         // fan-out has not filled it yet / N=1 compatibility) push to EVERY socket, as before. An
         // Attachment.device_id of None (pre-S1 token) also counts as a target (NULL tolerance).
@@ -302,7 +324,52 @@ impl UserInbox {
         // is no await between them and the DO is single-threaded, so a retry finds the envelope
         // with the correct liveness.
         self.dedup_insert(sender_id.to_string(), envelope_hash, row.id, now, delivered_live);
-        Ok((row.id, delivered_live, false))
+        // What a wake may carry: the frame, plus — for a 1:1 frame to an offline device — how many
+        // OLDER rows from the same sender device still wait for it (`push::carry`). The phone reads
+        // a carried 1:1 frame only when none do: one read ahead of more than the 40 skipped keys
+        // vodozemac keeps per chain would leave the oldest unreadable when `/sync` brings them —
+        // ack false, `delivery_failed`, a re-pair.
+        let mut carried = frame;
+        if let (false, Some(device), None) = (delivered_live, recipient_device_id, group_id) {
+            carried["older"] = serde_json::json!(self.older_queued(device, sender_id, sender_device_id, row.id));
+        }
+        Ok(Notified { id: row.id, delivered_live, deduped: false, frame: Some(carried) })
+    }
+
+    /// How many 1:1 rows older than `id`, from the same sender device, still wait for `device` —
+    /// counted up to [`OLDER_QUEUED_CAP`] (the phone only asks whether it is zero). Unreadable
+    /// storage reads as the cap: when in doubt, the push is not read ahead of the queue.
+    fn older_queued(
+        &self,
+        device: &str,
+        sender_id: &str,
+        sender_device_id: Option<&str>,
+        id: i64,
+    ) -> i64 {
+        #[derive(Deserialize)]
+        struct CountRow {
+            n: i64,
+        }
+        let sender_device = match sender_device_id {
+            Some(d) => JsValue::from_str(d),
+            None => JsValue::NULL,
+        };
+        self.state
+            .storage()
+            .sql()
+            .exec_raw(
+                OLDER_QUEUED_SQL,
+                Some(vec![
+                    JsValue::from_str(device),
+                    JsValue::from_str(sender_id),
+                    sender_device,
+                    JsValue::from_f64(id as f64),
+                ]),
+            )
+            .ok()
+            .and_then(|c| c.to_array::<CountRow>().ok())
+            .and_then(|rows| rows.into_iter().next())
+            .map_or(OLDER_QUEUED_CAP, |r| r.n)
     }
 
     /// Is there an existing msg_id in the dedup cache for (sender, envelope_hash)?
@@ -516,5 +583,41 @@ mod dedup_sql_tests {
             insert(&c, "alice", None).is_some(),
             "NULL env_hash allows multiple rows (old rows produce no UNIQUE collision)"
         );
+    }
+
+    /// What a carried 1:1 frame says of the queue ahead of it: the older rows from the SAME sender
+    /// device to the SAME recipient device, never a group's, another sender's or a later one —
+    /// counted up to 100.
+    #[test]
+    fn older_queued_counts_only_the_same_lane_ahead() {
+        let c = setup();
+        let row = |sender: &str, sdev: Option<&str>, dev: &str, group: Option<&str>| {
+            c.execute(
+                "INSERT INTO pending (sender_id, envelope_b64, created_at, group_id, device_id, sender_device_id)
+                 VALUES (?1, 'e', 1, ?2, ?3, ?4)",
+                params![sender, group, dev, sdev],
+            )
+            .unwrap();
+            c.last_insert_rowid()
+        };
+        let count = |dev: &str, sender: &str, sdev: Option<&str>, id: i64| -> i64 {
+            c.query_row(super::OLDER_QUEUED_SQL, params![dev, sender, sdev, id], |r| r.get(0))
+                .unwrap()
+        };
+        row("alice", Some("a1"), "b1", None); // counted
+        row("alice", Some("a2"), "b1", None); // another sender device
+        row("carol", Some("a1"), "b1", None); // another sender
+        row("alice", Some("a1"), "b2", None); // another recipient device
+        row("alice", Some("a1"), "b1", Some("room")); // a group row: Megolm, no Olm chain
+        let me = row("alice", Some("a1"), "b1", None);
+        row("alice", Some("a1"), "b1", None); // later: not ahead of it
+        assert_eq!(count("b1", "alice", Some("a1"), me), 1);
+        assert_eq!(count("b1", "alice", Some("a2"), me), 1);
+        assert_eq!(count("b1", "dave", Some("a1"), me), 0);
+        for _ in 0..150 {
+            row("eve", None, "b9", None);
+        }
+        let last = row("eve", None, "b9", None);
+        assert_eq!(count("b9", "eve", None, last), 100, "a NULL device matches, capped at 100");
     }
 }

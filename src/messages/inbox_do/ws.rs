@@ -3,8 +3,8 @@ use crate::push::coalesce::WakeIntent;
 
 impl UserInbox {
     /// WS frame handler — `DurableObject::websocket_message` delegates here.
-    /// Frame kinds: ack / ping / forward_ack / receipt_sync / self_read / self_read_sync /
-    /// send / read. Anything else is ignored. There is deliberately no `typing` kind — see the
+    /// Frame kinds: ack / ping / forward_ack / receipt_sync / push_key_get / self_read /
+    /// self_read_sync / send / read. Anything else is ignored. There is deliberately no `typing` kind — see the
     /// note where its arm used to be.
     pub(crate) async fn handle_ws_message(
         &self,
@@ -111,6 +111,9 @@ impl UserInbox {
                 let since = value.get("since").and_then(|v| v.as_i64()).unwrap_or(0);
                 self.receipt_sync(&ws, since);
             }
+            // The device asks for the key its carried pushes are sealed under (`push_keys.rs`),
+            // on every connect; an older client never does, and is woken content-free.
+            "push_key_get" => self.answer_push_key_get(&ws),
             // A device reports over the hot socket the msg_uids it read → self_read_state
             // set-once, plus a self_read_update delta to that user's other devices.
             "self_read" => {

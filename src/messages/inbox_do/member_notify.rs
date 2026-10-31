@@ -38,6 +38,8 @@ impl UserInbox {
         let covers_ms = crate::utils::now_ms() as i64;
         let mut results = Vec::with_capacity(targets.len());
         let mut fresh_asleep: Vec<Option<String>> = Vec::new();
+        // Each asleep device's own row, for its wake to carry (`push::carry`).
+        let mut carried = crate::push::carry::Carried::none();
         let mut failure = None;
         for device in targets {
             match self
@@ -52,14 +54,18 @@ impl UserInbox {
                 )
                 .await
             {
-                Ok((id, delivered_live, deduped)) => {
+                Ok(n) => {
                     // Only a device whose row THIS call stored is woken here. A dedup hit means an
                     // earlier call stored it and decided its wake — a hop whose answer was lost,
                     // the sender's retry, a drained row — and waking again is how one message
                     // used to wake a phone two or three times (the D8 review's F4).
-                    if !delivered_live && !deduped {
+                    if !n.delivered_live && !n.deduped {
+                        if let (Some(d), Some(frame)) = (&device, &n.frame) {
+                            carried.add(d, frame, self.push_key(d).as_ref());
+                        }
                         fresh_asleep.push(device.clone());
                     }
+                    let (id, delivered_live) = (n.id, n.delivered_live);
                     results.push(DeviceResult { device_id: device, id, delivered_live });
                 }
                 // One device failing fails the member: the caller retries it whole, and the dedup
@@ -76,10 +82,11 @@ impl UserInbox {
                 console_log!("[push] skipped (silent) group={} user={}", msg.group_id, body.recipient_id);
             } else {
                 console_log!(
-                    "[push] waking group={} user={} devices={}",
+                    "[push] waking group={} user={} devices={} carrying={}",
                     msg.group_id,
                     body.recipient_id,
-                    fresh_asleep.len()
+                    fresh_asleep.len(),
+                    carried.len()
                 );
                 let env = self.env.clone();
                 let user = body.recipient_id.clone();
@@ -95,6 +102,7 @@ impl UserInbox {
                             &user,
                             devices.as_deref(),
                             ask,
+                            &carried,
                         )
                         .await;
                     }

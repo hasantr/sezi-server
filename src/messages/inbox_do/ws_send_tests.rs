@@ -51,7 +51,7 @@ fn the_flags_reach_the_inboxs_notify_body() {
 fn a_silent_ws_send_wakes_nobody() {
     let inbox = include_str!("mod.rs");
     assert!(
-        inbox.contains(concat!("if !delivered_live && !deduped && ", "!body.silent {")),
+        inbox.contains(concat!("if !delivered_live && !notified.deduped && ", "!body.silent {")),
         "the /notify arm must not wake for a silent envelope"
     );
     assert!(inbox.contains(concat!("urgent: body", ".urgent")), "the /notify arm drops urgency");
