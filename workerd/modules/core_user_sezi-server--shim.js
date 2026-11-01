@@ -2,8 +2,8 @@ var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
 // build/index.js
-import { WorkerEntrypoint as Et } from "cloudflare:workers";
-import et from "./93c47706155dfd8fca0d2b031f26efe2183c31ee-index_bg.wasm";
+import { WorkerEntrypoint as Rt } from "cloudflare:workers";
+import et from "./d25073d7d6a30e6e0f5286cec23bf330843c8aaa-index_bg.wasm";
 var K = globalThis.__worker_init_state = { criticalError: false, instanceId: 0 };
 var W = class {
   static {
@@ -120,7 +120,7 @@ var z = class {
   }
 };
 Symbol.dispose && (z.prototype[Symbol.dispose] = z.prototype.free);
-var j = class i {
+var E = class i {
   static {
     __name(this, "i");
   }
@@ -147,8 +147,8 @@ var j = class i {
     return a(), e = s.intounderlyingsource_pull(this.__wbg_ptr, _(t)), d(e);
   }
 };
-Symbol.dispose && (j.prototype[Symbol.dispose] = j.prototype.free);
-var R = class i2 {
+Symbol.dispose && (E.prototype[Symbol.dispose] = E.prototype.free);
+var k = class i2 {
   static {
     __name(this, "i");
   }
@@ -192,7 +192,7 @@ var R = class i2 {
     a(), s.__wbg_set_minifyconfig_js(this.__wbg_ptr, t);
   }
 };
-Symbol.dispose && (R.prototype[Symbol.dispose] = R.prototype.free);
+Symbol.dispose && (k.prototype[Symbol.dispose] = k.prototype.free);
 var O = class {
   static {
     __name(this, "O");
@@ -339,7 +339,7 @@ var T = class {
 };
 Symbol.dispose && (T.prototype[Symbol.dispose] = T.prototype.free);
 function H() {
-  f++, S = null, M = null, typeof numBytesDecoded < "u" && (numBytesDecoded = 0), typeof h < "u" && (h = 0), typeof x < "u" && (x = new Array(1024).fill(void 0), x = x.concat([void 0, null, true, false]), typeof E < "u" && (E = x.length)), ct = false, $ = new WebAssembly.Instance(et, st()), s = $.exports, s.__wbindgen_start();
+  f++, S = null, M = null, typeof numBytesDecoded < "u" && (numBytesDecoded = 0), typeof h < "u" && (h = 0), typeof x < "u" && (x = new Array(1024).fill(void 0), x = x.concat([void 0, null, true, false]), typeof R < "u" && (R = x.length)), ct = false, $ = new WebAssembly.Instance(et, st()), s = $.exports, s.__wbindgen_start();
 }
 __name(H, "H");
 function nt() {
@@ -669,7 +669,12 @@ function st() {
     }, arguments);
   }, "__wbg_getReader_9facd4f899beac89"), __wbg_getTime_09f1dd40a44edb30: /* @__PURE__ */ __name(function(t) {
     return r(t).getTime();
-  }, "__wbg_getTime_09f1dd40a44edb30"), __wbg_getWebSockets_374c518f5a97d39c: /* @__PURE__ */ __name(function() {
+  }, "__wbg_getTime_09f1dd40a44edb30"), __wbg_getWebSocketAutoResponseTimestamp_bfb518e671baa61b: /* @__PURE__ */ __name(function() {
+    return c(function(t, e) {
+      let n = r(t).getWebSocketAutoResponseTimestamp(r(e));
+      return w(n) ? 0 : _(n);
+    }, arguments);
+  }, "__wbg_getWebSocketAutoResponseTimestamp_bfb518e671baa61b"), __wbg_getWebSockets_374c518f5a97d39c: /* @__PURE__ */ __name(function() {
     return c(function(t, e) {
       let n = r(e).getWebSockets(), o = V(n, s.__wbindgen_export), u = h;
       b().setInt32(t + 4, u, true), b().setInt32(t + 0, o, true);
@@ -736,7 +741,11 @@ function st() {
   }, "__wbg_get_value_31eb9abef97d98cb"), __wbg_get_with_ref_key_6412cf3094599694: /* @__PURE__ */ __name(function(t, e) {
     let n = r(t)[r(e)];
     return _(n);
-  }, "__wbg_get_with_ref_key_6412cf3094599694"), __wbg_headers_18f39f24d3837dc1: /* @__PURE__ */ __name(function(t) {
+  }, "__wbg_get_with_ref_key_6412cf3094599694"), __wbg_has_ef192b1f278770eb: /* @__PURE__ */ __name(function() {
+    return c(function(t, e) {
+      return Reflect.has(r(t), r(e));
+    }, arguments);
+  }, "__wbg_has_ef192b1f278770eb"), __wbg_headers_18f39f24d3837dc1: /* @__PURE__ */ __name(function(t) {
     let e = r(t).headers;
     return _(e);
   }, "__wbg_headers_18f39f24d3837dc1"), __wbg_headers_4cfb0c75793d7a8d: /* @__PURE__ */ __name(function(t) {
@@ -844,7 +853,7 @@ function st() {
     let n = r(e).method, o = m(n, s.__wbindgen_export, s.__wbindgen_export2), u = h;
     b().setInt32(t + 4, u, true), b().setInt32(t + 0, o, true);
   }, "__wbg_method_eadeb6c481ed3b2d"), __wbg_minifyconfig_new: /* @__PURE__ */ __name(function(t) {
-    let e = R.__wrap(t);
+    let e = k.__wrap(t);
     return _(e);
   }, "__wbg_minifyconfig_new"), __wbg_msCrypto_bd5a034af96bcba6: /* @__PURE__ */ __name(function(t) {
     let e = r(t).msCrypto;
@@ -876,7 +885,12 @@ function st() {
   }, "__wbg_new_227d7c05414eb861"), __wbg_new_310879b66b6e95e1: /* @__PURE__ */ __name(function() {
     let t = new Array();
     return _(t);
-  }, "__wbg_new_310879b66b6e95e1"), __wbg_new_7ddec6de44ff8f5d: /* @__PURE__ */ __name(function(t) {
+  }, "__wbg_new_310879b66b6e95e1"), __wbg_new_45a888c8e7433fb8: /* @__PURE__ */ __name(function() {
+    return c(function(t, e, n, o) {
+      let u = new WebSocketRequestResponsePair(p(t, e), p(n, o));
+      return _(u);
+    }, arguments);
+  }, "__wbg_new_45a888c8e7433fb8"), __wbg_new_7ddec6de44ff8f5d: /* @__PURE__ */ __name(function(t) {
     let e = new Uint8Array(r(t));
     return _(e);
   }, "__wbg_new_7ddec6de44ff8f5d"), __wbg_new_7ea411c80558cceb: /* @__PURE__ */ __name(function() {
@@ -925,7 +939,7 @@ function st() {
       return _(e);
     }, arguments);
   }, "__wbg_new_with_headers_444c1c017700c78e"), __wbg_new_with_into_underlying_source_fd904252f385f59c: /* @__PURE__ */ __name(function(t, e) {
-    let n = new ReadableStream(j.__wrap(t), d(e));
+    let n = new ReadableStream(E.__wrap(t), d(e));
     return _(n);
   }, "__wbg_new_with_into_underlying_source_fd904252f385f59c"), __wbg_new_with_length_99887c91eae4abab: /* @__PURE__ */ __name(function(t) {
     let e = new Uint8Array(t >>> 0);
@@ -945,7 +959,12 @@ function st() {
       let o = new Response(t === 0 ? void 0 : p(t, e), r(n));
       return _(o);
     }, arguments);
-  }, "__wbg_new_with_opt_str_and_init_1dd0a9ed589dcc68"), __wbg_new_with_str_and_init_ffe9977c986ea039: /* @__PURE__ */ __name(function() {
+  }, "__wbg_new_with_opt_str_and_init_1dd0a9ed589dcc68"), __wbg_new_with_request_a2e8f10a735d4ad3: /* @__PURE__ */ __name(function() {
+    return c(function(t) {
+      let e = new Request(r(t));
+      return _(e);
+    }, arguments);
+  }, "__wbg_new_with_request_a2e8f10a735d4ad3"), __wbg_new_with_str_and_init_ffe9977c986ea039: /* @__PURE__ */ __name(function() {
     return c(function(t, e, n) {
       let o = new Request(p(t, e), r(n));
       return _(o);
@@ -1057,7 +1076,11 @@ function st() {
     return c(function(t, e, n) {
       return r(t).setTimeout(r(e), n);
     }, arguments);
-  }, "__wbg_setTimeout_a2b48e67340623fd"), __wbg_set_24d0fa9e104112f9: /* @__PURE__ */ __name(function(t, e, n) {
+  }, "__wbg_setTimeout_a2b48e67340623fd"), __wbg_setWebSocketAutoResponse_20c448186197c473: /* @__PURE__ */ __name(function() {
+    return c(function(t, e) {
+      r(t).setWebSocketAutoResponse(r(e));
+    }, arguments);
+  }, "__wbg_setWebSocketAutoResponse_20c448186197c473"), __wbg_set_24d0fa9e104112f9: /* @__PURE__ */ __name(function(t, e, n) {
     r(t).set(F(e, n));
   }, "__wbg_set_24d0fa9e104112f9"), __wbg_set_6be42768c690e380: /* @__PURE__ */ __name(function(t, e, n) {
     r(t)[d(e)] = d(n);
@@ -1224,17 +1247,17 @@ function a() {
 }
 __name(a, "a");
 function at(i3, t) {
-  a(), s.__wasm_bindgen_func_elem_7965(i3, t);
+  a(), s.__wasm_bindgen_func_elem_7983(i3, t);
 }
 __name(at, "at");
 function ft(i3, t, e) {
-  a(), s.__wasm_bindgen_func_elem_7486(i3, t, _(e));
+  a(), s.__wasm_bindgen_func_elem_7504(i3, t, _(e));
 }
 __name(ft, "ft");
 function bt(i3, t, e) {
   try {
     let u = s.__wbindgen_add_to_stack_pointer(-16);
-    a(), s.__wasm_bindgen_func_elem_3935(u, i3, t, _(e));
+    a(), s.__wasm_bindgen_func_elem_3954(u, i3, t, _(e));
     var n = b().getInt32(u + 0, true), o = b().getInt32(u + 4, true);
     if (o) throw d(n);
   } finally {
@@ -1243,7 +1266,7 @@ function bt(i3, t, e) {
 }
 __name(bt, "bt");
 function gt(i3, t, e, n) {
-  a(), s.__wasm_bindgen_func_elem_3974(i3, t, _(e), _(n));
+  a(), s.__wasm_bindgen_func_elem_3993(i3, t, _(e), _(n));
 }
 __name(gt, "gt");
 var dt = ["bytes"];
@@ -1291,9 +1314,9 @@ var Z = typeof FinalizationRegistry > "u" ? { register: /* @__PURE__ */ __name((
   t === f && s.__wbg_userinbox_free(i3, 1);
 });
 function _(i3) {
-  E === x.length && x.push(x.length + 1);
-  let t = E;
-  return E = x[t], x[t] = i3, t;
+  R === x.length && x.push(x.length + 1);
+  let t = R;
+  return R = x[t], x[t] = i3, t;
 }
 __name(_, "_");
 var tt = typeof FinalizationRegistry > "u" ? { register: /* @__PURE__ */ __name(() => {
@@ -1332,7 +1355,7 @@ ${i3.stack}` : n;
 }
 __name(N, "N");
 function xt(i3) {
-  i3 < 1028 || (x[i3] = E, E = i3);
+  i3 < 1028 || (x[i3] = R, R = i3);
 }
 __name(xt, "xt");
 function It(i3, t) {
@@ -1374,7 +1397,7 @@ function c(i3, t) {
 __name(c, "c");
 var x = new Array(1024).fill(void 0);
 x.push(void 0, null, true, false);
-var E = x.length;
+var R = x.length;
 function w(i3) {
   return i3 == null;
 }
@@ -1455,25 +1478,25 @@ function G(i3) {
   i3 instanceof WebAssembly.RuntimeError && (console.error("Critical", i3), v.criticalError = true);
 }
 __name(G, "G");
-var k = class extends Et {
+var j = class extends Rt {
   static {
-    __name(this, "k");
+    __name(this, "j");
   }
 };
-k.prototype.fetch = function(t) {
+j.prototype.fetch = function(t) {
   return rt.call(this, t, this.env, this.ctx);
 };
-k.prototype.init = _t;
-k.prototype.scheduled = function(t) {
+j.prototype.init = _t;
+j.prototype.scheduled = function(t) {
   return ot.call(this, t, this.env, this.ctx);
 };
-k.prototype.start = it;
-var jt = { set: /* @__PURE__ */ __name((i3, t, e, n) => Reflect.set(i3.instance, t, e, n), "set"), has: /* @__PURE__ */ __name((i3, t) => Reflect.has(i3.instance, t), "has"), deleteProperty: /* @__PURE__ */ __name((i3, t) => Reflect.deleteProperty(i3.instance, t), "deleteProperty"), apply: /* @__PURE__ */ __name((i3, t, e) => Reflect.apply(i3.instance, t, e), "apply"), construct: /* @__PURE__ */ __name((i3, t, e) => Reflect.construct(i3.instance, t, e), "construct"), getPrototypeOf: /* @__PURE__ */ __name((i3) => Reflect.getPrototypeOf(i3.instance), "getPrototypeOf"), setPrototypeOf: /* @__PURE__ */ __name((i3, t) => Reflect.setPrototypeOf(i3.instance, t), "setPrototypeOf"), isExtensible: /* @__PURE__ */ __name((i3) => Reflect.isExtensible(i3.instance), "isExtensible"), preventExtensions: /* @__PURE__ */ __name((i3) => Reflect.preventExtensions(i3.instance), "preventExtensions"), getOwnPropertyDescriptor: /* @__PURE__ */ __name((i3, t) => Reflect.getOwnPropertyDescriptor(i3.instance, t), "getOwnPropertyDescriptor"), defineProperty: /* @__PURE__ */ __name((i3, t, e) => Reflect.defineProperty(i3.instance, t, e), "defineProperty"), ownKeys: /* @__PURE__ */ __name((i3) => Reflect.ownKeys(i3.instance), "ownKeys") };
+j.prototype.start = it;
+var Et = { set: /* @__PURE__ */ __name((i3, t, e, n) => Reflect.set(i3.instance, t, e, n), "set"), has: /* @__PURE__ */ __name((i3, t) => Reflect.has(i3.instance, t), "has"), deleteProperty: /* @__PURE__ */ __name((i3, t) => Reflect.deleteProperty(i3.instance, t), "deleteProperty"), apply: /* @__PURE__ */ __name((i3, t, e) => Reflect.apply(i3.instance, t, e), "apply"), construct: /* @__PURE__ */ __name((i3, t, e) => Reflect.construct(i3.instance, t, e), "construct"), getPrototypeOf: /* @__PURE__ */ __name((i3) => Reflect.getPrototypeOf(i3.instance), "getPrototypeOf"), setPrototypeOf: /* @__PURE__ */ __name((i3, t) => Reflect.setPrototypeOf(i3.instance, t), "setPrototypeOf"), isExtensible: /* @__PURE__ */ __name((i3) => Reflect.isExtensible(i3.instance), "isExtensible"), preventExtensions: /* @__PURE__ */ __name((i3) => Reflect.preventExtensions(i3.instance), "preventExtensions"), getOwnPropertyDescriptor: /* @__PURE__ */ __name((i3, t) => Reflect.getOwnPropertyDescriptor(i3.instance, t), "getOwnPropertyDescriptor"), defineProperty: /* @__PURE__ */ __name((i3, t, e) => Reflect.defineProperty(i3.instance, t, e), "defineProperty"), ownKeys: /* @__PURE__ */ __name((i3) => Reflect.ownKeys(i3.instance), "ownKeys") };
 var I = { construct(i3, t, e) {
   try {
     J();
     let n = { instance: Reflect.construct(i3, t, e), instanceId: v.instanceId, ctor: i3, args: t, newTarget: e };
-    return new Proxy(n, { ...jt, get(o, u, g) {
+    return new Proxy(n, { ...Et, get(o, u, g) {
       o.instanceId !== v.instanceId && (o.instance = Reflect.construct(o.ctor, o.args, o.newTarget), o.instanceId = v.instanceId);
       let l = Reflect.get(o.instance, u, g);
       return typeof l != "function" ? l : l.constructor === Function ? new Proxy(l, { apply(y, q, B) {
@@ -1496,12 +1519,12 @@ var I = { construct(i3, t, e) {
     throw v.criticalError = true, n;
   }
 } };
-var At = new Proxy(k, I);
+var At = new Proxy(j, I);
 var zt = new Proxy(W, I);
 var Ot = new Proxy(A, I);
 var Pt = new Proxy(z, I);
-var Tt = new Proxy(j, I);
-var Ut = new Proxy(R, I);
+var Tt = new Proxy(E, I);
+var Ut = new Proxy(k, I);
 var Mt = new Proxy(O, I);
 var Ct = new Proxy(P, I);
 var Lt = new Proxy(T, I);
@@ -1547,7 +1570,7 @@ var jsonError = /* @__PURE__ */ __name(async (request, env, _ctx, middlewareCtx)
 }, "jsonError");
 var middleware_miniflare3_json_error_default = jsonError;
 
-// .wrangler/tmp/bundle-6wd7Ku/middleware-insertion-facade.js
+// .wrangler/tmp/bundle-BnvGt3/middleware-insertion-facade.js
 var __INTERNAL_WRANGLER_MIDDLEWARE__ = [
   middleware_ensure_req_body_drained_default,
   middleware_miniflare3_json_error_default
@@ -1579,7 +1602,7 @@ function __facade_invoke__(request, env, ctx, dispatch, finalMiddleware) {
 }
 __name(__facade_invoke__, "__facade_invoke__");
 
-// .wrangler/tmp/bundle-6wd7Ku/middleware-loader.entry.ts
+// .wrangler/tmp/bundle-BnvGt3/middleware-loader.entry.ts
 var __Facade_ScheduledController__ = class ___Facade_ScheduledController__ {
   constructor(scheduledTime, cron, noRetry) {
     this.scheduledTime = scheduledTime;
@@ -1689,4 +1712,4 @@ export {
 };
 //# sourceMappingURL=shim.js.map
 
-//# sourceURL=file:///home/hasan/.cache/gecici/sezi-workerd.nW7Dc7/relay/.wrangler/tmp/dev-1djRQQ/shim.js
+//# sourceURL=file:///home/hasan/.cache/gecici/sezi-workerd.ov9dBo/relay/.wrangler/tmp/dev-MYi7sW/shim.js

@@ -421,11 +421,20 @@ async fn jwks(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
 /// Auth: `Sec-WebSocket-Protocol: sezgi.bearer.v1, <access_token>` — the first subprotocol names
 /// the scheme, the second carries the credential. The token stays out of the URL query, so it
 /// never surfaces in Workers tail logs (URLs are logged, headers are not).
+///
+/// Or `sezgi.refresh.v1, <refresh_token>`: the upgrade is then also the token refresh, and the
+/// socket's first frame carries the new pair (`auth::sync_refresh`).
 async fn sync_ws(req: Request, env: Env) -> Result<Response> {
-    let token = match extract_bearer_subprotocol(&req) {
-        Ok(t) => t,
+    use crate::auth::sync_refresh::{self, SyncCredential};
+    let protocol = req.headers().get("Sec-WebSocket-Protocol").ok().flatten();
+    let token = match sync_refresh::parse_credential(protocol.as_deref()) {
+        Ok(SyncCredential::Bearer(t)) => t,
+        Ok(SyncCredential::Refresh(rt)) => return sync_refresh::upgrade(req, &env, &rt).await,
         Err(e) => return json_err(400, e),
     };
+    if let Some(refused) = sync_refresh::refuse_planted(&req) {
+        return refused;
+    }
     let auth = match crate::auth::middleware::validate_active_token(&env, &token).await {
         Ok(auth) => auth,
         Err(resp) => return Ok(resp),

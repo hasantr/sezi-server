@@ -19,6 +19,8 @@ impl UserInbox {
         // refreshes here. `notify_inner` uses it as its zombie-socket test: the client pings every
         // 5s, so a live socket stays fresh while a half-open one left by a background kill goes
         // stale, and delivery to it stops counting as "live" (an FCM wake goes out instead).
+        // A ping the runtime answers itself never gets here; its own timestamp stands in for
+        // this stamp (`ws_ping.rs`, `UserInbox::ws_is_fresh`).
         // Errors are swallowed — a missing attachment just skips the refresh.
         if let Ok(Some(mut att)) = ws.deserialize_attachment::<Attachment>() {
             att.last_seen_ms = Some((now_secs() * 1000) as i64);
@@ -93,8 +95,9 @@ impl UserInbox {
             "ping" => {
                 // Application-level keepalive; the pong is mandatory for the client's zombie
                 // detection. Without it the client sees an open TCP connection while, after a
-                // hibernation or migration, the receive path is broken.
-                let _ = ws.send_with_str(r#"{"type":"pong"}"#);
+                // hibernation or migration, the receive path is broken. Where the runtime
+                // answers the ping itself (`ws_ping.rs`), this arm never runs.
+                let _ = ws.send_with_str(super::ws_ping::PONG);
             }
             // The client confirms it received the forwarded receipts → drop them from the queue.
             // Frame: `{ type: "forward_ack", ids: [...] }`
@@ -351,6 +354,7 @@ impl UserInbox {
                     delivered_live: bool,
                 }
                 let wake = ws_send_wake(&value);
+                let live = ws_send_live(&value);
                 let mut acks: Vec<serde_json::Value> = Vec::with_capacity(env_items.len());
                 for (dev, env_b64) in &env_items {
                     // This loop is its own per-device delivery path and does NOT go through
@@ -372,6 +376,7 @@ impl UserInbox {
                         dev.as_deref(),
                         env_b64,
                         wake,
+                        live,
                     );
                     let mut init = RequestInit::new();
                     init.with_method(Method::Post);
@@ -391,7 +396,13 @@ impl UserInbox {
                     };
                     // PARTIAL FAILURE: a successful device joins acks, a failed one DROPS OUT.
                     if let Some(id) = resp_id {
-                        acks.push(serde_json::json!({ "device_id": dev, "id": id }));
+                        // A dropped live envelope is acked too: nobody was there to see it, and
+                        // nothing failed (`live_frames.rs`).
+                        let dropped = live && id == super::live_frames::LIVE_DROPPED_ID;
+                        acks.push(super::live_frames::ack_item(dev.as_deref(), id, dropped));
+                        if dropped {
+                            continue;
+                        }
                         // Recipient is OFFLINE on that device (no live socket): the recipient's
                         // inbox sends the content-less wake itself, through its coalescing gate
                         // (`wake_gate.rs`) — or none, for silent control traffic. These lines
@@ -541,6 +552,12 @@ pub(super) fn ws_send_wake(frame: &serde_json::Value) -> WakeIntent {
     WakeIntent::from_flags(flag("silent"), flag("urgent"))
 }
 
+/// The frame asks for a live-only delivery (`live_frames.rs`): `"live": true`, written by the
+/// core for the typing indicator alone. Anything but a JSON `true` — an older client — is stored.
+pub(super) fn ws_send_live(frame: &serde_json::Value) -> bool {
+    frame.get("live").and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
 /// The recipient inbox's `/notify` body for one device of a WS `send` — the HTTP path's twin
 /// (`handlers::build_notify_payload`). 1:1 only: a group never comes this way (`group_via_http`).
 /// `silent` is persisted on the pending row, so the backstop alarm stays quiet about it too, and
@@ -552,6 +569,7 @@ pub(super) fn ws_notify_payload(
     recipient_device_id: Option<&str>,
     envelope_b64: &str,
     wake: WakeIntent,
+    live: bool,
 ) -> String {
     serde_json::json!({
         "sender_id": sender_id,
@@ -563,6 +581,7 @@ pub(super) fn ws_notify_payload(
         "envelope_b64": envelope_b64,
         "silent": wake.silent(),
         "urgent": wake.urgent(),
+        "live": live,
     })
     .to_string()
 }

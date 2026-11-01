@@ -108,7 +108,7 @@ impl UserInbox {
             // next 90s alarm. So write to EVERY socket (one may be hibernating but alive),
             // and mark "pushed" ONLY for a genuinely live socket (fresh last_seen) → on a
             // zombie pushed_at stays NULL and the next flush / force-reconnect replays it.
-            if ws.send_with_str(payload.as_str()).is_ok() && super::message::ws_is_fresh(&ws, now) {
+            if ws.send_with_str(payload.as_str()).is_ok() && self.ws_is_fresh(&ws, now) {
                 any_pushed = true;
             }
         }
@@ -197,7 +197,7 @@ impl UserInbox {
             // delivery to a genuinely live socket counts as "pushed", so on a zombie
             // pushed_at stays NULL and the next flush/force replays it. With force=true
             // (fresh reconnect) the socket was stamped at accept time and is always fresh.
-            if ws.send_with_str(payload.as_str()).is_ok() && super::message::ws_is_fresh(ws, now) {
+            if ws.send_with_str(payload.as_str()).is_ok() && self.ws_is_fresh(ws, now) {
                 pushed_ids.push(row.id);
             }
         }

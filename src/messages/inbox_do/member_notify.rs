@@ -51,6 +51,7 @@ impl UserInbox {
                     &msg.envelope_b64,
                     Some(msg.group_id.as_str()),
                     msg.silent,
+                    false, // a room's envelope is never live (`live_frames.rs`)
                 )
                 .await
             {

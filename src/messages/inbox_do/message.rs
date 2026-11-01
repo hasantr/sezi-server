@@ -46,15 +46,22 @@ pub(crate) fn ws_last_seen_ms(ws: &WebSocket) -> Option<i64> {
         .and_then(|a| a.last_seen_ms)
 }
 
-/// W1/W9: is the socket GENUINELY live — did its last inbound frame arrive within
-/// `WS_LIVENESS_WINDOW_MS`? On a zombie/half-open socket `send_with_str` returns Ok while the
-/// client receives nothing; this test stops us from counting that as a "live delivery/push".
-/// `now_ms` comes from the caller (one `now_secs()` read). Missing or stale last_seen → false.
-/// Shared by notify_inner (W1) and forward_signal (W9).
-pub(crate) fn ws_is_fresh(ws: &WebSocket, now_ms: i64) -> bool {
-    ws_last_seen_ms(ws)
-        .map(|ls| now_ms - ls <= WS_LIVENESS_WINDOW_MS)
-        .unwrap_or(false)
+/// Was a socket last heard at `last_heard_ms` still live at `now_ms`? Never heard → false.
+pub(crate) fn fresh_at(last_heard_ms: Option<i64>, now_ms: i64) -> bool {
+    last_heard_ms.is_some_and(|ls| now_ms - ls <= WS_LIVENESS_WINDOW_MS)
+}
+
+impl UserInbox {
+    /// W1/W9: is the socket GENUINELY live — did its last inbound frame, or its last ping the
+    /// runtime answered without waking us (`ws_ping.rs`), arrive within `WS_LIVENESS_WINDOW_MS`?
+    /// On a zombie/half-open socket `send_with_str` returns Ok while the client receives nothing;
+    /// this test stops us from counting that as a "live delivery/push". `now_ms` comes from the
+    /// caller (one `now_secs()` read). Missing or stale → false. Shared by notify_inner (W1) and
+    /// forward_signal (W9).
+    pub(crate) fn ws_is_fresh(&self, ws: &WebSocket, now_ms: i64) -> bool {
+        let heard = super::ws_ping::last_heard(ws_last_seen_ms(ws), self.auto_pong.last_ping_ms(ws));
+        fresh_at(heard, now_ms)
+    }
 }
 
 /// M2-S2.2: should this WS connection receive the frame for the given target device?
@@ -103,6 +110,9 @@ pub(crate) struct Notified {
     /// The `msg` frame this call stored and pushed — what its wake may carry (`push::carry`).
     /// None on a dedup hit: nothing was stored this time, and the call that stored it woke.
     pub(crate) frame: Option<serde_json::Value>,
+    /// A live envelope with no live socket to take it: nothing stored, pushed or to be woken;
+    /// `id` is [`live_frames::LIVE_DROPPED_ID`] (`live_frames.rs`).
+    pub(crate) dropped: bool,
 }
 
 impl UserInbox {
@@ -110,6 +120,9 @@ impl UserInbox {
     /// `needs_device_wake`). It is persisted on the pending row for ONE reason: the W1 backstop
     /// ALARM would otherwise wake the device minutes later for the very message the immediate path
     /// stayed quiet about, turning a removed wake into a randomly delayed one.
+    ///
+    /// `live` = worth something only to a device connected now (`live_frames.rs`): pushed to a
+    /// live socket and kept nowhere, or dropped. Ignored for a group's envelope.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn notify_inner(
         &self,
@@ -120,6 +133,7 @@ impl UserInbox {
         envelope_b64: &str,
         group_id: Option<&str>,
         silent: bool,
+        live: bool,
     ) -> Result<Notified> {
         // Returns `Notified`. `delivered_live` answers "did the push
         // reach at least one matching, genuinely-live (W1) socket?" — false means the recipient is
@@ -163,7 +177,28 @@ impl UserInbox {
             // `true`: on an in-request retry the first attempt's cross-DO response may be lost, so
             // the caller never saw that decision, and answering `true` would silently suppress the
             // FCM wake for an offline recipient.
-            return Ok(Notified { id: cached_id, delivered_live: cached_live, deduped: true, frame: None });
+            return Ok(Notified { id: cached_id, delivered_live: cached_live, deduped: true, frame: None, dropped: false });
+        }
+
+        // A live envelope is kept only as long as it takes to push it, and not even written when
+        // no socket of its device is live (`live_frames.rs`). Asked after the dedup lookup, so a
+        // retry of one that was pushed answers that push's id.
+        let fate = live_frames::live_fate(
+            live,
+            group_id.is_some(),
+            self.state
+                .get_websockets()
+                .iter()
+                .any(|ws| ws_targets_device(ws, recipient_device_id) && self.ws_is_fresh(ws, now * 1000)),
+        );
+        if fate == live_frames::LiveFate::Drop {
+            return Ok(Notified {
+                id: live_frames::LIVE_DROPPED_ID,
+                delivered_live: false,
+                deduped: false,
+                frame: None,
+                dropped: true,
+            });
         }
 
         let storage = self.state.storage();
@@ -228,7 +263,7 @@ impl UserInbox {
                     // Populate the in-memory dedup too, so a later retry within the same DO
                     // lifetime returns fast.
                     self.dedup_insert(sender_id.to_string(), envelope_hash, e.id, now, false);
-                    return Ok(Notified { id: e.id, delivered_live: false, deduped: true, frame: None });
+                    return Ok(Notified { id: e.id, delivered_live: false, deduped: true, frame: None, dropped: false });
                 }
                 // Unexpected (a conflict but no row — a race or a purge in between) → fail-safe:
                 // signal "not delivered" to the caller instead of attempting a fresh INSERT; the
@@ -296,7 +331,7 @@ impl UserInbox {
         for ws in self.state.get_websockets() {
             if ws_targets_device(&ws, recipient_device_id) {
                 let send_ok = ws.send_with_str(payload.as_str()).is_ok();
-                let fresh = ws_is_fresh(&ws, now_ms);
+                let fresh = self.ws_is_fresh(&ws, now_ms);
                 if send_ok && fresh {
                     delivered_live = true;
                 } else if send_ok && !fresh {
@@ -324,6 +359,15 @@ impl UserInbox {
         // is no await between them and the DO is single-threaded, so a retry finds the envelope
         // with the correct liveness.
         self.dedup_insert(sender_id.to_string(), envelope_hash, row.id, now, delivered_live);
+        // Pushed and gone: the row only minted the id the recipient acks, and an ack that finds
+        // no row forwards no `delivered` receipt (`ack.rs`). Nothing to carry — no wake follows.
+        if fate == live_frames::LiveFate::PushOnly {
+            let _ = storage.sql().exec_raw(
+                "DELETE FROM pending WHERE id = ?",
+                Some(vec![JsValue::from_f64(row.id as f64)]),
+            );
+            return Ok(Notified { id: row.id, delivered_live, deduped: false, frame: None, dropped: false });
+        }
         // What a wake may carry: the frame, plus — for a 1:1 frame to an offline device — how many
         // OLDER rows from the same sender device still wait for it (`push::carry`). The phone reads
         // a carried 1:1 frame only when none do: one read ahead of more than the 40 skipped keys
@@ -333,7 +377,7 @@ impl UserInbox {
         if let (false, Some(device), None) = (delivered_live, recipient_device_id, group_id) {
             carried["older"] = serde_json::json!(self.older_queued(device, sender_id, sender_device_id, row.id));
         }
-        Ok(Notified { id: row.id, delivered_live, deduped: false, frame: Some(carried) })
+        Ok(Notified { id: row.id, delivered_live, deduped: false, frame: Some(carried), dropped: false })
     }
 
     /// How many 1:1 rows older than `id`, from the same sender device, still wait for `device` —

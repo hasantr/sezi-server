@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod profile;
 pub mod refresh;
 pub mod relogin;
+pub(crate) mod sync_refresh;
 pub mod verify;
 
 #[cfg(test)]

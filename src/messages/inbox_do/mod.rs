@@ -8,6 +8,7 @@ mod alarm_ops;
 mod alarm_policy;
 mod bot;
 mod forward;
+pub(crate) mod live_frames;
 mod member_notify;
 mod message;
 mod receipt;
@@ -16,6 +17,7 @@ mod self_read;
 mod takeover_nudge;
 mod wake_gate;
 mod ws;
+mod ws_ping;
 
 const FLUSH_INTERVAL_MS: i64 = 90 * 1000;
 /// Alarm interval for a DO with nothing to deliver that still holds retention-eligible rows.
@@ -65,6 +67,8 @@ pub struct UserInbox {
     pub(crate) uid_persisted: std::cell::Cell<bool>,
     /// Is this a bot's inbox (`bot/`)? `None` until first read from storage.
     pub(crate) bot_mode: std::cell::Cell<Option<bool>>,
+    /// The keepalive the runtime answers without waking this object (`ws_ping.rs`).
+    pub(crate) auto_pong: ws_ping::AutoPong,
 }
 
 #[derive(Clone)]
@@ -104,6 +108,10 @@ struct NotifyBody {
     /// gate (`push::coalesce`). Absent reads as false, i.e. an ordinary wake.
     #[serde(default)]
     urgent: bool,
+    /// Worth something only to a device connected now (`live_frames.rs`): pushed to a live
+    /// socket and kept nowhere, or dropped. Absent reads as false, i.e. stored as always.
+    #[serde(default)]
+    live: bool,
 }
 
 #[derive(Deserialize)]
@@ -195,7 +203,13 @@ pub(crate) fn sql_no_args() -> Option<Vec<JsValue>> {
 
 impl DurableObject for UserInbox {
     fn new(state: State, env: Env) -> Self {
+        // The ping is answered by the runtime from here on, so an open app no longer keeps this
+        // object awake (`ws_ping.rs`).
+        let raw = state._inner();
+        let auto_pong = ws_ping::AutoPong::install(&raw);
+        let state = State::from(raw);
         Self {
+            auto_pong,
             state,
             env,
             initialized: std::cell::Cell::new(false),
@@ -311,9 +325,15 @@ impl DurableObject for UserInbox {
                         &body.envelope_b64,
                         body.group_id.as_deref(),
                         body.silent,
+                        body.live,
                     )
                     .await?;
                 let (id, delivered_live) = (notified.id, notified.delivered_live);
+                // A live envelope nobody was connected for: nothing was stored, so there is no
+                // row for a bot to read, no alarm to arm and no wake to send (`live_frames.rs`).
+                if notified.dropped {
+                    return Response::from_json(&live_frames::notify_answer(id, false, true));
+                }
                 if self.is_bot().await {
                     return self.bot_notified(id).await;
                 }
@@ -325,7 +345,7 @@ impl DurableObject for UserInbox {
                 // sends one. Silent control traffic wakes nobody (its row says so for the
                 // backstop too), and a dedup hit was woken by the call that stored it. The wake
                 // carries the frame it is for when that fits (`push::carry`).
-                if !delivered_live && !notified.deduped && !body.silent {
+                if !delivered_live && !notified.deduped && !body.silent && !body.live {
                     let ask = crate::push::coalesce::WakeAsk { covers_ms, urgent: body.urgent };
                     let mut carried = crate::push::carry::Carried::none();
                     if let (Some(device), Some(frame)) = (&body.recipient_device_id, &notified.frame) {
@@ -333,9 +353,7 @@ impl DurableObject for UserInbox {
                     }
                     self.wake_after_notify(body.recipient_id, body.recipient_device_id, ask, carried);
                 }
-                Response::from_json(
-                    &serde_json::json!({ "id": id, "delivered_live": delivered_live }),
-                )
+                Response::from_json(&live_frames::notify_answer(id, delivered_live, false))
             }
             // POST /forward-delivered, /forward-read {from, ids, uids} → 204. Both land in the
             // durable `receipt_state` plus a per-device cursor sync, NOT the consume-once
@@ -725,6 +743,12 @@ impl UserInbox {
             self.backfill_null_device_once(dev).await;
         }
 
+        // An upgrade that was also the token refresh: the new pair goes first, ahead of every
+        // queued frame (`auth::sync_refresh`).
+        let (tokens_frame, protocol) = crate::auth::sync_refresh::forwarded(&req);
+        if let Some(frame) = tokens_frame {
+            let _ = server.send_with_str(frame.as_str());
+        }
         self.flush_pending_to(&server);
         // force=true: a FRESH socket by definition never received what was pushed to the old
         // (dead/zombie) one, so ignore pushed_at and replay the whole queue. Without this a read
@@ -737,7 +761,7 @@ impl UserInbox {
         // the server's selection and fails with "no subprotocol selected" if it is not echoed.
         let resp = Response::from_websocket(pair.client)?;
         let headers = resp.headers().clone();
-        headers.set("Sec-WebSocket-Protocol", "sezgi.bearer.v1")?;
+        headers.set("Sec-WebSocket-Protocol", protocol)?;
         Ok(resp.with_headers(headers))
     }
 

@@ -10,6 +10,7 @@ const W4B_INITIAL_BACKOFF_SECS: i64 = 30; // delay from enqueue to the first dra
 const W4B_LEASE_SECS: i64 = 600;
 const W4B_BACKOFF_BASE_SECS: i64 = 120; // 120→240→…→cap
 const W4B_MAX_BACKOFF_SECS: i64 = 3600; // a long outage retries hourly and is NEVER deleted
+use crate::messages::inbox_do::live_frames::{self, LIVE_DROPPED_ID};
 use crate::push::coalesce::WakeIntent;
 use crate::respond::{json_err, no_content, passthrough};
 use crate::utils::now_secs;
@@ -96,6 +97,11 @@ struct SendBody {
     /// true; absent = an ordinary wake, as for every client before it.
     #[serde(default)]
     urgent: bool,
+    /// 1:1 only: worth something only to a recipient device connected now — the typing
+    /// indicator. Pushed to a live socket and kept nowhere, else dropped and acked as dropped
+    /// (`inbox_do/live_frames.rs`). Absent = stored as always; ignored for a group.
+    #[serde(default)]
+    live: bool,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +113,7 @@ struct NotifyResult {
 
 /// The recipient DO's `/notify` body (the 1:1 path; a group goes through `/notify-member`, see
 /// `group_fanout`).
+#[allow(clippy::too_many_arguments)]
 fn build_notify_payload(
     recipient_id: &str,
     sender_id: &str,
@@ -115,6 +122,7 @@ fn build_notify_payload(
     envelope_b64: &str,
     group_id: Option<&str>,
     wake: WakeIntent,
+    live: bool,
 ) -> String {
     serde_json::json!({
         "sender_id": sender_id,
@@ -129,6 +137,8 @@ fn build_notify_payload(
         "silent": wake.silent(),
         // Read by the inbox's wake: past the coalescing gate.
         "urgent": wake.urgent(),
+        // Pushed to a live socket or dropped, never stored (`inbox_do/live_frames.rs`).
+        "live": live,
     })
     .to_string()
 }
@@ -164,6 +174,9 @@ async fn notify_once(
 /// that device (per-device queue + ack isolation). The returned `id` is that RECIPIENT's pending
 /// sequence id. A per-device failure surfaces as `Err` rather than being silently skipped, which
 /// is what makes it visible during fan-out.
+///
+/// `live` asks for a live-only delivery (`inbox_do/live_frames.rs`); a live envelope nobody was
+/// connected for answers `LIVE_DROPPED_ID`, the id no row has.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn notify_recipient(
     namespace: &ObjectNamespace,
@@ -174,6 +187,7 @@ pub(crate) async fn notify_recipient(
     envelope_b64: &str,
     group_id: Option<&str>,
     wake: WakeIntent,
+    live: bool,
 ) -> Result<(i64, bool)> {
     let payload = build_notify_payload(
         recipient_id,
@@ -183,6 +197,7 @@ pub(crate) async fn notify_recipient(
         envelope_b64,
         group_id,
         wake,
+        live,
     );
     // A bounded in-request retry for a transient DO 5xx / overload / routing error. The DO's own
     // 60s dedup absorbs "it succeeded but the response was lost", so no duplicate pending row
@@ -411,14 +426,18 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             &e.envelope_b64,
             None,
             wake,
+            body.live,
         )
         .await
         {
             Ok((id, delivered_live)) => {
-                acks.push(serde_json::json!({
-                    "device_id": e.device_id,
-                    "id": id,
-                }));
+                // A dropped live envelope is still this device's ack: nothing failed, there was
+                // just nobody there to see it (`inbox_do/live_frames.rs`).
+                let dropped = body.live && id == LIVE_DROPPED_ID;
+                acks.push(live_frames::ack_item(e.device_id.as_deref(), id, dropped));
+                if dropped {
+                    continue;
+                }
                 // Offline on that device → the recipient's inbox sends the content-less wake
                 // itself, through its coalescing gate (`inbox_do/wake_gate.rs`), unless the
                 // message is silent control traffic, which is stored and delivered on the next

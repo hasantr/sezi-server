@@ -50,13 +50,49 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         Ok(b) => b,
         Err(_) => return json_err(400, "bad_request"),
     };
-    if body.refresh_token.len() < 20 || body.refresh_token.len() > 200 {
-        return json_err(400, "bad_request");
+    match rotate(&ctx.env, &body.refresh_token, body.device_id.as_deref()).await? {
+        Ok(t) => Response::from_json(&t.answer()),
+        Err((status, code)) => json_err(status, code),
+    }
+}
+
+/// A rotated session: the new pair and whom it belongs to (the device is the access token's).
+pub(crate) struct Rotated {
+    pub(crate) user_id: String,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+}
+
+impl Rotated {
+    /// `/auth/refresh`'s answer, and the `tokens` frame `/sync` sends first when the upgrade
+    /// itself was the refresh (`auth::sync_refresh`): the same fields either way.
+    pub(crate) fn answer(&self) -> serde_json::Value {
+        serde_json::json!({
+            "user_id": self.user_id,
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TTL_SEC,
+        })
+    }
+}
+
+/// Spend `refresh_token` for a new pair — `/auth/refresh` and the `/sync` upgrade that presents a
+/// refresh token (`auth::sync_refresh`) both come here, so the two cannot differ on rotation,
+/// replay or revocation. `Ok(Err((status, code)))` is a refusal to answer as such; `Err` is a D1
+/// or signing failure.
+pub(crate) async fn rotate(
+    env: &Env,
+    refresh_token: &str,
+    device_claim: Option<&str>,
+) -> Result<std::result::Result<Rotated, (u16, &'static str)>> {
+    if refresh_token.len() < 20 || refresh_token.len() > 200 {
+        return Ok(Err((400, "bad_request")));
     }
 
     let now = now_secs();
-    let old_hash = sha256_hex(&body.refresh_token);
-    let db = ctx.env.d1("DB")?;
+    let old_hash = sha256_hex(refresh_token);
+    let db = env.d1("DB")?;
 
     #[derive(Deserialize)]
     struct Row {
@@ -77,7 +113,7 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
         .await?;
     let row = match row {
         Some(r) if (r.expires_at as u64) > now => r,
-        _ => return json_err(401, "invalid_refresh"),
+        _ => return Ok(Err((401, "invalid_refresh"))),
     };
 
     let user_id = row.user_id;
@@ -87,12 +123,12 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
     // accommodating.
     let device_id = match row.device_id.as_deref().filter(|d| !d.is_empty()) {
         Some(d) => d,
-        None => return json_err(401, "invalid_refresh"),
+        None => return Ok(Err((401, "invalid_refresh"))),
     };
     // The stored row decides which device this session belongs to; the body may only reject.
     // See `check_device_claim` for what a caller-chosen device_id would buy an attacker.
-    if check_device_claim(device_id, body.device_id.as_deref()).is_err() {
-        return json_err(403, "device_mismatch");
+    if check_device_claim(device_id, device_claim).is_err() {
+        return Ok(Err((403, "device_mismatch")));
     }
     // A REMOVED device must not RESURRECT its session through /auth/refresh (parity with
     // relogin.rs). Revoked → 401, so it gets no new access token and the session dies within
@@ -108,10 +144,10 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
             .first(None)
             .await?;
         if rev.and_then(|r| r.revoked_at).is_some() {
-            return json_err(401, "device_revoked");
+            return Ok(Err((401, "device_revoked")));
         }
     }
-    let access_token = sign_access_token(&ctx.env, &user_id, device_id)?;
+    let access_token = sign_access_token(env, &user_id, device_id)?;
     let new_refresh = b64u_encode(&random_bytes(32));
     let new_hash = sha256_hex(&new_refresh);
     // ROTATION IS ONE WRITE. A standalone revoke UPDATE, with the successor INSERTed later,
@@ -145,18 +181,14 @@ pub async fn refresh(mut req: Request, ctx: RouteContext<()>) -> Result<Response
     // The heartbeat of a session that is actually being used — a device renews here about every
     // quarter of an hour, which is exactly the resolution the devices screen wants. Best-effort:
     // a failed note must not fail a refresh. See `middleware::touch_device_seen`.
-    if let Err(e) =
-        crate::auth::middleware::touch_device_seen(&ctx.env, &user_id, device_id).await
-    {
+    if let Err(e) = crate::auth::middleware::touch_device_seen(env, &user_id, device_id).await {
         worker::console_log!("last_seen touch failed on refresh for {device_id}: {e}");
     }
 
-    Response::from_json(&serde_json::json!({
-        "user_id": user_id,
-        "access_token": access_token,
-        "refresh_token": new_refresh,
-        "token_type": "Bearer",
-        "expires_in": ACCESS_TTL_SEC,
+    Ok(Ok(Rotated {
+        user_id,
+        access_token,
+        refresh_token: new_refresh,
     }))
 }
 

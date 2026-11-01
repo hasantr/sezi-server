@@ -249,6 +249,7 @@ impl UserInbox {
             &n.envelope_b64,
             None,
             crate::push::coalesce::WakeIntent::from_flags(silent, false),
+            false, // a bot sends nothing live-only
         )
         .await;
         // The member's wake, when no socket of theirs took it, is sent by THEIR inbox (its

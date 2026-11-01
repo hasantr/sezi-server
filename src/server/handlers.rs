@@ -129,8 +129,15 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         // The protocol capability announcement. device_addressing=1 means the server supports
         // the batch wire format (envelopes[]) and per-device OTK/bundle v2; the single
         // envelope_b64 form gets a 400.
+        //
+        // sync_refresh=1: `/sync` also takes `sezgi.refresh.v1, <refresh_token>` and answers the
+        // new pair as its first frame (`auth::sync_refresh`); a client uses it only when this
+        // says so. live_frames=1: a 1:1 send flagged `live` is pushed or dropped, never stored
+        // (`inbox_do/live_frames.rs`) — informational, as an older relay just stores it.
         "protocol": {
-            "device_addressing": 1
+            "device_addressing": 1,
+            "sync_refresh": 1,
+            "live_frames": 1
         },
         // Data retention announcement. The model is "relay": a message is deleted by the DO
         // fan-out on delivery (`on_delivery`), and an undelivered one is kept for at most
