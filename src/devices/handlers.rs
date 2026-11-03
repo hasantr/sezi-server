@@ -143,6 +143,8 @@ pub async fn put_list(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         Ok(rev) => rev,
         Err(resp) => return Ok(resp),
     };
+    // A device this list dropped will never read its queue: the inbox drops it now.
+    crate::realtime::drop_revoked_queues_best_effort(&ctx.env, &auth_user).await;
     // The invite grant is created during verify, but the first device list only arrives
     // afterwards. If the inviter's first pull hit a 404, this post-commit second nudge
     // restarts the authoritative sync — no app restart needed.

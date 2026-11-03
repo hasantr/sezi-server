@@ -57,9 +57,12 @@ impl UserInbox {
     /// as "idle" would end the alarm chain of a DO that still owes a client its messages, which is
     /// a far worse failure than one extra wake.
     pub(super) fn measure_alarm_work(&self, account_removed: bool) -> AlarmWork {
+        // A stalled device's rows (`dead_devices.rs`) are not work a client is waiting for.
+        let (pending_rows, stalled_rows) = self.pending_split();
         AlarmWork {
             account_removed,
-            pending_rows: self.count_or_busy("SELECT COUNT(*) AS n FROM pending"),
+            pending_rows,
+            stalled_rows,
             forward_rows: self.count_or_busy("SELECT COUNT(*) AS n FROM forward_queue"),
             sockets: self.state.get_websockets().len(),
             // The three tables only the daily cleanup ever empties. Summed in one statement so
@@ -196,6 +199,8 @@ impl UserInbox {
         if self.is_bot().await {
             self.bot_tick().await; // opens what members sent, before anything below reads `pending`
         }
+        // No socket without a device is flushed every device's rows (audit 2026-11-03 #7).
+        super::upgrade_refusal::close_unverified_sockets(&self.state);
         self.flush_pending_to_all();
         // If the sender misses the reconnect, the periodic alarm pushes anyway (idempotent: a
         // repeat is removed by the client's `forward_ack` and the sender side dedups it).
@@ -261,6 +266,11 @@ impl UserInbox {
         // for the life of this DO instance), and CONDITIONALLY: an inbox with nothing queued and
         // nobody connected stops rather than waking ~960 times a day (see `alarm_policy`). Both
         // events that create work — `/notify` and `ws_upgrade` — call `ensure_alarm`.
+        //
+        // A stalled queue may be a revoked device's whose `/devices-changed` was lost: re-read the
+        // revoked devices now and then (`dead_devices.rs`).
+        let (_, stalled) = self.pending_split();
+        self.reconcile_revoked_if_stalled(stalled).await;
         let work = self.measure_alarm_work(account_removed);
         if let Some(delay) = next_alarm_delay_ms(work, FLUSH_INTERVAL_MS, IDLE_INTERVAL_MS) {
             self.arm_alarm_within(delay).await;

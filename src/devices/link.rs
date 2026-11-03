@@ -297,6 +297,8 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
         Ok(rev) => rev,
         Err(resp) => return Ok(resp),
     };
+    // The list may also have dropped a device: its queue goes (`inbox_do/dead_devices.rs`).
+    crate::realtime::drop_revoked_queues_best_effort(&ctx.env, &auth_user).await;
 
     // Mint the tokens in memory only: an access JWT, plus a refresh token delivered in
     // plaintext while only its hash is stored.

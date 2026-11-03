@@ -82,13 +82,26 @@ pub async fn bootstrap(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         // `ADMIN_INVITE_KEY` is the gate; `self_provision` generates it on a fresh deploy and names
         // this as the consumer. Without it the answer is the ordinary closed-gate 410 — the same
         // reply a healthy server gives, so the endpoint never advertises that this server qualifies.
-        if !ghost_recovery_authorized(&req, &ctx.env) {
+        //
+        // The CLAIM SECRET is a second key (audit 2026-11-03 finding #5): no app sends the admin
+        // key, but the app that installed a relay holds its claim secret and already sends it here
+        // (`x-sezi-claim`), and it was checked above before any read. Its holder is who the server
+        // was set up for, so with it an owner that published no device in its first ten minutes —
+        // whatever refresh tokens it holds (an answer lost after the registration committed) — is
+        // stranded and is cleared too. A relay with no claim secret keeps the admin key alone.
+        let by_claim = crate::auth::claim::claim_secret_required(&ctx.env);
+        if !(by_claim || ghost_recovery_authorized(&req, &ctx.env)) {
             return json_err(410, "bootstrap_complete");
         }
         let device_count = count_rows(&db, "SELECT COUNT(*) AS n FROM devices WHERE user_id = ?", &o.id).await?;
         let refresh_count =
             count_rows(&db, "SELECT COUNT(*) AS n FROM refresh_tokens WHERE user_id = ?", &o.id).await?;
-        if !is_ghost_owner(device_count, refresh_count, o.created_at, now_secs()) {
+        let stranded = if by_claim {
+            is_stranded_owner(device_count, o.created_at, now_secs())
+        } else {
+            is_ghost_owner(device_count, refresh_count, o.created_at, now_secs())
+        };
+        if !stranded {
             return json_err(410, "bootstrap_complete");
         }
         // A device-less, session-less owner can do NOTHING anyway — no key, no token — so this
@@ -134,6 +147,9 @@ pub async fn bootstrap(req: Request, ctx: RouteContext<()>) -> Result<Response> 
             // also makes re-registering with that address possible again.
             db.prepare("DELETE FROM verification_codes WHERE email = ?")
                 .bind(&[d1_text(&o.email)])?,
+            // Its registration receipt, so a late retry cannot answer for the cleared account.
+            db.prepare("DELETE FROM registration_receipts WHERE user_id = ?")
+                .bind(&[d1_text(&o.id)])?,
             db.prepare("DELETE FROM users WHERE id = ? AND role = 'owner'")
                 .bind(&[d1_text(&o.id)])?,
         ])
@@ -264,6 +280,14 @@ fn is_ghost_owner(device_count: i64, refresh_count: i64, created_at: i64, now: u
     device_count == 0 && refresh_count == 0 && age >= GHOST_GRACE_SEC
 }
 
+/// What the claim secret's holder may clear: an owner with no device row at least ten minutes old,
+/// refresh tokens or not. Its registration committed but the app never published its device —
+/// typically an answer lost on the network, which left a refresh row nobody holds.
+fn is_stranded_owner(device_count: i64, created_at: i64, now: u64) -> bool {
+    let age = (now as i64).saturating_sub(created_at);
+    device_count == 0 && age >= GHOST_GRACE_SEC
+}
+
 /// Helper for `SELECT COUNT(*) AS n ...` (single-column count).
 async fn count_rows(db: &D1Database, sql: &str, user_id: &str) -> Result<i64> {
     #[derive(Deserialize)]
@@ -293,7 +317,7 @@ mod tests {
     #[test]
     fn the_ghost_recovery_is_gated_before_it_measures_or_deletes_anything() {
         let gate = SRC
-            .find(concat!("if !ghost_recovery_", "authorized(&req, &ctx.env)"))
+            .find(concat!("if !(by_claim || ghost_recovery_", "authorized(&req, &ctx.env))"))
             .expect("the ADMIN_INVITE_KEY gate on the ghost-owner recovery is gone");
         let measure = SRC
             .find(concat!("let device_", "count = count_rows"))
@@ -313,7 +337,7 @@ mod tests {
     #[test]
     fn an_unauthorized_recovery_answers_the_ordinary_closed_gate() {
         let gate = SRC
-            .find(concat!("if !ghost_recovery_", "authorized(&req, &ctx.env)"))
+            .find(concat!("if !(by_claim || ghost_recovery_", "authorized(&req, &ctx.env))"))
             .unwrap();
         let after = &SRC[gate..];
         let refusal = after
@@ -338,7 +362,7 @@ mod tests {
             .find(concat!("let db = ctx.env.", "d1(\"DB\")?;"))
             .expect("the handler's D1 binding moved — re-point this guard");
         let ghost = SRC
-            .find(concat!("if !ghost_recovery_", "authorized(&req, &ctx.env)"))
+            .find(concat!("if !(by_claim || ghost_recovery_", "authorized(&req, &ctx.env))"))
             .unwrap();
         let mint = SRC
             .find(concat!("let token = ensure_genesis_", "token(&db)"))
@@ -380,5 +404,29 @@ mod tests {
     #[test]
     fn a_future_dated_account_is_not_a_ghost() {
         assert!(!is_ghost_owner(0, 0, T0 + 3600, T0 as u64));
+    }
+
+    /// An owner whose registration committed but whose answer was lost holds a refresh row nobody
+    /// has: not a ghost by the admin key's criteria, but stranded for the claim secret's holder.
+    #[test]
+    fn the_claim_secrets_holder_clears_an_owner_that_never_published_a_device() {
+        let now = (T0 + GHOST_GRACE_SEC) as u64;
+        assert!(!is_ghost_owner(0, 1, T0, now), "the admin key's criteria leave it stuck");
+        assert!(is_stranded_owner(0, T0, now));
+        assert!(!is_stranded_owner(1, T0, now), "an owner with a device is never cleared");
+        assert!(!is_stranded_owner(0, T0, (T0 + GHOST_GRACE_SEC - 1) as u64), "the grace holds");
+    }
+
+    /// The claim secret opens the recovery only when the relay HAS one, and it was checked at the
+    /// top of the handler before anything was read.
+    #[test]
+    fn the_claim_secret_opens_the_recovery_only_where_it_is_required() {
+        let by_claim = SRC
+            .find(concat!("let by_claim = crate::auth::claim::claim_secret_", "required(&ctx.env);"))
+            .expect("the claim-secret recovery is keyed on a configured secret");
+        let claim = SRC
+            .find(concat!("if !crate::auth::claim::claim_", "authorized(&req, &ctx.env)"))
+            .unwrap();
+        assert!(claim < by_claim);
     }
 }

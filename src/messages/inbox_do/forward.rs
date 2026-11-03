@@ -1,4 +1,5 @@
 use super::*;
+use crate::d1util::MAX_BOUND_PARAMS;
 
 /// A FRESH-reconnect force-replay hands out only the last 48 hours of forwards. Replaying
 /// older orphan rows (e.g. a `delivery_failed` the client never `forward_ack`ed) re-triggers
@@ -201,15 +202,17 @@ impl UserInbox {
                 pushed_ids.push(row.id);
             }
         }
-        if !pushed_ids.is_empty() {
-            let placeholders = (0..pushed_ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        // Up to 500 pushed ids: one statement each ≤ the bound-parameter cap (`now` included). A
+        // single statement over it fails whole, the stamp never lands, and every row is pushed
+        // again on the next flush.
+        for chunk in pushed_ids.chunks(MAX_BOUND_PARAMS - 1) {
             let sql = format!(
                 "UPDATE forward_queue SET pushed_at = ? WHERE id IN ({})",
-                placeholders
+                crate::d1util::marks(chunk.len())
             );
-            let mut args: Vec<JsValue> = Vec::with_capacity(pushed_ids.len() + 1);
+            let mut args: Vec<JsValue> = Vec::with_capacity(chunk.len() + 1);
             args.push(JsValue::from_f64(now as f64));
-            for id in &pushed_ids {
+            for id in chunk {
                 args.push(JsValue::from_f64(*id as f64));
             }
             let _ = storage.sql().exec_raw(&sql, Some(args));
@@ -223,15 +226,17 @@ impl UserInbox {
             return;
         }
         let storage = self.state.storage();
-        // One BATCH delete with an IN clause instead of per-id binds (SQLite is fine
-        // with the ~500 placeholders a client batch can produce).
-        let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "DELETE FROM forward_queue WHERE id IN ({})",
-            placeholders
-        );
-        let args: Vec<JsValue> = ids.iter().map(|i| JsValue::from_f64(*i as f64)).collect();
-        let _ = storage.sql().exec_raw(&sql, Some(args));
+        // A delete with an IN clause instead of per-id statements, cut to the bound-parameter cap:
+        // a Durable Object's SQLite refuses more than 100 binds, so the ~500 a client batch can
+        // carry in one statement deleted nothing.
+        for chunk in ids.chunks(MAX_BOUND_PARAMS) {
+            let sql = format!(
+                "DELETE FROM forward_queue WHERE id IN ({})",
+                crate::d1util::marks(chunk.len())
+            );
+            let args: Vec<JsValue> = chunk.iter().map(|i| JsValue::from_f64(*i as f64)).collect();
+            let _ = storage.sql().exec_raw(&sql, Some(args));
+        }
     }
 
     pub(crate) fn flush_forwards_to_all(&self) {

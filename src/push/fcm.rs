@@ -319,16 +319,47 @@ fn body_signals_bad_token(body: &str) -> bool {
 
 /// Contentless wake through the relay — the default path for a self-host install without
 /// its own service account, and the resend of a wake Google refused for the owner's own project
-/// (K8). Ok(true) = sent, Ok(false) = STALE (the caller deletes it from push_tokens; the relay forwards FCM's
-/// UNREGISTERED signal as `stale:true`), Err = transient (429 / 5xx / network).
+/// (K8). Sent; STALE (the caller deletes it from push_tokens; the relay forwards FCM's
+/// UNREGISTERED signal as `stale:true`); BUSY (429: this token's budget at the relay is spent, and
+/// `Retry-After` says for how long); or failed (5xx / network). `urgent` marks a ring, which the
+/// relay counts apart (`push-relay/src/rate.js`).
 pub(crate) async fn send_wake_relay(
     relay_url: &str,
     fcm_token: &str,
     style: WakeStyle,
     carry: Option<&str>,
-) -> Result<bool> {
+    urgent: bool,
+) -> RelaySend {
+    match relay_once(relay_url, fcm_token, style, carry, urgent).await {
+        Ok(sent) => sent,
+        Err(e) => RelaySend::Failed(format!("{e:?}")),
+    }
+}
+
+/// One relay send's verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RelaySend {
+    Sent,
+    Stale,
+    /// 429, with the seconds the relay asked to wait (absent from a relay before 2026-11-03).
+    Busy { retry_after_s: Option<u32> },
+    Failed(String),
+}
+
+/// A 429's `Retry-After`, in whole seconds; anything else is no answer.
+pub(crate) fn retry_after_secs(header: Option<&str>) -> Option<u32> {
+    header.and_then(|h| h.trim().parse::<u32>().ok())
+}
+
+async fn relay_once(
+    relay_url: &str,
+    fcm_token: &str,
+    style: WakeStyle,
+    carry: Option<&str>,
+    urgent: bool,
+) -> Result<RelaySend> {
     let url = format!("{}/wake", relay_url.trim_end_matches('/'));
-    let payload = relay_body(fcm_token, style, carry).to_string();
+    let payload = relay_body(fcm_token, style, carry, urgent).to_string();
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     init.with_body(Some(payload.into()));
@@ -338,6 +369,10 @@ pub(crate) async fn send_wake_relay(
     let req = Request::new_with_init(&url, &init)?;
     let mut resp = Fetch::Request(req).send().await?;
     let code = resp.status_code();
+    if code == 429 {
+        let after = resp.headers().get("retry-after").ok().flatten();
+        return Ok(RelaySend::Busy { retry_after_s: retry_after_secs(after.as_deref()) });
+    }
     if code == 200 {
         #[derive(Deserialize)]
         struct RelayResp {
@@ -348,13 +383,13 @@ pub(crate) async fn send_wake_relay(
         }
         let r: RelayResp = resp.json().await?;
         if r.stale {
-            return Ok(false);
+            return Ok(RelaySend::Stale);
         }
         if r.ok {
-            return Ok(true);
+            return Ok(RelaySend::Sent);
         }
     }
-    Err(Error::RustError(format!("fcm relay: {code}")))
+    Ok(RelaySend::Failed(format!("fcm relay: {code}")))
 }
 
 #[cfg(test)]

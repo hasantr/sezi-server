@@ -57,6 +57,20 @@ pub(crate) fn group_acks(
         .collect()
 }
 
+/// Acked ids per statement: the bound-parameter cap less the device bind.
+pub(crate) const ACK_IDS_PER_STATEMENT: usize = crate::d1util::MAX_BOUND_PARAMS - 1;
+
+/// The SELECT and the DELETE of `n` acked ids, scoped to one device (its id is the last bind).
+/// Pure, so the cap can be tested against a capped SQLite.
+pub(crate) fn ack_sql(n: usize) -> (String, String) {
+    let marks = crate::d1util::marks(n);
+    let dev_clause = " AND (device_id = ? OR device_id IS NULL)";
+    (
+        format!("SELECT id, sender_id, device_id FROM pending WHERE id IN ({marks}){dev_clause}"),
+        format!("DELETE FROM pending WHERE id IN ({marks}){dev_clause}"),
+    )
+}
+
 impl UserInbox {
     /// SELECT and DELETE the acked rows, scoped to `ack_device`.
     ///
@@ -71,39 +85,28 @@ impl UserInbox {
         ids: &[i64],
         ack_device: Option<&str>,
     ) -> Result<Vec<AckRow>> {
-        let placeholders: String = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-        // `ack_device` is an Option only because the attachment may be missing on a socket that
-        // was never attached — not because a token can lack a device claim. The
+        // `ack_device` is an Option only because a socket accepted before 2026-11-03 may carry no
+        // attachment — not because a token can lack a device claim. Such a socket acks NOTHING:
+        // with no device clause its ack deleted every device's rows, and when it acked false the
+        // frames it could not decrypt, a sibling's messages were lost (audit finding #7). The
         // `OR device_id IS NULL` above is a different thing: it is about the pending ROW.
-        let (dev_clause, mut extra_arg): (&str, Option<JsValue>) = match ack_device {
-            Some(d) => (
-                " AND (device_id = ? OR device_id IS NULL)",
-                Some(JsValue::from_str(d)),
-            ),
-            None => ("", None),
+        let Some(device) = ack_device else {
+            return Ok(Vec::new());
         };
-        let select_sql = format!(
-            "SELECT id, sender_id, device_id FROM pending WHERE id IN ({}){}",
-            placeholders, dev_clause
-        );
-        let del_sql = format!(
-            "DELETE FROM pending WHERE id IN ({}){}",
-            placeholders, dev_clause
-        );
-        let base_vals: Vec<JsValue> = ids.iter().map(|i| JsValue::from_f64(*i as f64)).collect();
-        let mut select_vals = base_vals.clone();
-        if let Some(a) = extra_arg.take() {
-            select_vals.push(a);
-        }
-        let mut del_vals = base_vals;
-        if let Some(d) = ack_device {
-            del_vals.push(JsValue::from_str(d));
-        }
         let storage = self.state.storage();
         let sql = storage.sql();
-        let cursor = sql.exec_raw(&select_sql, Some(select_vals))?;
-        let rows: Vec<AckRow> = cursor.to_array()?;
-        sql.exec_raw(&del_sql, Some(del_vals))?;
+        let mut rows: Vec<AckRow> = Vec::with_capacity(ids.len());
+        // The ack list is the client's and uncapped; a statement is held to the platform's
+        // bound-parameter cap, the device bind included.
+        for chunk in ids.chunks(ACK_IDS_PER_STATEMENT) {
+            let (select_sql, del_sql) = ack_sql(chunk.len());
+            let mut vals: Vec<JsValue> =
+                chunk.iter().map(|i| JsValue::from_f64(*i as f64)).collect();
+            vals.push(JsValue::from_str(device));
+            let cursor = sql.exec_raw(&select_sql, Some(vals.clone()))?;
+            rows.extend(cursor.to_array::<AckRow>()?);
+            sql.exec_raw(&del_sql, Some(vals))?;
+        }
         Ok(rows)
     }
 
@@ -157,7 +160,40 @@ impl UserInbox {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_acks, AckRow};
+    use super::{ack_sql, group_acks, AckRow, ACK_IDS_PER_STATEMENT};
+
+    #[test]
+    fn a_long_ack_list_is_cut_under_the_bound_parameter_cap() {
+        // The ack list is the client's and uncapped; one statement over 100 binds fails whole
+        // on the platform, so nothing would be acked and every row would redeliver forever.
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        crate::test_schema::cap_binds_like_d1(&db);
+        db.execute_batch("CREATE TABLE pending (id INTEGER PRIMARY KEY, sender_id TEXT, device_id TEXT);")
+            .unwrap();
+        for id in 1..=250i64 {
+            let dev = if id % 2 == 0 { "mine" } else { "sibling" };
+            db.execute("INSERT INTO pending VALUES (?1, 's', ?2)", rusqlite::params![id, dev])
+                .unwrap();
+        }
+        let ids: Vec<i64> = (1..=250).collect();
+        let (_, one) = ack_sql(ids.len());
+        let mut all: Vec<rusqlite::types::Value> = ids.iter().map(|i| (*i).into()).collect();
+        all.push("mine".to_string().into());
+        assert!(db.execute(&one, rusqlite::params_from_iter(&all)).is_err());
+        for chunk in ids.chunks(ACK_IDS_PER_STATEMENT) {
+            let (_, del) = ack_sql(chunk.len());
+            let mut vals: Vec<rusqlite::types::Value> = chunk.iter().map(|i| (*i).into()).collect();
+            vals.push("mine".to_string().into());
+            db.execute(&del, rusqlite::params_from_iter(&vals)).unwrap();
+        }
+        let left: i64 = db
+            .query_row("SELECT COUNT(*) FROM pending WHERE device_id = 'mine'", [], |r| r.get(0))
+            .unwrap();
+        let sibling: i64 = db
+            .query_row("SELECT COUNT(*) FROM pending WHERE device_id = 'sibling'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((left, sibling), (0, 125), "mine all acked, the sibling's untouched");
+    }
 
     fn row(id: i64, sender: &str, device: Option<&str>) -> AckRow {
         AckRow { id, sender_id: sender.into(), device_id: device.map(str::to_string) }

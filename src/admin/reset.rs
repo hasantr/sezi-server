@@ -146,6 +146,7 @@ const WIPE_TABLES: &[&str] = &[
     "fanout_retry",
     "push_wake_debounce",
     "verification_codes",
+    "registration_receipts",
     "link_requests",
     // Stored-object bookkeeping (the blobs were copied into storage_orphans above).
     "media_objects",

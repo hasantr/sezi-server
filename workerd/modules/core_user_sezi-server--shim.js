@@ -3,7 +3,7 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 
 // build/index.js
 import { WorkerEntrypoint as Rt } from "cloudflare:workers";
-import et from "./5b462f96d9bc765115cf6b4e39389293a62ee308-index_bg.wasm";
+import et from "./9e248be9b8d65646421e53c9f8b85c1dfbbb32c6-index_bg.wasm";
 var K = globalThis.__worker_init_state = { criticalError: false, instanceId: 0 };
 var W = class {
   static {
@@ -419,7 +419,11 @@ function st() {
     return c(function(t, e) {
       r(t).acceptWebSocket(r(e));
     }, arguments);
-  }, "__wbg_acceptWebSocket_5d5a1f034c9bec0e"), __wbg_all_5a0f50ed86bbeec0: /* @__PURE__ */ __name(function() {
+  }, "__wbg_acceptWebSocket_5d5a1f034c9bec0e"), __wbg_accept_c2c2904bfae976b0: /* @__PURE__ */ __name(function() {
+    return c(function(t) {
+      r(t).accept();
+    }, arguments);
+  }, "__wbg_accept_c2c2904bfae976b0"), __wbg_all_5a0f50ed86bbeec0: /* @__PURE__ */ __name(function() {
     return c(function(t) {
       let e = r(t).all();
       return _(e);
@@ -1247,17 +1251,17 @@ function a() {
 }
 __name(a, "a");
 function at(i3, t) {
-  a(), s.__wasm_bindgen_func_elem_8027(i3, t);
+  a(), s.__wasm_bindgen_func_elem_8057(i3, t);
 }
 __name(at, "at");
 function ft(i3, t, e) {
-  a(), s.__wasm_bindgen_func_elem_7549(i3, t, _(e));
+  a(), s.__wasm_bindgen_func_elem_7579(i3, t, _(e));
 }
 __name(ft, "ft");
 function bt(i3, t, e) {
   try {
     let u = s.__wbindgen_add_to_stack_pointer(-16);
-    a(), s.__wasm_bindgen_func_elem_3959(u, i3, t, _(e));
+    a(), s.__wasm_bindgen_func_elem_3989(u, i3, t, _(e));
     var n = b().getInt32(u + 0, true), o = b().getInt32(u + 4, true);
     if (o) throw d(n);
   } finally {
@@ -1266,7 +1270,7 @@ function bt(i3, t, e) {
 }
 __name(bt, "bt");
 function gt(i3, t, e, n) {
-  a(), s.__wasm_bindgen_func_elem_3998(i3, t, _(e), _(n));
+  a(), s.__wasm_bindgen_func_elem_4028(i3, t, _(e), _(n));
 }
 __name(gt, "gt");
 var dt = ["bytes"];
@@ -1570,7 +1574,7 @@ var jsonError = /* @__PURE__ */ __name(async (request, env, _ctx, middlewareCtx)
 }, "jsonError");
 var middleware_miniflare3_json_error_default = jsonError;
 
-// .wrangler/tmp/bundle-i1Xbb7/middleware-insertion-facade.js
+// .wrangler/tmp/bundle-STtGIw/middleware-insertion-facade.js
 var __INTERNAL_WRANGLER_MIDDLEWARE__ = [
   middleware_ensure_req_body_drained_default,
   middleware_miniflare3_json_error_default
@@ -1602,7 +1606,7 @@ function __facade_invoke__(request, env, ctx, dispatch, finalMiddleware) {
 }
 __name(__facade_invoke__, "__facade_invoke__");
 
-// .wrangler/tmp/bundle-i1Xbb7/middleware-loader.entry.ts
+// .wrangler/tmp/bundle-STtGIw/middleware-loader.entry.ts
 var __Facade_ScheduledController__ = class ___Facade_ScheduledController__ {
   constructor(scheduledTime, cron, noRetry) {
     this.scheduledTime = scheduledTime;
@@ -1712,4 +1716,4 @@ export {
 };
 //# sourceMappingURL=shim.js.map
 
-//# sourceURL=file:///home/hasan/.cache/gecici/sezi-workerd.3XUtTB/relay/.wrangler/tmp/dev-R1BVEF/shim.js
+//# sourceURL=file:///home/hasan/.cache/gecici/sezi-workerd.3ENeK8/relay/.wrangler/tmp/dev-BkZbve/shim.js

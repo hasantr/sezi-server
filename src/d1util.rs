@@ -58,3 +58,14 @@ pub fn d1_opt_text(s: Option<&str>) -> JsValue {
         None => JsValue::null(),
     }
 }
+
+/// The most bound parameters one statement may carry. D1 refuses more than 100 per query, and a
+/// Durable Object's SQLite has the same cap, so every dynamically built `IN (?, …)` is cut into
+/// statements of at most this many binds, fixed binds included. Going over is not a slow path:
+/// the whole statement fails (`docs/RELAY_AUDIT_2026_11_03.md` finding #1).
+pub const MAX_BOUND_PARAMS: usize = 100;
+
+/// `n` comma-separated `?` marks, for an `IN (…)` list.
+pub fn marks(n: usize) -> String {
+    vec!["?"; n].join(",")
+}

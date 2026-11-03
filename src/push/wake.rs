@@ -12,7 +12,7 @@ use worker::*;
 use super::carry::Carried;
 use super::coalesce::{gate, Gate, WakeAsk, WakeMarks, BLIND_KEY};
 use super::config::{self, ProjectVerdict, PushConfig, SendMode, KEY_OWN_REACHED};
-use super::fcm::{send_wake, send_wake_relay, DirectSend};
+use super::fcm::{send_wake, send_wake_relay, DirectSend, RelaySend};
 use super::style::WakeStyle;
 use crate::d1util::d1_text;
 use crate::utils::now_secs;
@@ -112,9 +112,17 @@ pub(crate) trait WakePort {
         style: WakeStyle,
         carry: Option<&str>,
     ) -> DirectSend;
-    /// A send through the shared relay: Ok(true) sent, Ok(false) stale, Err failed.
-    async fn relay(&self, url: &str, token: &str, style: WakeStyle, carry: Option<&str>)
-        -> Result<bool>;
+    /// A send through the shared relay; `urgent` marks a ring (its own budget there).
+    async fn relay(
+        &self,
+        url: &str,
+        token: &str,
+        style: WakeStyle,
+        carry: Option<&str>,
+        urgent: bool,
+    ) -> RelaySend;
+    /// Wait before trying a busy relay again with a ring ([`ring_retry_delay_ms`]).
+    async fn pause_ms(&self, ms: u64);
     async fn delete_token(&self, device_id: &str);
     /// Record that the owner's own project has reached a device (`config::KEY_OWN_REACHED`).
     async fn record_reached(&self, verdict: ProjectVerdict);
@@ -222,7 +230,7 @@ pub(crate) async fn wake_with<P: WakePort>(
     // A device-blind wake names no row of one device, so it carries nothing.
     let none = Carried::none();
     let carried = if blind { &none } else { carried };
-    send(p, user, if blind { None } else { Some(&granted) }, &mut t, carried).await;
+    send(p, user, if blind { None } else { Some(&granted) }, &mut t, carried, ask.urgent).await;
     let reached: Vec<String> = if !blind {
         t.woke.clone()
     } else if t.woke.is_empty() {
@@ -248,6 +256,7 @@ async fn send<P: WakePort>(
     devices: Option<&[String]>,
     t: &mut WakeTally,
     carried: &Carried,
+    urgent: bool,
 ) {
     let Some(mode) = p.config().await.and_then(|c| c.send_mode()) else {
         p.log(format!("[push] user={user} mode=off -> skipped (FCM not configured, or 'off')"));
@@ -296,7 +305,7 @@ async fn send<P: WakePort>(
         };
         let (project_id, service_account, fallback) = match &mode {
             SendMode::Relay { url } => {
-                via_relay(p, user, url, row, t, carry).await;
+                via_relay(p, user, url, row, t, carry, urgent).await;
                 continue;
             }
             SendMode::Direct { project_id, service_account, fallback, .. } => {
@@ -307,7 +316,7 @@ async fn send<P: WakePort>(
         // relay, never direct again until the device registers another token (`handlers.rs`).
         // Every decision here is about one token: no wake moves any other device's route.
         if row.relay_project.as_deref() == Some(project_id.as_str()) {
-            relay_refused(p, user, fallback, row, t, carry).await;
+            relay_refused(p, user, fallback, row, t, carry, urgent).await;
             continue;
         }
         match p.direct(project_id, service_account, &row.fcm_token, row.style(), carry).await {
@@ -333,7 +342,7 @@ async fn send<P: WakePort>(
                     row.device_id
                 ));
                 t.routed += 1;
-                if relay_refused(p, user, fallback, row, t, carry).await {
+                if relay_refused(p, user, fallback, row, t, carry, urgent).await {
                     p.route_via_relay(row, project_id).await;
                 }
             }
@@ -366,6 +375,7 @@ async fn relay_refused<P: WakePort>(
     row: &TokenRow,
     t: &mut WakeTally,
     carry: Option<&str>,
+    urgent: bool,
 ) -> bool {
     let Some(url) = fallback else {
         t.failed += 1;
@@ -376,7 +386,21 @@ async fn relay_refused<P: WakePort>(
         return true;
     };
     t.relayed += 1;
-    via_relay(p, user, url, row, t, carry).await
+    via_relay(p, user, url, row, t, carry, urgent).await
+}
+
+/// How many times a ring tries a busy relay again.
+pub(crate) const RING_RETRIES: u32 = 2;
+
+/// How long a ring waits before trying a busy relay (429) again, or `None` to give up: what the
+/// relay asked (5 s when it did not say), never under 1 s nor over 10 s, twice at most. A ring
+/// rings for 45 s, so a wake 20 s late still rings it; left to the backstop, it never did. An
+/// ordinary wake is not retried here: the next message or the backstop wakes the device anyway.
+pub(crate) fn ring_retry_delay_ms(attempt: u32, retry_after_s: Option<u32>) -> Option<u64> {
+    if attempt >= RING_RETRIES {
+        return None;
+    }
+    Some(u64::from(retry_after_s.unwrap_or(5).clamp(1, 10)) * 1000)
 }
 
 /// One token through the shared relay. Answers whether the token is still registered.
@@ -387,23 +411,40 @@ async fn via_relay<P: WakePort>(
     row: &TokenRow,
     t: &mut WakeTally,
     carry: Option<&str>,
+    urgent: bool,
 ) -> bool {
-    match p.relay(url, &row.fcm_token, row.style(), carry).await {
-        Ok(true) => {
-            t.ok += 1;
-            t.carried += usize::from(carry.is_some());
-            t.woke.push(row.device_id.clone());
+    let mut attempt = 0;
+    loop {
+        match p.relay(url, &row.fcm_token, row.style(), carry, urgent).await {
+            RelaySend::Sent => {
+                t.ok += 1;
+                t.carried += usize::from(carry.is_some());
+                t.woke.push(row.device_id.clone());
+            }
+            RelaySend::Stale => {
+                stale(p, user, row, t).await;
+                return false;
+            }
+            RelaySend::Busy { retry_after_s } => {
+                if let Some(ms) = urgent.then(|| ring_retry_delay_ms(attempt, retry_after_s)).flatten() {
+                    p.log(format!(
+                        "[push] user={user} device={} ring BUSY at the relay -> again in {ms} ms",
+                        row.device_id
+                    ));
+                    p.pause_ms(ms).await;
+                    attempt += 1;
+                    continue;
+                }
+                t.failed += 1;
+                p.log(format!("[push] user={user} device={} send FAILED: relay 429", row.device_id));
+            }
+            RelaySend::Failed(e) => {
+                t.failed += 1;
+                p.log(format!("[push] user={user} device={} send FAILED: {e}", row.device_id));
+            }
         }
-        Ok(false) => {
-            stale(p, user, row, t).await;
-            return false;
-        }
-        Err(e) => {
-            t.failed += 1;
-            p.log(format!("[push] user={user} device={} send FAILED: {e:?}", row.device_id));
-        }
+        return true;
     }
-    true
 }
 
 /// Stale token → drop it, so later messages do not retry it for nothing. Logged per device on
@@ -451,9 +492,19 @@ impl WakePort for D1Wake<'_> {
         send_wake(self.env, service_account, token, project_id, style, carry).await
     }
 
-    async fn relay(&self, url: &str, token: &str, style: WakeStyle, carry: Option<&str>)
-        -> Result<bool> {
-        send_wake_relay(url, token, style, carry).await
+    async fn relay(
+        &self,
+        url: &str,
+        token: &str,
+        style: WakeStyle,
+        carry: Option<&str>,
+        urgent: bool,
+    ) -> RelaySend {
+        send_wake_relay(url, token, style, carry, urgent).await
+    }
+
+    async fn pause_ms(&self, ms: u64) {
+        Delay::from(std::time::Duration::from_millis(ms)).await;
     }
 
     async fn delete_token(&self, device_id: &str) {

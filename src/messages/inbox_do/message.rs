@@ -10,17 +10,16 @@ const WS_LIVENESS_WINDOW_MS: i64 = 20_000;
 
 /// A hard row-count cap on one recipient's `pending` table, the second line of defence behind TTL
 /// retention: retention bounds the queue in TIME, but a flood INSIDE that window still bloats the
-/// victim DO's SQLite. Past the cap the oldest surplus rows are evicted — bounded FIFO. The value
-/// is generous, so reaching it means a very long offline period or a DoS, and the client's history
-/// sync plus redelivery compensate for what is dropped.
+/// victim DO's SQLite. Past the cap the surplus is evicted, the least recently connected device's
+/// rows first and an open socket's last (`dead_devices::evict_sql`), so a dead device's queue
+/// goes before a live device loses anything. The value is generous, so reaching it means a very
+/// long offline period or a DoS; what is evicted from a 1:1 queue is lost to that device.
 ///
-/// KNOWN RESIDUE — eviction is GLOBAL-oldest, not per sender, so one noisy sender can push out
-/// another's older undelivered messages. The free half of that attack is closed elsewhere:
-/// envelopes for FABRICATED device ids no longer reach this table (`messages::recipient_devices`),
-/// so what remains costs a real sender its own rate limit. A proper fix is a per-sender share
-/// (evict from the largest slice first), which changes the eviction query's shape and cost — it
-/// was weighed, not missed.
-const PENDING_MAX_ROWS: i64 = 10_000;
+/// KNOWN RESIDUE — within one device eviction is oldest-first, not per sender, so one noisy
+/// sender can push out another's older undelivered messages. The free half of that attack is
+/// closed elsewhere: envelopes for FABRICATED device ids no longer reach this table
+/// (`messages::recipient_devices`), so what remains costs a real sender its own rate limit.
+pub(super) const PENDING_MAX_ROWS: i64 = 10_000;
 /// Enforce the cap roughly every N inserts rather than on EVERY one (amortizes the hot-path
 /// COUNT+DELETE; overshoot stays <= PENDING_MAX_ROWS + N). Gated on `row.id`, which is monotonic
 /// thanks to AUTOINCREMENT.
@@ -66,17 +65,15 @@ impl UserInbox {
 
 /// M2-S2.2: should this WS connection receive the frame for the given target device?
 /// - `recipient_device` None → every socket is a target (N=1 compatibility / pre-S2.3 fan-out).
-/// - WS attachment device None (pre-S1 token) → NULL tolerance, counts as a target.
+/// - WS attachment device None → never a target for another device's frame (audit 2026-11-03
+///   #7; `ws_upgrade` no longer accepts such a socket at all).
 /// - Both concrete → only the socket whose device matches is a target.
 pub(crate) fn ws_targets_device(ws: &WebSocket, recipient_device: Option<&str>) -> bool {
     let want = match recipient_device {
         Some(d) => d,
         None => return true,
     };
-    match ws_attachment_device(ws) {
-        Some(have) => have == want,
-        None => true, // attachment device unknown → tolerate
-    }
+    ws_attachment_device(ws).is_some_and(|have| have == want)
 }
 
 /// M2-S2.2: the device_id from the WS attachment, if present.
@@ -273,10 +270,9 @@ impl UserInbox {
         };
 
         // W2 (per-recipient pending DoS cap): an amortized hard cap. COUNT roughly every
-        // PENDING_CAP_ENFORCE_EVERY inserts; if the cap is exceeded, evict the oldest surplus
-        // (bounded FIFO — the row we just wrote is the newest and is kept). Running COUNT+DELETE
-        // only once per interval amortizes the hot-path cost. We log ONLY on a real eviction (a
-        // DoS indicator; silent in normal operation).
+        // PENDING_CAP_ENFORCE_EVERY inserts; if the cap is exceeded, evict the surplus, a dead
+        // device's rows first (`dead_devices.rs`). Running COUNT+DELETE only once per interval
+        // amortizes the hot-path cost. It logs ONLY on a real eviction (a DoS indicator).
         if row.id % PENDING_CAP_ENFORCE_EVERY == 0 {
             #[derive(Deserialize)]
             struct CountRow {
@@ -287,17 +283,7 @@ impl UserInbox {
                 .exec_raw("SELECT COUNT(*) AS n FROM pending", sql_no_args())
             {
                 if let Some(cnt) = c.to_array::<CountRow>().ok().and_then(|r| r.into_iter().next()) {
-                    if cnt.n > PENDING_MAX_ROWS {
-                        let evict = cnt.n - PENDING_MAX_ROWS;
-                        let _ = storage.sql().exec_raw(
-                            "DELETE FROM pending WHERE id IN (SELECT id FROM pending ORDER BY id ASC LIMIT ?)",
-                            Some(vec![JsValue::from_f64(evict as f64)]),
-                        );
-                        worker::console_log!(
-                            "[deliv] W2 pending-cap: evicted {evict} oldest rows (recipient bloat guard, count={})",
-                            cnt.n
-                        );
-                    }
+                    self.evict_over_cap(cnt.n, PENDING_MAX_ROWS);
                 }
             }
         }
@@ -485,14 +471,11 @@ impl UserInbox {
         // more, so keep going until the deadline. A foreground client decides on it the
         // notifications the backlog held back (core `kernel/notify_gate.rs`), and an older client
         // already swallows unknown `type`s → backwards compatible.
-        let flushed = rows.len();
-        let idle = serde_json::json!({
-            "type": "sync_idle",
-            "flushed": flushed,
-            "more": flushed >= 500,
-        })
-        .to_string();
-        let _ = ws.send_with_str(idle.as_str());
+        // A full page is remembered on the socket: the ack of its last row flushes the next
+        // page, with its own `sync_idle` (`flush_page.rs`).
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        self.note_flush_page(ws, &ids);
+        let _ = ws.send_with_str(super::flush_page::sync_idle_frame(rows.len()).as_str());
     }
 
     /// FIX-2(b): select pending rows for the given device. The Some branch uses

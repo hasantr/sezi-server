@@ -86,6 +86,16 @@ pub(crate) async fn nudge_takeover_best_effort(env: &Env, user_id: &str, device_
     }
 }
 
+/// `user_id` published a device list: its inbox drops the queues of every device the account has
+/// revoked (`inbox_do/dead_devices.rs`). Best-effort — the inbox's alarm repeats the same read
+/// while a stalled queue remains, so a lost call costs time, not rows forever.
+pub(crate) async fn drop_revoked_queues_best_effort(env: &Env, user_id: &str) {
+    let body = serde_json::json!({ "user_id": user_id }).to_string();
+    if let Err(error) = send_control(env, user_id, "/devices-changed", body).await {
+        console_warn!("revoked-device queue drop failed user={user_id}: {error:?}");
+    }
+}
+
 /// Live nudges are not authoritative: log them visibly without affecting handler success.
 pub(crate) async fn nudge_contact_update_best_effort(env: &Env, user_id: &str) {
     if let Err(error) = nudge_contact_update(env, user_id).await {

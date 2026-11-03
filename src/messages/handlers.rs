@@ -10,7 +10,7 @@ const W4B_INITIAL_BACKOFF_SECS: i64 = 30; // delay from enqueue to the first dra
 const W4B_LEASE_SECS: i64 = 600;
 const W4B_BACKOFF_BASE_SECS: i64 = 120; // 120→240→…→cap
 const W4B_MAX_BACKOFF_SECS: i64 = 3600; // a long outage retries hourly and is NEVER deleted
-use crate::messages::inbox_do::live_frames::{self, LIVE_DROPPED_ID};
+use crate::messages::inbox_do::live_frames;
 use crate::push::coalesce::WakeIntent;
 use crate::respond::{json_err, no_content, passthrough};
 use crate::utils::now_secs;
@@ -433,7 +433,7 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             Ok((id, delivered_live)) => {
                 // A dropped live envelope is still this device's ack: nothing failed, there was
                 // just nobody there to see it (`inbox_do/live_frames.rs`).
-                let dropped = body.live && id == LIVE_DROPPED_ID;
+                let dropped = live_frames::is_dropped(body.live, id);
                 acks.push(live_frames::ack_item(e.device_id.as_deref(), id, dropped));
                 if dropped {
                     continue;

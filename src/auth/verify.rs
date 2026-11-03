@@ -200,6 +200,23 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     let vc = match vc {
         Some(v) => v,
         None => {
+            // A code already spent by a registration whose answer was lost (`verify_replay.rs`).
+            if let Some(resp) = crate::auth::verify_replay::replay(
+                &ctx.env,
+                &db,
+                &body.email,
+                &body.code,
+                &body.identity_pubkey_b64,
+                &body.device_id,
+                MAX_CODE_ATTEMPTS,
+                REFRESH_TTL_SEC as i64,
+                ACCESS_TTL_SEC as i64,
+                now as i64,
+            )
+            .await?
+            {
+                return Ok(resp);
+            }
             // No slot. Re-read purely to say WHY — the guess itself is already refused, so this
             // costs one query on the failure path and none on the happy one.
             #[derive(Deserialize)]
@@ -352,8 +369,18 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     };
 
     let role = role_for_registration(redeemed_genesis);
-    let inserted = db
-        .prepare(
+
+    // The account is written as ONE D1 batch — an implicit transaction: the user row, its
+    // directory revision, signed prekey and one-time keys, the invite's attribution and grants,
+    // the code's deletion, the refresh token and the registration receipt commit together or not
+    // at all. Until 2026-11-03 they were about ten separate writes, and a failure after the user
+    // row stranded the account: a retry met the existing row (the owner was told
+    // `410 bootstrap_complete` for good), and after the code's deletion nothing could be retried
+    // (audit finding #5). Now a failed batch leaves nothing, so the same code simply works again,
+    // and a batch whose answer was lost is answered again from its receipt (`verify_replay.rs`).
+    let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(20);
+    stmts.push(
+        db.prepare(
             "INSERT INTO users (id, email, identity_pubkey, identity_ed_pub, display_name, fcm_token, role, created_at, last_seen_at)
              VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
         )
@@ -369,90 +396,57 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             d1_text(role),
             d1_int(now as i64),
             d1_int(now as i64),
-        ])?
-        .run()
-        .await;
-    if let Err(error) = inserted {
-        // `idx_one_owner` is the backstop: two genesis claims can be in flight at once (the first
-        // one's redeem flips its invite to used, so `/bootstrap` mints a second before the first
-        // verifies), and only one of them may become the owner. The loser is told the gate closed,
-        // in the words `/bootstrap` uses for it, rather than handed a bare 500.
-        if role == "owner" && crate::welcome::owner_exists(&ctx.env).await == Some(true) {
-            return json_err(410, "bootstrap_complete");
-        }
-        return Err(error);
-    }
+        ])?,
+    );
 
     // Directory V2 nudge log: the roster stays virtual and policy-filtered, and this row only
     // advances the authoritative revision pull. No email, last-seen or key material is copied in.
-    db.prepare(
-        "INSERT INTO directory_revisions
-           (event_id, user_id, change_type, profile_revision, created_at)
-         VALUES (?, ?, 'upsert', 1, ?)",
-    )
-    .bind(&[
-        d1_text(&random_b64u(18)),
-        d1_text(&user_id),
-        d1_int(now as i64),
-    ])?
-    .run()
-    .await?;
+    stmts.push(
+        db.prepare(
+            "INSERT INTO directory_revisions
+               (event_id, user_id, change_type, profile_revision, created_at)
+             VALUES (?, ?, 'upsert', 1, ?)",
+        )
+        .bind(&[
+            d1_text(&random_b64u(18)),
+            d1_text(&user_id),
+            d1_int(now as i64),
+        ])?,
+    );
 
-    db.prepare(
-        "INSERT INTO signed_prekeys (user_id, prekey_id, prekey_pub, signature, created_at, device_id)
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&[
-        d1_text(&user_id),
-        // The registration SPK prekey_id is 53-bit masked, for parity with replenish: without
-        // the mask, reading it back through workerd makes the bundle 500 — a first-contact wedge.
-        d1_prekey_id(body.signed_prekey.prekey_id),
-        d1_blob(&spk_pub),
-        d1_blob(&spk_sig),
-        d1_int(now as i64),
-        d1_text(device_id),
-    ])?
-    .run()
-    .await?;
+    stmts.push(
+        db.prepare(
+            "INSERT INTO signed_prekeys (user_id, prekey_id, prekey_pub, signature, created_at, device_id)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&[
+            d1_text(&user_id),
+            // The registration SPK prekey_id is 53-bit masked, for parity with replenish: without
+            // the mask, reading it back through workerd makes the bundle 500 — a first-contact
+            // wedge.
+            d1_prekey_id(body.signed_prekey.prekey_id),
+            d1_blob(&spk_pub),
+            d1_blob(&spk_sig),
+            d1_int(now as i64),
+            d1_text(device_id),
+        ])?,
+    );
 
-    // Batch-insert the OTKs in groups of 20 to stay under D1's placeholder limit.
-    if !body.otks.is_empty() {
-        for chunk in body.otks.chunks(20) {
-            let mut sql = String::from(
-                "INSERT OR IGNORE INTO one_time_prekeys (user_id, prekey_id, prekey_pub, consumed, device_id) VALUES ",
-            );
-            let mut binds: Vec<wasm_bindgen::JsValue> = Vec::with_capacity(chunk.len() * 4);
-            // Decode first so the pub_bytes outlive the binds vector, then bind.
-            let mut pubs: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
-            for k in chunk {
-                let p = b64_decode(&k.prekey_pub_b64)
-                    .map_err(|_| Error::RustError("bad otk pub".into()))?;
-                pubs.push(p);
-            }
-            for (i, (k, p)) in chunk.iter().zip(pubs.iter()).enumerate() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push_str("(?, ?, ?, 0, ?)");
-                binds.push(d1_text(&user_id));
-                // 53-bit masked, as above.
-                binds.push(d1_prekey_id(k.prekey_id));
-                binds.push(d1_blob(p));
-                // The pool is device-scoped: this is the pool `keys::bundle` serves peers from
-                // for this device, and the one `keys::replenish` tops up.
-                binds.push(d1_text(device_id));
-            }
-            db.prepare(&sql).bind(&binds)?.run().await?;
-        }
-    }
+    // The OTKs, 20 per statement to stay under D1's bound-parameter cap, 53-bit masked as above.
+    // The pool is device-scoped: the one `keys::bundle` serves peers from for this device and
+    // `keys::replenish` tops up.
+    let otks: Vec<(u64, String)> = body
+        .otks
+        .iter()
+        .map(|k| (k.prekey_id, k.prekey_pub_b64.clone()))
+        .collect();
+    stmts.extend(crate::bots::provision::otk_statements(&db, &user_id, device_id, &otks)?);
 
-    // ONE batch — an implicit transaction — so the attribution cannot complete while the
-    // grant/revisions are half-written, nor the single-use code be deleted while the attribution is
-    // lost. The grant is INSERT OR IGNORE: block/self/null cases are no-ops, and an existing or
-    // revoked relationship is NEVER reopened. Where invite_token/hash are NULL (a code bridged
-    // before 0031 whose ledger row could not be rebuilt) the invite statements are no-ops while the
-    // code DELETE still runs.
-    db.batch(vec![
+    // The attribution, the grants and the code's deletion. The grant is INSERT OR IGNORE:
+    // block/self/null cases are no-ops, and an existing or revoked relationship is NEVER reopened.
+    // Where invite_token/hash are NULL (a code bridged before 0031 whose ledger row could not be
+    // rebuilt) the invite statements are no-ops while the code DELETE still runs.
+    stmts.extend([
         db.prepare(MARK_ATTRIBUTED_SQL).bind(&[
             d1_text(&user_id),
             d1_int(now as i64),
@@ -484,24 +478,45 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             .bind(&[d1_text(&user_id), d1_int(now as i64)])?,
         db.prepare(crate::bots::provision::GRANT_REVISIONS_FOR_JOINER_SQL)
             .bind(&[d1_text(&user_id), d1_int(now as i64)])?,
+        // The receipt reads the code's hash before the code goes, in the same transaction.
+        crate::auth::verify_replay::receipt_statement(
+            &db,
+            &body.email,
+            &user_id,
+            device_id,
+            &identity_pubkey,
+            inviter_user_id.as_deref(),
+            inviter_ed_pub.as_deref(),
+            now as i64,
+        )?,
         db.prepare("DELETE FROM verification_codes WHERE email = ?")
             .bind(&[d1_text(&body.email)])?,
-    ])
-    .await?;
+    ]);
 
-    db.prepare(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
-         VALUES (?, ?, ?, 0, ?, ?)",
-    )
-    .bind(&[
-        d1_text(&refresh_hash),
-        d1_text(&user_id),
-        d1_int((now + REFRESH_TTL_SEC) as i64),
-        d1_int(now as i64),
-        d1_text(device_id),
-    ])?
-    .run()
-    .await?;
+    stmts.push(
+        db.prepare(
+            "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
+             VALUES (?, ?, ?, 0, ?, ?)",
+        )
+        .bind(&[
+            d1_text(&refresh_hash),
+            d1_text(&user_id),
+            d1_int((now + REFRESH_TTL_SEC) as i64),
+            d1_int(now as i64),
+            d1_text(device_id),
+        ])?,
+    );
+
+    if let Err(error) = db.batch(stmts).await {
+        // `idx_one_owner` is the backstop: two genesis claims can be in flight at once (the first
+        // one's redeem flips its invite to used, so `/bootstrap` mints a second before the first
+        // verifies), and only one of them may become the owner. The loser is told the gate closed,
+        // in the words `/bootstrap` uses for it, rather than handed a bare 500.
+        if role == "owner" && crate::welcome::owner_exists(&ctx.env).await == Some(true) {
+            return json_err(410, "bootstrap_complete");
+        }
+        return Err(error);
+    }
 
     // The account exists now, so the invite's landing group can take it.
     let landing = match &redemption {

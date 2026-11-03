@@ -5,6 +5,46 @@
 use super::*;
 
 #[test]
+fn a_full_day_of_expired_media_is_deleted_under_the_bound_parameter_cap() {
+    // Audit 2026-11-03 finding #1: 500 expired rows went into ONE `DELETE … IN`, which D1 refuses
+    // (>100 binds); the leg failed and every later leg of the daily cleanup was skipped, daily.
+    let db = crate::test_schema::full_schema();
+    db.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    crate::test_schema::cap_binds_like_d1(&db);
+    let ids: Vec<String> = (0..500).map(|i| format!("blob-{i:03}")).collect();
+    for id in &ids {
+        db.execute(
+            "INSERT INTO media_objects (blob_id, uploader_id, size_bytes, created_at, expires_at)
+             VALUES (?1, 'u', 1, 0, 1)",
+            [id],
+        )
+        .unwrap();
+    }
+    // The harness reproduces the platform: the old single statement is refused.
+    let one = expired_media_delete_sql(ids.len());
+    assert!(db.execute(&one, rusqlite::params_from_iter(&ids)).is_err());
+    // The chunked statements, as `cleanup_expired_media` builds them, all go through.
+    for chunk in ids.chunks(MAX_BOUND_PARAMS) {
+        db.execute(&expired_media_delete_sql(chunk.len()), rusqlite::params_from_iter(chunk))
+            .unwrap();
+    }
+    let left: i64 = db
+        .query_row("SELECT COUNT(*) FROM media_objects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[test]
+fn no_cleanup_leg_returns_early_into_the_next() {
+    // Every leg of `cleanup_expired` is logged on its own; a `?` in its body would skip the rest.
+    let src = include_str!("maintenance.rs");
+    let a = src.find("async fn cleanup_expired(env: &Env)").unwrap();
+    let body = &src[a..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(!body.contains(")?") && !body.contains(".await?"), "a leg propagates its error");
+}
+
+#[test]
 fn parse_stamp_falls_back_to_zero_when_corrupt_or_missing() {
     assert_eq!(parse_stamp(None), 0);
     assert_eq!(parse_stamp(Some("")), 0);

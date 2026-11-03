@@ -88,6 +88,9 @@ impl UserInbox {
                     recipient_id.as_deref(),
                 )
                 .await?;
+                // A queue longer than one flush: the next page once this one is all acked
+                // (`flush_page.rs`).
+                self.flush_next_page_if_due(&ws);
             }
             // NO `typing` ARM, deliberately. The indicator is an E2E-encrypted
             // `InnerMessage::Typing` inside an ordinary `send`, so the server never sees it as
@@ -387,7 +390,7 @@ impl UserInbox {
                     let do_req = Request::new_with_init("https://do.sezgi/notify", &init)?;
                     // (id, delivered_live). On error or doubt assume live=true (don't send a
                     // pointless wake).
-                    let (resp_id, live) = match stub.fetch_with_request(do_req).await {
+                    let (resp_id, delivered_live) = match stub.fetch_with_request(do_req).await {
                         Ok(mut resp) if resp.status_code() == 200 => match resp.json::<Idr>().await {
                             Ok(r) => (Some(r.id), r.delivered_live),
                             Err(_) => (None, true),
@@ -397,8 +400,8 @@ impl UserInbox {
                     // PARTIAL FAILURE: a successful device joins acks, a failed one DROPS OUT.
                     if let Some(id) = resp_id {
                         // A dropped live envelope is acked too: nobody was there to see it, and
-                        // nothing failed (`live_frames.rs`).
-                        let dropped = live && id == super::live_frames::LIVE_DROPPED_ID;
+                        // nothing failed (`live_frames.rs`). Judged by the REQUEST's flag.
+                        let dropped = super::live_frames::is_dropped(live, id);
                         acks.push(super::live_frames::ack_item(dev.as_deref(), id, dropped));
                         if dropped {
                             continue;
@@ -407,7 +410,7 @@ impl UserInbox {
                         // inbox sends the content-less wake itself, through its coalescing gate
                         // (`wake_gate.rs`) — or none, for silent control traffic. These lines
                         // only say that the WS path asked, apart from the HTTP one.
-                        if !live {
+                        if !delivered_live {
                             match wake {
                                 WakeIntent::Silent => console_log!(
                                     "[push] skipped (silent ws) 1:1 user={recipient_id} dev={dev:?}"

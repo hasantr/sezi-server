@@ -8,8 +8,11 @@
 //! When the worker has `SEZI_CLAIM_SECRET`, the genesis invite is handed out only to a request
 //! that carries the same value in the `x-sezi-claim` header, and the welcome page stops printing
 //! it. The installer generates the secret and keeps it, so the machine that installed the relay
-//! is the one that can claim it. Unset, nothing changes: the Cloudflare one-click deploy has no way
-//! to receive a secret, and keeps today's window.
+//! is the one that can claim it. The Cloudflare one-click deploy asks for it too, since 2026-11-03:
+//! the template's own `.dev.vars.example` names it, and the deploy page asks for every name there;
+//! the app's claim rung then asks the person for the value they chose. Unset, nothing changes and
+//! today's window stays: a relay with no secret is still claimable, because refusing would leave
+//! a deploy that skipped the field unclaimable for good.
 //!
 //! Contract with the app (stable wire names):
 //!  * the worker reads `SEZI_CLAIM_SECRET` — a `wrangler secret`, or a `.dev.vars` line for a
@@ -72,6 +75,27 @@ fn claim_permitted(expected: Option<&str>, submitted: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::claim_permitted;
+
+    /// "Deploy to Cloudflare" asks for every name in the template's `.dev.vars.example` (audit
+    /// 2026-11-03 finding #6). The claim key must be one, uncommented; and nothing else may be
+    /// there, since an example value there can end up deployed as the real one (the monorepo's
+    /// own file carries `ADMIN_INVITE_KEY="dev-secret"` and a placeholder PEM, for `wrangler dev`).
+    #[test]
+    fn the_deploy_button_asks_for_the_claim_key_and_nothing_else() {
+        let example = include_str!("../../template/.dev.vars.example");
+        let names: Vec<&str> = example
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.split('=').next().unwrap().trim())
+            .collect();
+        assert_eq!(names, vec![super::CLAIM_SECRET_BINDING]);
+        let line = example.lines().find(|l| l.starts_with("SEZI_CLAIM_SECRET=")).unwrap();
+        assert_eq!(line.trim(), "SEZI_CLAIM_SECRET=\"\"", "no example value to be deployed as is");
+        // The sync never copies the monorepo's `wrangler dev` file over it.
+        let sync = include_str!("../../scripts/sync-template.sh");
+        assert!(!sync.contains("cp -f \"$SRC/.dev.vars.example\""));
+    }
 
     #[test]
     fn without_a_secret_the_claim_window_is_unchanged() {

@@ -228,8 +228,11 @@ fn wake_data(carry: Option<&str>) -> Value {
 /// sends a plain data wake, which is what that device got before. A visible wake on the wake
 /// channel adds `wake_channel`: a relay that predates it draws the wake on the message channel, as
 /// it always did, and one that knows it takes only the same allow-listed id.
-pub(crate) fn relay_body(token: &str, style: WakeStyle, carry: Option<&str>) -> Value {
-    match (style, carry) {
+///
+/// A ring adds `urgent: true`, which the relay charges to a budget of its own (2026-11-03,
+/// `push-relay/src/rate.js`); an older relay ignores it and counts the ring with the rest.
+pub(crate) fn relay_body(token: &str, style: WakeStyle, carry: Option<&str>, urgent: bool) -> Value {
+    let mut body = match (style, carry) {
         (WakeStyle::Data, None) => json!({ "token": token }),
         (WakeStyle::Data, Some(frame)) => {
             let mut data = json!({});
@@ -243,7 +246,11 @@ pub(crate) fn relay_body(token: &str, style: WakeStyle, carry: Option<&str>) -> 
             }
             body
         }
+    };
+    if urgent {
+        body["urgent"] = json!(true);
     }
+    body
 }
 
 #[cfg(test)]

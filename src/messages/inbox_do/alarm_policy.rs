@@ -24,8 +24,13 @@
 pub(super) struct AlarmWork {
     /// The account was purged (`REMOVED_ACCOUNT_KEY`). Nothing will ever be queued here again.
     pub(super) account_removed: bool,
-    /// Undelivered rows in `pending`.
+    /// Undelivered rows in `pending` that a client is waiting for.
     pub(super) pending_rows: i64,
+    /// Undelivered rows of a device whose queue has stalled (`dead_devices.rs`): revoked, lost or
+    /// long away. Only retention or a reconnect will ever clear them, so they earn the slow alarm
+    /// like `retained_rows`, not the fast one — until 2026-11-03 they kept a dead device's inbox on
+    /// the 90 s alarm for the whole retention window.
+    pub(super) stalled_rows: i64,
     /// Unacked receipt forwards in `forward_queue`.
     pub(super) forward_rows: i64,
     /// Open WebSockets (hibernated ones included).
@@ -56,7 +61,7 @@ pub(super) fn next_alarm_delay_ms(work: AlarmWork, flush_ms: i64, idle_ms: i64) 
     if work.has_live_work() {
         return Some(flush_ms);
     }
-    if work.retained_rows > 0 {
+    if work.retained_rows > 0 || work.stalled_rows > 0 {
         // Nothing to deliver, but the daily retention purge still has rows to collect.
         return Some(idle_ms);
     }
@@ -97,10 +102,21 @@ mod tests {
         AlarmWork {
             account_removed: false,
             pending_rows: 0,
+            stalled_rows: 0,
             forward_rows: 0,
             sockets: 0,
             retained_rows: 0,
         }
+    }
+
+    /// A dead device's queue alone earns the slow alarm: retention still collects it, ~4 wakes a
+    /// day rather than ~960 for thirty days. Live rows beside it keep the fast one.
+    #[test]
+    fn a_stalled_devices_rows_get_the_slow_alarm_not_the_fast_one() {
+        let w = AlarmWork { stalled_rows: 400, ..idle_work() };
+        assert_eq!(next_alarm_delay_ms(w, FLUSH, IDLE), Some(IDLE));
+        let w = AlarmWork { stalled_rows: 400, pending_rows: 1, ..idle_work() };
+        assert_eq!(next_alarm_delay_ms(w, FLUSH, IDLE), Some(FLUSH));
     }
 
     /// The purged inbox: the case that was costing ~960 wakes a day for an account that no
@@ -112,6 +128,7 @@ mod tests {
             // Even with work on the books — a purge deletes the tables, so these cannot really
             // both hold, and if they somehow did the account is still gone.
             pending_rows: 5,
+            stalled_rows: 5,
             forward_rows: 5,
             sockets: 1,
             retained_rows: 5,

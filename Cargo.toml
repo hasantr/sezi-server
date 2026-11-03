@@ -70,7 +70,7 @@ sezi-hearings = { path = "core/crates/sezi-hearings" }
 sezi-redact = { path = "core/crates/sezi-redact" }
 
 [dev-dependencies]
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "limits"] }
 # The router's own matcher (the `worker` crate's, pinned to the version in Cargo.lock), so
 # `invite_page/route_tests.rs` can insert the real routing table and prove `/:invite` shadows
 # nothing.

@@ -19,7 +19,7 @@ fn a_data_wake_is_byte_identical_to_the_old_message() {
     .to_string();
     assert_eq!(fcm_message(TOKEN, WakeStyle::Data, None).to_string(), legacy);
     assert_eq!(
-        relay_body(TOKEN, WakeStyle::Data, None).to_string(),
+        relay_body(TOKEN, WakeStyle::Data, None, false).to_string(),
         serde_json::json!({ "token": TOKEN }).to_string(),
         "the relay body of a data wake is the old {{token}}"
     );
@@ -69,7 +69,7 @@ fn a_visible_wake_says_nothing_else() {
 #[test]
 fn the_relay_body_of_a_visible_wake_names_its_style_and_language() {
     assert_eq!(
-        relay_body(TOKEN, WakeStyle::Visible(Lang::En, WakeChannel::Messages), None),
+        relay_body(TOKEN, WakeStyle::Visible(Lang::En, WakeChannel::Messages), None, false),
         serde_json::json!({ "token": TOKEN, "wake": "visible", "lang": "en" })
     );
 }
@@ -82,7 +82,7 @@ fn a_data_wake_carries_its_frame_under_msg() {
     assert_eq!(m["message"]["data"], serde_json::json!({ "type": "wake", "msg": frame }));
     assert_eq!(m["message"]["android"], serde_json::json!({ "priority": "high" }));
     assert_eq!(
-        relay_body(TOKEN, WakeStyle::Data, Some(frame)),
+        relay_body(TOKEN, WakeStyle::Data, Some(frame), false),
         serde_json::json!({ "token": TOKEN, "data": { "msg": frame } })
     );
 }
@@ -95,8 +95,8 @@ fn a_visible_wake_carries_nothing() {
     let m = fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr, WakeChannel::Messages), Some(frame));
     assert_eq!(m, fcm_message(TOKEN, WakeStyle::Visible(Lang::Tr, WakeChannel::Messages), None));
     assert_eq!(
-        relay_body(TOKEN, WakeStyle::Visible(Lang::En, WakeChannel::Messages), Some(frame)),
-        relay_body(TOKEN, WakeStyle::Visible(Lang::En, WakeChannel::Messages), None)
+        relay_body(TOKEN, WakeStyle::Visible(Lang::En, WakeChannel::Messages), Some(frame), false),
+        relay_body(TOKEN, WakeStyle::Visible(Lang::En, WakeChannel::Messages), None, false)
     );
 }
 
@@ -138,9 +138,9 @@ fn a_visible_wake_on_the_wake_channel_names_it_and_nothing_else_changes() {
 fn the_relay_body_names_the_wake_channel_only_for_it() {
     let old = serde_json::json!({ "token": TOKEN, "wake": "visible", "lang": "tr" }).to_string();
     let messages = WakeStyle::Visible(Lang::Tr, WakeChannel::Messages);
-    assert_eq!(relay_body(TOKEN, messages, None).to_string(), old);
+    assert_eq!(relay_body(TOKEN, messages, None, false).to_string(), old);
     assert_eq!(
-        relay_body(TOKEN, WakeStyle::Visible(Lang::Tr, WakeChannel::Wake), Some("frame")),
+        relay_body(TOKEN, WakeStyle::Visible(Lang::Tr, WakeChannel::Wake), Some("frame"), false),
         serde_json::json!({
             "token": TOKEN, "wake": "visible", "lang": "tr", "wake_channel": "sezgi_wake_v1",
         })
@@ -175,7 +175,7 @@ fn the_wake_channel_is_allow_listed() {
     })
     .to_string();
     assert_eq!(fcm_message(TOKEN, data, None).to_string(), legacy);
-    assert_eq!(relay_body(TOKEN, data, None).to_string(), serde_json::json!({ "token": TOKEN }).to_string());
+    assert_eq!(relay_body(TOKEN, data, None, false).to_string(), serde_json::json!({ "token": TOKEN }).to_string());
 }
 
 /// What `/push/register` makes of a body: an old app's (no field) is the message channel, a new

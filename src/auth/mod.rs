@@ -14,6 +14,7 @@ pub mod refresh;
 pub mod relogin;
 pub(crate) mod sync_refresh;
 pub mod verify;
+pub(crate) mod verify_replay;
 
 #[cfg(test)]
 mod genesis_tests;

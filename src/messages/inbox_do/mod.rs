@@ -4,8 +4,10 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 mod ack;
+mod dead_devices;
 mod alarm_ops;
 mod alarm_policy;
+mod flush_page;
 mod bot;
 mod forward;
 pub(crate) mod live_frames;
@@ -15,6 +17,8 @@ mod receipt;
 mod push_keys;
 mod self_read;
 mod takeover_nudge;
+mod upgrade_refusal;
+use upgrade_refusal::refuse_unverified_upgrade;
 mod wake_gate;
 mod ws;
 mod ws_ping;
@@ -195,6 +199,11 @@ pub(crate) struct Attachment {
     /// stamp is what makes the FCM wake fire instead of a silent delivery loss.
     #[serde(rename = "lastSeenMs", default)]
     pub(crate) last_seen_ms: Option<i64>,
+    /// The last row id of a FULL flush page still being acked on this socket: the ack that leaves
+    /// none of its rows pending flushes the next page (`flush_page.rs`). `None` when the last
+    /// flush was the end of the queue; absent on an attachment written before 2026-11-03.
+    #[serde(rename = "pageHi", default, skip_serializing_if = "Option::is_none")]
+    pub(crate) page_hi: Option<i64>,
 }
 
 pub(crate) fn sql_no_args() -> Option<Vec<JsValue>> {
@@ -312,6 +321,7 @@ impl DurableObject for UserInbox {
             // A group message: one call per member, and a hop for a large room (D8).
             (Method::Post, "/notify-member") => self.notify_member(req).await,
             (Method::Post, "/fanout") => self.fanout_hop(req).await,
+            (Method::Post, "/devices-changed") => self.devices_changed(req).await, // dead_devices.rs
             (Method::Post, "/notify") => {
                 let body: NotifyBody = req.json().await?;
                 // Before the envelope is stored: what its wake must cover (`push::coalesce`).
@@ -684,9 +694,6 @@ impl UserInbox {
     }
 
     async fn ws_upgrade(&self, req: Request) -> Result<Response> {
-        let pair = WebSocketPair::new()?;
-        let server = pair.server;
-
         // A DO fetch does NOT pass through the lib.rs `#[event(fetch)]` boot guard (it may run in
         // a different isolate), so prepare the JWT key here too — from the env secret, or from the
         // D1 self-provision cache when there is none. Memoized, so an installation with the env
@@ -701,15 +708,22 @@ impl UserInbox {
         let attached: Option<(String, String)> = crate::extract_bearer_subprotocol(&req)
             .ok()
             .and_then(|t| crate::auth::jwt::token_identity(&self.env, &t).ok());
-        let attach_device: Option<&str> = attached.as_ref().map(|(_, d)| d.as_str());
+        // A token this DO cannot verify — it expired between the worker's check and this one, or
+        // the JWT key failed to load in this isolate — is REFUSED, never accepted device-blind.
+        // Until 2026-11-03 such a socket was accepted with no attachment: a target for every
+        // device's frames, flushed every device's rows, and its ack deleted them (audit finding #7).
+        let Some((user_id, device_id)) = attached else {
+            return refuse_unverified_upgrade(&req);
+        };
+        let attach_device: Option<&str> = Some(device_id.as_str());
+        let pair = WebSocketPair::new()?;
+        let server = pair.server;
 
         // The stale close is DEVICE-AWARE: only the previous socket of the SAME device is closed
         // as superseded (reconnect/zombie cleanup). Closing them all would have two devices of one
         // user constantly tearing down each other's socket, breaking the linking flow and
         // dual-device delivery — and it is unnecessary, because each socket flushes and acks only
-        // its own pending rows. Option equality gives exactly the right semantics: a device-less
-        // socket is kept when a device-aware one connects, and flush/ack tolerate
-        // "OR device_id IS NULL", so it still gets its queue.
+        // its own pending rows (a socket from before this build with no device is kept).
         let stale = self.state.get_websockets();
         self.state.accept_web_socket(&server);
         // This device is here: its next envelope after this connection wakes it at once, and the
@@ -728,20 +742,17 @@ impl UserInbox {
             }
         }
 
-        if let Some((uid, dev)) = attached.clone() {
-            let _ = server.serialize_attachment(Attachment {
-                user_id: uid,
-                device_id: dev,
-                // A freshly accepted socket counts as live for one `WS_LIVENESS_WINDOW_MS`, so no
-                // spurious push happens before the client sends its first ping.
-                last_seen_ms: Some((now_secs() * 1000) as i64),
-            });
-        }
+        let _ = server.serialize_attachment(Attachment {
+            user_id,
+            device_id: device_id.clone(),
+            // A freshly accepted socket counts as live for one `WS_LIVENESS_WINDOW_MS`, so no
+            // spurious push happens before the client sends its first ping.
+            last_seen_ms: Some((now_secs() * 1000) as i64),
+            page_hi: None,
+        });
 
         // The device comes straight from the claim and is NEVER derived.
-        if let Some(dev) = attach_device {
-            self.backfill_null_device_once(dev).await;
-        }
+        self.backfill_null_device_once(&device_id).await;
 
         // An upgrade that was also the token refresh: the new pair goes first, ahead of every
         // queued frame (`auth::sync_refresh`).

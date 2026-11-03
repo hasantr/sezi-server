@@ -26,3 +26,14 @@ pub(crate) fn full_schema() -> Connection {
     }
     db
 }
+
+/// Hold `db` to the bound-parameter cap D1 and a Durable Object's SQLite enforce
+/// (`d1util::MAX_BOUND_PARAMS`), so a statement built over it fails here as it would there.
+/// Bundled SQLite allows 32,766 by default, which hid finding #1 of the 2026-11-03 audit.
+pub(crate) fn cap_binds_like_d1(db: &Connection) {
+    db.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+        crate::d1util::MAX_BOUND_PARAMS as i32,
+    )
+    .unwrap();
+}

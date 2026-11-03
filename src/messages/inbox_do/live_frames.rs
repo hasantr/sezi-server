@@ -54,6 +54,14 @@ pub(crate) fn notify_answer(id: i64, delivered_live: bool, dropped: bool) -> ser
     v
 }
 
+/// Whether a send's answer for one device is a drop. Judged by the REQUEST's `live` flag: the
+/// inbox answers a drop with `delivered_live: false` (nobody was there), so judging it by that
+/// answer — what the WS send arm did until 2026-11-03, its `live` shadowed — never sees a drop,
+/// acks it without `dropped` and logs it as a wake.
+pub(crate) fn is_dropped(requested_live: bool, id: i64) -> bool {
+    requested_live && id == LIVE_DROPPED_ID
+}
+
 /// One device's entry in a send's `acks` (HTTP `/messages/send` and the WS `send_ack_batch`).
 pub(crate) fn ack_item(device_id: Option<&str>, id: i64, dropped: bool) -> serde_json::Value {
     let mut v = serde_json::json!({ "device_id": device_id, "id": id });
@@ -96,6 +104,19 @@ mod tests {
             ack_item(Some("d1"), LIVE_DROPPED_ID, true),
             serde_json::json!({ "device_id": "d1", "id": 0, "dropped": true })
         );
+    }
+
+    /// A drop is told by the request's flag, never by the answer's `delivered_live`, which a
+    /// drop answers `false` (audit 2026-11-03: the WS send arm judged it by the answer).
+    #[test]
+    fn a_drop_is_judged_by_the_requests_live_flag() {
+        let answer = notify_answer(LIVE_DROPPED_ID, false, true);
+        let id = answer["id"].as_i64().unwrap();
+        let delivered_live = answer["delivered_live"].as_bool().unwrap();
+        assert!(!is_dropped(delivered_live, id), "the answer's flag hides every drop");
+        assert!(is_dropped(true, id));
+        assert!(!is_dropped(false, id), "an envelope that was not live is never a drop");
+        assert!(!is_dropped(true, 7), "a live envelope a socket took has a real row id");
     }
 
     /// The flag is read from both send bodies: HTTP's `SendBody` and the WS frame.

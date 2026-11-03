@@ -95,6 +95,8 @@ pub(crate) struct FakeWake {
     pub(crate) marked_at_send: RefCell<Vec<usize>>,
     /// The frames the next wake carries, per device (`carry.rs`).
     pub(crate) carried: RefCell<Carried>,
+    /// The relay answers 429 to this many sends before `relay_answer` (`push-relay/src/rate.js`).
+    pub(crate) relay_busy: Cell<usize>,
 }
 
 pub(crate) const MINT: usize = 3;
@@ -159,6 +161,7 @@ impl FakeWake {
             logs: RefCell::new(Vec::new()),
             marked_at_send: RefCell::new(Vec::new()),
             carried: RefCell::new(Carried::none()),
+            relay_busy: Cell::new(0),
         }
     }
     fn note_send(&self) {
@@ -233,12 +236,31 @@ impl WakePort for FakeWake {
         self.tick(format!("direct:{token}{}{}", style_mark(style), carry_mark(carry)));
         (self.direct_answer)(token)
     }
-    async fn relay(&self, url: &str, token: &str, style: WakeStyle, carry: Option<&str>)
-        -> Result<bool> {
+    async fn relay(
+        &self,
+        url: &str,
+        token: &str,
+        style: WakeStyle,
+        carry: Option<&str>,
+        urgent: bool,
+    ) -> RelaySend {
         assert_eq!(url, "https://relay");
         self.note_send();
-        self.tick(format!("relay:{token}{}{}", style_mark(style), carry_mark(carry)));
-        (self.relay_answer)(token)
+        let ring = if urgent { ":urgent" } else { "" };
+        self.tick(format!("relay:{token}{}{}{ring}", style_mark(style), carry_mark(carry)));
+        if self.relay_busy.get() > 0 {
+            self.relay_busy.set(self.relay_busy.get() - 1);
+            return RelaySend::Busy { retry_after_s: Some(3) };
+        }
+        match (self.relay_answer)(token) {
+            Ok(true) => RelaySend::Sent,
+            Ok(false) => RelaySend::Stale,
+            Err(e) => RelaySend::Failed(format!("{e:?}")),
+        }
+    }
+    async fn pause_ms(&self, ms: u64) {
+        // Not a subrequest: on the call list, never charged to `spent`.
+        self.calls.borrow_mut().push(format!("pause:{ms}"));
     }
     async fn delete_token(&self, device_id: &str) {
         self.tick(format!("delete:{device_id}"));
@@ -723,6 +745,44 @@ fn an_urgent_wake_goes_past_an_unfetched_wake() {
     let t = f.wake_urgent(&["d0"]);
     assert_eq!((t.woke.as_slice(), t.coalesced.len()), (&["d0".to_string()][..], 0));
     assert!(f.logs.borrow().iter().any(|l| l.starts_with("[push] urgent user=u device=d0")));
+}
+
+/// A ring the shared relay refuses for its rate limit is tried again in seconds, as the relay
+/// asked, and reaches the device; an ordinary wake is not (the next message or the backstop
+/// wakes it). Until 2026-11-03 a ring's 429 was a failed wake that nothing retried.
+#[test]
+fn a_ring_the_relay_refuses_as_busy_is_tried_again_soon() {
+    let f = relay_fleet(1);
+    f.relay_busy.set(1);
+    let t = f.wake_urgent(&["d0"]);
+    assert_eq!(t.woke, ["d0"]);
+    assert_eq!(f.calls(), ["relay:t0:urgent", "pause:3000", "relay:t0:urgent"]);
+
+    let f = relay_fleet(1);
+    f.relay_busy.set(1);
+    let t = f.wake_devices(&["d0"]);
+    assert_eq!((t.woke.len(), t.failed), (0, 1));
+    assert_eq!(f.calls(), ["relay:t0"], "an ordinary wake is not retried, nor marked urgent");
+
+    // A relay busy for longer: twice more at most, then the ring is a failed wake like before.
+    let f = relay_fleet(1);
+    f.relay_busy.set(5);
+    let t = f.wake_urgent(&["d0"]);
+    assert_eq!((t.woke.len(), t.failed), (0, 1));
+    assert_eq!(f.calls().iter().filter(|c| c.starts_with("relay:")).count(), 1 + RING_RETRIES as usize);
+}
+
+/// The wait follows the relay's `Retry-After`, within bounds; a relay that did not say gets 5 s.
+#[test]
+fn a_rings_retry_waits_as_the_relay_asked_within_bounds() {
+    assert_eq!(ring_retry_delay_ms(0, Some(3)), Some(3_000));
+    assert_eq!(ring_retry_delay_ms(0, None), Some(5_000));
+    assert_eq!(ring_retry_delay_ms(1, Some(0)), Some(1_000));
+    assert_eq!(ring_retry_delay_ms(1, Some(57)), Some(10_000), "a ring rings for 45 s");
+    assert_eq!(ring_retry_delay_ms(RING_RETRIES, Some(1)), None);
+    assert_eq!(super::super::fcm::retry_after_secs(Some(" 12 ")), Some(12));
+    assert_eq!(super::super::fcm::retry_after_secs(Some("Wed, 21 Oct 2015")), None);
+    assert_eq!(super::super::fcm::retry_after_secs(None), None);
 }
 
 /// An urgent wake marks like any other: the ordinary envelope right behind it coalesces.

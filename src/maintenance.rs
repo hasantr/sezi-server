@@ -30,7 +30,9 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use crate::auth::hashing::sha256_hex;
-use crate::d1util::{d1_blob, d1_int, d1_null, d1_opt_int, d1_opt_text, d1_text};
+use crate::d1util::{
+    d1_blob, d1_int, d1_null, d1_opt_int, d1_opt_text, d1_text, marks, MAX_BOUND_PARAMS,
+};
 use crate::utils::now_secs;
 
 /// Isolate-local throttle on D1 lookups: the stamp SELECT runs at most once per this
@@ -356,13 +358,8 @@ async fn stamp(db: &D1Database, key: &str) {
 /// rows on a second run, gc_fanout_retry is a cutoff DELETE, and reconcile recomputes the
 /// truth (the last writer writes the same value).
 pub(crate) async fn run_daily(env: &Env) {
-    if let Err(e) = cleanup_expired(env).await {
-        // Never the Debug format: the error can carry SQL bindings (user_id, email, …).
-        // 80 chars shows the error category without the PII.
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("cleanup error: {}", truncated);
-    }
+    // Logs each of its own legs; one failing leg no longer skips the rest.
+    cleanup_expired(env).await;
     crate::messages::handlers::gc_fanout_retry(env).await;
     // The door's miss counter keeps one row per address; finished windows carry nothing.
     if let Ok(db) = env.d1("DB") {
@@ -372,40 +369,29 @@ pub(crate) async fn run_daily(env: &Env) {
     //
     // The group library's retention sweep (≤100 expired parts per run). Before the reconcile, so
     // the counters it recomputes already reflect what the sweep removed.
-    if let Err(e) = crate::room_library::sweep_expired(env).await {
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("library sweep error: {}", truncated);
-    }
-    //
+    log_leg("library sweep", crate::room_library::sweep_expired(env).await);
     // Recompute drift in the best-effort storage counters (user_storage/server_stats)
     // from the media tables.
-    if let Err(e) = crate::usage::reconcile_storage(env).await {
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("usage reconcile error: {}", truncated);
-    }
+    log_leg("usage reconcile", crate::usage::reconcile_storage(env).await);
     // Backfill the plugin-code inventory from R2, so "where does this blob live" is
     // answerable for blobs written before put_code started recording it inline.
     // Idempotent (INSERT OR IGNORE, r2-primary).
-    if let Err(e) = crate::storage::maint::backfill_plugin_code(env).await {
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("plugin-code backfill error: {}", truncated);
-    }
+    log_leg("plugin-code backfill", crate::storage::maint::backfill_plugin_code(env).await);
     // Probe every backend whose state != 'disabled', refreshing last_health_* so the panel
     // stays current instead of turning red between crons.
-    if let Err(e) = crate::storage::probe_all(env).await {
-        let msg = e.to_string();
-        let truncated: String = msg.chars().take(80).collect();
-        console_log!("storage probe error: {}", truncated);
-    }
+    log_leg("storage probe", crate::storage::probe_all(env).await);
     // Retry the deletion of orphan-blob tombstones (≤50 per run). A successful delete
     // drops the row; a backend still down bumps retry_count and is tried again tomorrow.
-    if let Err(e) = crate::storage::maint::retry_orphans(env).await {
+    log_leg("orphan retry", crate::storage::maint::retry_orphans(env).await);
+}
+
+/// Log one daily leg's failure as `<what> error: …` and carry on. Never the Debug format: the
+/// error can carry SQL bindings (user_id, email, …); 80 chars shows its category without them.
+fn log_leg<T>(what: &str, result: Result<T>) {
+    if let Err(e) = result {
         let msg = e.to_string();
         let truncated: String = msg.chars().take(80).collect();
-        console_log!("orphan retry error: {}", truncated);
+        console_log!("{} error: {}", what, truncated);
     }
 }
 
@@ -574,141 +560,176 @@ pub(crate) const CONTACT_QR_OFFER_CLEANUP_SQL: &str = "DELETE FROM contact_qr_of
          WHERE expires_at_ms < ? LIMIT 500
       )";
 
-/// Sweep up expired leftovers. Media is already deleted the moment the recipient acks, so
-/// the media leg here is the fallback for "nobody ever fetched it and
-/// `server_settings.retention_days` elapsed". The rest keeps D1 from growing: expired
-/// invite_tokens, verification_codes, refresh_tokens, device-link requests, contact-QR
-/// records and consumed one-time prekeys.
-async fn cleanup_expired(env: &Env) -> Result<()> {
-    let now = now_secs() as i64;
-    let db = env.d1("DB")?;
-
-    // 1) expired media: delete from R2 + D1
+/// The expired-media leg: blobs out of their store, then their rows out of D1. No client acks
+/// media (`POST /media/:id/ack` has no caller), so this is how EVERY file leaves the server once
+/// `server_settings.retention_days` elapse, up to 500 a day.
+async fn cleanup_expired_media(env: &Env, db: &D1Database, now: i64) -> Result<()> {
     let rows: Vec<ExpiredMediaRow> = db
         .prepare("SELECT blob_id, size_bytes, uploader_id, store_id FROM media_objects WHERE expires_at < ? LIMIT 500")
         .bind(&[d1_int(now)])?
         .all()
         .await?
         .results()?;
-
-    if !rows.is_empty() {
-        // Deletes go per backend through the single choke point (StorageRouter). On a lite
-        // deployment (no R2 binding) any_available() is false, so the blob delete is
-        // skipped while the D1 metadata delete and counter decrement still happen —
-        // otherwise cleanup would Err every run and the legs below it would never be
-        // reached. A blob that cannot be deleted becomes a `storage_orphans` tombstone (the
-        // D1 metadata still goes) for the daily `retry_orphans`, so it does not become a
-        // permanent orphan on an external backend. router.delete writes no health marks on
-        // this bulk path (≤500 rows × a write each would bloat it), hence one aggregated
-        // mark per failing backend below.
-        let router = crate::storage::StorageRouter::from_env(env).await?;
-        let mut orphans: Vec<(String, String, i64)> = Vec::new(); // (store_id, key, size)
-        if router.any_available() {
-            for row in &rows {
-                let key = crate::storage::media_key(&row.blob_id);
-                if router.delete(&row.store_id, &key).await.is_err() {
-                    orphans.push((row.store_id.clone(), key, row.size_bytes));
-                }
-            }
-        }
-        if !orphans.is_empty() {
-            crate::storage::maint::insert_orphans(&db, &orphans).await;
-            let mut marked: Vec<&str> = Vec::new();
-            for (sid, _, _) in &orphans {
-                if !marked.contains(&sid.as_str()) {
-                    marked.push(sid);
-                    crate::storage::write_health(env, sid, false, Some("delete_failed_cleanup"))
-                        .await;
-                }
-            }
-        }
-        let placeholders: String = (0..rows.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "DELETE FROM media_objects WHERE blob_id IN ({})",
-            placeholders
-        );
-        let binds: Vec<JsValue> = rows.iter().map(|r| JsValue::from_str(&r.blob_id)).collect();
-        db.prepare(&sql).bind(&binds)?.run().await?;
-        console_log!("cleanup: {} expired media blobs removed", rows.len());
-        // Best-effort: subtract the deleted media from the storage counters (clamped at 0).
-        // An error does not break cleanup, and the daily reconcile repairs it.
-        let removed: Vec<(String, i64)> = rows
-            .iter()
-            .map(|r| (r.uploader_id.clone(), r.size_bytes))
-            .collect();
-        crate::usage::media_removed(&db, &removed).await;
+    if rows.is_empty() {
+        return Ok(());
     }
+    // Deletes go per backend through the single choke point (StorageRouter). On a lite
+    // deployment (no R2 binding) any_available() is false, so the blob delete is skipped while
+    // the D1 metadata delete and counter decrement still happen. A blob that cannot be deleted
+    // becomes a `storage_orphans` tombstone (the D1 metadata still goes) for the daily
+    // `retry_orphans`, so it does not become a permanent orphan on an external backend.
+    // router.delete writes no health marks on this bulk path (≤500 rows × a write each would
+    // bloat it), hence one aggregated mark per failing backend below.
+    let router = crate::storage::StorageRouter::from_env(env).await?;
+    let mut orphans: Vec<(String, String, i64)> = Vec::new(); // (store_id, key, size)
+    if router.any_available() {
+        for row in &rows {
+            let key = crate::storage::media_key(&row.blob_id);
+            if router.delete(&row.store_id, &key).await.is_err() {
+                orphans.push((row.store_id.clone(), key, row.size_bytes));
+            }
+        }
+    }
+    if !orphans.is_empty() {
+        crate::storage::maint::insert_orphans(db, &orphans).await;
+        let mut marked: Vec<&str> = Vec::new();
+        for (sid, _, _) in &orphans {
+            if !marked.contains(&sid.as_str()) {
+                marked.push(sid);
+                crate::storage::write_health(env, sid, false, Some("delete_failed_cleanup")).await;
+            }
+        }
+    }
+    // ≤100 binds per statement (one `DELETE … IN` of 500 is refused outright, and the same rows
+    // came back every day after), all of them in one batch: atomic, and one subrequest.
+    let mut stmts = Vec::new();
+    for chunk in rows.chunks(MAX_BOUND_PARAMS) {
+        let binds: Vec<JsValue> = chunk.iter().map(|r| d1_text(&r.blob_id)).collect();
+        stmts.push(db.prepare(expired_media_delete_sql(chunk.len())).bind(&binds)?);
+    }
+    db.batch(stmts).await?;
+    console_log!("cleanup: {} expired media blobs removed", rows.len());
+    // Best-effort: subtract the deleted media from the storage counters (clamped at 0).
+    // An error does not break cleanup, and the daily reconcile repairs it.
+    let removed: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| (r.uploader_id.clone(), r.size_bytes))
+        .collect();
+    crate::usage::media_removed(db, &removed).await;
+    Ok(())
+}
+
+/// `DELETE` of `n` media rows by blob id; `n` ≤ `MAX_BOUND_PARAMS`.
+fn expired_media_delete_sql(n: usize) -> String {
+    format!("DELETE FROM media_objects WHERE blob_id IN ({})", marks(n))
+}
+
+/// One bound statement, run.
+async fn run_bound(db: &D1Database, sql: &str, binds: &[JsValue]) -> Result<()> {
+    db.prepare(sql).bind(binds)?.run().await?;
+    Ok(())
+}
+
+/// Sweep up expired leftovers: expired media (see its leg), then what keeps D1 from growing —
+/// invite_tokens, verification_codes, refresh_tokens, join and device-link requests, contact-QR
+/// records and consumed one-time prekeys. Every leg logs its own failure and the next one runs
+/// anyway: until 2026-11-03 a `?` here returned early, so one failing media delete stopped every
+/// leg below it, every day.
+async fn cleanup_expired(env: &Env) {
+    let now = now_secs() as i64;
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(e) => return log_leg("cleanup", Err::<(), _>(e)),
+    };
+
+    // 1) expired media: delete from the store + D1
+    log_leg("cleanup media", cleanup_expired_media(env, &db, now).await);
 
     // Move pre-0031 used tokens into the hash ledger first; the raw secret is never written
     // to the audit trail. Anything outside this slice is protected by the cleanup predicate.
-    let legacy_backfilled = backfill_legacy_invite_attributions(&db).await?;
-    if legacy_backfilled > 0 {
-        console_log!(
+    match backfill_legacy_invite_attributions(&db).await {
+        Ok(legacy_backfilled) if legacy_backfilled > 0 => console_log!(
             "cleanup: {} legacy invite attribution hash-backfill",
             legacy_backfilled
-        );
+        ),
+        Ok(_) => {}
+        Err(e) => log_leg("cleanup invite backfill", Err::<(), _>(e)),
     }
 
     // Self-heal the legacy/API `used` flag from the claim ledger, which is authoritative.
     // If a redeem's claim INSERT succeeded but the follow-up UPDATE hit a transient error,
     // admin/stats/bootstrap must not keep reporting the invite as "unused" forever.
-    db.prepare(RECONCILE_INVITE_CLAIMS_SQL).run().await?;
+    log_leg("cleanup invite claims", run_bound(&db, RECONCILE_INVITE_CLAIMS_SQL, &[]).await);
 
     // 2) expired invite-token secrets. A used token is kept until its TTL expires, so
     // maintenance never cuts the redeem→verify window short. The attribution ledger is
     // independent of the source token and outlives it.
-    db.prepare(INVITE_TOKEN_CLEANUP_SQL)
-        .bind(&[d1_int(now)])?
-        .run()
-        .await?;
+    log_leg("cleanup invites", run_bound(&db, INVITE_TOKEN_CLEANUP_SQL, &[d1_int(now)]).await);
 
     // 3) expired verification codes
-    db.prepare("DELETE FROM verification_codes WHERE expires_at < ?")
-        .bind(&[d1_int(now)])?
-        .run()
-        .await?;
+    log_leg(
+        "cleanup codes",
+        run_bound(&db, "DELETE FROM verification_codes WHERE expires_at < ?", &[d1_int(now)]).await,
+    );
+
+    // 3b) expired registration receipts (`auth/verify_replay.rs`)
+    log_leg(
+        "cleanup receipts",
+        run_bound(&db, crate::auth::verify_replay::RECEIPT_CLEANUP_SQL, &[d1_int(now)]).await,
+    );
 
     // 4) revoked / expired refresh tokens
-    db.prepare("DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1")
-        .bind(&[d1_int(now)])?
-        .run()
-        .await?;
+    log_leg(
+        "cleanup refresh tokens",
+        run_bound(
+            &db,
+            "DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked = 1",
+            &[d1_int(now)],
+        )
+        .await,
+    );
 
     // 4b) decided join requests, once the requester has had a month to read the answer. A pending
     //     request never expires: it waits for a group admin however long that takes.
-    db.prepare(DECIDED_JOIN_REQUEST_CLEANUP_SQL)
-        .bind(&[d1_int(now - DECIDED_JOIN_REQUEST_KEEP_SECS)])?
-        .run()
-        .await?;
+    log_leg(
+        "cleanup join requests",
+        run_bound(
+            &db,
+            DECIDED_JOIN_REQUEST_CLEANUP_SQL,
+            &[d1_int(now - DECIDED_JOIN_REQUEST_KEEP_SECS)],
+        )
+        .await,
+    );
 
     // 5) expired device-link requests (consuming one already deletes the row, so a
     //    'consumed' state is never persisted; this sweep collects the expired ones)
-    db.prepare("DELETE FROM link_requests WHERE expires_at < ?")
-        .bind(&[d1_int(now)])?
-        .run()
-        .await?;
+    log_leg(
+        "cleanup link requests",
+        run_bound(&db, "DELETE FROM link_requests WHERE expires_at < ?", &[d1_int(now)]).await,
+    );
 
     // 6) Single-use mutual QR records. They are kept for 24 hours so a client can still read
     // the "expired" state for a while; the capability secret is never written to D1 in the
-    // first place. Deleting the claim before the offer leaves no orphan row even on an older
-    // D1 deployment with foreign-key enforcement off.
+    // first place. The claim goes before the offer, so even an older D1 deployment with
+    // foreign-key enforcement off is left no orphan row — and a failed claim delete skips the
+    // offer delete.
     let qr_cutoff_ms = now
         .saturating_mul(1000)
         .saturating_sub(CONTACT_QR_RETENTION_MS);
-    db.prepare(CONTACT_QR_CLAIM_CLEANUP_SQL)
-        .bind(&[d1_int(qr_cutoff_ms)])?
-        .run()
-        .await?;
-    db.prepare(CONTACT_QR_OFFER_CLEANUP_SQL)
-        .bind(&[d1_int(qr_cutoff_ms)])?
-        .run()
-        .await?;
+    let qr = match run_bound(&db, CONTACT_QR_CLAIM_CLEANUP_SQL, &[d1_int(qr_cutoff_ms)]).await {
+        Ok(()) => run_bound(&db, CONTACT_QR_OFFER_CLEANUP_SQL, &[d1_int(qr_cutoff_ms)]).await,
+        Err(e) => Err(e),
+    };
+    log_leg("cleanup contact QR", qr);
 
     // 7) Consumed one-time prekeys past the retention window. `MAX_OTK_POOL` bounds the
     // unconsumed pool per device; the consumed side had no ceiling at all. A leg of the daily GC
     // rather than a fourth maintenance stamp: a window measured in a hundred thousand keys does
-    // not need a 2-minute tick. Last on purpose, so a failure here cannot skip a leg above it —
-    // `?` still propagates and `run_daily` carries on to the rest of the daily set.
+    // not need a 2-minute tick.
+    log_leg("cleanup one-time prekeys", cleanup_consumed_otks(&db).await);
+}
+
+async fn cleanup_consumed_otks(db: &D1Database) -> Result<()> {
     let swept = db
         .prepare(OTK_CONSUMED_CLEANUP_SQL)
         .bind(&[d1_int(OTK_CONSUMED_RETAIN_IDS), d1_int(OTK_SWEEP_LIMIT)])?
@@ -724,7 +745,6 @@ async fn cleanup_expired(env: &Env) -> Result<()> {
             );
         }
     }
-
     Ok(())
 }
 
