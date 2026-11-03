@@ -86,6 +86,23 @@ pub fn encrypt_to_room(
     msg_uid: Option<String>,
     ext: serde_json::Value,
 ) -> Result<EncryptedRoomMessage, String> {
+    encrypt_to_room_framed(session_pickle, pickle_key, inner, thread_id, thread_title, msg_uid, ext, false)
+}
+
+/// `encrypt_to_room`, and with `frame` the payload is framed first (`sezi_protocol::payload_frame`)
+/// — only when every member device of the room said it reads framed payloads
+/// (`kernel/olm_frame.rs`), since one envelope goes to all of them.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_to_room_framed(
+    session_pickle: String,
+    pickle_key: Vec<u8>,
+    inner: InnerMessage,
+    thread_id: Option<String>,
+    thread_title: Option<String>,
+    msg_uid: Option<String>,
+    ext: serde_json::Value,
+    frame: bool,
+) -> Result<EncryptedRoomMessage, String> {
     let key = to_key32(&pickle_key)?;
     let pickle = GroupSessionPickle::from_encrypted(&session_pickle, &key)
         .map_err(|e| format!("crypto/group-session-pickle-unreadable: {e}"))?;
@@ -97,7 +114,11 @@ pub fn encrypt_to_room(
     payload.msg_uid = msg_uid;
     payload.ext = ext;
     let message_index = session.message_index();
-    let msg = session.encrypt(payload.encode());
+    let mut bytes = payload.encode();
+    if frame {
+        bytes = sezi_protocol::payload_frame::seal(&bytes);
+    }
+    let msg = session.encrypt(bytes);
     let envelope = WireEnvelope::from_megolm(&msg, &session_id);
     let envelope_json = serde_json::to_vec(&envelope).map_err(|e| format!("envelope json: {e}"))?;
     let envelope_b64 = vodozemac::base64_encode(envelope_json);
@@ -200,8 +221,10 @@ pub fn decrypt_from_room(
     let decrypted = session
         .decrypt(&msg)
         .map_err(|e| format!("megolm decrypt: {e}"))?;
-    let payload =
-        ChatPayload::decode(&decrypted.plaintext).map_err(|e| format!("payload decode: {e}"))?;
+    // A framed payload (`sezi_protocol::payload_frame`) is opened first; a plain one passes.
+    let plaintext = sezi_protocol::payload_frame::open(&decrypted.plaintext)
+        .map_err(|e| format!("payload frame: {e}"))?;
+    let payload = ChatPayload::decode(&plaintext).map_err(|e| format!("payload decode: {e}"))?;
     let new_inbound_pickle = session.pickle().encrypt(&key);
     Ok(DecryptedRoomMessage {
         payload,

@@ -15,11 +15,14 @@ use super::style::WakeStyle;
 ///
 /// Every register states how the device is woken (`style.rs`), so a device whose Autostart was
 /// turned on goes back to `data` at its next register; a client that sends no `wake` registers
-/// `data`, which is what every token was before.
+/// `data`, which is what every token was before. So does the channel a visible wake is drawn on
+/// (`WakeChannel`): a register that does not name the wake channel — an older app, a data token —
+/// clears it, and the message channel is used again.
 pub(crate) const REGISTER_SQL: &str =
     "INSERT INTO push_tokens
-        (user_id, device_id, fcm_token, platform, created_at, last_seen_at, wake, wake_lang)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, device_id, fcm_token, platform, created_at, last_seen_at, wake, wake_lang,
+         wake_channel)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id, device_id) DO UPDATE SET
         relay_project = CASE WHEN push_tokens.fcm_token = excluded.fcm_token
                              THEN push_tokens.relay_project ELSE NULL END,
@@ -27,10 +30,11 @@ pub(crate) const REGISTER_SQL: &str =
         platform = excluded.platform,
         last_seen_at = excluded.last_seen_at,
         wake = excluded.wake,
-        wake_lang = excluded.wake_lang";
+        wake_lang = excluded.wake_lang,
+        wake_channel = excluded.wake_channel";
 
 #[derive(Deserialize)]
-struct RegisterBody {
+pub(crate) struct RegisterBody {
     fcm_token: String,
     device_id: String,
     platform: String, // "android" | "ios"
@@ -40,6 +44,17 @@ struct RegisterBody {
     /// The visible notification's language, "tr" | "en".
     #[serde(default)]
     lang: Option<String>,
+    /// "sezgi_wake_v1": the app created the badge-less wake channel. Taken only as that exact id
+    /// (`WakeChannel::parse`); anything else is the message channel.
+    #[serde(default)]
+    wake_channel: Option<String>,
+}
+
+impl RegisterBody {
+    /// How the device asked to be woken (`style.rs`), every field through its allow-list.
+    pub(crate) fn style(&self) -> WakeStyle {
+        WakeStyle::parse(self.wake.as_deref(), self.lang.as_deref(), self.wake_channel.as_deref())
+    }
 }
 
 pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -86,7 +101,7 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         Err(_) => return json_err(503, "revoke_check_unavailable"),
     }
     let now = now_secs();
-    let style = WakeStyle::parse(body.wake.as_deref(), body.lang.as_deref());
+    let style = body.style();
     let db = ctx.env.d1("DB")?;
     db.prepare(REGISTER_SQL)
     .bind(&[
@@ -98,6 +113,7 @@ pub async fn register(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         d1_int(now as i64),
         d1_text(style.column()),
         style.lang_column().map(d1_text).unwrap_or(JsValue::NULL),
+        style.channel_column().map(d1_text).unwrap_or(JsValue::NULL),
     ])?
     .run()
     .await?;

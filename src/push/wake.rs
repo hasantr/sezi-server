@@ -43,14 +43,16 @@ pub async fn maybe_push_wake(
 }
 
 /// One device's push token.
-const DEVICE_TOKEN_SQL: &str = "SELECT device_id, fcm_token, relay_project, wake, wake_lang FROM push_tokens
+pub(crate) const DEVICE_TOKEN_SQL: &str = "SELECT device_id, fcm_token, relay_project, wake, wake_lang, wake_channel
+     FROM push_tokens
      WHERE user_id = ? AND device_id = ?";
 
 /// The push tokens of a user — what a device-blind wake, and a member with several asleep devices,
 /// read. Never a REVOKED device's (its token used to outlive it: the D8 review's F6), and at most
 /// `MAX_DEVICES`, newest first, so a pile of tokens from before device addressing cannot turn one
 /// wake into a dozen fetches. Rows with no device row at all are such pre-addressing tokens.
-const USER_TOKENS_SQL: &str = "SELECT pt.device_id, pt.fcm_token, pt.relay_project, pt.wake, pt.wake_lang
+pub(crate) const USER_TOKENS_SQL: &str = "SELECT pt.device_id, pt.fcm_token, pt.relay_project, pt.wake, pt.wake_lang,
+            pt.wake_channel
      FROM push_tokens pt
      WHERE pt.user_id = ?
        AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.user_id = pt.user_id
@@ -65,7 +67,7 @@ pub(crate) const ROUTE_VIA_RELAY_SQL: &str = "UPDATE push_tokens SET relay_proje
      WHERE user_id = ?2 AND device_id = ?3 AND fcm_token = ?4";
 
 /// One registered device's token.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct TokenRow {
     pub(crate) device_id: String,
     pub(crate) fcm_token: String,
@@ -78,12 +80,19 @@ pub(crate) struct TokenRow {
     pub(crate) wake: Option<String>,
     #[serde(default)]
     pub(crate) wake_lang: Option<String>,
+    /// The channel a visible wake is drawn on (`style.rs` `WakeChannel`); None = the message one.
+    #[serde(default)]
+    pub(crate) wake_channel: Option<String>,
 }
 
 impl TokenRow {
     /// How this token is woken. A row from before the column, or with any other value, is `data`.
     pub(crate) fn style(&self) -> WakeStyle {
-        WakeStyle::parse(self.wake.as_deref(), self.wake_lang.as_deref())
+        WakeStyle::parse(
+            self.wake.as_deref(),
+            self.wake_lang.as_deref(),
+            self.wake_channel.as_deref(),
+        )
     }
 }
 
@@ -283,7 +292,7 @@ async fn send<P: WakePort>(
         // starting the app, so a payload would reach nobody (`style.rs`).
         let carry = match row.style() {
             WakeStyle::Data => carried.for_device(&row.device_id),
-            WakeStyle::Visible(_) => None,
+            WakeStyle::Visible(..) => None,
         };
         let (project_id, service_account, fallback) = match &mode {
             SendMode::Relay { url } => {

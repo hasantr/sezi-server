@@ -11,3 +11,6 @@ mod session_collision_tests;
 /// A 1:1 message's `ext` (caption, album, voice data, forwarded) crossing Olm whole.
 #[cfg(test)]
 mod payload_ext_tests;
+/// A framed payload (padded, maybe deflated) crossing Olm and Megolm.
+#[cfg(test)]
+mod payload_frame_tests;

@@ -482,9 +482,9 @@ impl UserInbox {
         // are single-threaded and ordered, so `sync_idle` is guaranteed to arrive after the last
         // `msg` — no race). A background drain reads it as "no more pending to move this round" and
         // finishes its acks before exiting. `more=true` (the 500-row cap was hit) means there is
-        // more, so keep going until the deadline. A foreground client IGNORES this frame (it is
-        // only meaningful in drain mode), and an older client already swallows unknown `type`s →
-        // backwards compatible.
+        // more, so keep going until the deadline. A foreground client decides on it the
+        // notifications the backlog held back (core `kernel/notify_gate.rs`), and an older client
+        // already swallows unknown `type`s → backwards compatible.
         let flushed = rows.len();
         let idle = serde_json::json!({
             "type": "sync_idle",

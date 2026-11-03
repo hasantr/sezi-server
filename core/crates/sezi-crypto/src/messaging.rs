@@ -172,6 +172,38 @@ pub fn encrypt_inner_to_peer_uid(
     msg_uid: Option<String>,
     ext: serde_json::Value,
 ) -> Result<EncryptedMessage, String> {
+    encrypt_inner_to_peer_framed(
+        identity_blob,
+        pickle_key,
+        peer_x_pub_b64,
+        peer_otk_pub_b64,
+        session_blob,
+        inner,
+        thread_id,
+        thread_title,
+        msg_uid,
+        ext,
+        false,
+    )
+}
+
+/// `encrypt_inner_to_peer_uid`, and with `frame` the payload is framed first — padded to a bucket,
+/// deflated when that pays (`sezi_protocol::payload_frame`). Only for a device that said it reads
+/// framed payloads (`kernel/olm_frame.rs`); with `frame = false` the bytes are today's exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_inner_to_peer_framed(
+    identity_blob: String,
+    pickle_key: Vec<u8>,
+    peer_x_pub_b64: String,
+    peer_otk_pub_b64: Option<String>,
+    session_blob: Option<String>,
+    inner: InnerMessage,
+    thread_id: Option<String>,
+    thread_title: Option<String>,
+    msg_uid: Option<String>,
+    ext: serde_json::Value,
+    frame: bool,
+) -> Result<EncryptedMessage, String> {
     let key = to_key32(&pickle_key)?;
 
     let pickle = AccountPickle::from_encrypted(&identity_blob, &key)
@@ -195,7 +227,10 @@ pub fn encrypt_inner_to_peer_uid(
     let mut payload = ChatPayload::new(thread_id, thread_title, inner);
     payload.msg_uid = msg_uid;
     payload.ext = ext;
-    let payload_bytes = payload.encode();
+    let mut payload_bytes = payload.encode();
+    if frame {
+        payload_bytes = sezi_protocol::payload_frame::seal(&payload_bytes);
+    }
     let cipher = session
         .encrypt(&payload_bytes)
         .map_err(|e| format!("encrypt: {e}"))?;
@@ -410,6 +445,10 @@ pub fn decrypt_payload_from_peer_sessions(
     };
 
     let new_session_blob = pickle_session(&session, &key);
+    // A framed payload (padded, maybe deflated; `sezi_protocol::payload_frame`) is opened first;
+    // a plain one — every older sender's — passes as it is.
+    let plain_bytes = sezi_protocol::payload_frame::open(&plain_bytes)
+        .map_err(|e| format!("chat payload frame: {e}"))?;
     let payload =
         ChatPayload::decode(&plain_bytes).map_err(|e| format!("chat payload parse: {e}"))?;
     let new_identity_blob = if identity_changed {
@@ -697,8 +736,11 @@ pub fn decrypt_from_peer(
         | InnerMessage::DeleteSelfSync { .. }
         | InnerMessage::OwnFileRequest { .. }
         | InnerMessage::OwnFileOffer { .. }
+        | InnerMessage::HistoryPageRequest { .. }
+        | InnerMessage::HistoryPageAnswer { .. }
         | InnerMessage::EscrowCopy { .. }
         | InnerMessage::TakeoverNotice { .. }
+        | InnerMessage::Indirect(_)
         | InnerMessage::RoomKeyGossip { .. }
         | InnerMessage::RoomKeyRequest { .. }
         | InnerMessage::GroupOutboundCopy { .. }

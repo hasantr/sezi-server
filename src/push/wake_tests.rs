@@ -145,9 +145,7 @@ impl FakeWake {
                     .map(|i| TokenRow {
                         device_id: format!("d{i}"),
                         fcm_token: format!("t{i}"),
-                        relay_project: None,
-                        wake: None,
-                        wake_lang: None,
+                        ..TokenRow::default()
                     })
                     .collect(),
             ),
@@ -276,7 +274,7 @@ impl WakePort for FakeWake {
 fn style_mark(style: WakeStyle) -> String {
     match style {
         WakeStyle::Data => String::new(),
-        WakeStyle::Visible(l) => format!(":visible-{}", l.code()),
+        WakeStyle::Visible(l, _) => format!(":visible-{}", l.code()),
     }
 }
 
@@ -468,7 +466,7 @@ fn schema_with_token(token: &str) -> rusqlite::Connection {
         [],
     )
     .unwrap();
-    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", token, "android", 1, 1, "data", None::<String>])
+    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", token, "android", 1, 1, "data", None::<String>, None::<String>])
         .unwrap();
     db
 }
@@ -488,10 +486,10 @@ fn a_mark_lives_with_its_token() {
     // A mark for a token the device has replaced meanwhile writes nothing.
     db.execute(ROUTE_VIA_RELAY_SQL, rusqlite::params!["other", "u", "d0", "tok-old"]).unwrap();
     assert_eq!(mark(&db).as_deref(), Some("owner-proj"));
-    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-a", "android", 2, 2, "data", None::<String>])
+    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-a", "android", 2, 2, "data", None::<String>, None::<String>])
         .unwrap();
     assert_eq!(mark(&db).as_deref(), Some("owner-proj"), "the same token keeps its mark");
-    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-b", "android", 3, 3, "data", None::<String>])
+    db.execute(super::super::handlers::REGISTER_SQL, rusqlite::params!["u", "d0", "tok-b", "android", 3, 3, "data", None::<String>, None::<String>])
         .unwrap();
     assert_eq!(mark(&db), None, "a new token is asked again");
     db.execute(ROUTE_VIA_RELAY_SQL, rusqlite::params!["owner-proj", "u", "d0", "tok-b"]).unwrap();
@@ -547,7 +545,7 @@ fn the_token_reads_carry_the_wake_style() {
     let register = |wake: &str, lang: Option<&str>| {
         db.execute(
             super::super::handlers::REGISTER_SQL,
-            rusqlite::params!["u", "d0", "tok-a", "android", 2, 2, wake, lang],
+            rusqlite::params!["u", "d0", "tok-a", "android", 2, 2, wake, lang, None::<String>],
         )
         .unwrap();
     };

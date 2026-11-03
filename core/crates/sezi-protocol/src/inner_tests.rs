@@ -1409,3 +1409,42 @@ fn the_takeover_controls_are_invisible_and_round_trip() {
     let older = json.replace("takeover_notice", "some_kind_this_build_lacks");
     assert!(ChatPayload::decode(older.as_bytes()).unwrap().drops_silently());
 }
+
+/// The older-history controls (`crate::history_page`) round-trip with their optional fields and
+/// carry the invisible mark: an older primary that receives a request drops it silently.
+#[test]
+fn the_history_page_controls_are_invisible_and_round_trip() {
+    use crate::history_page::{HistoryCursor, HistoryPagePart};
+    let ask = InnerMessage::HistoryPageRequest {
+        conversation: "peer-b".into(),
+        request_id: "hp-1".into(),
+        before: Some(HistoryCursor { sent_at: 42, local_id: None }),
+    };
+    let json = String::from_utf8(ChatPayload::new(None, None, ask).encode()).unwrap();
+    assert!(json.contains(r#""kind":"history_page_request""#) && json.contains(r#""invisible":true"#), "{json}");
+    assert!(!json.contains("local_id"), "an absent id stays off the wire: {json}");
+    match ChatPayload::decode(json.as_bytes()).unwrap().inner {
+        InnerMessage::HistoryPageRequest { conversation, request_id, before } => {
+            assert_eq!((conversation.as_str(), request_id.as_str()), ("peer-b", "hp-1"));
+            assert_eq!(before, Some(HistoryCursor { sent_at: 42, local_id: None }));
+        }
+        other => panic!("expected HistoryPageRequest, got {other:?}"),
+    }
+    let older = json.replace("history_page_request", "some_kind_this_build_lacks");
+    assert!(ChatPayload::decode(older.as_bytes()).unwrap().drops_silently());
+
+    let answer = InnerMessage::HistoryPageAnswer {
+        conversation: "room-1".into(),
+        request_id: "hp-2".into(),
+        count: 3,
+        has_more: true,
+        next: Some(HistoryCursor { sent_at: 7, local_id: Some("m-1".into()) }),
+        blob: None,
+        part: Some(HistoryPagePart { index: 0, total: 2, data_b64: "AA".into() }),
+    };
+    let json = String::from_utf8(ChatPayload::new(None, None, answer.clone()).encode()).unwrap();
+    assert!(json.contains(r#""kind":"history_page_answer""#) && json.contains(r#""invisible":true"#), "{json}");
+    assert!(!json.contains("blob"), "{json}");
+    let back = ChatPayload::decode(json.as_bytes()).unwrap().inner;
+    assert_eq!(format!("{back:?}"), format!("{answer:?}"));
+}

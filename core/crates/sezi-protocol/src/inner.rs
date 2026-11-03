@@ -887,6 +887,42 @@ pub enum InnerMessage {
     /// the primary, if it is alive, shows a refuse prompt. `request_id` names the relay's request,
     /// which the receiver reads back from the relay before it believes any of it. Invisible.
     TakeoverNotice { request_id: String },
+    /// "Older messages are on your phone": a linked device of mine asks my PRIMARY for the next
+    /// older page of one conversation (`crate::history_page`, `kernel/history_page/`). Sent once
+    /// per page, `SendControl` to my own user (which reaches the primary), and the one control
+    /// of this feature that wakes the primary: the person is waiting. `conversation` is the peer
+    /// of a 1:1 or the room; `before` the cursor the page must lie below (`None`: the newest
+    /// page — this device holds nothing there). Invisible; answered only from my own user, by
+    /// the primary, in the foreground. An older primary drops it silently (`invisible: true`).
+    HistoryPageRequest {
+        conversation: String,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<crate::history_page::HistoryCursor>,
+    },
+    /// The primary's answer to [`InnerMessage::HistoryPageRequest`], to the asking device alone
+    /// (`SendSelfState`, silent). `count` messages, `has_more` older than them, and `next` the
+    /// cursor to ask with for the page after. The page is ONE package: `blob` names it in the
+    /// relay's media store with its one-time key; without a blob store it rides in `part`s, one
+    /// answer each. Neither, with `count == 0`: nothing older. Invisible, from my own user only.
+    HistoryPageAnswer {
+        conversation: String,
+        request_id: String,
+        count: u32,
+        has_more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<crate::history_page::HistoryCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob: Option<FileManifest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part: Option<crate::history_page::HistoryPagePart>,
+    },
+    /// A payload too big for one relay envelope, in the relay's media store
+    /// (`crate::indirect`, `kernel/indirect/`): the receiver fetches it, checks its length and
+    /// hash, opens it and dispatches the `ChatPayload` inside as if it had arrived inline from
+    /// the same sender and device. Never nested. Invisible; an older build drops it silently —
+    /// and only a payload the relay would have refused with a 400 is ever sent this way.
+    Indirect(crate::indirect::IndirectRef),
     /// Forward-compatibility catch-all — messages carrying an unknown `kind` tag land here.
     /// Thanks to `#[serde(other)]` the payload of any unrecognized tag is silently
     /// swallowed; the decrypt chain does not collapse.
@@ -1051,6 +1087,9 @@ impl InnerMessage {
                 | InnerMessage::MessageEdit { .. }
                 | InnerMessage::EscrowCopy { .. }
                 | InnerMessage::TakeoverNotice { .. }
+                | InnerMessage::HistoryPageRequest { .. }
+                | InnerMessage::HistoryPageAnswer { .. }
+                | InnerMessage::Indirect(_)
         )
     }
 

@@ -18,6 +18,15 @@
 //! no server id, room, sender or count. Google already learns "a push happened, now" from a data
 //! wake; a visible one adds only that the device shows a notification. One `tag` for every wake,
 //! so ten messages are one notification, not ten.
+//!
+//! **Which channel it is drawn on** (POCO, MIUI, 2026-11-03). The launcher badge counts posted
+//! notifications, and the message channel shows a badge: the generic wake counted one, the real
+//! notification one more, and the app taking the generic one down one less — a counter rising and
+//! falling on its own. An app that created the badge-less [`WAKE_CHANNEL`] says so at register
+//! (`wake_channel`), and only then is its visible wake drawn there ([`WakeChannel`]). Android puts
+//! a notification that names a channel the app never created on FCM's fallback channel, which is
+//! quiet on many phones, so a token that did not say it — every app before this — keeps
+//! [`CHANNEL`].
 
 use serde_json::{json, Value};
 
@@ -25,6 +34,9 @@ use super::carry::DATA_KEY;
 
 /// The notification channel the app creates (`fcm_service.dart`'s `_kMsgChannel`).
 pub(crate) const CHANNEL: &str = "sezgi_messages_v2";
+/// The badge-less channel for visible wakes (`autostart.dart`'s `kVisibleWakeChannel`). Named only
+/// for a token whose app said it created it ([`WakeChannel::parse`]).
+pub(crate) const WAKE_CHANNEL: &str = "sezgi_wake_v1";
 /// The app's monochrome status-bar icon (`ic_stat_sezgi` drawable).
 pub(crate) const ICON: &str = "ic_stat_sezgi";
 /// One tag for every visible wake: the next one replaces the last one. The app takes it down
@@ -65,22 +77,63 @@ impl Lang {
     }
 }
 
+/// The channel a visible wake is drawn on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WakeChannel {
+    /// [`CHANNEL`], the message channel: what every visible wake was drawn on before, and what a
+    /// token whose app did not say it has the wake channel still gets.
+    #[default]
+    Messages,
+    /// [`WAKE_CHANNEL`]: the app created it, with no badge.
+    Wake,
+}
+
+impl WakeChannel {
+    /// From a register body or a `push_tokens` row (`wake_channel`). An allow-list: only the exact
+    /// id of the channel this server knows the app creates. Anything else — no field, an old row,
+    /// a value from a newer or a hostile client — is the message channel; a client's own string
+    /// never goes into a push.
+    pub(crate) fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some(WAKE_CHANNEL) => WakeChannel::Wake,
+            _ => WakeChannel::Messages,
+        }
+    }
+
+    /// The Android channel id the notification names.
+    fn id(self) -> &'static str {
+        match self {
+            WakeChannel::Messages => CHANNEL,
+            WakeChannel::Wake => WAKE_CHANNEL,
+        }
+    }
+
+    /// The `push_tokens.wake_channel` column and the shared relay's `wake_channel` field: only the
+    /// wake channel is spelled out; the message channel is the absence of both.
+    fn named(self) -> Option<&'static str> {
+        match self {
+            WakeChannel::Messages => None,
+            WakeChannel::Wake => Some(WAKE_CHANNEL),
+        }
+    }
+}
+
 /// How one token is woken.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WakeStyle {
     #[default]
     Data,
-    Visible(Lang),
+    Visible(Lang, WakeChannel),
 }
 
 impl WakeStyle {
-    /// From a register body or a `push_tokens` row (`wake`, `wake_lang`). Anything but
-    /// `visible` is `data`: an old row (the column's default), an old client (no field), and a
-    /// value a newer client might send that this server does not know — the behaviour every
-    /// token had before visible wakes existed.
-    pub(crate) fn parse(wake: Option<&str>, lang: Option<&str>) -> Self {
+    /// From a register body or a `push_tokens` row (`wake`, `wake_lang`, `wake_channel`).
+    /// Anything but `visible` is `data`: an old row (the column's default), an old client (no
+    /// field), and a value a newer client might send that this server does not know — the
+    /// behaviour every token had before visible wakes existed. A data token has no channel.
+    pub(crate) fn parse(wake: Option<&str>, lang: Option<&str>, channel: Option<&str>) -> Self {
         match wake {
-            Some("visible") => WakeStyle::Visible(Lang::parse(lang)),
+            Some("visible") => WakeStyle::Visible(Lang::parse(lang), WakeChannel::parse(channel)),
             _ => WakeStyle::Data,
         }
     }
@@ -89,7 +142,7 @@ impl WakeStyle {
     pub(crate) fn column(self) -> &'static str {
         match self {
             WakeStyle::Data => "data",
-            WakeStyle::Visible(_) => "visible",
+            WakeStyle::Visible(..) => "visible",
         }
     }
 
@@ -97,7 +150,15 @@ impl WakeStyle {
     pub(crate) fn lang_column(self) -> Option<&'static str> {
         match self {
             WakeStyle::Data => None,
-            WakeStyle::Visible(l) => Some(l.code()),
+            WakeStyle::Visible(l, _) => Some(l.code()),
+        }
+    }
+
+    /// The `push_tokens.wake_channel` column: only a visible token on the wake channel names one.
+    pub(crate) fn channel_column(self) -> Option<&'static str> {
+        match self {
+            WakeStyle::Data => None,
+            WakeStyle::Visible(_, c) => c.named(),
         }
     }
 }
@@ -129,7 +190,7 @@ pub(crate) fn fcm_message(token: &str, style: WakeStyle, carry: Option<&str>) ->
                 "android": { "priority": "high" }
             }
         }),
-        WakeStyle::Visible(lang) => json!({
+        WakeStyle::Visible(lang, channel) => json!({
             "message": {
                 "token": token,
                 // Kept, so a tap opens the app and an app that IS started still drains.
@@ -140,7 +201,7 @@ pub(crate) fn fcm_message(token: &str, style: WakeStyle, carry: Option<&str>) ->
                         // The product's name, not a sentence: the same in every language.
                         "title": "Sezi",
                         "body": lang.new_message(),
-                        "channel_id": CHANNEL,
+                        "channel_id": channel.id(),
                         "icon": ICON,
                         "tag": TAG,
                         "notification_priority": "PRIORITY_HIGH",
@@ -164,7 +225,9 @@ fn wake_data(carry: Option<&str>) -> Value {
 /// The shared push relay's `/wake` body (`push-relay/src/index.js`). A data wake with nothing to
 /// carry sends what it always sent, `{token}`; one that carries a frame adds
 /// `data:{msg:<frame>}`. A relay that predates either ignores the fields it does not know and
-/// sends a plain data wake, which is what that device got before.
+/// sends a plain data wake, which is what that device got before. A visible wake on the wake
+/// channel adds `wake_channel`: a relay that predates it draws the wake on the message channel, as
+/// it always did, and one that knows it takes only the same allow-listed id.
 pub(crate) fn relay_body(token: &str, style: WakeStyle, carry: Option<&str>) -> Value {
     match (style, carry) {
         (WakeStyle::Data, None) => json!({ "token": token }),
@@ -173,8 +236,12 @@ pub(crate) fn relay_body(token: &str, style: WakeStyle, carry: Option<&str>) -> 
             data[DATA_KEY] = json!(frame);
             json!({ "token": token, "data": data })
         }
-        (WakeStyle::Visible(lang), _) => {
-            json!({ "token": token, "wake": "visible", "lang": lang.code() })
+        (WakeStyle::Visible(lang, channel), _) => {
+            let mut body = json!({ "token": token, "wake": "visible", "lang": lang.code() });
+            if let Some(id) = channel.named() {
+                body["wake_channel"] = json!(id);
+            }
+            body
         }
     }
 }

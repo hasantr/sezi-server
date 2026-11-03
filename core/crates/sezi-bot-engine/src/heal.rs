@@ -2,7 +2,7 @@
 //!
 //! The kernel's rules, unchanged, because the far end IS a kernel:
 //!
-//! - **The lower id initiates** (`kernel/inbound.rs` `self_heal_session`, `inbound_receipts.rs`
+//! - **The lower id initiates** (`kernel/inbound_self_heal.rs` `self_heal_session`, `inbound_receipts.rs`
 //!   on `delivery_failed`). Only the side whose user id sorts lower sends the PreKey pair-ack that
 //!   re-pairs the two; the higher side waits for it. Two sides that both initiated would each open
 //!   a session the other is not using — the glare storm.
