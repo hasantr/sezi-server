@@ -1,0 +1,17 @@
+{
+  "name": "sezi-server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Sezi self-host relay — wrangler EXACT-PIN (sürüm-drift'e karşı reprodüksiyon kilidi).",
+  "//": "wrangler'ı KASITLI olarak tam sürüme sabitliyoruz. `npx wrangler@4` = her çalıştırmada 'latest 4.x' çeker → miniflare .wrangler/state/v3 formatı ya da workerd davranışı habersiz değişebilir (Fable-denetim riski #2: 'boş' açılan sunucu). Güncelleme = BİLİNÇLİ commit: bu satırı elle yükselt, `npm install` ile package-lock.json'u tazele, prebuilt-WASM ile smoke-test et, sonra commit'le.",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "wrangler": "4.86.0"
+  },
+  "scripts": {
+    "//": "Self-host relay'i lokal workerd (wrangler dev) ile başlatır — SADECE 127.0.0.1 (dış erişim yalnız tünel/caddy önünden). Kalıcı veri --persist-to state dizininde. systemd bunu doğrudan node_modules/.bin/wrangler ile çağırır (deploy/README.md).",
+    "relay": "wrangler dev --config wrangler.selfhost.toml --ip 127.0.0.1 --port 8788 --persist-to .wrangler/state"
+  }
+}

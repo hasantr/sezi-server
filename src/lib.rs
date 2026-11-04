@@ -38,6 +38,8 @@ mod server;
 mod sigv4;
 mod storage;
 #[cfg(test)]
+mod template_tests;
+#[cfg(test)]
 mod test_schema;
 mod turn;
 mod usage;

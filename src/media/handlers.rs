@@ -17,7 +17,7 @@ pub async fn upload(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // R2 is OPTIONAL: with no MEDIA binding the media path is off, so answer 503 FIRST — after
     // auth, before rate-limit/quota/D1 — and a binding-less install then writes no orphan meta rows
     // and no inflated counters. The client treats "media_not_configured" as nonretryable
-    // (op_result.rs): it stays 503 until the owner adds the binding.
+    // (the kernel's `op_outcome.rs`): it stays 503 until the owner adds the binding.
     let router = crate::storage::StorageRouter::from_env(&ctx.env).await?;
     if !router.any_available() {
         return json_err(503, "media_not_configured");
