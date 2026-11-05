@@ -15,7 +15,7 @@ workspace = true
 [dependencies]
 # No default features: `chrono-clock` reads the system clock (it panics on wasm32) and `rayon`
 # spawns threads. What is left parses, decompresses (with the caps in `limits.rs`) and decrypts.
-lopdf = { version = "0.45", default-features = false }
+lopdf = { version = "0.46", default-features = false }
 # Only the Unicode classes the rules use (`\b`, `\s`, `\p{L}`), but WITH the speed-ups: without
 # `perf` the wasm is 0.26 MB smaller (1.83 vs 2.09 MB, opt-z + LTO) and parsing is eight times
 # slower (0.08 → 0.66 ms for one page; 20 pages 10.3 → 21.3 ms; native, measured 2026-10-27), and
@@ -27,7 +27,7 @@ serde = { workspace = true }
 # refuses wasm32-unknown-unknown without a backend. `wasm_js` is lopdf's switch for it; native
 # builds do not need it, so it is turned on for wasm only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-lopdf = { version = "0.45", default-features = false, features = ["wasm_js"] }
+lopdf = { version = "0.46", default-features = false, features = ["wasm_js"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

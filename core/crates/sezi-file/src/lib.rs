@@ -19,14 +19,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use chacha20poly1305::{
-    aead::{
-        stream::{DecryptorBE32, EncryptorBE32},
-        KeyInit,
-    },
-    XChaCha20Poly1305,
-};
-use rand::{rngs::OsRng, RngCore};
+use aead_stream::{DecryptorBE32, EncryptorBE32};
+use chacha20poly1305::{aead::KeyInit, XChaCha20Poly1305};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use tokio_util::sync::CancellationToken;
 
 use sezi_transfer::progress::{emit_bytes, TransferStep};
@@ -62,10 +57,39 @@ pub fn encrypt_in_memory(
     filename: &str,
     content_type: &str,
 ) -> Result<(FileManifest, Vec<u8>)> {
+    let (key, nonce) = fresh_key_and_nonce();
+    encrypt_in_memory_keyed(plaintext, &key, &nonce, filename, content_type)
+}
+
+/// A fresh key and STREAM nonce for [`encrypt_in_memory_keyed`], base64 as a manifest carries
+/// them.
+pub fn fresh_key_and_nonce() -> (String, String) {
     let mut key = [0u8; KEY_SIZE];
     let mut nonce = [0u8; STREAM_NONCE_SIZE];
-    OsRng.fill_bytes(&mut key);
-    OsRng.fill_bytes(&mut nonce);
+    UnwrapErr(SysRng).fill_bytes(&mut key);
+    UnwrapErr(SysRng).fill_bytes(&mut nonce);
+    (vodozemac::base64_encode(key), vodozemac::base64_encode(nonce))
+}
+
+/// [`encrypt_in_memory`] under a key and nonce chosen earlier (base64): the same bytes in give
+/// the same ciphertext out. For an upload that is RETRIED under one object id — a relay that
+/// already holds the object answers success without taking the bytes again, so a retry that
+/// re-encrypted under a new key would hand out a key the stored object does not open.
+pub fn encrypt_in_memory_keyed(
+    plaintext: &[u8],
+    key_b64: &str,
+    nonce_b64: &str,
+    filename: &str,
+    content_type: &str,
+) -> Result<(FileManifest, Vec<u8>)> {
+    let key: [u8; KEY_SIZE] = vodozemac::base64_decode(key_b64)
+        .ok()
+        .and_then(|k| k.try_into().ok())
+        .ok_or_else(|| Error::Crypto("bad key".into()))?;
+    let nonce: [u8; STREAM_NONCE_SIZE] = vodozemac::base64_decode(nonce_b64)
+        .ok()
+        .and_then(|n| n.try_into().ok())
+        .ok_or_else(|| Error::Crypto("bad nonce".into()))?;
 
     let cipher = XChaCha20Poly1305::new(&key.into());
     let mut encryptor = EncryptorBE32::from_aead(cipher, (&nonce).into());
@@ -539,8 +563,8 @@ fn derive_or_use_fixed_key_nonce(
         (None, None) => {
             let mut k = [0u8; KEY_SIZE];
             let mut n = [0u8; STREAM_NONCE_SIZE];
-            OsRng.fill_bytes(&mut k);
-            OsRng.fill_bytes(&mut n);
+            UnwrapErr(SysRng).fill_bytes(&mut k);
+            UnwrapErr(SysRng).fill_bytes(&mut n);
             Ok((k, n))
         }
         _ => Err(Error::Malformed("fixed_key/nonce must be both or neither")),

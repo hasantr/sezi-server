@@ -13,6 +13,11 @@
 //!   (disable); false → DELETE (enable). Returns `{"ok":true,"disabled":[...]}`
 //!   with the up-to-date list.
 //!
+//! - **The plugin log's append** (`plugin_log::append`) asks [`append_refused`]: an entry for a
+//!   disabled plugin is refused with `400 {"error":"plugin_disabled"}`. It is the one place the
+//!   relay sees a plugin id in the clear; everything else a plugin sends is end-to-end encrypted
+//!   and gated by the app's core (`core/src/kernel/plugin_policy.rs`).
+//!
 //! Precedent: the cf_config/fcm_config admin self-service pattern plus the
 //! require_admin GET in stats.rs, and plugin_epoch_floor's "table missing →
 //! fail-open" read discipline.
@@ -60,6 +65,45 @@ pub async fn get_plugin_policy(req: Request, ctx: RouteContext<()>) -> Result<Re
     let db = ctx.env.d1("DB")?;
     let disabled = read_disabled(&db).await;
     Response::from_json(&serde_json::json!({ "disabled": disabled }))
+}
+
+/// Plugin ids no policy row can switch off — the core's `NEVER_DISABLED`
+/// (`core/src/kernel/plugin_policy.rs`), kept in step by a test. `library` is the group library's
+/// record layer (course sessions, attendance, recordings), not a plugin anyone picks; a server
+/// turns its library off with `/capabilities` `features.library`, never with this table.
+pub(crate) const NEVER_DISABLED: &[&str] = &["library"];
+
+/// One plugin's row: present = disabled.
+pub(crate) const IS_DISABLED_SQL: &str =
+    "SELECT 1 AS disabled FROM server_plugin_policy WHERE plugin_id = ?1 LIMIT 1";
+
+/// How a plugin-log append for a disabled plugin is answered (`plugin_log::append`).
+///
+/// A `400`, not a `403`, for the apps already out there: every app since 2046 ends an op at the
+/// first `400` (`core/src/kernel/op_error.rs` `is_request_refused`, terminal, its own lane — never
+/// held behind it), while a `403` is no code it knows and walks the eight-attempt retry ladder,
+/// once per record the plugin writes. The body's code is what an app reads to tell why.
+pub(crate) const APPEND_REFUSED_STATUS: u16 = 400;
+pub(crate) const APPEND_REFUSED_CODE: &str = "plugin_disabled";
+
+/// The decision, given whether the table holds a row for `plugin_id`.
+pub(crate) fn refuses_append(plugin_id: &str, row_present: bool) -> bool {
+    row_present && !NEVER_DISABLED.contains(&plugin_id)
+}
+
+/// Must an append to `plugin_id`'s log be refused? Reads the one row; a missing table or a D1
+/// error refuses nothing (fail-open, as `read_disabled` and `plugin_log::epoch_floor` read).
+/// Only appends ask: reads stay open, since nothing is deleted on a disable and re-enabling
+/// brings every entry back.
+pub(crate) async fn append_refused(db: &D1Database, plugin_id: &str) -> bool {
+    if NEVER_DISABLED.contains(&plugin_id) {
+        return false;
+    }
+    let row_present = match db.prepare(IS_DISABLED_SQL).bind(&[d1_text(plugin_id)]) {
+        Ok(stmt) => matches!(stmt.first::<serde_json::Value>(None).await, Ok(Some(_))),
+        Err(_) => false,
+    };
+    refuses_append(plugin_id, row_present)
 }
 
 #[derive(Deserialize, Default)]
@@ -129,6 +173,61 @@ pub async fn set_plugin_policy(mut req: Request, ctx: RouteContext<()>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped lookup, run against the real schema: a row = disabled, no row = enabled.
+    fn row_present(db: &rusqlite::Connection, plugin_id: &str) -> bool {
+        db.query_row(IS_DISABLED_SQL, [plugin_id], |_| Ok(()))
+            .map(|_| true)
+            .unwrap_or(false)
+    }
+
+    fn schema_with_disabled(ids: &[&str]) -> rusqlite::Connection {
+        let db = crate::test_schema::full_schema();
+        for id in ids {
+            db.execute(
+                "INSERT INTO server_plugin_policy (plugin_id, disabled_at) VALUES (?1, 1)",
+                [id],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn an_append_for_a_disabled_plugin_is_refused() {
+        let db = schema_with_disabled(&["draw"]);
+        assert!(refuses_append("draw", row_present(&db, "draw")));
+    }
+
+    #[test]
+    fn an_append_for_an_enabled_plugin_goes_through() {
+        let db = schema_with_disabled(&["draw"]);
+        assert!(!refuses_append("todo", row_present(&db, "todo")));
+        // An empty table — every server that never touched the policy — refuses nothing.
+        let empty = schema_with_disabled(&[]);
+        assert!(!refuses_append("draw", row_present(&empty, "draw")));
+    }
+
+    /// `library` is the group library's record layer, not a plugin anyone picks; the core never
+    /// obeys a policy row for it (`core/src/kernel/plugin_policy.rs` `NEVER_DISABLED`) and
+    /// neither does the relay, or course sessions and attendance would stop here while the app
+    /// still offered them.
+    #[test]
+    fn the_library_is_never_refused_whatever_the_table_says() {
+        let db = schema_with_disabled(&["library"]);
+        assert!(row_present(&db, "library"), "the premise: a hand-made row exists");
+        assert!(!refuses_append("library", row_present(&db, "library")));
+        assert_eq!(NEVER_DISABLED, &["library"], "keep in step with the core's NEVER_DISABLED");
+    }
+
+    /// The status is part of the contract with apps already out there: every app since 2046
+    /// ends an op at the first `400` (`core/src/kernel/op_error.rs` `is_request_refused`), while
+    /// a `403` walks the eight-attempt retry ladder once per record. The code is the reason.
+    #[test]
+    fn the_refusal_is_a_400_plugin_disabled() {
+        assert_eq!(APPEND_REFUSED_STATUS, 400);
+        assert_eq!(APPEND_REFUSED_CODE, "plugin_disabled");
+    }
 
     #[test]
     fn plugin_id_validation() {

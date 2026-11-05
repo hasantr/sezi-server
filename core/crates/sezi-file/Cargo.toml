@@ -21,6 +21,7 @@ sezi-error = { path = "../sezi-error" }
 sezi-protocol = { path = "../sezi-protocol" }
 sezi-transfer = { path = "../sezi-transfer" }
 chacha20poly1305 = { workspace = true }
+aead-stream = { workspace = true }
 rand = { workspace = true }
 # NOT for Olm — this layer does no session crypto. `vodozemac::base64_encode/decode` is where the
 # manifest's key/nonce encoding comes from, and it has to stay that encoding (unpadded, Matrix-style)
@@ -34,5 +35,5 @@ log = "0.4"
 # The group library's per-part key derivation (`part.rs`): HKDF-SHA256 over the part index. Both
 # were already in the lock — the root crate and `sezi-backup` derive their backup keys the same
 # way — and both are pure Rust, so the wasm island is unaffected.
-hkdf = "0.12"
-sha2 = "0.10"
+hkdf = "0.13"
+sha2 = "0.11"

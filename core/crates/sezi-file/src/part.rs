@@ -32,7 +32,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
-use rand::{rngs::OsRng, RngCore};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use sha2::Sha256;
 
 use sezi_error::{Error, Result};
@@ -75,7 +75,7 @@ impl ItemKey {
     /// A fresh key from the OS RNG.
     pub fn generate() -> Self {
         let mut k = [0u8; KEY_SIZE];
-        OsRng.fill_bytes(&mut k);
+        UnwrapErr(SysRng).fill_bytes(&mut k);
         Self(k)
     }
 

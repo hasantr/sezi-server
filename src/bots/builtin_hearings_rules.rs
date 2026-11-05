@@ -148,6 +148,30 @@ impl Columns {
     }
 }
 
+/// The default column names in every language the bot speaks, keyed by its language code —
+/// served beside the configuration on `GET /admin/bots/:id/builtin` as `hearing_columns`, so the
+/// app's form starts from THIS table and no copy of it lives anywhere else (decision review B5,
+/// 2026-11-05: the relay owns the names; it matches the sheet's headers by them).
+///
+/// Additive: an app from before it ignores the field and keeps the copy it ships. An app on a
+/// relay from before it finds none and leaves the names empty, which the PUT leaves out and
+/// [`columns`] fills with these same defaults.
+pub(crate) fn default_columns_table() -> serde_json::Value {
+    serde_json::json!({
+        "tr": Columns::defaults(Lang::Tr),
+        "en": Columns::defaults(Lang::En),
+    })
+}
+
+/// `GET …/builtin`'s answer with [`default_columns_table`] added at its top level. Anything that
+/// is not a JSON object (an error page passed through) is left alone.
+pub(crate) fn with_columns_table(mut answer: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = answer.as_object_mut() {
+        obj.insert("hearing_columns".into(), default_columns_table());
+    }
+    answer
+}
+
 /// What the bot's inbox keeps for the hearings kind (no key: that is its own `bot_kv` row).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HearingsConfig {

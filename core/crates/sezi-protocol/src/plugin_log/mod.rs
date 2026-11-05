@@ -10,7 +10,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use serde::{Deserialize, Serialize};
 
 /// Field separator for the signing bytes (domain separation). A version string + NUL →
@@ -130,7 +130,7 @@ pub const PLUGIN_LOG_NONCE_LEN: usize = 24;
 /// Generate a new epoch key (CSPRNG).
 pub fn generate_epoch_key() -> PluginEpochKey {
     let mut k = [0u8; 32];
-    OsRng.fill_bytes(&mut k);
+    UnwrapErr(SysRng).fill_bytes(&mut k);
     k
 }
 
@@ -165,12 +165,12 @@ pub fn seal(
     aad: &[u8],
 ) -> Result<(Vec<u8>, [u8; PLUGIN_LOG_NONCE_LEN])> {
     let mut nonce = [0u8; PLUGIN_LOG_NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    UnwrapErr(SysRng).fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| Error::Crypto("plugin-log seal: key length".into()))?;
     let ct = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad,
@@ -190,7 +190,7 @@ pub fn open(key: &PluginEpochKey, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -
         .map_err(|_| Error::Crypto("plugin-log open: key length".into()))?;
     cipher
         .decrypt(
-            XNonce::from_slice(nonce),
+            &XNonce::try_from(nonce).expect("nonce length checked"),
             Payload {
                 msg: ciphertext,
                 aad,

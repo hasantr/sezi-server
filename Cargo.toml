@@ -21,9 +21,6 @@ console_error_panic_hook = "0.1"
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
-# FCM HTTP v1 OAuth2 service-account JWT (RS256). Saf-Rust (WebCrypto subtle yerine);
-# PKCS8 PEM import + deterministik PKCS1v15 imza (RNG gerektirmez).
-rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 pbkdf2 = { version = "0.12", default-features = false }
 hmac = "0.12"
@@ -51,6 +48,11 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # Wasm interop (D1 BLOB binding)
 js-sys = "0.3"
 wasm-bindgen = "0.2"
+# The FCM JWT's RS256 signature through the platform's WebCrypto (`push/fcm_sign.rs`), not the
+# `rsa` crate (RUSTSEC-2023-0071, Marvin, no fixed release). Both are already in the tree through
+# `worker`; named here for the SubtleCrypto bindings.
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["CryptoKey", "SubtleCrypto"] }
 
 # The bot's end of the encryption runs inside the relay, in the bot's own UserInbox
 # (docs/BOTS_BUILD.md §1). Path dependencies into core's workspace: cargo resolves their
@@ -78,7 +80,7 @@ matchit = "=0.7.3"
 # A member device that speaks Olm the way a kernel does, so the bot inbox's tests drive the real
 # engine through the DO store (`messages/inbox_do/bot/engine_tests.rs`).
 sezi-crypto = { path = "core/crates/sezi-crypto" }
-vodozemac = "0.10"
+vodozemac = "0.11"
 
 [profile.release]
 opt-level = "s"

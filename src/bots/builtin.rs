@@ -3,7 +3,7 @@
 //! | Route | What |
 //! |---|---|
 //! | `PUT /admin/bots/:id/builtin` | set `sheet` / `ai` / `hearings`, or `kind: null` for program mode → `{ok, sheet_secret?, has_api_key?}` |
-//! | `GET /admin/bots/:id/builtin` | the configuration WITHOUT `api_key`, with `has_api_key` |
+//! | `GET /admin/bots/:id/builtin` | the configuration WITHOUT `api_key`, with `has_api_key`, and the hearing bot's default column names per language (`hearing_columns`) |
 //!
 //! The configuration is checked here (`builtin_rules::validate`) and kept in the bot's inbox,
 //! with its secrets; D1 holds only what a listing needs — `bots.builtin`, `bots.ai_provider` and
@@ -81,6 +81,12 @@ pub async fn get(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
-    let resp = super::bot_inbox(&ctx.env, &bot_id, Method::Get, "/bot/builtin", None).await?;
-    crate::respond::passthrough(resp).await
+    let mut resp = super::bot_inbox(&ctx.env, &bot_id, Method::Get, "/bot/builtin", None).await?;
+    if resp.status_code() != 200 {
+        return crate::respond::passthrough(resp).await;
+    }
+    // The hearing bot's default column names ride with every answer: the relay owns them
+    // (`builtin_hearings_rules::default_columns_table`, decision review B5).
+    let answer: serde_json::Value = resp.json().await?;
+    Response::from_json(&super::builtin_hearings_rules::with_columns_table(answer))
 }

@@ -139,9 +139,9 @@ pub enum InnerMessage {
     ActivityBatch { events: Vec<crate::activity_batch::ActivityBatchItem> },
     /// Local call-history record (shown in the chat bubble as "📞 Voice call · 2:34" /
     /// "Missed call"). NEVER GOES TO THE OTHER SIDE — each endpoint writes it from its own
-    /// perspective (`direction` in/out + `status`) inside its own `_teardown`;
-    /// `handle_log_call` inserts a LOCAL MessageRow and it is never sent via
-    /// SendControl/Olm (if one arrives inbound it is ignored).
+    /// perspective (`direction` in/out + `status`), decided by its core from what its call layer
+    /// reported (`kernel/call_log.rs`); `log_call_at` inserts a LOCAL MessageRow and it is never
+    /// sent via SendControl/Olm (if one arrives inbound it is ignored).
     /// `call_type`: "voice"|"video"; `status`: "completed"|"missed"|"declined"|"canceled".
     CallLog {
         call_type: String,

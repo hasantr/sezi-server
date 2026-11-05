@@ -23,17 +23,18 @@ doc_overindented_list_items = "allow"
 # would break the conversions in a way whose error message points nowhere useful.
 [workspace.dependencies]
 thiserror         = "1"
-vodozemac         = "0.10"
+vodozemac         = "0.11"
 serde_json        = "1"
 rusqlite          = { version = "0.40", features = ["bundled", "blob"] }
-reqwest           = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest           = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 blake3            = "1.5"
 hex               = "0.4"
 serde             = { version = "1", features = ["derive"] }
 tar               = "0.4"
-chacha20poly1305  = { version = "0.10", features = ["stream"] }
-rand              = { version = "0.8", features = ["std", "std_rng"] }
+chacha20poly1305  = "0.11"
+aead-stream       = { version = "0.6", features = ["alloc"] }
+rand              = { version = "0.10", features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 # `CancellationToken` (handed out by `sezi-transfer`, selected on in this crate's chunk loops)
 # and `UnboundedSender<TransferProgress>` (built by the kernel, stored by the crate) both cross
 # the boundary — two declarations resolving differently would fail at those call sites.
@@ -49,7 +50,7 @@ rand              = { version = "0.8", features = ["std", "std_rng"] }
 tokio             = { version = "1", features = ["macros", "sync", "io-util", "time", "rt"] }
 tokio-util        = { version = "0.7", default-features = false, features = ["rt"] }
 # Three users now: `sezi-crypto::kdf`, `sezi-store` (auth/identity stores) and this crate's `depot`.
-argon2            = "0.5"
+argon2            = "0.6"
 # `sezi-net::build_tls_config` returns a `rustls::ClientConfig` that this crate's WS path wraps in
 # tokio-rustls, and `client/sync.rs` installs the aws-lc-rs provider PROCESS-GLOBALLY. Two resolutions
 # would compile and then fail the handshake at runtime — the provider installed in one does not apply

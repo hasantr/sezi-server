@@ -20,7 +20,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use serde::{Deserialize, Serialize};
 use vodozemac::{Curve25519PublicKey, Curve25519SecretKey};
 
@@ -87,9 +87,9 @@ pub fn seal_to_one_time_key(one_time_pub_b64: &str, plaintext: &[u8]) -> Result<
         .ok_or(Error::Malformed("takeover one-time key is not contributory"))?;
     let key = release_key(shared.as_bytes(), eph_pub.as_bytes(), their.as_bytes());
     let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    UnwrapErr(SysRng).fill_bytes(&mut nonce);
     let ct = XChaCha20Poly1305::new(&key.into())
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: eph_pub.as_bytes() })
+        .encrypt(&XNonce::from(nonce), Payload { msg: plaintext, aad: eph_pub.as_bytes() })
         .map_err(|e| Error::Crypto(format!("takeover seal: {e}")))?;
     let mut out = Vec::with_capacity(32 + NONCE_LEN + ct.len());
     out.extend_from_slice(eph_pub.as_bytes());
@@ -115,7 +115,10 @@ pub fn open_with_one_time_key(one_time_secret: &[u8; 32], sealed_b64: &str) -> R
         .ok_or(Error::Malformed("takeover box key is not contributory"))?;
     let key = release_key(shared.as_bytes(), &eph_pub, mine.as_bytes());
     XChaCha20Poly1305::new(&key.into())
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: &eph_pub })
+        .decrypt(
+            &XNonce::try_from(nonce).expect("nonce length checked"),
+            Payload { msg: ct, aad: &eph_pub },
+        )
         .map_err(|_| Error::Crypto("takeover/release-unreadable".into()))
 }
 

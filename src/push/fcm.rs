@@ -7,25 +7,25 @@
 //!
 //! Flow: service account (env secret `FCM_SERVICE_ACCOUNT`, JSON) → RS256-signed JWT →
 //! Google OAuth2 (`oauth2.googleapis.com/token`, jwt-bearer) → `access_token` (cached
-//! module-globally, ~1h) → `fcm/v1/projects/{FCM_PROJECT_ID}/messages:send`. RS256 comes
-//! from the pure-Rust `rsa` crate (deterministic PKCS1v15, so no RNG is needed).
+//! module-globally, ~1h) → `fcm/v1/projects/{FCM_PROJECT_ID}/messages:send`. The JWT's pure
+//! parts are `fcm_jwt.rs`; RS256 is the platform's WebCrypto (`fcm_sign.rs`), the imported key
+//! cached beside the token.
 //! 404/UNREGISTERED means the token is stale and the caller deletes it from `push_tokens`.
 //!
 //! This file is the two senders — Google directly and the shared push relay. Which one a wake
 //! uses is `config.rs`; the wake itself (tokens, verdicts, deletes) is `wake.rs`.
 
+use std::cell::RefCell;
 use std::sync::Mutex;
 
-use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::signature::{SignatureEncoding, Signer};
-use rsa::RsaPrivateKey;
 use serde::Deserialize;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+use web_sys::CryptoKey;
 use worker::*;
 
+use super::{fcm_jwt, fcm_sign};
 use super::style::{fcm_message, relay_body, WakeStyle};
-use crate::utils::{b64u_encode, now_secs};
+use crate::utils::now_secs;
 
 #[derive(Deserialize)]
 struct ServiceAccount {
@@ -46,6 +46,27 @@ struct CachedToken {
 // token from the old one may still be used until it expires (~1h). Acceptable — isolates recycle
 // often, and an old token Google still accepts keeps push working meanwhile.
 static TOKEN_CACHE: Mutex<Option<CachedToken>> = Mutex::new(None);
+
+thread_local! {
+    /// The service account's key as WebCrypto imported it, beside the token cache: a
+    /// `CryptoKey` is a JS object, not `Send`, so it lives per thread — which on workerd is per
+    /// isolate. Keyed by the SHA-256 of the key's DER, so a new service account imports anew.
+    static SIGNING_KEY: RefCell<Option<([u8; 32], CryptoKey)>> = const { RefCell::new(None) };
+}
+
+/// The imported signing key for `der`, from the isolate's cache or imported now.
+async fn signing_key(der: &[u8]) -> Result<CryptoKey> {
+    let id: [u8; 32] = Sha256::digest(der).into();
+    let cached = SIGNING_KEY.with(|k| {
+        k.borrow().as_ref().filter(|(kid, _)| *kid == id).map(|(_, key)| key.clone())
+    });
+    if let Some(key) = cached {
+        return Ok(key);
+    }
+    let key = fcm_sign::import_signing_key(der).await.map_err(Error::RustError)?;
+    SIGNING_KEY.with(|k| *k.borrow_mut() = Some((id, key.clone())));
+    Ok(key)
+}
 
 /// Where the OAuth token is shared between isolates: the KV namespace the rate limits already use.
 ///
@@ -85,31 +106,16 @@ async fn get_access_token(env: &Env, sa_json: &str) -> Result<String> {
 
     let sa: ServiceAccount = serde_json::from_str(sa_json)
         .map_err(|e| Error::RustError(format!("fcm: service_account parse: {e}")))?;
-    // Inside the JSON string the private_key line breaks may be `\n`-escaped → restore real
-    // newlines.
-    let pem = sa.private_key.replace("\\n", "\n");
+    // Inside the JSON string the private_key line breaks may be `\n`-escaped; `pkcs8_der`
+    // restores them.
+    let der = fcm_jwt::pkcs8_der(&sa.private_key).map_err(Error::RustError)?;
 
     // --- RS256 JWT (assertion) ---
-    let iat = now;
-    let exp = now + 3600;
-    let header = br#"{"alg":"RS256","typ":"JWT"}"#;
-    let claims = serde_json::json!({
-        "iss": sa.client_email,
-        "scope": "https://www.googleapis.com/auth/firebase.messaging",
-        "aud": "https://oauth2.googleapis.com/token",
-        "iat": iat,
-        "exp": exp,
-    })
-    .to_string();
-    let signing_input = format!("{}.{}", b64u_encode(header), b64u_encode(claims.as_bytes()));
+    let signing_input = fcm_jwt::signing_input(&sa.client_email, now);
 
-    let key = RsaPrivateKey::from_pkcs8_pem(pem.trim())
-        .map_err(|e| Error::RustError(format!("fcm: private_key pkcs8 parse: {e}")))?;
-    let signing_key = SigningKey::<Sha256>::new(key);
-    let sig = signing_key
-        .try_sign(signing_input.as_bytes())
-        .map_err(|e| Error::RustError(format!("fcm: jwt sign: {e}")))?;
-    let jwt = format!("{}.{}", signing_input, b64u_encode(&sig.to_bytes()));
+    let key = signing_key(&der).await?;
+    let sig = fcm_sign::sign(&key, signing_input.as_bytes()).await.map_err(Error::RustError)?;
+    let jwt = fcm_jwt::assemble(&signing_input, &sig);
 
     // --- JWT → access_token (jwt-bearer grant) ---
     let body = format!(

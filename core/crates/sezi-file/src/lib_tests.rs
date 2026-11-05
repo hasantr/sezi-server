@@ -236,8 +236,8 @@ fn resume_encrypt_with_fixed_key_nonce_matches_oneshot() {
     // Generate a random key+nonce, base64-encode them
     let mut key = [0u8; KEY_SIZE];
     let mut nonce = [0u8; STREAM_NONCE_SIZE];
-    OsRng.fill_bytes(&mut key);
-    OsRng.fill_bytes(&mut nonce);
+    UnwrapErr(SysRng).fill_bytes(&mut key);
+    UnwrapErr(SysRng).fill_bytes(&mut nonce);
     let key_b64 = vodozemac::base64_encode(key);
     let nonce_b64 = vodozemac::base64_encode(nonce);
 

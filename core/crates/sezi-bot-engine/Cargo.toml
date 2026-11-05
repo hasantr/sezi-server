@@ -23,3 +23,5 @@ serde_json = { workspace = true }
 # (worker-rs) turns it on anyway; this lets the crate's own wasm check stand alone (CI).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+# rand 0.10 (sezi-protocol, sezi-crypto) reaches getrandom 0.4, which wants its `wasm_js` feature.
+getrandom_v4 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }

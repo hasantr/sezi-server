@@ -347,6 +347,18 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     {
         return json_err(403, "author_mismatch");
     }
+    // SERVER PLUGIN POLICY: a plugin the admins switched off takes no new entries. The plugin id
+    // is the one thing here the relay can read in the clear (its activities, records and installs
+    // travel inside Olm/Megolm), and apps before the core's own gate (2046–2061) still append for
+    // a disabled plugin. Checked before the epoch floor, whose 409 sends the app round a refresh
+    // and a re-append that would only be refused again. Reads (`sync`) stay open: nothing is
+    // deleted, so re-enabling brings everything back. Why a 400: `APPEND_REFUSED_STATUS`.
+    if crate::admin::plugin_policy::append_refused(&db, &plugin_id).await {
+        return json_err(
+            crate::admin::plugin_policy::APPEND_REFUSED_STATUS,
+            crate::admin::plugin_policy::APPEND_REFUSED_CODE,
+        );
+    }
     // FORWARD-SECRECY EPOCH-FLOOR gate: the floor was bumped when a member left, so
     // `key_epoch < floor` is an attempt to write new data under an OLD epoch → REJECT with
     // `409 epoch_stale`. Neither the ejected member nor a writer left behind can punch through
@@ -434,3 +446,7 @@ pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let do_req = Request::new(&do_url, Method::Get)?;
     passthrough(stub.fetch_with_request(do_req).await?).await
 }
+
+#[cfg(test)]
+#[path = "plugin_log_tests.rs"]
+mod tests;

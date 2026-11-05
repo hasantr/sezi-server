@@ -61,7 +61,7 @@ pub fn derive_pickle_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
     }
 
     let mut out = [0u8; 32];
-    argon2::Argon2::default()
+    stored_argon2()
         .hash_password_into(passphrase.as_bytes(), salt, &mut out)
         .map_err(|e| Error::Crypto(format!("argon2: {e}")))?;
 
@@ -85,6 +85,19 @@ pub fn clear_cache() {
     }
 }
 
+/// The Argon2 every passphrase-derived key on a device was made with: Argon2id, version 0x13,
+/// 19 MiB, two passes, one lane, 32 bytes out. These are argon2 0.5's and 0.6's `Default`, written
+/// out so that a library moving its defaults cannot move the key a stored blob opens with — the
+/// identity, the tokens, the pickle key and the depot list would stop opening, and nothing but a
+/// corpus recorded before the move would notice. `stored_argon2_is_pinned` holds the answer.
+pub fn stored_argon2() -> argon2::Argon2<'static> {
+    argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(19 * 1024, 2, 1, Some(32)).expect("fixed, valid parameters"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +107,23 @@ mod tests {
     // named constants so a future test cannot reintroduce a too-short one by accident.
     const SALT_A: &[u8] = b"salt-aaaaaaaaaaa";
     const SALT_B: &[u8] = b"salt-bbbbbbbbbbb";
+
+    #[test]
+    fn stored_argon2_is_pinned() {
+        // Recorded on argon2 0.6 (2060), whose keys are 2059's: the old_state corpus's identity,
+        // sealed under a key argon2 0.5 derived, opens with this one. A different answer means
+        // every passphrase-derived key on a phone would change: never update it.
+        let mut out = [0u8; 32];
+        stored_argon2().hash_password_into(b"hunter2", SALT_A, &mut out).unwrap();
+        assert_eq!(hex_of(&out), PINNED_HUNTER2_SALT_A);
+    }
+
+    fn hex_of(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    const PINNED_HUNTER2_SALT_A: &str =
+        "8519634fd98dcc334394901f2154f0669fedde4c65c29974953f67afd2a00d38";
 
     #[test]
     fn the_memo_returns_what_argon2_would_have() {

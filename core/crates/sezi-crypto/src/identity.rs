@@ -175,34 +175,26 @@ impl Identity {
 
     /// Deterministic 32-byte seed for deriving the P2P (iroh) NodeId.
     ///
-    /// The base64 of vodozemac's `Account::pickle()` output (an opaque blob
-    /// covering the whole Ed25519 + Curve25519 secret state) is run through a
-    /// BLAKE3 KDF. Same identity → same seed → same SecretKey → same NodeId.
+    /// Derived from the account's long-term Ed25519 key alone: the account signs a fixed context
+    /// (Ed25519 signatures are deterministic, RFC 8032) and the signature is run through a BLAKE3
+    /// KDF. Same identity → same seed → same SecretKey → same NodeId, whatever else the account
+    /// does — new one-time keys, a renewed fallback key, a vodozemac that encodes its pickle
+    /// differently.
     ///
-    /// Domain separation: `new_derive_key("sezgi-p2p-node-v1")` — the iroh
-    /// ed25519 key MUST be **different from the vodozemac Ed25519 signing
-    /// key** (best practice; the same bytes under two protocols is a
-    /// side-channel risk).
+    /// v1 hashed the whole encrypted `Account` pickle, so the NodeId moved every time the account
+    /// generated a one-time key or rotated its fallback, and would have moved with any change of
+    /// the pickle's encoding (2060's dependency review). Nothing pinned a NodeId then — a peer
+    /// relearns it from every offer ticket — so the move to v2 changes every node's id once and
+    /// costs nothing else.
     ///
-    /// v1 versioning: if the pickle format changes later, or another
-    /// derivation is needed, derive a `-v2` and let old peers produce both
-    /// seeds during a grace period.
+    /// Domain separation: the iroh ed25519 key MUST differ from the vodozemac Ed25519 signing key
+    /// (the same bytes under two protocols is a side-channel risk). The signature is secret-derived
+    /// and never leaves this function; only the KDF output does.
     pub fn p2p_secret_seed(&self) -> [u8; 32] {
-        // The `AccountPickle` is base64'd through vodozemac's pickle cipher: AES-256-CBC with
-        // a truncated HMAC-SHA256 tag, both derived from the key below. NOT an AEAD, and the
-        // difference matters here — CBC takes its IV from the same derivation, which is the
-        // only reason a CONSTANT key produces DETERMINISTIC bytes at all. Under a nonce-based
-        // AEAD this construction would either be non-deterministic or a nonce-reuse hazard.
-        //
-        // The key is not about confidentiality: it is a way to get those deterministic bytes,
-        // and it is separate from the real pickle at rest. The base64 output is hashed by the
-        // BLAKE3 KDF and dropped right here, so the ciphertext never leaves this function; that
-        // — not the key being secret — is what makes a hard-coded key safe. The pickle itself
-        // DOES carry the account's secret keys.
-        const SEED_PICKLE_KEY: [u8; 32] = *b"sezgi-p2p-node-seed-keyv1-pickle";
-        let pickle_b64 = self.account.pickle().encrypt(&SEED_PICKLE_KEY);
-        let mut hasher = blake3::Hasher::new_derive_key("sezgi-p2p-node-v1");
-        hasher.update(pickle_b64.as_bytes());
+        const SEED_CONTEXT: &[u8] = b"sezgi-p2p-node-seed-v2";
+        let signature = self.account.sign(SEED_CONTEXT);
+        let mut hasher = blake3::Hasher::new_derive_key("sezgi-p2p-node-v2");
+        hasher.update(&signature.to_bytes());
         let mut seed = [0u8; 32];
         hasher.finalize_xof().fill(&mut seed);
         seed
@@ -251,6 +243,21 @@ pub fn otk_inventory(identity_blob: &str, pickle_key: &[u8]) -> Result<(usize, u
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
     Ok((count, next_id))
+}
+
+/// The account's CURRENT fallback key as its signed prekey — `(public key, its signature by the
+/// account's Ed25519 key)`, both base64 — without rotating it; `None` when the account has none.
+/// What a takeover publishes for the account it adopted, whose fallback key it renewed
+/// (`sezi_backup::escrow::EscrowCopyV1::account_for_adoption`).
+pub fn signed_fallback_from_blob(identity_blob: &str, pickle_key: &[u8]) -> Result<Option<(String, String)>, String> {
+    let key = to_key32(pickle_key)?;
+    let pickle = vodozemac::olm::AccountPickle::from_encrypted(identity_blob, &key)
+        .map_err(|e| format!("crypto/identity-blob-unreadable: {e}"))?;
+    let account = Account::from_pickle(pickle);
+    Ok(account.fallback_key().into_values().next().map(|pub_key| {
+        let signature = account.sign(pub_key.as_bytes());
+        (vodozemac::base64_encode(pub_key.to_bytes()), vodozemac::base64_encode(signature.to_bytes()))
+    }))
 }
 
 #[cfg(test)]
@@ -309,3 +316,7 @@ mod otk_inventory_tests {
         assert!(otk_inventory(&blob, &[2u8; 32]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "identity_tests.rs"]
+mod identity_tests;

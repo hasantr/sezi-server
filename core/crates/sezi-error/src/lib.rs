@@ -31,6 +31,20 @@ pub enum Error {
     #[error("backup/wrong-key")]
     BackupWrongKey,
 
+    /// The device's database carries a key check (`sezi_store::key_check`) that the master key
+    /// the key store handed over does not open: this key did not make this data. Nothing was
+    /// written. The UI's answer is the key screen (the right key may be in another store), never
+    /// a retry with the same key.
+    #[error("storage/wrong-key")]
+    StorageWrongKey,
+
+    /// A master key minted just now (the key store answered that it held none) was offered over
+    /// a database that already holds data. A new key would not open that data, so it was refused
+    /// and nothing was written; the frontend must not keep the minted key. The key is MISSING,
+    /// not new — the UI says so and offers to move the old data aside.
+    #[error("storage/key-missing-over-data")]
+    StorageKeyMissingOverData,
+
     /// No `ServerCtx` for this server id — it is not attached (logged out, detached, or the id is
     /// wrong). The UI's answer differs from every other failure: there is nothing to retry, the
     /// user has to attach the server.

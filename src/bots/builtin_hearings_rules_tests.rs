@@ -174,3 +174,29 @@ fn the_key_slot_follows_the_service_across_kinds() {
     let sheet = put(serde_json::json!({ "kind": "sheet" })).unwrap().config.unwrap();
     assert!(!service_follows(Some(&sheet), &h));
 }
+
+#[test]
+fn the_default_column_names_are_served_in_every_language_and_an_empty_put_takes_them() {
+    // B5: the relay owns the names; the app reads them from this table and keeps no copy.
+    let table = default_columns_table();
+    assert_eq!(table["tr"]["court"], "Mahkeme");
+    assert_eq!(table["tr"]["esas"], "Esas No");
+    assert_eq!(table["en"]["decisions"], "Interim Decisions");
+    for lang in ["tr", "en"] {
+        assert_eq!(table[lang].as_object().unwrap().len(), 7, "{lang}: every column named");
+    }
+    // What the app sends when it knows no names (an app on a relay from before the table): no
+    // columns at all, and the relay names every one in the bot's language.
+    let c = hearings(serde_json::json!({ "columns": {} })).unwrap();
+    let h = c.config.unwrap().hearings.unwrap();
+    assert_eq!(serde_json::to_value(&h.columns).unwrap(), table["tr"]);
+}
+
+#[test]
+fn the_owners_get_carries_the_table_and_an_error_is_left_alone() {
+    let answer = with_columns_table(serde_json::json!({ "kind": null, "has_api_key": false }));
+    assert_eq!(answer["kind"], serde_json::Value::Null, "the configuration is untouched");
+    assert_eq!(answer["hearing_columns"], default_columns_table());
+    let not_an_object = serde_json::json!("error page");
+    assert_eq!(with_columns_table(not_an_object.clone()), not_an_object);
+}
