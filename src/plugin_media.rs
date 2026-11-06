@@ -48,16 +48,48 @@ pub(crate) const MEDIA_FULL_STATUS: u16 = 400;
 pub(crate) const MEMBER_USAGE_SQL: &str = "SELECT COALESCE(SUM(size_bytes), 0) AS bytes, \
         COUNT(*) AS objects FROM plugin_media_objects WHERE room_id = ?1 AND uploader_id = ?2";
 
-/// Which budget an upload of `size` bytes would break, given what its uploader keeps in the room:
-/// `Some(("bytes"|"objects", limit))`, or `None` when it fits.
-pub(crate) fn media_refusal(bytes: i64, objects: i64, size: i64) -> Option<(&'static str, i64)> {
-    if bytes.saturating_add(size) > MAX_BYTES_PER_MEMBER_PER_ROOM {
-        return Some(("bytes", MAX_BYTES_PER_MEMBER_PER_ROOM));
+/// The two budgets as this server's owner set them (`plugin_limits.rs` `media_bytes`,
+/// `media_objects`); the default is the constants above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaLimits {
+    pub bytes: i64,
+    pub objects: i64,
+}
+
+impl Default for MediaLimits {
+    fn default() -> Self {
+        Self { bytes: MAX_BYTES_PER_MEMBER_PER_ROOM, objects: MAX_OBJECTS_PER_MEMBER_PER_ROOM }
     }
-    if objects >= MAX_OBJECTS_PER_MEMBER_PER_ROOM {
-        return Some(("objects", MAX_OBJECTS_PER_MEMBER_PER_ROOM));
+}
+
+/// Which budget an upload of `size` bytes would break, given what its uploader keeps in the room:
+/// `Some(("bytes"|"objects", limit))`, or `None` when it fits. Only what an upload ADDS is
+/// measured: a lowered limit deletes nothing, it refuses the next upload.
+pub(crate) fn media_refusal(
+    bytes: i64,
+    objects: i64,
+    size: i64,
+    limits: MediaLimits,
+) -> Option<(&'static str, i64)> {
+    if bytes.saturating_add(size) > limits.bytes {
+        return Some(("bytes", limits.bytes));
+    }
+    if objects >= limits.objects {
+        return Some(("objects", limits.objects));
     }
     None
+}
+
+/// The `usage` block an accepted upload answers with — what its uploader now keeps in the room
+/// against this server's limits — so the app can tell its person at 80 %. Additive; an app from
+/// before ignores it.
+pub(crate) fn usage_after(bytes: i64, objects: i64, size: i64, limits: MediaLimits) -> serde_json::Value {
+    serde_json::json!({
+        "bytes": bytes.saturating_add(size),
+        "objects": objects.saturating_add(1),
+        "limit_bytes": limits.bytes,
+        "limit_objects": limits.objects,
+    })
 }
 
 /// `POST /plugin-media/:room/:id` — upload (encrypted) member plugin media. PERSISTENT.
@@ -108,9 +140,11 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // not the KV rate limit above exists. Two uploads racing past it overshoot by one blob at
     // most each, which the rate limit and the 50 MiB ceiling bound. A count that cannot be read
     // refuses nothing, as `check_upload` below.
-    if let Some((scope, limit)) = member_usage(&db, &room_id, &user_id)
-        .await
-        .and_then(|(bytes, objects)| media_refusal(bytes, objects, size as i64))
+    // The owner's limits (`plugin_limits.rs`); unset = the defaults.
+    let limits = crate::plugin_limits::read(&db).await.media_limits();
+    let held = member_usage(&db, &room_id, &user_id).await;
+    if let Some((scope, limit)) =
+        held.and_then(|(bytes, objects)| media_refusal(bytes, objects, size as i64, limits))
     {
         let resp = Response::from_json(&serde_json::json!({
             "error": MEDIA_FULL_CODE,
@@ -164,7 +198,11 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
         crate::usage::count_bump(&db, "upload_bytes", size as i64).await;
         crate::usage::count_bump(&db, "upload_count", 1).await;
     }
-    Response::from_json(&serde_json::json!({ "id": blob_id, "size": size }))
+    let mut body = serde_json::json!({ "id": blob_id, "size": size });
+    if let Some((bytes, objects)) = held {
+        body["usage"] = usage_after(bytes, objects, size as i64, limits);
+    }
+    Response::from_json(&body)
 }
 
 /// `GET /plugin-media/:room/:id` — download (encrypted) member plugin media. Gated on active

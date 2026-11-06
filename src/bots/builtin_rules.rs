@@ -131,6 +131,17 @@ pub(crate) struct PutBody {
     pub(crate) hearings: Option<HearingsIn>,
 }
 
+impl PutBody {
+    /// An AI bot whose owner names no `daily_calls` gets this server's default — the owner's
+    /// `ai_daily_calls` (`plugin_limits.rs`), [`DEFAULT_AI_DAILY_CALLS`] when unset.
+    pub(crate) fn with_server_daily_calls(mut self, server_default: u32) -> Self {
+        if let Some(ai) = self.ai.as_mut() {
+            ai.daily_calls.get_or_insert(server_default);
+        }
+        self
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub(crate) struct SheetIn {
     #[serde(default)]

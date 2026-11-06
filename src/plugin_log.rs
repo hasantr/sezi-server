@@ -172,6 +172,10 @@ impl PluginRoomLog {
     /// has ALREADY validated the JWT, active membership and author binding → the DO is just opaque
     /// storage plus a sequencer (the trust boundary sits in the handler).
     async fn do_append(&self, mut req: Request) -> Result<Response> {
+        // The owner's limits, read by the handler (`plugin_limits.rs`); none = the defaults.
+        let limits = budget::LogLimits::from_header(
+            req.headers().get(budget::LIMITS_HEADER).ok().flatten().as_deref(),
+        );
         let e: PluginLogEntry = match req.json().await {
             Ok(b) => b,
             Err(_) => return Response::error("bad_request", 400),
@@ -192,18 +196,21 @@ impl PluginRoomLog {
             entry_hash: e.entry_hash.as_deref(),
         });
         let books = DoSql(&sql);
-        match budget::admit(&books, &e.plugin_id, &e.author_id, cost) {
-            Ok(Some(full)) => {
+        let before = match budget::admit(&books, &e.plugin_id, &e.author_id, cost, limits) {
+            Ok((Some(full), _)) => {
                 let resp = Response::from_json(&serde_json::json!({
                     "error": budget::LOG_FULL_CODE,
                     "scope": full.scope(),
-                    "limit_bytes": full.limit_bytes(),
+                    "limit_bytes": full.limit_bytes(limits),
                 }))?;
                 return Ok(resp.with_status(budget::LOG_FULL_STATUS));
             }
-            Ok(None) => {}
-            Err(err) => console_log!("plugin_log: budget unread, append admitted: {err}"),
-        }
+            Ok((None, usage)) => Some(usage),
+            Err(err) => {
+                console_log!("plugin_log: budget unread, append admitted: {err}");
+                None
+            }
+        };
         sql.exec_raw(
             "INSERT OR IGNORE INTO plugin_log_meta (plugin_id, last_seq) VALUES (?, 0)",
             Some(vec![JsValue::from_str(&e.plugin_id)]),
@@ -256,7 +263,11 @@ impl PluginRoomLog {
             // Not lost: the mark stays behind this seq, so the next append counts the row.
             console_log!("plugin_log: budget charge failed, recounted next append: {err}");
         }
-        Response::from_json(&serde_json::json!({ "seq": seq }))
+        let mut body = serde_json::json!({ "seq": seq });
+        if let Some(before) = before {
+            body["usage"] = budget::usage_after(&before, cost, limits);
+        }
+        Response::from_json(&body)
     }
 
     /// Sync: the entries after the cursor (`seq > since ORDER BY seq ASC LIMIT 500` + `more`).
@@ -457,6 +468,9 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     init.with_body(Some(body.into()));
     let headers = Headers::new();
     headers.set("content-type", "application/json")?;
+    // The owner's budgets (`plugin_limits.rs`), read here because the room's DO reads no D1.
+    let limits = crate::plugin_limits::read(&db).await.log_limits();
+    headers.set(crate::plugin_log_budget::LIMITS_HEADER, &limits.to_header())?;
     init.with_headers(headers);
     let do_req = Request::new_with_init("https://do.sezgi/append", &init)?;
     passthrough(stub.fetch_with_request(do_req).await?).await

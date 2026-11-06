@@ -44,6 +44,9 @@ pub async fn put(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Ok(body) = req.json::<PutBody>().await else {
         return json_err(400, "bad_request");
     };
+    // The server's own default for an AI bot's model calls a day (`plugin_limits.rs`).
+    let server_calls = crate::plugin_limits::read(&ctx.env.d1("DB")?).await.ai_daily_calls();
+    let body = body.with_server_daily_calls(server_calls);
     let checked = match builtin_rules::validate(body, builtin_rules::allow_lan(&ctx.env)) {
         Ok(c) => c,
         Err(code) => return json_err(400, code),

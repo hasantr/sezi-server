@@ -31,15 +31,40 @@ fn the_usage_is_one_members_in_one_room() {
     assert_eq!(usage(&db, "r1", "bob"), (40, 1));
 }
 
+const D: MediaLimits = MediaLimits { bytes: MAX_BYTES_PER_MEMBER_PER_ROOM, objects: MAX_OBJECTS_PER_MEMBER_PER_ROOM };
+
+/// The owner's figures are the ones enforced, and the refusal names them; a member already past a
+/// lowered limit is refused the next upload, nothing more (Hasan, 2026-11-06).
+#[test]
+fn the_owners_limits_are_the_ones_enforced() {
+    assert_eq!(MediaLimits::default(), D);
+    let owner = MediaLimits { bytes: 10 * 1024 * 1024, objects: 3 };
+    assert_eq!(media_refusal(0, 0, 11 * 1024 * 1024, owner), Some(("bytes", 10 * 1024 * 1024)));
+    assert_eq!(media_refusal(0, 3, 1, owner), Some(("objects", 3)));
+    assert_eq!(media_refusal(0, 2, 1, owner), None);
+    // Lowered below what someone holds: the next upload is refused, with the new figure.
+    assert_eq!(media_refusal(20 * 1024 * 1024, 1, 1, owner), Some(("bytes", 10 * 1024 * 1024)));
+    let u = usage_after(100, 2, 50, owner);
+    assert_eq!((u["bytes"].as_i64(), u["objects"].as_i64()), (Some(150), Some(3)));
+    assert_eq!((u["limit_bytes"].as_i64(), u["limit_objects"].as_i64()), (Some(10 * 1024 * 1024), Some(3)));
+}
+
+/// `put_media` reads the owner's limits and answers its usage on success.
+#[test]
+fn put_media_reads_the_owners_limits() {
+    assert!(SRC.contains("crate::plugin_limits::read(&db).await.media_limits()"));
+    assert!(SRC.contains("body[\"usage\"] = usage_after("));
+}
+
 #[test]
 fn an_upload_past_the_member_budget_is_refused() {
-    assert_eq!(media_refusal(0, 0, 50 * 1024 * 1024), None);
+    assert_eq!(media_refusal(0, 0, 50 * 1024 * 1024, D), None);
     let max = MAX_BYTES_PER_MEMBER_PER_ROOM;
-    assert_eq!(media_refusal(max - 10, 1, 10), None, "exactly full fits");
-    assert_eq!(media_refusal(max - 10, 1, 11), Some(("bytes", max)));
+    assert_eq!(media_refusal(max - 10, 1, 10, D), None, "exactly full fits");
+    assert_eq!(media_refusal(max - 10, 1, 11, D), Some(("bytes", max)));
     let n = MAX_OBJECTS_PER_MEMBER_PER_ROOM;
-    assert_eq!(media_refusal(0, n - 1, 1), None);
-    assert_eq!(media_refusal(0, n, 1), Some(("objects", n)));
+    assert_eq!(media_refusal(0, n - 1, 1, D), None);
+    assert_eq!(media_refusal(0, n, 1, D), Some(("objects", n)));
 }
 
 #[test]

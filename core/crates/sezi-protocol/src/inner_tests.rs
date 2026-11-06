@@ -1386,6 +1386,67 @@ fn an_edit_round_trips_with_its_content_nested() {
     }
 }
 
+/// A pin's bytes, pinned: the exact JSON every build that knows it reads, `until_ms` and
+/// `conversation` left off when absent, and the invisible mark beside it. An older build decodes
+/// it as `Unknown` and, seeing the mark, drops it without a row.
+#[test]
+fn a_pin_round_trips_byte_for_byte_and_an_older_build_drops_it() {
+    let pin = InnerMessage::Pin {
+        target_uid: "loc-1".into(),
+        target_by: "u-mert".into(),
+        pinned: true,
+        until_ms: Some(1_790_086_400_000),
+        at_ms: 1_790_000_000_000,
+        conversation: None,
+    };
+    let json = serde_json::to_string(&pin).unwrap();
+    assert_eq!(
+        json,
+        r#"{"kind":"pin","target_uid":"loc-1","target_by":"u-mert","pinned":true,"until_ms":1790086400000,"at_ms":1790000000000}"#
+    );
+    let unpin = InnerMessage::Pin {
+        target_uid: "loc-1".into(),
+        target_by: "u-mert".into(),
+        pinned: false,
+        until_ms: None,
+        at_ms: 7,
+        conversation: Some("room-1".into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&unpin).unwrap(),
+        r#"{"kind":"pin","target_uid":"loc-1","target_by":"u-mert","pinned":false,"at_ms":7,"conversation":"room-1"}"#
+    );
+
+    let p = ChatPayload::new(None, None, pin).with_msg_uid("pin-1");
+    let wire = String::from_utf8(p.encode()).unwrap();
+    assert!(wire.contains(r#""invisible":true"#), "{wire}");
+    let back = ChatPayload::decode(wire.as_bytes()).unwrap();
+    assert_eq!(back.msg_uid.as_deref(), Some("pin-1"));
+    assert!(back.invisible && !back.drops_silently(), "a build that knows it reads it");
+    match back.inner {
+        InnerMessage::Pin { target_uid, target_by, pinned, until_ms, at_ms, conversation } => {
+            assert_eq!((target_uid.as_str(), target_by.as_str()), ("loc-1", "u-mert"));
+            assert!(pinned);
+            assert_eq!((until_ms, at_ms, conversation), (Some(1_790_086_400_000), 1_790_000_000_000, None));
+        }
+        other => panic!("expected Pin, got {other:?}"),
+    }
+
+    // A build that knows no pins: `Unknown`, marked invisible, so no "unsupported" row.
+    let older = br#"{"kind":"some_kind_from_later","invisible":true}"#;
+    assert!(ChatPayload::decode(older).unwrap().drops_silently());
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum OlderInner {
+        Text { body: String },
+        #[serde(other)]
+        Unknown,
+    }
+    let old: OlderInner = serde_json::from_str(&wire).expect("an older build still decodes it");
+    assert!(matches!(old, OlderInner::Unknown), "got {old:?}");
+}
+
 /// A kind this build does not know, sent by a build that marked it invisible, is dropped
 /// silently; an unknown kind without the mark is still the "Unsupported message" row it was.
 /// A visible message never carries the mark, so its payload is byte for byte what it was.

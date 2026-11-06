@@ -175,6 +175,22 @@ fn an_ai_bot_has_a_bot_wide_daily_cap() {
     assert_eq!(old.to_owner_json(false)["ai"]["daily_calls"], DEFAULT_AI_DAILY_CALLS);
 }
 
+/// The server owner's `ai_daily_calls` (`plugin_limits.rs`) is the default of an AI bot that names
+/// none; a bot's own figure still wins.
+#[test]
+fn the_servers_default_fills_an_unsaid_daily_cap() {
+    let body = |v: serde_json::Value| serde_json::from_value::<PutBody>(v).unwrap();
+    let ai = serde_json::json!({ "provider": "anthropic", "model": "m", "instructions": "x" });
+    let unsaid = body(serde_json::json!({ "kind": "ai", "ai": ai.clone() })).with_server_daily_calls(70);
+    let c = validate(unsaid, false).unwrap();
+    assert_eq!(c.config.unwrap().ai.unwrap().daily_calls, 70);
+    let mut own = ai;
+    own["daily_calls"] = 9.into();
+    let said = body(serde_json::json!({ "kind": "ai", "ai": own })).with_server_daily_calls(70);
+    assert_eq!(validate(said, false).unwrap().config.unwrap().ai.unwrap().daily_calls, 9);
+    assert!(include_str!("builtin.rs").contains(".with_server_daily_calls(server_calls)"));
+}
+
 #[test]
 fn an_ai_bot_keeps_a_sheet_only_when_it_writes_rows() {
     let sheet = serde_json::json!({ "url": "https://script.google.com/macros/s/AKfy/exec" });

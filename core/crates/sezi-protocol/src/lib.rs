@@ -17,6 +17,8 @@ pub mod media_meta;
 pub mod mentions;
 /// The framed payload: deflated when it pays, padded to a bucket (`kernel/olm_frame.rs`).
 pub mod payload_frame;
+/// Pinned messages: the cap, the durations, expiry and last-writer-wins (`kernel/message_pins.rs`).
+pub mod pin;
 pub mod reaction;
 pub mod reply;
 pub mod sticker;

@@ -883,6 +883,30 @@ pub enum InnerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
     },
+    /// A pin: the sender pins a message to the top of its conversation (`pinned: true`) or takes
+    /// it off (`false`) — `crate::pin`. Anyone in the conversation may; nobody has more say.
+    /// Invisible control (NO UI row), a durable op that must arrive. It names its target as a
+    /// reaction does (the target's `msg_uid` and its author) and carries its own end, `until_ms`
+    /// (epoch ms; none: no end), after which every device reads it as gone without a word sent.
+    /// Last writer wins per (conversation, message) by `at_ms`, the pinner's clock.
+    ///
+    /// It travels as a reaction does: Megolm in a group, Olm to every device of the peer in a
+    /// 1:1, and self-Olm to my own other devices — the one copy that says `conversation`. An older
+    /// build decodes it as `Unknown` and, since the payload says it is invisible
+    /// ([`InnerMessage::is_invisible`]), drops it silently (builds up to 2006 show "unsupported").
+    ///
+    /// Not `msg_uid` for the target's id: `ChatPayload.msg_uid` shadows a variant field of that
+    /// name under `flatten` (the `GroupOutboundCopy::origin_local_id` hazard).
+    Pin {
+        target_uid: String,
+        target_by: String,
+        pinned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_ms: Option<i64>,
+        at_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
     /// The PRIMARY's Olm account, escrowed to one of my linked devices
     /// (`docs/PRIMARY_DEVICE_LOSS_PLAN.md` §4.1): `copy_b64` is the account sealed under a random
     /// secret `R` (`sezi_backup::escrow`), and `R` itself is on the relay, bound to this device,
@@ -1096,6 +1120,7 @@ impl InnerMessage {
             InnerMessage::Reaction { .. }
                 | InnerMessage::RoomDelete { .. }
                 | InnerMessage::MessageEdit { .. }
+                | InnerMessage::Pin { .. }
                 | InnerMessage::EscrowCopy { .. }
                 | InnerMessage::TakeoverNotice { .. }
                 | InnerMessage::HistoryPageRequest { .. }

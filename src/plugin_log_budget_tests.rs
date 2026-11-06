@@ -96,8 +96,13 @@ fn cost_of(ciphertext: &str) -> i64 {
 
 /// The whole guarded append: admit, write, charge. `Some(full)` = refused.
 fn append(m: &Mem, plugin: &str, author: &str, ciphertext: &str) -> Option<Full> {
+    append_under(m, plugin, author, ciphertext, LogLimits::default())
+}
+
+/// [`append`] under a server's own limits.
+fn append_under(m: &Mem, plugin: &str, author: &str, ciphertext: &str, limits: LogLimits) -> Option<Full> {
     let cost = cost_of(ciphertext);
-    if let Some(full) = admit(m, plugin, author, cost).unwrap() {
+    if let (Some(full), _) = admit(m, plugin, author, cost, limits).unwrap() {
         return Some(full);
     }
     let seq = raw_append(m, plugin, author, ciphertext);
@@ -190,6 +195,48 @@ fn the_refusal_is_a_400_with_a_typed_code() {
     assert_eq!(LOG_FULL_STATUS, 400, "apps since 2046 end an op at a 400 and retry nothing");
     assert_eq!(LOG_FULL_CODE, "plugin/log-full");
     assert_eq!(Full::App.scope(), "app");
-    assert_eq!(Full::Room.limit_bytes(), MAX_BYTES_PER_MEMBER_PER_ROOM);
+    assert_eq!(Full::Room.limit_bytes(LogLimits::default()), MAX_BYTES_PER_MEMBER_PER_ROOM);
     const { assert!(MAX_BYTES_PER_MEMBER_PER_APP <= MAX_BYTES_PER_MEMBER_PER_ROOM) };
+}
+
+/// The owner's limits (`plugin_limits.rs`) are the ones held, the refusal names them, and a member
+/// past a LOWERED limit keeps everything and adds nothing (Hasan, 2026-11-06).
+#[test]
+fn the_owners_limits_are_the_ones_held() {
+    let m = room();
+    let small = LogLimits { app_bytes: 1_000, room_bytes: 1_500 };
+    assert_eq!(append_under(&m, "html:a", "alice", &"a".repeat(800), small), None);
+    assert_eq!(append_under(&m, "html:a", "alice", &"a".repeat(200), small), Some(Full::App));
+    assert_eq!(Full::App.limit_bytes(small), 1_000);
+    assert_eq!(append_under(&m, "html:b", "alice", &"a".repeat(700), small), Some(Full::Room));
+    // The defaults would have taken it: the figure, not the code, decides.
+    assert_eq!(append(&m, "html:a", "alice", &"a".repeat(200)), None);
+    let held = usage(&m, "html:a", "alice");
+    // Lowered below what alice holds: nothing she has is touched, the next entry is refused.
+    let lowered = LogLimits { app_bytes: 500, room_bytes: 500 };
+    assert_eq!(append_under(&m, "html:a", "alice", "x", lowered), Some(Full::App));
+    assert_eq!(usage(&m, "html:a", "alice"), held);
+}
+
+/// The DO learns the limits from the handler's header; anything odd is the defaults.
+#[test]
+fn the_limits_header_round_trips_and_falls_back() {
+    let l = LogLimits { app_bytes: 5, room_bytes: 9 };
+    assert_eq!(LogLimits::from_header(Some(&l.to_header())), l);
+    for odd in [None, Some(""), Some("5"), Some("a,b"), Some("0,9"), Some("-1,9")] {
+        assert_eq!(LogLimits::from_header(odd), LogLimits::default(), "{odd:?}");
+    }
+    let before = UsageRow { app_bytes: 10, room_bytes: 30 };
+    let u = usage_after(&before, 5, l);
+    assert_eq!((u["app_bytes"].as_i64(), u["room_bytes"].as_i64()), (Some(15), Some(35)));
+    assert_eq!((u["app_limit"].as_i64(), u["room_limit"].as_i64()), (Some(5), Some(9)));
+}
+
+/// The append handler hands the DO the owner's limits.
+#[test]
+fn the_handler_passes_the_owners_limits() {
+    let src = include_str!("plugin_log.rs");
+    assert!(src.contains("crate::plugin_limits::read(&db).await.log_limits()"));
+    assert!(src.contains("headers.set(crate::plugin_log_budget::LIMITS_HEADER"));
+    assert!(src.contains("budget::LogLimits::from_header("));
 }

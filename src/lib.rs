@@ -25,6 +25,7 @@ mod messages;
 mod page_cursor;
 mod plugin_blob;
 mod plugin_log;
+mod plugin_limits;
 mod plugin_log_budget;
 mod plugin_media;
 mod push;
@@ -236,6 +237,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             "/admin/plugin-policy",
             admin::plugin_policy::set_plugin_policy,
         )
+        // The plugin limits the owner sets (`plugin_limits.rs`): GET = admin, PATCH = owner.
+        .get_async("/admin/plugin-limits", admin::plugin_limits::get_plugin_limits)
+        .patch_async("/admin/plugin-limits", admin::plugin_limits::set_plugin_limits)
         // Pluggable storage — the owner attaches and manages external blob backends. GET/probe =
         // require_admin; POST/PATCH/DELETE/drain = require_owner, because backend credentials are
         // powerful. `config_json` is a secret returned by NO response — WRITE-ONLY, same contract

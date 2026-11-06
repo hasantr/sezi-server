@@ -61,21 +61,58 @@ impl Full {
         }
     }
 
-    pub(crate) fn limit_bytes(self) -> i64 {
+    /// The budget this refusal broke, as this server set it.
+    pub(crate) fn limit_bytes(self, limits: LogLimits) -> i64 {
         match self {
-            Full::App => MAX_BYTES_PER_MEMBER_PER_APP,
-            Full::Room => MAX_BYTES_PER_MEMBER_PER_ROOM,
+            Full::App => limits.app_bytes,
+            Full::Room => limits.room_bytes,
         }
     }
 }
 
+/// The two budgets as this server's owner set them (`plugin_limits.rs` `log_app_bytes`,
+/// `log_room_bytes`); the default is the constants above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogLimits {
+    pub app_bytes: i64,
+    pub room_bytes: i64,
+}
+
+impl Default for LogLimits {
+    fn default() -> Self {
+        Self { app_bytes: MAX_BYTES_PER_MEMBER_PER_APP, room_bytes: MAX_BYTES_PER_MEMBER_PER_ROOM }
+    }
+}
+
+/// The header the append handler hands the room's DO the server's limits in (the DO reads no
+/// D1): `<app_bytes>,<room_bytes>`.
+pub(crate) const LIMITS_HEADER: &str = "x-sezi-log-limits";
+
+impl LogLimits {
+    /// The [`LIMITS_HEADER`] value.
+    pub(crate) fn to_header(self) -> String {
+        format!("{},{}", self.app_bytes, self.room_bytes)
+    }
+
+    /// Read [`LIMITS_HEADER`]; absent or malformed (a positive pair is required) = the defaults.
+    pub(crate) fn from_header(raw: Option<&str>) -> Self {
+        let parsed = raw.and_then(|r| {
+            let (a, b) = r.split_once(',')?;
+            let (a, b) = (a.trim().parse::<i64>().ok()?, b.trim().parse::<i64>().ok()?);
+            (a > 0 && b > 0).then_some(Self { app_bytes: a, room_bytes: b })
+        });
+        parsed.unwrap_or_default()
+    }
+}
+
 /// May an entry of `cost` bytes go in, given what its author already keeps in this app's log
-/// (`app_bytes`) and in the whole room's (`room_bytes`)? `None` = it may.
-pub(crate) fn refusal(app_bytes: i64, room_bytes: i64, cost: i64) -> Option<Full> {
-    if app_bytes.saturating_add(cost) > MAX_BYTES_PER_MEMBER_PER_APP {
+/// (`app_bytes`) and in the whole room's (`room_bytes`)? `None` = it may. Only what an entry ADDS
+/// is measured: a member already past a lowered limit keeps everything, and adds nothing.
+pub(crate) fn refusal(app_bytes: i64, room_bytes: i64, cost: i64, limits: LogLimits) -> Option<Full> {
+    if app_bytes.saturating_add(cost) > limits.app_bytes {
         return Some(Full::App);
     }
-    if room_bytes.saturating_add(cost) > MAX_BYTES_PER_MEMBER_PER_ROOM {
+    if room_bytes.saturating_add(cost) > limits.room_bytes {
         return Some(Full::Room);
     }
     None
@@ -176,7 +213,7 @@ pub(crate) struct BehindRow {
 }
 
 /// A [`USAGE_SQL`] row.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UsageRow {
     pub app_bytes: i64,
     pub room_bytes: i64,
@@ -198,15 +235,16 @@ pub(crate) trait LogSql {
 }
 
 /// Before an append: count whatever the log holds past each plugin's mark, then say whether an
-/// entry of `cost` bytes by `author_id` fits. `Err` = the count could not be read or written;
-/// the caller refuses nothing on it (an append must not fail on its own bookkeeping, and the next
-/// append counts again from the mark).
+/// entry of `cost` bytes by `author_id` fits, with what the author keeps BEFORE it. `Err` = the
+/// count could not be read or written; the caller refuses nothing on it (an append must not fail
+/// on its own bookkeeping, and the next append counts again from the mark).
 pub(crate) fn admit(
     db: &impl LogSql,
     plugin_id: &str,
     author_id: &str,
     cost: i64,
-) -> Result<Option<Full>, String> {
+    limits: LogLimits,
+) -> Result<(Option<Full>, UsageRow), String> {
     for row in db.behind()? {
         db.exec(
             CATCH_UP_SQL,
@@ -215,7 +253,19 @@ pub(crate) fn admit(
         db.exec(MARK_COUNTED_SQL, &[Arg::Text(&row.plugin_id), Arg::Int(row.last_seq)])?;
     }
     let usage = db.usage(plugin_id, author_id)?;
-    Ok(refusal(usage.app_bytes, usage.room_bytes, cost))
+    Ok((refusal(usage.app_bytes, usage.room_bytes, cost, limits), usage))
+}
+
+/// The `usage` block an accepted append answers with — what its author now keeps against this
+/// server's limits — so the app can tell its person at 80 % (`plugin_limits::NEAR_PERCENT`)
+/// before a refusal ever comes. An app from before ignores it.
+pub(crate) fn usage_after(before: &UsageRow, cost: i64, limits: LogLimits) -> serde_json::Value {
+    serde_json::json!({
+        "app_bytes": before.app_bytes.saturating_add(cost),
+        "room_bytes": before.room_bytes.saturating_add(cost),
+        "app_limit": limits.app_bytes,
+        "room_limit": limits.room_bytes,
+    })
 }
 
 /// After an append landed as `seq`: charge its author and move the plugin's mark over it.

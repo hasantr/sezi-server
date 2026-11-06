@@ -100,6 +100,10 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         (retention_days, message_retention_days, delete_window_hours, library_days),
         media_ok,
     )?;
+    // The plugin limits this server's owner set (`plugin_limits.rs`): every key, the value in
+    // force, so each member's app holds its records to them and can warn at 80 %. Additive: an
+    // app from before ignores the block and keeps its built-in figures.
+    body["plugin_limits"] = crate::plugin_limits::read(&db).await.announced();
     // Where it runs, which Cloudflare version and which commit (`release_info.rs`): additive keys,
     // null when unknown.
     let version_id = ctx
