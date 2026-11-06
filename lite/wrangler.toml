@@ -26,6 +26,13 @@ compatibility_date = "2026-10-23"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
+# Version metadata — which Worker version is serving. The relay announces its id on /capabilities
+# (`version_id`), so the app can prove that the Worker it would update through the Cloudflare API is
+# THIS server before it touches anything (docs/SERVER_UPDATE_PLAN.md §3.2). Read-only; it costs
+# nothing and grants nothing.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
 # D1 — the server database (members, invitations, queue metadata; message CONTENT is end-to-end
 # encrypted and the server cannot read it). The schema installs itself on the first request
 # (self-migration), so no migration command is needed.

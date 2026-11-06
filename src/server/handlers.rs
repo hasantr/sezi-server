@@ -92,7 +92,43 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         .await
         .map(|r| r.any_available())
         .unwrap_or(false);
-    Response::from_json(&serde_json::json!({
+    let mut body = capabilities_body(
+        &ctx.env,
+        name,
+        directory_mode,
+        dm_policy,
+        (retention_days, message_retention_days, delete_window_hours, library_days),
+        media_ok,
+    )?;
+    // Where it runs, which Cloudflare version and which commit (`release_info.rs`): additive keys,
+    // null when unknown.
+    let version_id = ctx
+        .env
+        .get_binding::<worker::WorkerVersionMetadata>(super::release_info::VERSION_METADATA)
+        .ok()
+        .map(|m| m.id());
+    let hosting_var = crate::utils::env_text(&ctx.env, "SEZI_HOSTING");
+    let release = super::release_info::fields(
+        super::release_info::hosting(hosting_var.as_deref(), version_id.is_some()),
+        version_id,
+        super::release_info::commit(option_env!("SEZI_COMMIT")),
+    );
+    if let (Some(b), serde_json::Value::Object(r)) = (body.as_object_mut(), release) {
+        b.extend(r);
+    }
+    Response::from_json(&body)
+}
+
+/// The announcement's body — everything except the release facts merged in by the caller.
+fn capabilities_body(
+    env: &Env,
+    name: String,
+    directory_mode: String,
+    dm_policy: String,
+    (retention_days, message_retention_days, delete_window_hours, library_days): (i64, i64, i64, Option<i64>),
+    media_ok: bool,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
         "version": 1,
         // Self-host update detection: a BUILD-TIME stamp, a monotonic yyyyMMddHHmm integer.
         // `sync-template.ps1` sets the `SEZI_BUILD` env var BEFORE the worker build and
@@ -106,12 +142,12 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
         // below it tells its person to update; raised only with the core's `CLIENT_LEVEL`.
         "min_client_level": crate::server::client_level::MIN_CLIENT_LEVEL,
         "name": name,
-        "server_fingerprint": server_instance_fingerprint(&ctx.env)?,
-        "server_instance_fingerprint": server_instance_fingerprint(&ctx.env)?,
+        "server_fingerprint": server_instance_fingerprint(env)?,
+        "server_instance_fingerprint": server_instance_fingerprint(env)?,
         // Setup state, the same value `/server/info` carries: `/bootstrap` hands out the genesis
         // invite only with the `x-sezi-claim` header (`auth::claim`). A configuration fact, so it
         // stays true after the server is claimed.
-        "claim_secret_required": crate::auth::claim::claim_secret_required(&ctx.env),
+        "claim_secret_required": crate::auth::claim::claim_secret_required(env),
         "policy": {
             "directory_mode": directory_mode,
             "dm_policy": dm_policy,

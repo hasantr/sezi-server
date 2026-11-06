@@ -130,8 +130,15 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // The app's form of the same question, for an invite it holds as a bearer token: the
         // token goes in the body, never in a URL.
         .post_async("/invites/describe", invite_page::describe_post)
+        // `migrations` (additive): `ok`, `failed:<name>` or `unchecked` — an update tells a failed
+        // migration from any other failure by it (`self_provision::migration_status`). `ok` stays
+        // true either way: the relay serves on the old schema (fail-soft), and liveness probes
+        // read only the status code.
         .get("/healthz", |_, _| {
-            Response::from_json(&serde_json::json!({"ok": true}))
+            Response::from_json(&serde_json::json!({
+                "ok": true,
+                "migrations": self_provision::migration_status(),
+            }))
         })
         .get_async("/.well-known/jwks.json", jwks)
         .get_async("/server/info", server::handlers::info)

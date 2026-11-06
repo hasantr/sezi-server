@@ -44,6 +44,10 @@ thread_local! {
     /// Isolate-scoped "migrations have been checked" flag, so we do not hit D1 on every
     /// request (a WASM isolate is single-threaded, so a thread_local is an isolate memo).
     static MIGRATIONS_CHECKED: Cell<bool> = const { Cell::new(false) };
+    /// The migration the last attempt in this isolate could not reach (`/healthz`'s
+    /// `failed:<name>`); cleared by a success. `ATTEMPTING` is the one in flight.
+    static MIGRATION_FAILED: RefCell<Option<String>> = const { RefCell::new(None) };
+    static ATTEMPTING: RefCell<Option<String>> = const { RefCell::new(None) };
     /// The JWT PKCS8 PEM resolved from or generated for D1. Populated ONLY when there is
     /// no env secret; jwt.rs's `load_signing_key` fallback reads it from here, keeping
     /// the hot path free of D1.
@@ -336,15 +340,36 @@ async fn ensure_migrations(env: &Env) {
     // retried. Repeating them is safe (tolerant and batch-atomic), so a retry loop is the better
     // risk.
     match run_migrations(&db).await {
-        Ok(()) => MIGRATIONS_CHECKED.with(|c| c.set(true)),
-        Err(e) => console_error!(
-            "self_provision: self-migration stopped (serving on with the existing schema): {}",
-            e
-        ),
+        Ok(()) => {
+            MIGRATIONS_CHECKED.with(|c| c.set(true));
+            MIGRATION_FAILED.with(|f| *f.borrow_mut() = None);
+        }
+        Err(e) => {
+            let at = ATTEMPTING.with(|a| a.borrow().clone()).unwrap_or_else(|| "tracking".into());
+            MIGRATION_FAILED.with(|f| *f.borrow_mut() = Some(at));
+            console_error!(
+                "self_provision: self-migration stopped (serving on with the existing schema): {}",
+                e
+            )
+        }
     }
 }
 
+/// `/healthz`'s `migrations` word for this isolate: `ok`, `failed:<name>` (the migration the
+/// schema could not reach — the last pending one when the single batch failed, since a batch
+/// cannot say which file broke) or `unchecked` (no attempt yet, or no D1 binding). An update
+/// reads it to tell a failed migration from any other failure (`docs/SERVER_UPDATE_PLAN.md` §3.4).
+pub fn migration_status() -> String {
+    let failed = MIGRATION_FAILED.with(|f| f.borrow().clone());
+    crate::server::release_info::migration_status(MIGRATIONS_CHECKED.with(|c| c.get()), failed.as_deref())
+}
+
+fn attempting(name: Option<&str>) {
+    ATTEMPTING.with(|a| *a.borrow_mut() = name.map(str::to_string));
+}
+
 async fn run_migrations(db: &D1Database) -> Result<()> {
+    attempting(None);
     // Tracking table — DELIBERATELY named apart from wrangler's `d1_migrations`: wrangler
     // owns its own table and may change its schema, so we stay out of it.
     spent();
@@ -397,6 +422,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
     // one `db.batch` — one subrequest, one implicit transaction. This is what fits a fresh
     // install's first boot inside the free plan's ~50-subrequest gate, and it makes the
     // "bare ALTER then UPDATE" trap all-or-nothing across the WHOLE pending set.
+    attempting(pending.last().map(|p| p.0));
     let merged = merge_pending_statements(&pending);
     let mut stmts: Vec<D1PreparedStatement> = Vec::with_capacity(merged.len());
     for m in &merged {
@@ -430,6 +456,7 @@ async fn run_migrations(db: &D1Database) -> Result<()> {
                     msg
                 );
                 for &(name, sql) in &pending {
+                    attempting(Some(name));
                     apply_one(db, name, sql).await?;
                 }
                 Ok(())

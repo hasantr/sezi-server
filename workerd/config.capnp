@@ -11,8 +11,8 @@ const config :Workerd.Config = ( services = [
             esModule = embed "modules/core_user_sezi-server--__mf_do_wrapper.js" ),
           ( name = "shim.js",
             esModule = embed "modules/core_user_sezi-server--shim.js" ),
-          ( name = "041810471840a8f76a5853c1c8301f164f1f5c0f-index_bg.wasm",
-            wasm = embed "modules/core_user_sezi-server--041810471840a8f76a5853c1c8301f164f1f5c0f-index_bg.wasm" ) ],
+          ( name = "e10f05167f34a4d4e38063bd896e0d5e800756a0-index_bg.wasm",
+            wasm = embed "modules/core_user_sezi-server--e10f05167f34a4d4e38063bd896e0d5e800756a0-index_bg.wasm" ) ],
         compatibilityDate = "2026-10-23",
         compatibilityFlags = ["nodejs_compat"],
         bindings = [
@@ -69,7 +69,8 @@ const config :Workerd.Config = ( services = [
           ( name = "TURN_MONTHLY_CAP",
             fromEnvironment = "TURN_MONTHLY_CAP" ),
           ( name = "TURN_USER_MONTHLY_CAP",
-            fromEnvironment = "TURN_USER_MONTHLY_CAP" ) ],
+            fromEnvironment = "TURN_USER_MONTHLY_CAP" ),
+          (name = "SEZI_HOSTING", text = "workerd") ],
         globalOutbound = (
           name = "strip-cf-connecting-ip:0",
           props = (empty = void) ),

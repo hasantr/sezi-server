@@ -44,6 +44,7 @@ sudo useradd --system --home /var/lib/sezi --shell /usr/sbin/nologin sezi || tru
 sudo mkdir -p /var/lib/sezi/state /var/lib/sezi/backups
 sudo git clone https://github.com/hasantr/sezi-server /opt/sezi-server   # or your fork
 sudo chown -R sezi:sezi /opt/sezi-server /var/lib/sezi
+sudo bash /opt/sezi-server/deploy/update.sh --layout   # releases/<build> + current, see below
 sudo -u sezi -H sh /opt/sezi-server/deploy/fetch-workerd.sh
 ```
 
@@ -52,13 +53,25 @@ checks the tarball's sha512 against the lock **before** unpacking it, and instal
 `/var/lib/sezi/.local/sezi-workerd/<version>/`, with `current` pointing at it. A download that
 does not match is not installed. Nothing system-wide is touched.
 
-> **An update is `sudo bash /opt/sezi-server/deploy/update.sh`.** It pulls and, when
-> `workerd/WORKERD.lock` changed, fetches the new workerd while the relay still runs; then it stops
-> the relay only to back up `state/` and start it again (about two seconds of downtime — clients
-> reconnect and resend what was not acked), checks that it is healthy on the new build, and rolls
-> code, workerd and data back if it is not. By hand it is the same steps: `git pull`,
-> `fetch-workerd.sh` if the lock changed, restart; the old workerd stays beside the new one, so
-> going back is moving `current`.
+> **An update is `sudo bash /opt/sezi-server/deploy/update.sh`.** It fetches, exports the new
+> build into `releases/<build>/` and fetches its workerd while the relay still runs; then it stops
+> the relay only to back up `state/`, points `current` at the new build and starts it again (about
+> two seconds of downtime — clients reconnect and resend what was not acked), checks that it is
+> healthy on the new build, and moves code, workerd and data back if it is not.
+>
+> - `--to <build>` moves to that build instead — a newer one, or an older one to **go back**. Going
+>   back keeps your data as it is: the relay's database changes only ever ADD, so an older build
+>   runs on a newer database.
+> - `--commit <sha>` moves to exactly that template commit.
+> - The last three builds and three state backups (`/var/lib/sezi/backup-pre-update-*.tar`) are
+>   kept, older ones removed; `/var/lib/sezi/update-result.json` says how the last run ended.
+> - An install from before this layout (the unit running `/opt/sezi-server/workerd/`) is moved on
+>   its first run: the running build becomes `releases/<build>`, and the unit's paths are rewritten
+>   to `current/` once (the old unit is kept as `sezi-relay.service.pre-releases`). A unit you
+>   changed so that it no longer runs `/opt/sezi-server/workerd/config.capnp` is left alone and the
+>   script tells you what to change.
+> - Another user than `sezi`, or other folders: `SEZI_USER`, `SEZI_DIR`, `SEZI_DATA`, `SEZI_UNIT`,
+>   `SEZI_PORT` (`sudo SEZI_USER=me bash …`).
 
 ---
 
@@ -71,7 +84,7 @@ sudo systemctl enable --now sezi-relay
 curl -s http://127.0.0.1:8788/healthz    # {"ok":true}
 ```
 
-`sezi-relay.service` runs `workerd serve` on `workerd/config.capnp`, listening on
+`sezi-relay.service` runs `workerd serve` on `current/workerd/config.capnp` (the build `update.sh` last moved to), listening on
 `127.0.0.1:8788`, with its stores in `/var/lib/sezi/state/v3/` (see the comments in the file).
 `Restart=always`.
 
