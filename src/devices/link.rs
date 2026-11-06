@@ -13,8 +13,10 @@
 //! - **PoP (link-start):** the new device sends `ed_priv.sign(ed_pub||x_pub)` and the server
 //!   verifies it with ed_pub. This proves possession of ed_priv and binds the two keys
 //!   together, so a stolen ed_pub paired with someone else's x_pub is rejected.
-//! - **Status proof:** the new device sends `ed_priv.sign(link_code)`, verified against the
-//!   stored new_ed_pub, so EVEN IF the link_code leaks only the holder of ed_priv gets a token.
+//! - **Status proof:** the new device sends `ed_priv.sign("sezi-device-link-v1\0" || link_code)`
+//!   (an app before CRY-1: `ed_priv.sign(link_code)`, still accepted — `link_proof_verifies`),
+//!   verified against the stored new_ed_pub, so EVEN IF the link_code leaks only the holder of
+//!   ed_priv gets a token.
 //! - **Cross-check (approve):** the linked entry in the signed doc must match the EXACT keys
 //!   recorded in link_requests (ed/x/device_id), so neither the server nor a MITM can
 //!   substitute keys.
@@ -358,8 +360,8 @@ pub async fn link_approve(mut req: Request, ctx: RouteContext<()>) -> Result<Res
 #[derive(Deserialize)]
 struct LinkStatusBody {
     link_code: String,
-    /// PoP: `ed_priv.sign(link_code_bytes)` (64 bytes, base64), verified against the stored
-    /// new_ed_pub.
+    /// PoP: `ed_priv.sign(tag || link_code_bytes)`, or the raw code from an app before CRY-1
+    /// (64 bytes, base64), verified against the stored new_ed_pub (`link_proof_verifies`).
     proof_b64: String,
 }
 
@@ -411,8 +413,9 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     };
 
     // Proof: only the holder of ed_priv may read the status, so a leaked link_code cannot
-    // be turned into a stolen token. proof = ed_priv.sign(link_code), verified against the
-    // stored new_ed_pub.
+    // be turned into a stolen token. proof = ed_priv.sign(tag || link_code), or the raw
+    // link_code from apps before CRY-1 (`link_proof_verifies`), verified against the stored
+    // new_ed_pub.
     let ed_arr: [u8; 32] = match row.new_ed_pub.as_slice().try_into() {
         Ok(a) => a,
         Err(_) => return json_err(500, "bad_stored_key"),
@@ -427,10 +430,7 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
     };
     let proof_arr: [u8; 64] = proof.as_slice().try_into().unwrap();
     let proof_sig = ed25519_dalek::Signature::from_bytes(&proof_arr);
-    if verifying
-        .verify(body.link_code.as_bytes(), &proof_sig)
-        .is_err()
-    {
+    if !link_proof_verifies(&verifying, &body.link_code, &proof_sig) {
         return json_err(401, "bad_proof");
     }
 
@@ -486,6 +486,21 @@ pub async fn link_status(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
         }
         _ => Response::from_json(&serde_json::json!({ "status": "consumed" })),
     }
+}
+
+/// The `link-status` proof, in either form a device in the field sends (CRY-1,
+/// `sezi_protocol::link_proof`): the TAGGED one, `ed_priv.sign("sezi-device-link-v1\0" ||
+/// link_code)`, from apps of 2026-11-06 on, or the RAW `ed_priv.sign(link_code)` of every app
+/// before. Both stay accepted: an older app cannot be told to change (AGENTS.md, "Server ↔ app
+/// compatibility"), and dropping the raw form would need `MIN_CLIENT_LEVEL` raised with the core's
+/// `CLIENT_LEVEL`. The raw form costs this relay nothing — the code is one it minted itself.
+pub(crate) fn link_proof_verifies(
+    verifying: &VerifyingKey,
+    link_code: &str,
+    proof: &ed25519_dalek::Signature,
+) -> bool {
+    let tagged = sezi_protocol::link_proof::link_proof_message(link_code);
+    verifying.verify(&tagged, proof).is_ok() || verifying.verify(link_code.as_bytes(), proof).is_ok()
 }
 
 /// Fetch the ed_pub_b64 of the PRIMARY device from the user's stored signed list — the

@@ -27,3 +27,5 @@ web-time = { workspace = true }
 serde_json = { workspace = true }
 # `kdf::derive_pickle_key`. Shared with the root crate (depot) and `sezi-store`, hence a workspace dep.
 argon2 = { workspace = true }
+# Wipes the KDF memo's keys when it forgets them (CRY-3). Already in the lock.
+zeroize = "1.7"

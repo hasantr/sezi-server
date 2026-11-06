@@ -173,31 +173,62 @@ impl Identity {
         &self.account
     }
 
+    /// The new device's `link-status` proof over a relay-chosen `link_code`, in the tagged form:
+    /// `sign(LINK_PROOF_TAG || link_code)` (`sezi_protocol::link_proof`). Never the raw code.
+    pub fn sign_link_proof(&self, link_code: &str) -> Ed25519Signature {
+        self.account.sign(sezi_protocol::link_proof::link_proof_message(link_code))
+    }
+
+    /// The legacy, untagged `link-status` proof (`sign(link_code)`) that relays before CRY-1
+    /// verify — and ONLY for a code of the shape an honest relay mints (43 base64url characters,
+    /// `is_relay_minted_link_code`), a shape no other message this key signs can take. `None` for
+    /// any other code: that relay is not one this build will hand a raw signature to.
+    pub fn sign_legacy_link_proof(&self, link_code: &str) -> Option<Ed25519Signature> {
+        sezi_protocol::link_proof::is_relay_minted_link_code(link_code)
+            .then(|| self.account.sign(link_code.as_bytes()))
+    }
+
     /// Deterministic 32-byte seed for deriving the P2P (iroh) NodeId.
     ///
-    /// Derived from the account's long-term Ed25519 key alone: the account signs a fixed context
-    /// (Ed25519 signatures are deterministic, RFC 8032) and the signature is run through a BLAKE3
-    /// KDF. Same identity → same seed → same SecretKey → same NodeId, whatever else the account
-    /// does — new one-time keys, a renewed fallback key, a vodozemac that encodes its pickle
-    /// differently.
+    /// v3 (CRY-1, 2026-11-06): a BLAKE3 key derivation over the account's Curve25519 IDENTITY
+    /// SECRET. That key never signs anything — vodozemac only does Diffie-Hellman with it, whose
+    /// output never leaves Olm's own KDF — so no signature anyone can obtain, over any bytes, by
+    /// any path present or future, says anything about this seed. Same identity → same seed →
+    /// same NodeId, whatever else the account does (new one-time keys, a renewed fallback key, a
+    /// pickle round trip).
     ///
-    /// v1 hashed the whole encrypted `Account` pickle, so the NodeId moved every time the account
-    /// generated a one-time key or rotated its fallback, and would have moved with any change of
-    /// the pickle's encoding (2060's dependency review). Nothing pinned a NodeId then — a peer
-    /// relearns it from every offer ticket — so the move to v2 changes every node's id once and
-    /// costs nothing else.
+    /// v2 (2061) hashed the Ed25519 signature of a fixed context. The link proof signed whatever
+    /// `link_code` the relay chose, so a relay naming that context got the very signature the seed
+    /// came from. v1 hashed the whole encrypted pickle and moved with every one-time key. Nothing
+    /// pins a NodeId — a peer relearns it from every offer ticket (`inbound_direct.rs`) — so each
+    /// move changes every node's id once and costs nothing else.
     ///
-    /// Domain separation: the iroh ed25519 key MUST differ from the vodozemac Ed25519 signing key
-    /// (the same bytes under two protocols is a side-channel risk). The signature is secret-derived
-    /// and never leaves this function; only the KDF output does.
-    pub fn p2p_secret_seed(&self) -> [u8; 32] {
-        const SEED_CONTEXT: &[u8] = b"sezgi-p2p-node-seed-v2";
-        let signature = self.account.sign(SEED_CONTEXT);
-        let mut hasher = blake3::Hasher::new_derive_key("sezgi-p2p-node-v2");
-        hasher.update(&signature.to_bytes());
+    /// The secret is read out of the account's pickle (vodozemac keeps the live key private) and
+    /// checked against the account's public Curve25519 key, so a pickle that encodes it
+    /// differently fails loudly here instead of seeding a NodeId from the wrong bytes.
+    pub fn p2p_secret_seed(&self) -> Result<[u8; 32], String> {
+        let secret = self.curve25519_identity_secret()?;
+        let mut hasher = blake3::Hasher::new_derive_key("sezi-p2p-node-v3 from the curve25519 identity secret");
+        hasher.update(&secret[..]);
         let mut seed = [0u8; 32];
         hasher.finalize_xof().fill(&mut seed);
-        seed
+        Ok(seed)
+    }
+
+    /// The account's Curve25519 identity secret, out of its (unencrypted, in-memory) pickle.
+    fn curve25519_identity_secret(&self) -> Result<Box<[u8; 32]>, String> {
+        let mut value = serde_json::to_value(self.account.pickle())
+            .map_err(|e| format!("crypto/p2p-seed-pickle: {e}"))?;
+        let key_value = value
+            .get_mut("diffie_hellman_key")
+            .map(serde_json::Value::take)
+            .ok_or_else(|| "crypto/p2p-seed-pickle: no diffie_hellman_key".to_string())?;
+        let secret: vodozemac::Curve25519SecretKey = serde_json::from_value(key_value)
+            .map_err(|e| format!("crypto/p2p-seed-pickle: {e}"))?;
+        if Curve25519PublicKey::from(&secret) != self.account.curve25519_key() {
+            return Err("crypto/p2p-seed-pickle: the secret is not the identity key's".into());
+        }
+        Ok(secret.to_bytes())
     }
 
     pub(crate) fn account_mut(&mut self) -> &mut Account {

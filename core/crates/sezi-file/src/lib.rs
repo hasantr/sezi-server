@@ -15,8 +15,8 @@
 //! attachments stage plaintext in the `media_blobs` table and never touch a path: the kernel is
 //! given BYTES, and a download with no `media_dir` returns plaintext rather than refusing.
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use aead_stream::{DecryptorBE32, EncryptorBE32};
@@ -243,15 +243,14 @@ pub fn decrypt_in_memory(manifest: &FileManifest, ciphertext: &[u8]) -> Result<V
 //  file size, against the 4× file size a single-shot approach costs.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Streaming AEAD encrypt, input_path → output_path.
+/// Streaming AEAD encrypt, input_path → output_path, under a fresh random key and nonce.
 ///
-/// - `resume_from_byte`: a completed-chunk boundary (multiple of chunk_size) for an outbound
-///   resume; 0 starts from scratch.
-/// - `fixed_key_b64` + `fixed_nonce_b64`: both or neither. Supplying them makes a resume produce
-///   BYTE-IDENTICAL ciphertext, hence the same BLAKE3 hash and the same iroh ticket. Random when
-///   None.
-/// - On cancel the `.part` file is KEPT for resume; a user-cancel deletes it in the caller, while
-///   cleaning up the outbox.
+/// On cancel the `.part` file is left behind; the caller deletes it while cleaning up the outbox.
+///
+/// It once took a resume offset and a caller-chosen key and nonce, so that a resumed encrypt gave
+/// byte-identical ciphertext (the same iroh ticket). No caller ever resumed — every one passed
+/// `0, None, None` — and a fixed key and nonce handed to a second file would have reused the
+/// STREAM nonce under one key (FIL-1, removed 2026-11-06).
 pub fn encrypt_file_to_file(
     input_path: &Path,
     output_path: &Path,
@@ -259,58 +258,30 @@ pub fn encrypt_file_to_file(
     content_type: &str,
     progress_key: Option<&str>,
     cancel: Option<&CancellationToken>,
-    resume_from_byte: u64,
-    fixed_key_b64: Option<&str>,
-    fixed_nonce_b64: Option<&str>,
 ) -> Result<FileManifest> {
     let chunk_size = CHUNK_SIZE_STREAMING;
-    if !resume_from_byte.is_multiple_of(chunk_size as u64) {
-        return Err(Error::Malformed("resume_from_byte not chunk-aligned"));
-    }
     let t_start = std::time::Instant::now();
     let mut t_read_ns: u128 = 0;
     let mut t_aead_ns: u128 = 0;
     let mut t_write_ns: u128 = 0;
     let mut t_emit_ns: u128 = 0;
-    let resume_chunk_index = (resume_from_byte / chunk_size as u64) as u32;
 
-    let (key, nonce) = derive_or_use_fixed_key_nonce(fixed_key_b64, fixed_nonce_b64)?;
+    let mut key = [0u8; KEY_SIZE];
+    let mut nonce = [0u8; STREAM_NONCE_SIZE];
+    UnwrapErr(SysRng).fill_bytes(&mut key);
+    UnwrapErr(SysRng).fill_bytes(&mut nonce);
 
     let cipher = XChaCha20Poly1305::new(&key.into());
     let mut encryptor = EncryptorBE32::from_aead(cipher, (&nonce).into());
 
-    // The STREAM API has no way to SET the counter, only to advance it one `encrypt_next` at a
-    // time, so a resume replays that many empty calls. Each costs an empty input plus a tag.
-    for _ in 0..resume_chunk_index {
-        encryptor
-            .encrypt_next(&[][..])
-            .map_err(|e| Error::Crypto(format!("aead resume advance: {e}")))?;
-    }
-
     let input_size = std::fs::metadata(input_path)?.len();
-    if resume_from_byte > input_size {
-        return Err(Error::Malformed("resume_from_byte beyond input size"));
-    }
     let mut input = BufReader::with_capacity(IO_BUF_SIZE, File::open(input_path)?);
-    if resume_from_byte > 0 {
-        input.seek(SeekFrom::Start(resume_from_byte))?;
-    }
 
     let part_path = part_path_for(output_path);
-    let output_file = if resume_from_byte > 0 {
-        let expected = resume_chunk_index as u64 * (chunk_size + TAG_SIZE) as u64;
-        let actual = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
-        if actual != expected {
-            return Err(Error::Malformed("resume part size mismatch"));
-        }
-        OpenOptions::new().append(true).open(&part_path)?
-    } else {
-        let _ = std::fs::remove_file(&part_path);
-        File::create(&part_path)?
-    };
-    let mut output = BufWriter::with_capacity(IO_BUF_SIZE, output_file);
+    let _ = std::fs::remove_file(&part_path);
+    let mut output = BufWriter::with_capacity(IO_BUF_SIZE, File::create(&part_path)?);
 
-    let mut bytes_done = resume_from_byte;
+    let mut bytes_done = 0u64;
     let mut buf = vec![0u8; chunk_size];
 
     if input_size == 0 {
@@ -324,8 +295,8 @@ pub fn encrypt_file_to_file(
         let first_n = read_exact_or_eof(&mut input, &mut buf)?;
         t_read_ns += t_r.elapsed().as_nanos();
         if first_n == 0 {
-            // resume_from_byte == input_size: every chunk is written but `encrypt_last` never
-            // ran, so finalize with an empty one.
+            // The file shrank to nothing after its size was read: finalize with an empty chunk,
+            // and the size check on the other end refuses it.
             let ct = encryptor
                 .encrypt_last(&[][..])
                 .map_err(|e| Error::Crypto(format!("aead trailing empty: {e}")))?;
@@ -535,39 +506,6 @@ fn check_cancel(cancel: Option<&CancellationToken>) -> Result<()> {
 fn emit_progress(key: Option<&str>, step: TransferStep, done: u64, total: u64) {
     if let Some(k) = key {
         emit_bytes(k, step, done, total);
-    }
-}
-
-fn derive_or_use_fixed_key_nonce(
-    fixed_key_b64: Option<&str>,
-    fixed_nonce_b64: Option<&str>,
-) -> Result<([u8; KEY_SIZE], [u8; STREAM_NONCE_SIZE])> {
-    match (fixed_key_b64, fixed_nonce_b64) {
-        (Some(kb64), Some(nb64)) => {
-            let kbytes =
-                vodozemac::base64_decode(kb64).map_err(|_| Error::Malformed("fixed_key_b64"))?;
-            if kbytes.len() != KEY_SIZE {
-                return Err(Error::Malformed("fixed_key length"));
-            }
-            let nbytes =
-                vodozemac::base64_decode(nb64).map_err(|_| Error::Malformed("fixed_nonce_b64"))?;
-            if nbytes.len() != STREAM_NONCE_SIZE {
-                return Err(Error::Malformed("fixed_nonce length"));
-            }
-            let mut k = [0u8; KEY_SIZE];
-            k.copy_from_slice(&kbytes);
-            let mut n = [0u8; STREAM_NONCE_SIZE];
-            n.copy_from_slice(&nbytes);
-            Ok((k, n))
-        }
-        (None, None) => {
-            let mut k = [0u8; KEY_SIZE];
-            let mut n = [0u8; STREAM_NONCE_SIZE];
-            UnwrapErr(SysRng).fill_bytes(&mut k);
-            UnwrapErr(SysRng).fill_bytes(&mut n);
-            Ok((k, n))
-        }
-        _ => Err(Error::Malformed("fixed_key/nonce must be both or neither")),
     }
 }
 

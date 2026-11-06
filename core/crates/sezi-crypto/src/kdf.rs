@@ -67,11 +67,20 @@ pub fn derive_pickle_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
 
     if let Ok(mut map) = cache().lock() {
         if map.len() >= MAX_ENTRIES {
-            map.clear();
+            wipe(&mut map);
         }
         map.insert(index, out);
     }
     Ok(out)
+}
+
+/// Empty the memo, overwriting every key it held first: `HashMap::clear` only frees, and freed
+/// memory keeps the bytes until something reuses it (CRY-3). The copies a caller took are its own.
+fn wipe(map: &mut HashMap<[u8; 32], [u8; 32]>) {
+    for key in map.values_mut() {
+        zeroize::Zeroize::zeroize(key);
+    }
+    map.clear();
 }
 
 /// Forget every derived key. Call this wherever the kernel's own key material goes away.
@@ -81,7 +90,7 @@ pub fn derive_pickle_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
 /// entries are keyed by their inputs, so the worst case is memory that outlives its usefulness.
 pub fn clear_cache() {
     if let Ok(mut map) = cache().lock() {
-        map.clear();
+        wipe(&mut map);
     }
 }
 

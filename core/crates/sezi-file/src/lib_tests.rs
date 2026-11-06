@@ -131,7 +131,7 @@ fn roundtrip_file_to_file_3mb() {
     write_random_file(&plain_path, 3 * 1024 * 1024 + 123);
     let m = encrypt_file_to_file(
         &plain_path, &ct_path, "test.bin", "application/octet-stream",
-        None, None, 0, None, None,
+        None, None,
     )
     .unwrap();
     assert_eq!(m.chunk_size, CHUNK_SIZE_STREAMING as u32);
@@ -158,7 +158,7 @@ fn roundtrip_chunk_boundary_exact() {
 
     write_random_file(&plain_path, CHUNK_SIZE_STREAMING * 3);
     let m = encrypt_file_to_file(
-        &plain_path, &ct_path, "x", "x", None, None, 0, None, None,
+        &plain_path, &ct_path, "x", "x", None, None,
     )
     .unwrap();
     decrypt_file_to_file(&m, &ct_path, &out_path, None, None).unwrap();
@@ -176,7 +176,7 @@ fn decrypt_rejects_truncated_ciphertext() {
 
     write_random_file(&plain_path, CHUNK_SIZE_STREAMING * 2 + 17);
     let m = encrypt_file_to_file(
-        &plain_path, &ct_path, "x", "x", None, None, 0, None, None,
+        &plain_path, &ct_path, "x", "x", None, None,
     )
     .unwrap();
 
@@ -195,7 +195,7 @@ fn decrypt_rejects_truncated_ciphertext() {
 }
 
 #[test]
-fn cancel_mid_encrypt_keeps_part_for_resume() {
+fn cancel_mid_encrypt_writes_no_output() {
     let plain_path = tmp_path("can-plain");
     let ct_path = tmp_path("can-ct");
     cleanup(&[&plain_path, &ct_path]);
@@ -205,90 +205,17 @@ fn cancel_mid_encrypt_keeps_part_for_resume() {
     token.cancel(); // cancel immediately
 
     let res = encrypt_file_to_file(
-        &plain_path, &ct_path, "x", "x", None, Some(&token), 0, None, None,
+        &plain_path, &ct_path, "x", "x", None, Some(&token),
     );
     match res {
         Err(Error::Cancelled) => {}
         other => panic!("expected Cancelled, got {other:?}"),
     }
-    // The final output must not be created; the `.part` must remain for an outbound resume.
+    // The final output must not be created.
     assert!(!ct_path.exists(), "the final output must not be written");
     // The `.part` file may have been created with the first chunk written (cancel is
     // checked after the first chunk read). Whether it survives or not, this test only
     // guarantees the absence of the final output.
-
-    cleanup(&[&plain_path, &ct_path]);
-}
-
-#[test]
-fn resume_encrypt_with_fixed_key_nonce_matches_oneshot() {
-    // With the same plaintext + the same fixed key+nonce:
-    // (a) single-shot encrypt → ct_full
-    // (b) encrypt to 50% + resume from 50% → ct_resumed
-    // Expectation: ct_full == ct_resumed (byte-for-byte; the same BLAKE3 hash)
-    let plain_path = tmp_path("res-plain");
-    let ct_full = tmp_path("res-ct-full");
-    let ct_resumed = tmp_path("res-ct-resumed");
-    cleanup(&[&plain_path, &ct_full, &ct_resumed]);
-
-    write_random_file(&plain_path, CHUNK_SIZE_STREAMING * 4 + 333);
-
-    // Generate a random key+nonce, base64-encode them
-    let mut key = [0u8; KEY_SIZE];
-    let mut nonce = [0u8; STREAM_NONCE_SIZE];
-    UnwrapErr(SysRng).fill_bytes(&mut key);
-    UnwrapErr(SysRng).fill_bytes(&mut nonce);
-    let key_b64 = vodozemac::base64_encode(key);
-    let nonce_b64 = vodozemac::base64_encode(nonce);
-
-    // (a) single-shot
-    let _m_full = encrypt_file_to_file(
-        &plain_path, &ct_full, "x", "x",
-        None, None, 0, Some(&key_b64), Some(&nonce_b64),
-    )
-    .unwrap();
-    let bytes_full = read_all(&ct_full);
-
-    // (b) The interrupted encrypt, simulated: take the first 2 chunks of the single-shot result
-    // as the `.part` — the same fixed key and nonce make them what an interrupted run would have
-    // left — then resume from there.
-    let part = part_path_for(&ct_resumed);
-    let two_chunks = 2 * (CHUNK_SIZE_STREAMING + TAG_SIZE);
-    std::fs::write(&part, &bytes_full[..two_chunks]).unwrap();
-
-    let _m_res = encrypt_file_to_file(
-        &plain_path, &ct_resumed, "x", "x",
-        None, None,
-        (2 * CHUNK_SIZE_STREAMING) as u64,
-        Some(&key_b64), Some(&nonce_b64),
-    )
-    .unwrap();
-    let bytes_resumed = read_all(&ct_resumed);
-
-    assert_eq!(
-        bytes_full.len(),
-        bytes_resumed.len(),
-        "the resumed ciphertext has a different length"
-    );
-    assert_eq!(bytes_full, bytes_resumed, "not equal byte for byte");
-
-    cleanup(&[&plain_path, &ct_full, &ct_resumed]);
-}
-
-#[test]
-fn fixed_key_nonce_mismatched_pair_rejected() {
-    let plain_path = tmp_path("mis-plain");
-    let ct_path = tmp_path("mis-ct");
-    cleanup(&[&plain_path, &ct_path]);
-
-    write_random_file(&plain_path, 100);
-    let key_b64 = vodozemac::base64_encode([0u8; KEY_SIZE]);
-
-    let res = encrypt_file_to_file(
-        &plain_path, &ct_path, "x", "x",
-        None, None, 0, Some(&key_b64), None,
-    );
-    assert!(matches!(res, Err(Error::Malformed(_))));
 
     cleanup(&[&plain_path, &ct_path]);
 }

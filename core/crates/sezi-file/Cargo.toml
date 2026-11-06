@@ -36,4 +36,6 @@ log = "0.4"
 # were already in the lock — the root crate and `sezi-backup` derive their backup keys the same
 # way — and both are pure Rust, so the wasm island is unaffected.
 hkdf = "0.13"
+# Wipes the item and part keys when they drop (CRY-3). Already in the lock (sezi-backup, the root crate).
+zeroize = { version = "1.7", features = ["derive"] }
 sha2 = "0.11"

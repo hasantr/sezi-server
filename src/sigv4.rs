@@ -145,19 +145,18 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// `scheme://host[:port]/path?query` → (host[:port], path, query). Minimal and dependency-free so
-/// it also runs in host tests without pulling in worker::Url. userinfo is ignored; an empty path
-/// becomes `/`.
+/// `scheme://[userinfo@]host[:port]/path?query` → (host[:port], path, query). Minimal and
+/// dependency-free so it also runs in host tests without pulling in worker::Url; an empty path
+/// becomes `/`. The host is signed as the HTTP client SENDS it (`signed_host`), not as written.
 fn parse_url(url: &str) -> Result<(String, String, String), SigV4Error> {
-    let after_scheme = url
-        .split_once("://")
-        .map(|(_, r)| r)
-        .ok_or_else(|| SigV4Error::BadUrl(url.to_string()))?;
+    let (scheme, after_scheme) =
+        url.split_once("://").ok_or_else(|| SigV4Error::BadUrl(url.to_string()))?;
     let (authority, rest) = match after_scheme.find(['/', '?']) {
         Some(idx) => after_scheme.split_at(idx),
         None => (after_scheme, ""),
     };
-    if authority.is_empty() {
+    let host = signed_host(scheme, authority);
+    if host.is_empty() {
         return Err(SigV4Error::BadUrl(url.to_string()));
     }
     let (path, query) = match rest.split_once('?') {
@@ -165,7 +164,30 @@ fn parse_url(url: &str) -> Result<(String, String, String), SigV4Error> {
         None => (rest, ""),
     };
     let path = if path.is_empty() { "/" } else { path };
-    Ok((authority.to_string(), path.to_string(), query.to_string()))
+    Ok((host, path.to_string(), query.to_string()))
+}
+
+/// The `Host` an HTTP client sends for `authority` (DEP-1, 2026-11-06): no userinfo, the host
+/// lowercased, the scheme's default port (443, 80) dropped — what the URL parser behind the request
+/// normalises to. Signing the authority as written (`User@Bucket.S3…:443`) signed a host the
+/// server never saw, and it answered `SignatureDoesNotMatch`. An IPv6 literal keeps its brackets.
+/// A host outside ASCII is not punycoded here: an endpoint never has one.
+fn signed_host(scheme: &str, authority: &str) -> String {
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = match host_port.rfind(':') {
+        Some(i) if !host_port[i..].contains(']') => (&host_port[..i], Some(&host_port[i + 1..])),
+        _ => (host_port, None),
+    };
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "https" => Some("443"),
+        "http" => Some("80"),
+        _ => None,
+    };
+    let host = host.to_ascii_lowercase();
+    match port {
+        Some(p) if !p.is_empty() && Some(p) != default_port => format!("{host}:{p}"),
+        _ => host,
+    }
 }
 
 /// Signing result. `authorization` is what production uses; the intermediates
@@ -328,6 +350,19 @@ mod tests {
     const VEC_KEY: &str = "AKIDEXAMPLE";
     const VEC_SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
     const VEC_DATETIME: &str = "20150830T123600Z";
+
+    /// DEP-1: the host is signed as the client sends it — no userinfo, lowercase, no default port.
+    #[test]
+    fn the_signed_host_is_the_one_the_client_sends() {
+        let host = |url: &str| parse_url(url).unwrap().0;
+        assert_eq!(host("https://User:pw@Bucket.S3.Example.com:443/k?x=1"), "bucket.s3.example.com");
+        assert_eq!(host("http://minio.local:80/b"), "minio.local");
+        assert_eq!(host("https://minio.local:9000/b"), "minio.local:9000");
+        assert_eq!(host("http://[::1]:9000/b"), "[::1]:9000");
+        assert_eq!(host("https://[::1]/b"), "[::1]");
+        assert_eq!(parse_url("https://h.example").unwrap(), ("h.example".into(), "/".into(), String::new()));
+        assert!(parse_url("https://user@/b").is_err());
+    }
 
     #[test]
     fn empty_body_sha256_matches_the_known_value() {

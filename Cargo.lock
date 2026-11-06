@@ -1621,6 +1621,7 @@ dependencies = [
  "sezi-protocol",
  "vodozemac",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]
@@ -1647,6 +1648,7 @@ dependencies = [
  "sha2 0.11.1",
  "tokio-util",
  "vodozemac",
+ "zeroize",
 ]
 
 [[package]]

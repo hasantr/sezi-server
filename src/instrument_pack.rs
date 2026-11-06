@@ -35,12 +35,15 @@ use worker::*;
 /// Hard ceiling for an uploaded pack, in the `media/handlers.rs` style (a content-length gate
 /// first, the buffered length second).
 ///
-/// ⚠ 200 MiB is the WORKER's stop, not the platform's. Cloudflare refuses a request body over
+/// 128 MiB, the same as the apps' `sezi_music::MAX_PACK_BYTES`: a pack the relay took above it
+/// would upload fine and then be refused by every app that fetches it.
+///
+/// ⚠ This is the WORKER's stop, not the platform's. Cloudflare refuses a request body over
 /// the plan's limit (100 MB on Free/Pro) before the worker ever runs, and an isolate has 128 MB
 /// of memory while the body must be buffered once to hash it. The packs this is built for are
 /// ~30 MB (GeneralUser GS v2.0.3); anything near this ceiling will die on the platform's limit
 /// or the isolate's memory, whichever comes first.
-const MAX_PACK_SIZE: u64 = 200 * 1024 * 1024;
+const MAX_PACK_SIZE: u64 = 128 * 1024 * 1024;
 
 /// Display-name ceiling: "GeneralUser GS v2.0.3" is 21 characters, so 120 is generous.
 const MAX_NAME_CHARS: usize = 120;

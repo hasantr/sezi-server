@@ -10,6 +10,8 @@ pub mod history_page;
 pub mod indirect;
 pub mod inner;
 pub mod link_card;
+/// What a new device signs while it polls `link-status` (CRY-1: tagged, never the raw code).
+pub mod link_proof;
 pub mod media_id;
 pub mod media_meta;
 pub mod mentions;

@@ -96,6 +96,33 @@ fn link_approve_requires_an_active_unrevoked_device() {
     );
 }
 
+/// CRY-1: `link-status` takes the TAGGED proof (`"sezi-device-link-v1\0" || link_code`, apps from
+/// this build on) and the RAW one (`link_code`, every app before it, still in the field). Nothing
+/// else: a signature over another code, or over the tag with another code, is refused.
+#[test]
+fn link_status_accepts_the_tagged_and_the_legacy_proof() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use sezi_protocol::link_proof::link_proof_message;
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let verifying = key.verifying_key();
+    let code = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdE";
+    let tagged = key.sign(&link_proof_message(code));
+    let raw = key.sign(code.as_bytes());
+    assert!(super::link_proof_verifies(&verifying, code, &tagged), "the tagged proof");
+    assert!(super::link_proof_verifies(&verifying, code, &raw), "the legacy proof");
+
+    let other = "ZbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdE";
+    let tagged_other = key.sign(&link_proof_message(other));
+    assert!(!super::link_proof_verifies(&verifying, code, &tagged_other), "another code, tagged");
+    assert!(!super::link_proof_verifies(&verifying, code, &key.sign(other.as_bytes())), "another code, raw");
+    let stranger = SigningKey::from_bytes(&[8u8; 32]);
+    let forged = stranger.sign(&link_proof_message(code));
+    assert!(!super::link_proof_verifies(&verifying, code, &forged), "another key");
+
+    let src = handler_src("pub async fn link_status");
+    assert!(src.contains("link_proof_verifies("), "the handler checks the proof through it");
+}
+
 /// `link-start` and `link-status` are unauthenticated ON PURPOSE, and must stay that way.
 ///
 /// The device calling them does not have an account token yet — obtaining one is the entire point

@@ -60,8 +60,8 @@ const NONCE_PREFIX_SIZE: usize = 19;
 const PART_INFO: &[u8] = b"sezi/library/part/v1";
 
 /// The one secret of a library item. Random, never reused, and the only key the item's record
-/// carries; every part key is derived from it.
-#[derive(Clone, PartialEq, Eq)]
+/// carries; every part key is derived from it. Wiped when it drops (CRY-3).
+#[derive(Clone, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ItemKey([u8; KEY_SIZE]);
 
 // Never print key material, not even in a debug log.
@@ -112,11 +112,13 @@ impl ItemKey {
         key.copy_from_slice(&okm[..KEY_SIZE]);
         let mut prefix = [0u8; NONCE_PREFIX_SIZE];
         prefix.copy_from_slice(&okm[KEY_SIZE..]);
+        zeroize::Zeroize::zeroize(&mut okm);
         PartSecret { key, prefix }
     }
 }
 
-/// A derived part key and nonce prefix.
+/// A derived part key and nonce prefix. Wiped when it drops (CRY-3).
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct PartSecret {
     key: [u8; KEY_SIZE],
     prefix: [u8; NONCE_PREFIX_SIZE],
