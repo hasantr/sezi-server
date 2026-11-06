@@ -13,5 +13,8 @@
   "scripts": {
     "//": "Self-host relay'i lokal workerd (wrangler dev) ile başlatır — SADECE 127.0.0.1 (dış erişim yalnız tünel/caddy önünden). Kalıcı veri --persist-to state dizininde. systemd bunu doğrudan node_modules/.bin/wrangler ile çağırır (deploy/README.md).",
     "relay": "wrangler dev --config wrangler.selfhost.toml --ip 127.0.0.1 --port 8788 --persist-to .wrangler/state"
+  },
+  "overrides": {
+    "workerd": "1.20261023.1"
   }
 }

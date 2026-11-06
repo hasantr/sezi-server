@@ -12,7 +12,7 @@
 
 name = "sezi-server"
 main = "build/worker/shim.mjs"
-compatibility_date = "2026-05-01"
+compatibility_date = "2026-10-23"
 compatibility_flags = ["nodejs_compat"]
 # workers_dev burada anlamsız (lokal dev) ama tutarlılık için bırakıldı.
 workers_dev = true
