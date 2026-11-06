@@ -10,6 +10,7 @@ fn ai(provider: Provider, sheet_tool: bool) -> AiConfig {
         model: "the-model".into(),
         instructions: "Answer questions about hearings.".into(),
         sheet_tool,
+        daily_calls: crate::bots::builtin_rules::DEFAULT_AI_DAILY_CALLS,
     }
 }
 

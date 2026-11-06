@@ -27,14 +27,25 @@ pub(super) const UPDATE_PUSH: &str =
 pub(super) const UPDATE_CONFIRM: &str =
     "DELETE FROM bot_updates WHERE update_id < ? AND delivered_at IS NOT NULL";
 /// What a poll answers: from the offset on, plus anything below it never handed out (left there by
-/// a wrong offset, or by a webhook since cleared), in update order. Bind: offset, limit.
+/// a wrong offset, or by a webhook since cleared), in update order — and never a row past the
+/// window, whether or not the housekeeping has run since (review H7). Bind: offset, cutoff
+/// (now − [`UPDATE_TTL_MS`]), limit.
 pub(super) const UPDATE_READ: &str = "SELECT update_id, json FROM bot_updates
-      WHERE update_id >= ? OR delivered_at IS NULL ORDER BY update_id LIMIT ?";
+      WHERE (update_id >= ? OR delivered_at IS NULL) AND created_at >= ? ORDER BY update_id LIMIT ?";
 /// Bind: now, first update_id read, last update_id read.
 pub(super) const UPDATE_MARK: &str = "UPDATE bot_updates SET delivered_at = ?,
       attempts = attempts + 1 WHERE update_id >= ? AND update_id <= ?";
 /// Bind: cutoff.
 pub(super) const UPDATE_EXPIRE: &str = "DELETE FROM bot_updates WHERE created_at < ?";
+/// When the oldest update or member's file (`files.rs`, its key inside) is due to go: one past
+/// its window, since the expiries delete rows strictly older than the cutoff. The alarm comes
+/// back for it (`bot_rearm`), so the 24 h hold for a bot nobody polls and nobody writes to —
+/// until review H7 only a tick ran the expiry, and an idle bot's inbox kept members' words and
+/// file keys for as long as it stayed idle. NULL when nothing is kept. Bind: the updates' keep,
+/// the files' keep.
+pub(super) const RETENTION_NEXT: &str = "SELECT MIN(t) AS t FROM (
+      SELECT MIN(created_at) + ? + 1 AS t FROM bot_updates
+      UNION ALL SELECT MIN(created_at) + ? + 1 FROM bot_files)";
 
 /// The sender as D1 has them.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -225,7 +236,12 @@ impl UserInbox {
         }
         let mut waited = 0;
         let rows: Vec<UpdateRow> = loop {
-            let args = vec![JsValue::from_f64(offset as f64), JsValue::from_f64(limit as f64)];
+            let cutoff = (now_secs() * 1000) as i64 - UPDATE_TTL_MS;
+            let args = vec![
+                JsValue::from_f64(offset as f64),
+                JsValue::from_f64(cutoff as f64),
+                JsValue::from_f64(limit as f64),
+            ];
             let rows: Vec<UpdateRow> = sql.exec_raw(UPDATE_READ, Some(args))?.to_array()?;
             if !rows.is_empty() || waited >= timeout {
                 break rows;
@@ -245,6 +261,10 @@ impl UserInbox {
             // The program has them: the members' blue ticks go out with the next tick.
             self.bot_updates_taken(&ctx, first, last.update_id, now);
             self.arm_alarm_within(0).await;
+        } else {
+            // Nothing handed out: still bring the alarm back for what is kept, so rows an idle
+            // inbox held past their 24 h (an inbox from before H7's alarm) go at once.
+            self.bot_rearm().await;
         }
         let rows = rows.into_iter().map(|r| (r.update_id, r.json));
         Response::from_json(&crate::bots::api_answer::updates(rows))

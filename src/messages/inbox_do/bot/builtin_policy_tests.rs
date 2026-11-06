@@ -165,6 +165,7 @@ fn cfg(kind: Kind, url: Option<&str>, tool: bool) -> Config {
             model: "m".into(),
             instructions: "x".into(),
             sheet_tool: tool,
+            daily_calls: crate::bots::builtin_rules::DEFAULT_AI_DAILY_CALLS,
         }),
         hearings: None,
     }

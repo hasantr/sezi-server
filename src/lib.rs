@@ -25,6 +25,7 @@ mod messages;
 mod page_cursor;
 mod plugin_blob;
 mod plugin_log;
+mod plugin_log_budget;
 mod plugin_media;
 mod push;
 mod quota;

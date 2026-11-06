@@ -17,6 +17,9 @@ pub(super) enum Line {
     TryLater,
     /// Past the 50 model calls a member gets a day.
     DailyLimit,
+    /// Past the AI bot's model calls for the day, every member together (the owner's
+    /// `daily_calls`, review H8).
+    BotDailyLimit,
     /// Asked before an AI bot writes a row; the row follows it.
     ConfirmRow,
     /// After the row it follows.
@@ -94,10 +97,11 @@ pub(super) enum Line {
 
 /// Every line, for the tests.
 #[cfg(test)]
-pub(super) const ALL: [Line; 37] = [
+pub(super) const ALL: [Line; 38] = [
     Line::AiUnavailable,
     Line::TryLater,
     Line::DailyLimit,
+    Line::BotDailyLimit,
     Line::ConfirmRow,
     Line::ConfirmHint,
     Line::RowSaved,
@@ -142,6 +146,8 @@ pub(super) fn line(lang: Lang, l: Line) -> &'static str {
         (Lang::En, Line::TryLater) => "I couldn't handle your message right now. Please write again a little later.",
         (Lang::Tr, Line::DailyLimit) => "Bugünlük sınıra ulaştın (günde 50 mesaj). Yarın yine yazabilirsin.",
         (Lang::En, Line::DailyLimit) => "You've reached today's limit (50 messages a day). You can write again tomorrow.",
+        (Lang::Tr, Line::BotDailyLimit) => "Bu botun bugünkü yanıt sınırı doldu; yarın yeniden açılır.",
+        (Lang::En, Line::BotDailyLimit) => "This bot's answers for today have run out; they are back tomorrow.",
         (Lang::Tr, Line::ConfirmRow) => "Şunu kaydedeyim mi?",
         (Lang::En, Line::ConfirmRow) => "Shall I save this?",
         (Lang::Tr, Line::ConfirmHint) => "evet / hayır",

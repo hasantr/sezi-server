@@ -30,6 +30,36 @@ use worker::*;
 /// anyway).
 const MAX_PLUGIN_MEDIA_SIZE: u64 = 50 * 1024 * 1024;
 
+/// What one member may keep in one room's plugin media (review 2026-11 H10). An app can upload
+/// with no gesture of the member's, and nothing but the owner's server-wide storage cap — none
+/// by default — bounded what it left behind in a room for good (plugin media has no TTL). Ten
+/// full-size blobs of the 50 MiB ceiling; a piano take is a few MB.
+pub(crate) const MAX_BYTES_PER_MEMBER_PER_ROOM: i64 = 512 * 1024 * 1024;
+/// How many blobs one member may keep in one room's plugin media.
+pub(crate) const MAX_OBJECTS_PER_MEMBER_PER_ROOM: i64 = 4096;
+/// The refusal of an upload past either: `400 {"error":"plugin/media-full","scope":"bytes"|
+/// "objects","limit":N}`. A `400` because every app since 2046 ends an op at the first `400`
+/// rather than walking the retry ladder, and nothing frees room in plugin media on its own.
+pub(crate) const MEDIA_FULL_CODE: &str = "plugin/media-full";
+pub(crate) const MEDIA_FULL_STATUS: u16 = 400;
+
+/// What an uploader keeps in one room's plugin media. Binds: room_id, uploader_id. Reads the
+/// room's rows by the primary key's prefix.
+pub(crate) const MEMBER_USAGE_SQL: &str = "SELECT COALESCE(SUM(size_bytes), 0) AS bytes, \
+        COUNT(*) AS objects FROM plugin_media_objects WHERE room_id = ?1 AND uploader_id = ?2";
+
+/// Which budget an upload of `size` bytes would break, given what its uploader keeps in the room:
+/// `Some(("bytes"|"objects", limit))`, or `None` when it fits.
+pub(crate) fn media_refusal(bytes: i64, objects: i64, size: i64) -> Option<(&'static str, i64)> {
+    if bytes.saturating_add(size) > MAX_BYTES_PER_MEMBER_PER_ROOM {
+        return Some(("bytes", MAX_BYTES_PER_MEMBER_PER_ROOM));
+    }
+    if objects >= MAX_OBJECTS_PER_MEMBER_PER_ROOM {
+        return Some(("objects", MAX_OBJECTS_PER_MEMBER_PER_ROOM));
+    }
+    None
+}
+
 /// `POST /plugin-media/:room/:id` — upload (encrypted) member plugin media. PERSISTENT.
 /// Auth: ANY active member of that room (admin NOT required). Quota and usage land on the SAME
 /// counters as `media`. Idempotent: the same (room,id) again → 200 with NO re-upload.
@@ -73,6 +103,21 @@ pub async fn put_media(mut req: Request, ctx: RouteContext<()>) -> Result<Respon
     // idempotency and the core client's "2xx = success" contract.
     if let Some(existing) = existing_size(&db, &room_id, &blob_id).await? {
         return Response::from_json(&serde_json::json!({ "id": blob_id, "size": existing }));
+    }
+    // The MEMBER BUDGET in this room (review 2026-11 H10): a D1 count, so it bounds whether or
+    // not the KV rate limit above exists. Two uploads racing past it overshoot by one blob at
+    // most each, which the rate limit and the 50 MiB ceiling bound. A count that cannot be read
+    // refuses nothing, as `check_upload` below.
+    if let Some((scope, limit)) = member_usage(&db, &room_id, &user_id)
+        .await
+        .and_then(|(bytes, objects)| media_refusal(bytes, objects, size as i64))
+    {
+        let resp = Response::from_json(&serde_json::json!({
+            "error": MEDIA_FULL_CODE,
+            "scope": scope,
+            "limit": limit,
+        }))?;
+        return Ok(resp.with_status(MEDIA_FULL_STATUS));
     }
     // Quota ENFORCEMENT: the SAME check_upload as `media` (server_stats + user_storage vs the
     // owner's caps). FAIL-OPEN: if a cap or counter cannot be read, nothing is rejected; a NULL
@@ -191,6 +236,24 @@ async fn media_store_id(db: &D1Database, room_id: &str, blob_id: &str) -> Result
     Ok(row.map(|r| r.store_id))
 }
 
+/// What `uploader_id` keeps in `room_id`'s plugin media: `(bytes, objects)`, `None` when it
+/// cannot be read.
+async fn member_usage(db: &D1Database, room_id: &str, uploader_id: &str) -> Option<(i64, i64)> {
+    #[derive(Deserialize)]
+    struct UsageRow {
+        bytes: i64,
+        objects: i64,
+    }
+    let row: UsageRow = db
+        .prepare(MEMBER_USAGE_SQL)
+        .bind(&[d1_text(room_id), d1_text(uploader_id)])
+        .ok()?
+        .first(None)
+        .await
+        .ok()??;
+    Some((row.bytes, row.objects))
+}
+
 /// Does a meta row for (room,id) exist? Returns its `size_bytes` if so (the idempotent-PUT
 /// short-circuit).
 async fn existing_size(db: &D1Database, room_id: &str, blob_id: &str) -> Result<Option<i64>> {
@@ -242,3 +305,7 @@ async fn insert_meta(
         .await?;
     Ok(res.results::<IdRow>().map(|r| !r.is_empty()).unwrap_or(false))
 }
+
+#[cfg(test)]
+#[path = "plugin_media_tests.rs"]
+mod tests;

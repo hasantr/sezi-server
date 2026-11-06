@@ -13,6 +13,7 @@
 use crate::auth::middleware::{device_revoked, require_auth_device};
 use crate::groups::group_role;
 use crate::messages::inbox_do::sql_no_args;
+use crate::plugin_log_budget as budget;
 use crate::respond::{json_err, passthrough};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
@@ -28,6 +29,31 @@ const MAX_INLINE_B64: usize = 32 * 1024;
 const MAX_FIELD_B64: usize = 4 * 1024;
 /// Entry limit for one sync page (the receipt_sync pattern; `more` signals continuation).
 const SYNC_LIMIT: i64 = 500;
+
+/// The room DO's tables (one DO per room; `plugin_id` separates the logs inside it).
+pub(crate) const CREATE_META_SQL: &str = "CREATE TABLE IF NOT EXISTS plugin_log_meta (
+    plugin_id TEXT PRIMARY KEY,
+    last_seq INTEGER NOT NULL DEFAULT 0,
+    head_hash TEXT
+)";
+pub(crate) const CREATE_ENTRIES_SQL: &str = "CREATE TABLE IF NOT EXISTS plugin_log_entries (
+    plugin_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    author_id TEXT NOT NULL,
+    author_device_id TEXT NOT NULL,
+    key_epoch INTEGER NOT NULL,
+    author_counter INTEGER NOT NULL,
+    content_kind TEXT NOT NULL,
+    ciphertext_b64 TEXT,
+    nonce_b64 TEXT,
+    blob_id TEXT,
+    blob_hash TEXT,
+    aad_hash TEXT NOT NULL,
+    prev_hash TEXT,
+    entry_hash TEXT,
+    uploaded_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (plugin_id, seq)
+)";
 
 /// One log entry — both the client→handler→DO body and (minus `seq`) the DO row. The server is
 /// BLIND: `ciphertext_b64`/`blob_id` are opaque; `author_*` is enforced server-honest and the reader
@@ -129,35 +155,15 @@ impl PluginRoomLog {
             return Ok(());
         }
         let storage = self.state.storage();
-        storage.sql().exec_raw(
-            "CREATE TABLE IF NOT EXISTS plugin_log_meta (
-                plugin_id TEXT PRIMARY KEY,
-                last_seq INTEGER NOT NULL DEFAULT 0,
-                head_hash TEXT
-            )",
-            sql_no_args(),
-        )?;
-        storage.sql().exec_raw(
-            "CREATE TABLE IF NOT EXISTS plugin_log_entries (
-                plugin_id TEXT NOT NULL,
-                seq INTEGER NOT NULL,
-                author_id TEXT NOT NULL,
-                author_device_id TEXT NOT NULL,
-                key_epoch INTEGER NOT NULL,
-                author_counter INTEGER NOT NULL,
-                content_kind TEXT NOT NULL,
-                ciphertext_b64 TEXT,
-                nonce_b64 TEXT,
-                blob_id TEXT,
-                blob_hash TEXT,
-                aad_hash TEXT NOT NULL,
-                prev_hash TEXT,
-                entry_hash TEXT,
-                uploaded_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (plugin_id, seq)
-            )",
-            sql_no_args(),
-        )?;
+        for ddl in [
+            CREATE_META_SQL,
+            CREATE_ENTRIES_SQL,
+            // The member budget's count (expand-only: tables the previous build never reads).
+            budget::CREATE_USAGE_SQL,
+            budget::CREATE_COUNTED_SQL,
+        ] {
+            storage.sql().exec_raw(ddl, sql_no_args())?;
+        }
         self.initialized.set(true);
         Ok(())
     }
@@ -172,6 +178,32 @@ impl PluginRoomLog {
         };
         let storage = self.state.storage();
         let sql = storage.sql();
+        // The member budget (review 2026-11 H10, `plugin_log_budget.rs`), asked before a seq is
+        // taken so a refused entry leaves no gap. Synchronous from here to the charge below, so
+        // no other append of this room runs in between. A count that cannot be read refuses
+        // nothing; the next append counts again from the mark.
+        let cost = budget::entry_bytes(&budget::EntryFields {
+            ciphertext_b64: e.ciphertext_b64.as_deref(),
+            nonce_b64: e.nonce_b64.as_deref(),
+            blob_id: e.blob_id.as_deref(),
+            blob_hash: e.blob_hash.as_deref(),
+            aad_hash: &e.aad_hash,
+            prev_hash: e.prev_hash.as_deref(),
+            entry_hash: e.entry_hash.as_deref(),
+        });
+        let books = DoSql(&sql);
+        match budget::admit(&books, &e.plugin_id, &e.author_id, cost) {
+            Ok(Some(full)) => {
+                let resp = Response::from_json(&serde_json::json!({
+                    "error": budget::LOG_FULL_CODE,
+                    "scope": full.scope(),
+                    "limit_bytes": full.limit_bytes(),
+                }))?;
+                return Ok(resp.with_status(budget::LOG_FULL_STATUS));
+            }
+            Ok(None) => {}
+            Err(err) => console_log!("plugin_log: budget unread, append admitted: {err}"),
+        }
         sql.exec_raw(
             "INSERT OR IGNORE INTO plugin_log_meta (plugin_id, last_seq) VALUES (?, 0)",
             Some(vec![JsValue::from_str(&e.plugin_id)]),
@@ -219,6 +251,10 @@ impl PluginRoomLog {
                 "UPDATE plugin_log_meta SET head_hash = ? WHERE plugin_id = ?",
                 Some(vec![JsValue::from_str(eh), JsValue::from_str(&e.plugin_id)]),
             );
+        }
+        if let Err(err) = budget::charge(&books, &e.plugin_id, &e.author_id, cost, seq) {
+            // Not lost: the mark stays behind this seq, so the next append counts the row.
+            console_log!("plugin_log: budget charge failed, recounted next append: {err}");
         }
         Response::from_json(&serde_json::json!({ "seq": seq }))
     }
@@ -302,6 +338,19 @@ pub async fn bump_epoch_floor(db: &D1Database, room_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The status of an append below the room's epoch floor. Apps since the floor's first day read
+/// it, so it never changes.
+pub(crate) const EPOCH_STALE_STATUS: u16 = 409;
+
+/// The body of that refusal: `{"error":"epoch_stale","floor":N}`. The code is the one every app
+/// reads; `floor` was added on 2026-11-06 (review 2026-11 H1) so a room admin's app mints its next
+/// epoch at or past the floor in one step — before, it could only learn that it was below it,
+/// and the floor rises by one per removal while an app's epoch rose by one per rotation it
+/// happened to see, so the two could drift apart for good. An older app ignores the field.
+pub(crate) fn epoch_stale_body(floor: i64) -> serde_json::Value {
+    serde_json::json!({ "error": "epoch_stale", "floor": floor })
+}
+
 // ───────────────────────── HTTP handlers (lib.rs router) ─────────────────────────
 
 /// `POST /plugin-log/:room/:plugin/append` — validate JWT + active membership + author binding, then
@@ -329,6 +378,11 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Some(p) => p.clone(),
         None => return json_err(400, "bad_request"),
     };
+    // Only a well-formed id (the policy's own rule; review 2026-11 H10): it was any string up to
+    // 4 KB, installed or not, each one a log of its own in the room's DO.
+    if !crate::admin::plugin_policy::plugin_id_ok(&plugin_id) {
+        return json_err(400, crate::admin::plugin_policy::BAD_ID_CODE);
+    }
     // Active-membership gate (E2E: the server cannot see the content, it only gates on the
     // membership table).
     let db = ctx.env.d1("DB")?;
@@ -362,12 +416,13 @@ pub async fn append(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // FORWARD-SECRECY EPOCH-FLOOR gate: the floor was bumped when a member left, so
     // `key_epoch < floor` is an attempt to write new data under an OLD epoch → REJECT with
     // `409 epoch_stale`. Neither the ejected member nor a writer left behind can punch through
-    // forward secrecy with a stale epoch after the removal. The client catches the 409 → refreshes
-    // membership/device list, rotates, and retries the pending write under the NEW epoch, so nothing
-    // is lost. The server stays BLIND: it only compares INTEGERS (key_epoch is plaintext meta).
+    // forward secrecy with a stale epoch after the removal. The 409 names the floor: a room admin's
+    // app mints an epoch at or past it, a member's asks an admin to, and the pending write is
+    // re-appended under the new epoch, so nothing is lost. The server stays BLIND: it only
+    // compares INTEGERS (key_epoch is plaintext meta).
     let floor = epoch_floor(&db, &room_id).await?;
     if entry.key_epoch < floor {
-        return json_err(409, "epoch_stale");
+        return crate::respond::json_status(EPOCH_STALE_STATUS, &epoch_stale_body(floor));
     }
     // Size ceilings, applied to ALL content kinds and not just inline ones: inline → ciphertext is
     // mandatory and ≤ MAX_INLINE_B64; any kind → ciphertext ≤ MAX_INLINE_B64 (stops a `blob` kind
@@ -428,6 +483,11 @@ pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         Some(p) => p.clone(),
         None => return json_err(400, "bad_request"),
     };
+    // The append's own rule, which also keeps the id safe to splice into the DO URL below (no
+    // `&`, `=`, `#` or space can pass it).
+    if !crate::admin::plugin_policy::plugin_id_ok(&plugin_id) {
+        return json_err(400, crate::admin::plugin_policy::BAD_ID_CODE);
+    }
     let db = ctx.env.d1("DB")?;
     if group_role(&db, &room_id, &user_id).await?.is_none() {
         return json_err(403, "not_member");
@@ -445,6 +505,42 @@ pub async fn sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let do_url = format!("https://do.sezgi/sync?plugin={plugin_id}&since={since}");
     let do_req = Request::new(&do_url, Method::Get)?;
     passthrough(stub.fetch_with_request(do_req).await?).await
+}
+
+/// The room DO's storage as the member budget reads and writes it (`plugin_log_budget::LogSql`).
+struct DoSql<'a>(&'a SqlStorage);
+
+impl budget::LogSql for DoSql<'_> {
+    fn exec(&self, sql: &str, args: &[budget::Arg<'_>]) -> std::result::Result<(), String> {
+        let bound = args
+            .iter()
+            .map(|a| match a {
+                budget::Arg::Text(s) => JsValue::from_str(s),
+                budget::Arg::Int(i) => JsValue::from_f64(*i as f64),
+            })
+            .collect::<Vec<_>>();
+        self.0.exec_raw(sql, Some(bound)).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn behind(&self) -> std::result::Result<Vec<budget::BehindRow>, String> {
+        self.0
+            .exec_raw(budget::BEHIND_SQL, sql_no_args())
+            .and_then(|c| c.to_array())
+            .map_err(|e| e.to_string())
+    }
+
+    fn usage(&self, plugin_id: &str, author_id: &str) -> std::result::Result<budget::UsageRow, String> {
+        self.0
+            .exec_raw(
+                budget::USAGE_SQL,
+                Some(vec![JsValue::from_str(plugin_id), JsValue::from_str(author_id)]),
+            )
+            .and_then(|c| c.to_array::<budget::UsageRow>())
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no usage row".to_string())
+    }
 }
 
 #[cfg(test)]

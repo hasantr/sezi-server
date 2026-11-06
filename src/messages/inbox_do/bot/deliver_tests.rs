@@ -19,7 +19,7 @@ fn push(c: &Connection, at: i64) -> i64 {
 
 fn due(c: &Connection) -> Vec<i64> {
     let mut s = c.prepare(HOOK_DUE).unwrap();
-    s.query_map([10], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    s.query_map([0, 10], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
 }
 
 fn next(c: &Connection) -> Option<i64> {

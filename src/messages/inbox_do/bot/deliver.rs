@@ -56,9 +56,12 @@ pub(super) const SRC_DROP: &str = "DELETE FROM bot_update_src WHERE update_id >=
 pub(super) const SRC_ORPHANS: &str =
     "DELETE FROM bot_update_src WHERE update_id NOT IN (SELECT update_id FROM bot_updates)";
 /// What the webhook's queue owes, oldest first — not the updates set aside off its order
-/// (`deliver_order.rs`). Bind: limit.
+/// (`deliver_order.rs`), nor one past its 24 h window: the round runs before the tick's retention
+/// cleanup, and `getUpdates` hands out nothing older either (`updates::UPDATE_READ`, the same
+/// `created_at >= now - UPDATE_TTL_MS` rule). Bind: cutoff (`now - UPDATE_TTL_MS`), limit.
 pub(super) const HOOK_DUE: &str = "SELECT update_id, json, attempts, next_at FROM bot_updates
-      WHERE delivered_at IS NULL AND update_id NOT IN (SELECT update_id FROM bot_update_aside)
+      WHERE delivered_at IS NULL AND created_at >= ?
+        AND update_id NOT IN (SELECT update_id FROM bot_update_aside)
       ORDER BY update_id LIMIT ?";
 /// When the webhook next needs the alarm (0 = now): the queue's head, or the earliest set-aside
 /// update, whichever is first; NULL when nothing waits.
@@ -265,8 +268,10 @@ impl UserInbox {
             }
         }
         let sql = self.state.storage().sql();
+        // Past its window an update is owed to nobody (`HOOK_DUE`, `ASIDE_DUE`).
+        let cutoff = start - super::updates::UPDATE_TTL_MS;
         let main: Vec<Due> = match sql
-            .exec_raw(HOOK_DUE, Some(vec![JsValue::from_f64(max_posts as f64)]))
+            .exec_raw(HOOK_DUE, Some(vec![JsValue::from_f64(cutoff as f64), JsValue::from_f64(max_posts as f64)]))
             .and_then(|c| c.to_array())
         {
             Ok(r) => r,
@@ -277,7 +282,11 @@ impl UserInbox {
         };
         let aside = |limit: i64| -> Vec<Due> {
             let now = (now_secs() * 1000) as i64;
-            let args = vec![JsValue::from_f64(now as f64), JsValue::from_f64(limit as f64)];
+            let args = vec![
+                JsValue::from_f64(now as f64),
+                JsValue::from_f64((now - super::updates::UPDATE_TTL_MS) as f64),
+                JsValue::from_f64(limit as f64),
+            ];
             sql.exec_raw(ASIDE_DUE, Some(args)).and_then(|c| c.to_array()).unwrap_or_default()
         };
         let clock = || (now_secs() * 1000) as i64;

@@ -10,7 +10,8 @@
 //!   Before the sheet's address is set ("not connected"), each message is answered with one line
 //!   saying the bot is not set up yet; no row is queued and nothing is retried.
 //! - `ai`: one model call with that member's last 10 turns; the answer goes back as the bot's
-//!   message. With rows on, a `ROW:` line in the answer becomes a proposal the member is asked
+//!   message — up to 50 a member a day and the owner's `daily_calls` for the whole bot
+//!   (`ai_limit`); past either the member hears it instead. With rows on, a `ROW:` line in the answer becomes a proposal the member is asked
 //!   to confirm, shown whole; their "evet"/"yes" queues the row, "hayır"/"no" drops it, any
 //!   other message leaves it behind, and after 10 minutes it lapses. A passing failure
 //!   (unreachable, overloaded, rate-limited) is tried twice more (5 s, 30 s), then said; any
@@ -422,8 +423,10 @@ impl UserInbox {
         let day = bs::day_of(now);
         // The cap counts per member, across their 1:1 chat and every room.
         let used = store.db.int(bs::USAGE_GET, &[Arg::T(from), Arg::I(day)]).unwrap_or(0);
-        if used >= bs::DAILY_CALLS {
-            self.builtin_answer(ctx, ask, line(run.lang, Line::DailyLimit), spent).await;
+        // The bot's own day, every member together (H8); a total that cannot be read is spent.
+        let bot_used = store.db.int(bs::USAGE_DAY_TOTAL, &[Arg::I(day)]).unwrap_or(i64::MAX);
+        if let Some(l) = ai_limit(used, bot_used, ai.daily_calls) {
+            self.builtin_answer(ctx, ask, line(run.lang, l), spent).await;
             return Handled::Done;
         }
         let Some(key) = self.builtin_api_key() else {
@@ -546,3 +549,20 @@ impl UserInbox {
         }
     }
 }
+
+/// Which day's limit refuses an AI bot's model call, if any: the member's own
+/// [`bs::DAILY_CALLS`] first, then the bot's `daily_calls`, every member together (review H8).
+/// `bot_used` is `i64::MAX` when the day's total could not be read, so the cap fails closed.
+fn ai_limit(member_used: i64, bot_used: i64, daily_calls: u32) -> Option<Line> {
+    if member_used >= bs::DAILY_CALLS {
+        Some(Line::DailyLimit)
+    } else if bot_used >= i64::from(daily_calls) {
+        Some(Line::BotDailyLimit)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+#[path = "builtin_run_tests.rs"]
+mod tests;

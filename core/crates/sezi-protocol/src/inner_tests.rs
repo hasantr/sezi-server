@@ -992,6 +992,29 @@ fn inner_message_plugin_epoch_key_share_roundtrip() {
     }
 }
 
+/// Review 2026-11 H1: a member below the relay's epoch floor asks the room's admins for a new
+/// epoch. Invisible (a build that does not know it drops it silently), primary-only like the
+/// other plugin pulls, and the floor it names survives the round trip.
+#[test]
+fn inner_message_plugin_epoch_request_roundtrip() {
+    let msg = InnerMessage::PluginEpochRequest {
+        room: "g-aile".into(),
+        plugin: "html:meydan".into(),
+        floor: 3,
+    };
+    assert!(msg.is_invisible(), "an older build must not draw it");
+    assert!(!msg.requires_device_fanout(), "a pull goes to the admin's primary");
+    let bytes = msg.encode();
+    let json = String::from_utf8(bytes.clone()).unwrap();
+    assert!(json.contains(r#""kind":"plugin_epoch_request""#), "json: {json}");
+    match InnerMessage::decode(&bytes).unwrap() {
+        InnerMessage::PluginEpochRequest { room, plugin, floor } => {
+            assert_eq!((room.as_str(), plugin.as_str(), floor), ("g-aile", "html:meydan", 3));
+        }
+        other => panic!("expected PluginEpochRequest, got {other:?}"),
+    }
+}
+
 #[test]
 fn inner_message_group_receipt_roundtrip() {
     let msg = InnerMessage::GroupReceipt {

@@ -54,6 +54,7 @@ fn a_stored_key_follows_only_the_service_it_was_given_for() {
         model: "m".into(),
         instructions: "x".into(),
         sheet_tool: false,
+        daily_calls: DEFAULT_AI_DAILY_CALLS,
     };
     let c = |a: AiConfig| Config { kind: Kind::Ai, lang: Lang::Tr, sheet_url: None, ai: Some(a), hearings: None };
     let old = ai(Provider::Openai, Some("https://api.openai.com/v1"));
@@ -144,6 +145,36 @@ fn an_ai_bot_is_checked_field_by_field() {
     assert_eq!(put(serde_json::json!({ "kind": "ai" })), Err("builtin/ai"));
 }
 
+/// H8: an AI bot's model calls a day, every member together, are bounded by the owner's
+/// `daily_calls` — [`DEFAULT_AI_DAILY_CALLS`] when unsaid, and for a configuration stored before
+/// the setting existed.
+#[test]
+fn an_ai_bot_has_a_bot_wide_daily_cap() {
+    let ai = |extra: serde_json::Value| {
+        let mut v = serde_json::json!({ "provider": "anthropic", "model": "m", "instructions": "x" });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        put(serde_json::json!({ "kind": "ai", "ai": v })).map(|c| c.config.unwrap().ai.unwrap().daily_calls)
+    };
+    assert_eq!(ai(serde_json::json!({})), Ok(DEFAULT_AI_DAILY_CALLS));
+    assert_eq!(ai(serde_json::json!({ "daily_calls": 40 })), Ok(40));
+    assert_eq!(ai(serde_json::json!({ "daily_calls": *AI_DAILY_CALLS.end() })), Ok(*AI_DAILY_CALLS.end()));
+    assert_eq!(ai(serde_json::json!({ "daily_calls": 0 })), Err("builtin/ai-daily-calls"));
+    assert_eq!(
+        ai(serde_json::json!({ "daily_calls": *AI_DAILY_CALLS.end() + 1 })),
+        Err("builtin/ai-daily-calls")
+    );
+    // What an inbox stored before the setting existed reads the default.
+    let old: Config = serde_json::from_value(serde_json::json!({
+        "kind": "ai", "lang": "tr",
+        "ai": { "provider": "openai", "model": "m", "instructions": "x" },
+    }))
+    .unwrap();
+    assert_eq!(old.ai.as_ref().unwrap().daily_calls, DEFAULT_AI_DAILY_CALLS);
+    assert_eq!(old.to_owner_json(false)["ai"]["daily_calls"], DEFAULT_AI_DAILY_CALLS);
+}
+
 #[test]
 fn an_ai_bot_keeps_a_sheet_only_when_it_writes_rows() {
     let sheet = serde_json::json!({ "url": "https://script.google.com/macros/s/AKfy/exec" });
@@ -175,7 +206,8 @@ fn the_owner_reads_the_config_back_without_any_key() {
         serde_json::json!({
             "kind": "ai", "lang": "en", "sheet": null,
             "ai": { "provider": "openai", "base_url": null, "model": "openai/gpt-5",
-                    "instructions": "Be brief.", "sheet_tool": false },
+                    "instructions": "Be brief.", "sheet_tool": false,
+                    "daily_calls": DEFAULT_AI_DAILY_CALLS },
             "has_api_key": true,
         })
     );

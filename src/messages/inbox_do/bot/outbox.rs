@@ -286,7 +286,8 @@ impl UserInbox {
     }
 
     /// Arm the alarm for whatever the bot still owes: now while frames wait, else the outbox's
-    /// earliest retry, or the webhook's next attempt. (`arm_alarm_within` only ever pulls an alarm EARLIER.)
+    /// earliest retry, or the webhook's next attempt, or the oldest kept update's or file's expiry.
+    /// (`arm_alarm_within` only ever pulls an alarm EARLIER.)
     pub(super) async fn bot_rearm(&self) {
         let now = (now_secs() * 1000) as i64;
         let store = self.bot_store();
@@ -300,8 +301,12 @@ impl UserInbox {
             self.arm_alarm_within(0).await;
             return;
         }
+        // Members' updates and files go after 24 h whether or not anyone polls or writes: an
+        // idle inbox has no other alarm, and only a tick runs the expiry (review H7).
+        let keep = || super::store::Arg::I(super::updates::UPDATE_TTL_MS);
         let next = [
             store.db.int(OUTBOX_NEXT, &[]),
+            store.db.int(super::updates::RETENTION_NEXT, &[keep(), keep()]),
             self.bot_webhook_next(),
             self.bot_builtin_next(),
             self.bot_builtin_expiry_next(),

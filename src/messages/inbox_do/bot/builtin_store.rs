@@ -94,7 +94,7 @@ pub(super) const USAGE_GET: &str = "SELECT n FROM bot_ai_usage WHERE user_id = ?
 /// Bind: user, day.
 pub(super) const USAGE_BUMP: &str = "INSERT INTO bot_ai_usage (user_id, day, n) VALUES (?, ?, 1)
       ON CONFLICT(user_id, day) DO UPDATE SET n = n + 1";
-/// The bot's model calls on a day, every member together (a hearings bot's `daily_calls`).
+/// The bot's model calls on a day, every member together (the `daily_calls` of a hearings or AI bot).
 /// Bind: day.
 pub(super) const USAGE_DAY_TOTAL: &str = "SELECT COALESCE(SUM(n), 0) AS n FROM bot_ai_usage WHERE day = ?";
 /// Bind: the oldest day kept.

@@ -5,3 +5,4 @@ Run, from this directory:
 
 Environment (all optional; a missing one is the relay's default): FCM_PROJECT_ID, FCM_SERVICE_ACCOUNT, PUSH_RELAY_URL, RESET_PASSWORD, SEZI_CLAIM_SECRET, SEZI_TRUSTED_PROXY_HEADER, SEZI_WEB_ORIGINS, SFU_APP_ID, SFU_APP_TOKEN, SFU_CAP_GB, SFU_ROUTE, TURN_API_TOKEN, TURN_KEY_ID, TURN_MONTHLY_CAP, TURN_USER_MONTHLY_CAP
 Text bindings baked into the captured config and dropped: none
+Outbound networks, public addresses only: internet

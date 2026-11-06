@@ -17,7 +17,10 @@ use worker::{console_log, kv::KvStore, Env, Result};
 /// omit the namespace, and losing a rate limit is a better failure than losing the
 /// endpoint. It does mean a limit is never a BOUND — anything that must actually be
 /// bounded needs a D1 count beside it, the way `groups::create_group` pairs its brake
-/// with `MAX_OWNED_GROUPS`.
+/// with `MAX_OWNED_GROUPS`, and the plugin log and plugin media pair theirs with a member's
+/// byte budget per room (`plugin_log_budget.rs`, `plugin_media::MAX_BYTES_PER_MEMBER_PER_ROOM`;
+/// review 2026-11 H10, which proposed failing closed for writes here instead — the budgets bound
+/// what an app can leave behind whether or not this binding exists, and cost no endpoint).
 pub async fn check_rate_limit_env(env: &Env, key: &str, max_hits: usize, window_sec: u64) -> bool {
     check_rate_limit_weighted_env(env, key, max_hits, window_sec, 1).await
 }

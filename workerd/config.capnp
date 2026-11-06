@@ -11,8 +11,8 @@ const config :Workerd.Config = ( services = [
             esModule = embed "modules/core_user_sezi-server--__mf_do_wrapper.js" ),
           ( name = "shim.js",
             esModule = embed "modules/core_user_sezi-server--shim.js" ),
-          ( name = "e10f05167f34a4d4e38063bd896e0d5e800756a0-index_bg.wasm",
-            wasm = embed "modules/core_user_sezi-server--e10f05167f34a4d4e38063bd896e0d5e800756a0-index_bg.wasm" ) ],
+          ( name = "8211f5a18ebe1f7af936f295125ee06ba67b4fea-index_bg.wasm",
+            wasm = embed "modules/core_user_sezi-server--8211f5a18ebe1f7af936f295125ee06ba67b4fea-index_bg.wasm" ) ],
         compatibilityDate = "2026-10-23",
         compatibilityFlags = ["nodejs_compat"],
         bindings = [
@@ -261,7 +261,7 @@ const config :Workerd.Config = ( services = [
         containerEngine = (none = void) ) ),
     ( name = "internet",
       network = (
-        allow = ["public", "private", "240.0.0.0/4"],
+        allow = ["public"],
         deny = [],
         tlsOptions = (
           requireClientCerts = false,

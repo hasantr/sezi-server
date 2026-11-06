@@ -5,7 +5,7 @@
 use super::super::deliver::{HOOK_DUE, HOOK_NEXT};
 use super::super::store::tests::Lite;
 use super::super::store::TABLES as BOT_TABLES;
-use super::super::updates::UPDATE_PUSH;
+use super::super::updates::{UPDATE_PUSH, UPDATE_TTL_MS};
 use super::*;
 use rusqlite::{params, Connection};
 use std::cell::{Cell, RefCell};
@@ -64,9 +64,10 @@ impl Sim {
     /// The same, with `max_posts` of the tick's purse.
     fn round_within(&self, max_posts: i64) -> (bool, i64) {
         let c = &self.db.0;
-        let main = rows(c, HOOK_DUE, &[max_posts]);
         let now = self.clock.get();
-        let aside = |limit: i64| rows(c, ASIDE_DUE, &[now, limit]);
+        let cutoff = now - UPDATE_TTL_MS;
+        let main = rows(c, HOOK_DUE, &[cutoff, max_posts]);
+        let aside = |limit: i64| rows(c, ASIDE_DUE, &[now, cutoff, limit]);
         block_on(hook_round(&self.db, main, aside, max_posts, || self.clock.get(), |id, json| {
             assert!(json.contains(&format!("\"update_id\":{id}")), "the POST names its update");
             let taken = !(self.refuse)(id);
@@ -217,11 +218,11 @@ fn the_alarm_follows_the_queue_head_and_the_earliest_set_aside_update() {
     c.execute(HOOK_RETRY, params![50_000, a]).unwrap();
     c.execute(ASIDE_PUT, [a]).unwrap();
     assert_eq!(next(), Some(0), "b heads the queue now, due at once");
-    assert_eq!(rows(c, HOOK_DUE, &[10]).iter().map(|d| d.update_id).collect::<Vec<_>>(), vec![b]);
+    assert_eq!(rows(c, HOOK_DUE, &[0, 10]).iter().map(|d| d.update_id).collect::<Vec<_>>(), vec![b]);
     c.execute(HOOK_DONE, [b]).unwrap();
     assert_eq!(next(), Some(50_000), "only the set-aside one waits");
-    assert_eq!(rows(c, ASIDE_DUE, &[49_999, 10]).len(), 0);
-    assert_eq!(rows(c, ASIDE_DUE, &[50_000, 10]).len(), 1);
+    assert_eq!(rows(c, ASIDE_DUE, &[49_999, 0, 10]).len(), 0);
+    assert_eq!(rows(c, ASIDE_DUE, &[50_000, 0, 10]).len(), 1);
     c.execute(HOOK_DONE, [a]).unwrap();
     assert_eq!(next(), None);
 }
@@ -239,4 +240,39 @@ fn the_do_drives_this_round_and_marks_what_it_takes_read() {
     assert!(round.contains("ASIDE_DUE"), "set-aside updates are never retried");
     let housekeeping = include_str!("send.rs");
     assert!(housekeeping.contains("ASIDE_ORPHANS"), "marks outlive their updates");
+}
+
+/// An update past its 24 h window is never POSTed (A4's follow-up): the webhook round ran before
+/// the tick's retention cleanup, so a program whose webhook kept failing could be handed, once, an
+/// update the window had already ended — and `getUpdates` would not have shown it
+/// (`updates::UPDATE_READ`). Both ways out now apply the one rule: `created_at >= now - 24 h`.
+#[test]
+fn an_update_past_its_window_is_never_posted_queued_or_set_aside() {
+    // Behind an endpoint that is down: the queue's head.
+    let down = Sim::new(|_| true);
+    down.push();
+    down.run_until(T0 + 24 * HOUR - 1);
+    let before = down.posts.borrow().len();
+    down.db.0.execute("UPDATE bot_updates SET next_at = 0", []).unwrap();
+    down.clock.set(T0 + UPDATE_TTL_MS + 1);
+    down.round();
+    assert_eq!(down.posts.borrow().len(), before, "the head is past its window: no POST");
+
+    // Set aside as poison, its own ladder due again only after the window.
+    let sim = Sim::new(|id| id == 1);
+    let ids: Vec<i64> = (0..2).map(|_| sim.push()).collect();
+    sim.run_until(T0 + 20 * MIN);
+    assert_eq!(sim.aside(), 1);
+    let before = sim.posts_of(ids[0]);
+    sim.db.0.execute("UPDATE bot_updates SET next_at = 0", []).unwrap();
+    sim.clock.set(T0 + UPDATE_TTL_MS + 1);
+    sim.round();
+    assert_eq!(sim.posts_of(ids[0]), before, "the set-aside one is past its window too");
+
+    // Inside the window, the same update is still owed.
+    let fresh = Sim::new(|_| true);
+    fresh.push();
+    fresh.clock.set(T0 + UPDATE_TTL_MS);
+    fresh.round();
+    assert_eq!(fresh.posts.borrow().len(), 1, "exactly 24 h is still inside");
 }

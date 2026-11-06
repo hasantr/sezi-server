@@ -9,7 +9,8 @@
 //!   admin). Every client reads it to filter its plugin picker. Returns
 //!   `{"disabled":[...]}`.
 //! - **POST /admin/plugin-policy** — auth: `require_admin` (admin|owner). Body:
-//!   `{"plugin_id":"...","disabled":true|false}`. true → INSERT OR REPLACE
+//!   `{"plugin_id":"...","disabled":true|false}` — a built-in's bare id or a web app's
+//!   `html:…` ([`plugin_id_ok`]; anything else is `400 plugin/bad-id`). true → INSERT OR REPLACE
 //!   (disable); false → DELETE (enable). Returns `{"ok":true,"disabled":[...]}`
 //!   with the up-to-date list.
 //!
@@ -106,21 +107,52 @@ pub(crate) async fn append_refused(db: &D1Database, plugin_id: &str) -> bool {
     refuses_append(plugin_id, row_present)
 }
 
+/// The refusal of a plugin id outside [`plugin_id_ok`] — on a policy write and on both plugin-log
+/// handlers. A `400`, terminal for every app (see [`APPEND_REFUSED_STATUS`]).
+pub(crate) const BAD_ID_CODE: &str = "plugin/bad-id";
+
 #[derive(Deserialize, Default)]
 struct PolicyBody {
     plugin_id: Option<String>,
     disabled: Option<bool>,
 }
 
-/// plugin_id validation: non-empty, ≤128 chars, [A-Za-z0-9._-] (slug or
-/// reverse-DNS id). The tight charset guards against SQL/log injection and
-/// control-character DoS (same class as cf_config's field_ok, but stricter
-/// because this is a PRIMARY KEY).
-fn plugin_id_ok(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+/// The longest plugin id, in bytes — the core's `MAX_PLUGIN_ID_BYTES`
+/// (`core/src/kernel/plugin_install_inbound.rs`).
+pub(crate) const MAX_PLUGIN_ID_BYTES: usize = 128;
+/// The longest namespace before an id's `:` — the core's `MAX_ID_NAMESPACE_BYTES`.
+const MAX_ID_NAMESPACE_BYTES: usize = 32;
+
+/// A plugin id the relay takes — in the policy table (a PRIMARY KEY) and in a plugin-log path.
+/// Non-empty, ≤ [`MAX_PLUGIN_ID_BYTES`], `[A-Za-z0-9._:-]` only (no space, slash, control or
+/// non-ASCII: nothing that escapes a URL, a log line or a key), and one of the core's two shapes:
+/// a BARE id (a compiled-in plugin: `draw`, `library`, a reverse-DNS `com.sezi.arena`), or
+/// `<namespace>:<name>` with a lowercase `[a-z0-9-]{1,32}` namespace and a non-empty name — every
+/// web app (`html:…`) and the manifest ids to come (`ext:…`). Until review 2026-11 H9 the `:` was
+/// refused, so the owner's switch could reach no web app at all.
+///
+/// Which namespaces an INSTALL may take is the core's rule (`install_refusal`); the relay keeps
+/// no list of them, so a namespace added tomorrow needs no relay release.
+pub(crate) fn plugin_id_ok(s: &str) -> bool {
+    if s.is_empty()
+        || s.len() > MAX_PLUGIN_ID_BYTES
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        return false;
+    }
+    match s.split_once(':') {
+        None => true,
+        Some((namespace, name)) => {
+            !namespace.is_empty()
+                && namespace.len() <= MAX_ID_NAMESPACE_BYTES
+                && namespace
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !name.is_empty()
+        }
+    }
 }
 
 /// `POST /admin/plugin-policy` — admin|owner disables/enables one plugin
@@ -139,7 +171,8 @@ pub async fn set_plugin_policy(mut req: Request, ctx: RouteContext<()>) -> Resul
     let body: PolicyBody = req.json().await.unwrap_or_default();
     let plugin_id = match body.plugin_id.as_deref().map(str::trim) {
         Some(p) if plugin_id_ok(p) => p.to_string(),
-        _ => return json_err(400, "bad_request"),
+        Some(_) => return json_err(400, BAD_ID_CODE),
+        None => return json_err(400, "bad_request"),
     };
     let Some(disabled) = body.disabled else {
         return json_err(400, "bad_request");
@@ -246,5 +279,30 @@ mod tests {
         assert!(!plugin_id_ok("a\nb"));
         assert!(!plugin_id_ok("emoji😀"));
         assert!(!plugin_id_ok("path/traversal"));
+    }
+
+    /// Review 2026-11 H9: every web app's id is `html:<name>` (the editor's `html:u-<base36>`, the
+    /// built-in `html:echo`), and the owner's switch must reach them — the core already obeys a
+    /// policy row for any id (`core/src/kernel/plugin_policy.rs`). The shape is the core's install
+    /// rule (`plugin_install_inbound.rs` `install_refusal`): a lowercase namespace before the `:`,
+    /// a non-empty name after it.
+    #[test]
+    fn a_web_app_id_can_be_switched_off() {
+        assert!(plugin_id_ok("html:echo"));
+        assert!(plugin_id_ok("html:u-m3k9x2a"));
+        assert!(plugin_id_ok("ext:com.example.board"), "a later namespace, the same shape");
+        assert!(plugin_id_ok("html:a:b"), "the name may hold a colon, as the core allows");
+        assert!(!plugin_id_ok("html:"), "no name");
+        assert!(!plugin_id_ok(":echo"), "no namespace");
+        assert!(!plugin_id_ok("HTML:echo"), "a namespace is lowercase");
+        assert!(!plugin_id_ok(&format!("{}:x", "n".repeat(33))), "a namespace is ≤ 32 bytes");
+        assert!(!plugin_id_ok(&format!("html:{}", "a".repeat(124))), "the whole id is ≤ 128");
+        assert!(!plugin_id_ok("html:a b"));
+        assert!(!plugin_id_ok("html:a/b"));
+    }
+
+    #[test]
+    fn a_bad_id_is_refused_with_a_typed_code() {
+        assert_eq!(BAD_ID_CODE, "plugin/bad-id");
     }
 }

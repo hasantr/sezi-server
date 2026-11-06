@@ -54,10 +54,12 @@ pub(super) const TABLES: [&str; 1] = [
 pub(super) const ASIDE_PUT: &str = "INSERT OR IGNORE INTO bot_update_aside (update_id) VALUES (?)";
 /// Bind: update_id.
 pub(super) const ASIDE_DROP: &str = "DELETE FROM bot_update_aside WHERE update_id = ?";
-/// Set-aside updates due now, oldest first. Bind: now, limit.
+/// Set-aside updates due now and still inside their 24 h window, oldest first. Bind: now, cutoff
+/// (`now - UPDATE_TTL_MS`), limit.
 pub(super) const ASIDE_DUE: &str = "SELECT u.update_id, u.json, u.attempts, u.next_at
       FROM bot_updates u JOIN bot_update_aside a ON a.update_id = u.update_id
-     WHERE u.delivered_at IS NULL AND COALESCE(u.next_at, 0) <= ? ORDER BY u.update_id LIMIT ?";
+     WHERE u.delivered_at IS NULL AND COALESCE(u.next_at, 0) <= ? AND u.created_at >= ?
+     ORDER BY u.update_id LIMIT ?";
 /// Marks whose update was taken, polled, confirmed or expired.
 pub(super) const ASIDE_ORPHANS: &str = "DELETE FROM bot_update_aside WHERE update_id NOT IN
       (SELECT update_id FROM bot_updates WHERE delivered_at IS NULL)";

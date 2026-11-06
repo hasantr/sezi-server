@@ -89,11 +89,51 @@ fn db() -> Connection {
 }
 
 fn read(c: &Connection, offset: i64, limit: i64) -> Vec<i64> {
+    read_at(c, offset, i64::MIN, limit)
+}
+
+/// What a poll at `cutoff` (= now − the window) answers.
+fn read_at(c: &Connection, offset: i64, cutoff: i64, limit: i64) -> Vec<i64> {
     let mut s = c.prepare(UPDATE_READ).unwrap();
-    s.query_map(params![offset, limit], |r| r.get(0))
+    s.query_map(params![offset, cutoff, limit], |r| r.get(0))
         .unwrap()
         .map(Result::unwrap)
         .collect()
+}
+
+/// H7: an idle bot's housekeeping runs only on a tick, so a row past its 24 h may still be in
+/// the table when a poll comes. A poll never hands it out, below the offset or above it.
+#[test]
+fn a_poll_never_hands_out_an_update_past_its_window() {
+    let c = db();
+    c.query_row(UPDATE_PUSH, params!["{}", 1_000], |r| r.get::<_, i64>(0)).unwrap();
+    c.query_row(UPDATE_PUSH, params!["{}", 5_000], |r| r.get::<_, i64>(0)).unwrap();
+    let now = 1_000 + UPDATE_TTL_MS + 1;
+    assert_eq!(read_at(&c, 0, now - UPDATE_TTL_MS, 100), vec![2], "1 is past 24 h");
+    assert_eq!(read_at(&c, 5, now - UPDATE_TTL_MS, 100), vec![2], "nor below a wrong offset");
+    assert_eq!(read_at(&c, 0, 1_000, 100), vec![1, 2], "at exactly 24 h it is still served");
+}
+
+/// H7: the alarm comes back when the oldest update or member's file is due to go, so retention
+/// holds for a bot nobody polls and nobody writes to. NULL when nothing is kept.
+#[test]
+fn the_alarm_comes_back_when_the_oldest_update_or_file_is_due_to_go() {
+    let c = db();
+    for t in super::super::files::TABLES {
+        c.execute_batch(t).unwrap();
+    }
+    let next = |c: &Connection| -> Option<i64> {
+        c.query_row(RETENTION_NEXT, params![UPDATE_TTL_MS, UPDATE_TTL_MS], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(next(&c), None, "nothing kept, no alarm");
+    c.query_row(UPDATE_PUSH, params!["{}", 9_000], |r| r.get::<_, i64>(0)).unwrap();
+    // One past the window: `UPDATE_EXPIRE` deletes rows strictly older than the cutoff.
+    assert_eq!(next(&c), Some(9_000 + UPDATE_TTL_MS + 1));
+    c.execute(super::super::files::FILE_PUT, params!["f-1", 1, "alice", "{}", 4_000]).unwrap();
+    assert_eq!(next(&c), Some(4_000 + UPDATE_TTL_MS + 1), "a file's key goes on time too");
+    // At that moment the housekeeping's own cutoff takes the file.
+    c.execute(super::super::files::FILE_EXPIRE, [4_000 + UPDATE_TTL_MS + 1 - UPDATE_TTL_MS]).unwrap();
+    assert_eq!(next(&c), Some(9_000 + UPDATE_TTL_MS + 1));
 }
 
 #[test]

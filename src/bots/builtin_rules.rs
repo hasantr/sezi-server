@@ -7,7 +7,10 @@
 //! `.internal`, `.lan`, `.home.arpa`, `.localdomain`, `.box`, `.corp` or `.home` — a self-hosted
 //! relay sits on someone's LAN, and its fetch reaches whatever that LAN has. The same rule is
 //! applied to every redirect hop the sheet follows. It judges NAMES only: a public name that
-//! resolves to a private address gets through.
+//! resolves to a private address gets through it. The ADDRESS is the network's to refuse: on
+//! Cloudflare no private network is reachable, and the bare-workerd config a self-hosted relay
+//! runs restricts its outbound network to public addresses, applied to what a name resolves to
+//! (`scripts/workerd_config.py`, `OUTBOUND_ALLOW`; review H6).
 //!
 //! **The lab escape.** `BOT_BUILTIN_ALLOW_LAN=1` in the relay's environment lifts the host rule
 //! and allows `http`, so the E2E lab can point a bot at a stand-in endpoint on its own network.
@@ -27,6 +30,17 @@ const MAX_KEY_CHARS: usize = 512;
 const MAX_URL_LEN: usize = 512;
 /// The environment switch that lets the lab reach its own network (module doc).
 pub(crate) const ALLOW_LAN_VAR: &str = "BOT_BUILTIN_ALLOW_LAN";
+/// An AI bot's model calls a (UTC) day, every member together, when the owner says nothing — and
+/// for a configuration stored before the setting existed (review H8).
+///
+/// Each member has their own 50 a day; without a bot-wide bound the owner's bill grew with the
+/// headcount alone (80 members × 50 calls on an expensive model). A chat call carries at most ten
+/// turns of context, far less than a hearing record, so the default sits above the hearings
+/// bot's 300: ten members at their full 50, or many more at ordinary use. The owner may set it.
+pub(crate) const DEFAULT_AI_DAILY_CALLS: u32 = 500;
+/// What the owner may set it to: at least one, and at most what 200 members at their own 50
+/// would spend — past that the bound means little, and a larger number is likelier a slip.
+pub(crate) const AI_DAILY_CALLS: std::ops::RangeInclusive<u32> = 1..=10_000;
 
 /// What a built-in bot is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +152,9 @@ pub(crate) struct AiIn {
     pub(crate) instructions: String,
     #[serde(default)]
     pub(crate) sheet_tool: bool,
+    /// Absent = [`DEFAULT_AI_DAILY_CALLS`].
+    #[serde(default)]
+    pub(crate) daily_calls: Option<u32>,
 }
 
 /// What the bot's inbox keeps (`bot_kv` `builtin`). No key and no secret are in it: those are
@@ -165,6 +182,14 @@ pub(crate) struct AiConfig {
     pub(crate) instructions: String,
     #[serde(default)]
     pub(crate) sheet_tool: bool,
+    /// Model calls a day for the whole bot ([`DEFAULT_AI_DAILY_CALLS`] for a configuration
+    /// stored before the setting existed).
+    #[serde(default = "default_ai_daily_calls")]
+    pub(crate) daily_calls: u32,
+}
+
+fn default_ai_daily_calls() -> u32 {
+    DEFAULT_AI_DAILY_CALLS
 }
 
 impl Config {
@@ -247,6 +272,7 @@ impl Config {
                 "model": a.model,
                 "instructions": a.instructions,
                 "sheet_tool": a.sheet_tool,
+                "daily_calls": a.daily_calls,
             })),
             "has_api_key": has_api_key,
         });
@@ -317,6 +343,10 @@ pub(crate) fn validate(body: PutBody, allow_lan: bool) -> Result<Checked, &'stat
             if instructions.is_empty() || instructions.chars().count() > MAX_INSTRUCTIONS_CHARS {
                 return Err("builtin/ai-instructions");
             }
+            let daily_calls = ai.daily_calls.unwrap_or(DEFAULT_AI_DAILY_CALLS);
+            if !AI_DAILY_CALLS.contains(&daily_calls) {
+                return Err("builtin/ai-daily-calls");
+            }
             let config = Config {
                 kind,
                 lang,
@@ -329,6 +359,7 @@ pub(crate) fn validate(body: PutBody, allow_lan: bool) -> Result<Checked, &'stat
                     model: model.to_string(),
                     instructions: instructions.to_string(),
                     sheet_tool: ai.sheet_tool,
+                    daily_calls,
                 }),
                 hearings: None,
             };

@@ -70,12 +70,13 @@ pub(crate) fn taken(status: u16) -> bool {
 /// with its lab escape); else `None`.
 ///
 /// The host rule is not optional. A relay on Cloudflare cannot reach a private network, but a
-/// self-hosted one runs on bare workerd with miniflare's `internet` service, which allows
-/// `private` addresses: there the bot inbox's POST reaches whatever the owner's LAN and the
-/// relay's own machine have (the router's page, a NAS, a local admin port). Whoever holds a bot's
-/// key — the owner's program, a developer it was given to, someone it leaked to — would have had
-/// that reach. As with the built-in rule, a public NAME that resolves to a private address is not
-/// caught here.
+/// self-hosted one runs on bare workerd, whose network miniflare's capture allowed `private`
+/// addresses: there the bot inbox's POST reached whatever the owner's LAN and the relay's own
+/// machine have (the router's page, a NAS, a local admin port). Whoever holds a bot's key — the
+/// owner's program, a developer it was given to, someone it leaked to — would have had that
+/// reach. As with the built-in rule, a public NAME that resolves to a private address is not
+/// caught here; since review H6 the generated config's network refuses the address itself
+/// (`scripts/workerd_config.py`, `OUTBOUND_ALLOW`), so a relay built since is closed both ways.
 pub(crate) fn clean_url(raw: &str, allow_lan: bool) -> Option<String> {
     if raw.trim().len() > MAX_URL_LEN {
         return None;

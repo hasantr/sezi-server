@@ -584,6 +584,17 @@ pub enum InnerMessage {
         epoch: i64,
         key_b64: String,
     },
+    /// A member's append was refused below the relay's epoch floor (`409 epoch_stale`), and only
+    /// a room admin may mint the shared epoch: it asks the room's admins for one at or past
+    /// `floor` (review 2026-11 H1, 2026-11-06). An admin answers with a `PluginEpochKeyShare` —
+    /// a new epoch, or its current one when that is already at the floor. INBOUND GATE: from an
+    /// active member, for a plugin the receiver has; the claimed floor is bounded by the
+    /// receiver. Invisible control; an older client drops it.
+    PluginEpochRequest {
+        room: String,
+        plugin: String,
+        floor: i64,
+    },
     /// Self-copy (M2-S3.1): a separate Olm envelope of a 1:1 message going from device A to
     /// a peer, addressed to the sender's OWN other active devices (active_ids(my_user) MINUS
     /// my_device). My own receiving device catches it in the early branch → and writes it
@@ -1090,6 +1101,7 @@ impl InnerMessage {
                 | InnerMessage::HistoryPageRequest { .. }
                 | InnerMessage::HistoryPageAnswer { .. }
                 | InnerMessage::Indirect(_)
+                | InnerMessage::PluginEpochRequest { .. }
         )
     }
 
