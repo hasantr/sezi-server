@@ -2,7 +2,7 @@
 //!
 //! | method | body | answer |
 //! |---|---|---|
-//! | `getMe` | `{}` | `{ok, bot:{bot_id, name, about}}` |
+//! | `getMe` | `{}` | `{ok, bot:{bot_id, name, about}, api_version, features}` (API v1; the contract is `tools/bots/API_V1.md`) |
 //! | `getUpdates` | `{offset?, timeout? 0..25, limit? 1..100}` | `{ok, updates:[…]}`; below `offset`, what a poll handed out is confirmed and deleted |
 //! | `sendMessage` | `{chat:{user_id}\|{room_id}, text ≤4000, reply_to?, client_id?}` | `{ok, message_id}` (`b-<uuid>`); a repeated `client_id` answers the first send's `message_id` with `duplicate: true` |
 //! | `setWebhook` | `{url}` (https; `""` or `null` clears) | `{ok, webhook_secret}` |

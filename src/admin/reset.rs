@@ -216,6 +216,11 @@ const KEEP_TABLES: &[&str] = &[
     "server_settings",
     "server_config",
     "server_plugin_policy",
+    // The owner's plugin allowlist (Wave C3): configuration, like the per-plugin switches above.
+    // `added_by` may then name an account that is gone; nothing joins on it.
+    "plugin_allowlist",
+    // The owner's app catalog (Wave C5): configuration too, and its bundles stay referenced.
+    "app_catalog",
     "storage_backends",
     // Populated by the wipe itself: the blobs still have to be deleted from the store.
     "storage_orphans",
@@ -224,6 +229,10 @@ const KEEP_TABLES: &[&str] = &[
     // The month's SFU spend on the owner's Cloudflare app. The money is spent whatever the D1
     // says; wiping it would hand the month's cap back in full.
     "sfu_usage",
+    // The box's update requests and results (`server_update.rs`): the history of the machine, not
+    // of its people — a wipe leaves the box on the build it runs. `requested_by` may then name an
+    // account that is gone; nothing joins on it.
+    "server_update_requests",
 ];
 
 pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {

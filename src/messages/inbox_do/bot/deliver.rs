@@ -226,13 +226,7 @@ impl UserInbox {
     /// `/bot/ping`: the owner's "Dene" — a `ping` update, delivered like any other.
     pub(super) async fn bot_ping(&self, who: serde_json::Value) -> Result<Response> {
         let now = (now_secs() * 1000) as i64;
-        let owner = who.get("user_id").cloned().unwrap_or(serde_json::Value::Null);
-        let update = serde_json::json!({
-            "kind": "ping",
-            "at": now,
-            "chat": { "type": "direct", "user_id": owner },
-            "who": who,
-        });
+        let update = super::updates::ping_update(now, who);
         let Some(update_id) = self.bot_push_update(&update, now) else {
             return Response::error("update write failed", 500);
         };

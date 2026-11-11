@@ -20,7 +20,7 @@
 //! Delivered = a 2xx or a 3xx, fetched with `redirect: manual`: an Apps Script web app answers
 //! its POST with a 302 after the script ran, and following it would only fetch the result page.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use worker::*;
 
@@ -34,7 +34,7 @@ pub(crate) const ENVELOPE_V: u32 = 1;
 const MAX_URL_LEN: usize = 512;
 
 fn hmac_hex(key: &[u8], data: &[u8]) -> String {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(data);
     hex::encode(mac.finalize().into_bytes())
 }

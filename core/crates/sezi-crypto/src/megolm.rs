@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn olm_envelope_rejected_by_megolm() {
         // to_megolm must reject an envelope with kind != 2 (no protocol mixing).
-        let env = WireEnvelope { kind: 1, ciphertext: "AAAA".into(), session_id: None };
+        let env = WireEnvelope { kind: 1, ciphertext: "AAAA".into(), session_id: None, schedule: None };
         assert!(env.to_megolm().is_err());
     }
 

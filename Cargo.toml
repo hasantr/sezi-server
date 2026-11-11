@@ -20,10 +20,10 @@ serde_json = "1"
 console_error_panic_hook = "0.1"
 
 # Crypto
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
-sha2 = "0.10"
-pbkdf2 = { version = "0.12", default-features = false }
-hmac = "0.12"
+ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
+sha2 = "0.11"
+pbkdf2 = { version = "0.13", default-features = false }
+hmac = "0.13"
 # device_id türetimi (core ile parite: hex(blake3(ed_pub)[..8])). no_std/portable
 # (wasm32 SIMD-yok fallback) — default-features kapalı.
 blake3 = { version = "1", default-features = false }
@@ -31,15 +31,19 @@ blake3 = { version = "1", default-features = false }
 # Sealing the frame a wake carries to its device (`push/carry.rs`). The core's own AEAD, so the
 # two halves of the sealed form are one primitive; no default features (the nonce comes from
 # `getrandom` below).
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 
 # Encoding
-base64 = "0.22"
+# Scalar `general_purpose` engines only; the default `simd-unsafe` engines are not used here.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 hex = "0.4"
 
 # Misc
 uuid = { version = "1", features = ["v4", "js"] }
-getrandom = { version = "0.2", features = ["js"] }
+# The relay's own randomness (nonces, keys, salts), from the platform's crypto.getRandomValues. The
+# same major the RustCrypto crates and rand 0.10 already pull in; `wasm_js` is its Workers/browser
+# backend (0.2 called it `js`).
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 # Bounded concurrency for the group fan-out (`buffer_unordered`). Already in the tree through
 # `worker`; named here so the fan-out can use it directly.
@@ -70,9 +74,13 @@ sezi-file = { path = "core/crates/sezi-file" }
 # wasm32 on their own; the self-host template vendors them with the others.
 sezi-hearings = { path = "core/crates/sezi-hearings" }
 sezi-redact = { path = "core/crates/sezi-redact" }
+# The owner's plugin allowlist (review 2026-11 § 3.5, Wave C3): the rule every member's core
+# applies too (`allowlist`), and the publisher signature check of what an admin's code upload
+# presents (`plugin_bundle_v2::verify_detached`). Pure, builds for wasm; vendored with the others.
+sezi-plugin-fmt = { path = "core/crates/sezi-plugin-fmt" }
 
 [dev-dependencies]
-rusqlite = { version = "0.40", features = ["bundled", "limits"] }
+rusqlite = { version = "0.41", features = ["bundled", "limits"] }
 # The router's own matcher (the `worker` crate's, pinned to the version in Cargo.lock), so
 # `invite_page/route_tests.rs` can insert the real routing table and prove `/:invite` shadows
 # nothing.

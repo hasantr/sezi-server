@@ -14,9 +14,41 @@ pub(crate) fn rate_limited(retry_after_s: u64) -> Value {
     json!({ "ok": false, "error": "bot/rate-limited", "retry_after": retry_after_s })
 }
 
-/// `getMe`.
+/// The bot API's major version: the `v1` in `/bot/v1/`. Inside it every change is additive (a new
+/// method, field, update `kind`, error code or feature), each with its entry in
+/// `tools/bots/CHANGELOG.md`; a breaking change is a new major served beside this one at
+/// `/bot/v2/`, never a change to what v1 answers.
+pub(crate) const API_VERSION: u32 = 1;
+
+/// What this relay's v1 does, by name (`tools/bots/api_v1.json` describes each). A program asks
+/// `features` rather than guessing from a server's build: a name is added when its behaviour
+/// ships and is never taken back inside v1.
+pub(crate) const FEATURES: [&str; 9] = [
+    "long_poll",
+    "webhook",
+    "direct_messages",
+    "commands",
+    "room_messages",
+    "room_replies",
+    "idempotent_send",
+    "member_files",
+    "discovery",
+];
+
+/// The bot API as `/capabilities` announces it (`bot_api`): readable before a program holds a
+/// key, so a tool can tell which API a server speaks without one.
+pub(crate) fn discovery() -> Value {
+    json!({ "version": API_VERSION, "path": "/bot/v1/", "features": FEATURES })
+}
+
+/// `getMe`: the bot, and (since 1.1) the API version and features this relay serves.
 pub(crate) fn me(bot_id: &str, name: &str, about: Option<&str>) -> Value {
-    json!({ "ok": true, "bot": { "bot_id": bot_id, "name": name, "about": about } })
+    json!({
+        "ok": true,
+        "bot": { "bot_id": bot_id, "name": name, "about": about },
+        "api_version": API_VERSION,
+        "features": FEATURES,
+    })
 }
 
 /// `getUpdates`: each stored update with its row id as `update_id`; a row that is not JSON (it

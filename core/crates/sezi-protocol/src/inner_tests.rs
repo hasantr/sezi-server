@@ -143,6 +143,7 @@ fn requires_device_fanout_classification() {
             room_id: "r".into(),
             msg_uids: vec!["u".into()],
             read: true,
+            reads: Vec::new(),
         },
         InnerMessage::GroupJoinAccepted { room_id: "r".into() },
         InnerMessage::GroupMembershipChanged { room_id: "r".into() },
@@ -1021,12 +1022,14 @@ fn inner_message_group_receipt_roundtrip() {
         room_id: "room-1".into(),
         msg_uids: vec!["out-9".into(), "out-10".into()],
         read: true,
+        reads: vec!["scheduled".into()],
     };
     let bytes = msg.encode();
     let json = String::from_utf8(bytes.clone()).unwrap();
     assert!(json.contains(r#""kind":"group_receipt""#), "json: {json}");
     match InnerMessage::decode(&bytes).unwrap() {
-        InnerMessage::GroupReceipt { room_id, msg_uids, read } => {
+        InnerMessage::GroupReceipt { room_id, msg_uids, read, reads } => {
+            assert_eq!(reads, vec!["scheduled".to_string()]);
             assert_eq!(room_id, "room-1");
             assert_eq!(msg_uids, vec!["out-9".to_string(), "out-10".to_string()]);
             assert!(read);
@@ -1108,6 +1111,7 @@ fn inner_message_wire_byte_snapshots() {
                 longitude: 2.5,
                 label: None,
                 accuracy: None,
+                live_until_ms: None,
             }
             .encode()
         )
@@ -1531,4 +1535,169 @@ fn the_history_page_controls_are_invisible_and_round_trip() {
     assert!(!json.contains("blob"), "{json}");
     let back = ChatPayload::decode(json.as_bytes()).unwrap().inner;
     assert_eq!(format!("{back:?}"), format!("{answer:?}"));
+}
+
+/// A live location's start is an ordinary `Location` with `live_until_ms`, and a build that
+/// predates the field reads it as the plain location it was before: the variant ignores a field
+/// it does not know. `Old` is `InnerMessage::Location` as it stood before live location, inside a
+/// payload shaped like `ChatPayload` (flattened, internally tagged), as an older build decodes it.
+#[test]
+fn a_live_start_reads_as_a_plain_location_on_an_older_build() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Old {
+        Location {
+            latitude: f64,
+            longitude: f64,
+            #[serde(default)]
+            #[allow(dead_code)]
+            label: Option<String>,
+            #[serde(default)]
+            accuracy: Option<f64>,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct OldPayload {
+        #[serde(flatten)]
+        inner: Old,
+    }
+    let start = InnerMessage::Location {
+        latitude: 41.0,
+        longitude: 29.0,
+        label: None,
+        accuracy: Some(8.0),
+        live_until_ms: Some(1_700_000_000_000),
+    };
+    let bytes = ChatPayload::new(None, None, start).encode();
+    let json = String::from_utf8(bytes.clone()).unwrap();
+    assert!(json.contains(r#""live_until_ms":1700000000000"#), "json: {json}");
+    assert!(!ChatPayload::decode(&bytes).unwrap().invisible, "the start is a visible message");
+    let old: OldPayload = serde_json::from_slice(&bytes).unwrap();
+    match old.inner {
+        Old::Location { latitude, longitude, accuracy, .. } => {
+            assert_eq!((latitude, longitude, accuracy), (41.0, 29.0, Some(8.0)));
+        }
+        other => panic!("an older build must read a plain location, got {other:?}"),
+    }
+}
+
+/// A live location's update is invisible (an older build drops it silently), and its fields —
+/// the stop flag absent when false — survive the round trip.
+#[test]
+fn inner_message_live_location_update_roundtrip() {
+    let msg = InnerMessage::LiveLocationUpdate {
+        target_uid: "u-1".into(),
+        target_by: "alice".into(),
+        latitude: 41.5,
+        longitude: 29.25,
+        accuracy: None,
+        at_ms: 42,
+        stopped: false,
+        conversation: None,
+    };
+    assert!(msg.is_invisible(), "an older build must not draw it");
+    let json = String::from_utf8(msg.encode()).unwrap();
+    assert_eq!(
+        json,
+        r#"{"kind":"live_location_update","target_uid":"u-1","target_by":"alice","latitude":41.5,"longitude":29.25,"at_ms":42}"#
+    );
+    let stop = InnerMessage::LiveLocationUpdate {
+        target_uid: "u-1".into(),
+        target_by: "alice".into(),
+        latitude: 41.5,
+        longitude: 29.25,
+        accuracy: Some(3.0),
+        at_ms: 43,
+        stopped: true,
+        conversation: Some("g-room".into()),
+    };
+    match InnerMessage::decode(&stop.encode()).unwrap() {
+        InnerMessage::LiveLocationUpdate { stopped, conversation, accuracy, at_ms, .. } => {
+            assert!(stopped);
+            assert_eq!(conversation.as_deref(), Some("g-room"));
+            assert_eq!((accuracy, at_ms), (Some(3.0), 43));
+        }
+        other => panic!("expected LiveLocationUpdate, got {other:?}"),
+    }
+}
+
+/// A scheduled message's key and cancel: invisible (an older build drops them silently), round
+/// trip, and a room's count as a room secret, so no bot is ever handed one.
+#[test]
+fn scheduled_key_and_cancel_are_invisible_and_a_rooms_are_room_secrets() {
+    let key = InnerMessage::ScheduledKey {
+        schedule_id: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+        key: crate::scheduled::KeyB64("a2V5".into()),
+        release_at_ms: 1_800_000_000_000,
+        digest: "d".into(),
+        conversation: None,
+        room: false,
+    };
+    assert!(key.is_invisible());
+    assert!(!key.carries_room_secret(), "a 1:1 key is not a room's");
+    assert!(!format!("{key:?}").contains("a2V5"), "Debug must not print the key");
+    let json = String::from_utf8(key.encode()).unwrap();
+    assert_eq!(
+        json,
+        r#"{"kind":"scheduled_key","schedule_id":"0f8fad5b-d9cb-469f-a165-70867728950e","key":"a2V5","release_at_ms":1800000000000,"digest":"d"}"#
+    );
+    let in_room = InnerMessage::ScheduledKey {
+        schedule_id: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+        key: crate::scheduled::KeyB64("a2V5".into()),
+        release_at_ms: 1,
+        digest: String::new(),
+        conversation: Some("room-1".into()),
+        room: true,
+    };
+    assert!(in_room.carries_room_secret());
+    match InnerMessage::decode(&in_room.encode()).unwrap() {
+        InnerMessage::ScheduledKey { conversation, room, key, .. } => {
+            assert!(room);
+            assert_eq!(conversation.as_deref(), Some("room-1"));
+            assert_eq!(key.0, "a2V5");
+        }
+        other => panic!("expected ScheduledKey, got {other:?}"),
+    }
+    let cancel = InnerMessage::ScheduledCancel { schedule_id: "s".into(), conversation: Some("room-1".into()), room: true };
+    assert!(cancel.is_invisible());
+    assert!(cancel.carries_room_secret());
+    assert!(matches!(InnerMessage::decode(&cancel.encode()).unwrap(), InnerMessage::ScheduledCancel { room: true, .. }));
+}
+
+/// A scheduled envelope is told apart from an Olm or Megolm one by its kind alone, and every other
+/// envelope's bytes are unchanged by the new field.
+#[test]
+fn a_scheduled_envelope_round_trips_and_others_do_not_read_as_one() {
+    use crate::envelope::WireEnvelope;
+    let b64 = WireEnvelope::scheduled_b64("sid", "c2VhbGVk");
+    assert_eq!(WireEnvelope::scheduled_parts(&b64), Some(("sid".into(), "c2VhbGVk".into())));
+    let olm = WireEnvelope { kind: 1, ciphertext: "AAAA".into(), session_id: None, schedule: None };
+    let olm_b64 = vodozemac::base64_encode(serde_json::to_vec(&olm).unwrap());
+    assert_eq!(WireEnvelope::scheduled_parts(&olm_b64), None);
+    assert_eq!(serde_json::to_string(&olm).unwrap(), r#"{"kind":1,"ciphertext":"AAAA"}"#);
+    assert_eq!(WireEnvelope::scheduled_parts("garbage"), None);
+}
+
+/// Re-review N5: what the relay refuses on its send path and what a receiver reads as a release are
+/// ONE test — a fixed base64 prefix, so the relay checks twelve characters, not a parse of every
+/// envelope. A kind-3 envelope written any other way (whitespace, another field first) is no
+/// release to a receiver either, so nothing gets past the relay that a receiver would take.
+#[test]
+fn a_release_is_told_by_its_canonical_prefix_on_both_sides() {
+    use crate::envelope::WireEnvelope;
+    let canonical = WireEnvelope::scheduled_b64("sid", "c2VhbGVk");
+    assert!(WireEnvelope::is_scheduled_b64(&canonical));
+    assert!(WireEnvelope::scheduled_parts(&canonical).is_some());
+    for odd in [
+        r#"{ "kind":3,"ciphertext":"c2VhbGVk","schedule":"sid"}"#,
+        r#"{"ciphertext":"c2VhbGVk","kind":3,"schedule":"sid"}"#,
+        r#"{"kind":30,"ciphertext":"c2VhbGVk","schedule":"sid"}"#,
+    ] {
+        let b64 = vodozemac::base64_encode(odd.as_bytes());
+        assert!(WireEnvelope::scheduled_parts(&b64).is_none(), "{odd} read as a release");
+    }
+    let olm = vodozemac::base64_encode(br#"{"kind":1,"ciphertext":"AAAA"}"#);
+    assert!(!WireEnvelope::is_scheduled_b64(&olm));
 }

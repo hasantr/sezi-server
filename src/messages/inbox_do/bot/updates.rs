@@ -188,6 +188,17 @@ pub(crate) fn room_event_update(
     })
 }
 
+/// The update for the owner's "Dene" (`/bot/ping`): `who` is the owner, as the Worker read them.
+pub(crate) fn ping_update(at_ms: i64, who: serde_json::Value) -> serde_json::Value {
+    let owner = who.get("user_id").cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "kind": "ping",
+        "at": at_ms,
+        "chat": { "type": "direct", "user_id": owner },
+        "who": who,
+    })
+}
+
 #[derive(Deserialize)]
 struct UpdateRow {
     update_id: i64,

@@ -25,4 +25,6 @@ hex = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand = { workspace = true }
 # The framed payload's deflate (`payload_frame.rs`); pure Rust, builds for wasm.
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
+# Wipes a scheduled message's one-time key and its opened frame (`scheduled.rs`).
+zeroize = "1.7"

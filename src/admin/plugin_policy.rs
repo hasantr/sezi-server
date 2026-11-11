@@ -7,7 +7,9 @@
 //!
 //! - **GET /plugin-policy** — auth: `require_active_auth` (ANY authenticated member, NOT
 //!   admin). Every client reads it to filter its plugin picker. Returns
-//!   `{"disabled":[...]}`.
+//!   `{"disabled":[...],"mode":"open"|"allowlist","allowed":[rows…]}` — the owner's allowlist
+//!   (Wave C3, `crate::plugin_allowlist`; its writes are `admin/plugin_allowlist.rs`) rides on the
+//!   same read, additively: an app from before it reads `disabled` alone.
 //! - **POST /admin/plugin-policy** — auth: `require_admin` (admin|owner). Body:
 //!   `{"plugin_id":"...","disabled":true|false}` — a built-in's bare id or a web app's
 //!   `html:…` ([`plugin_id_ok`]; anything else is `400 plugin/bad-id`). true → INSERT OR REPLACE
@@ -34,7 +36,7 @@ use worker::*;
 /// keeps the wire format and the tests stable. Missing table (migration not
 /// applied yet) or a D1 error → empty list (fail-open, the
 /// plugin_log::epoch_floor pattern), so the picker sees "everything enabled".
-async fn read_disabled(db: &D1Database) -> Vec<String> {
+pub(crate) async fn read_disabled(db: &D1Database) -> Vec<String> {
     #[derive(Deserialize)]
     struct Row {
         plugin_id: String,
@@ -64,8 +66,14 @@ pub async fn get_plugin_policy(req: Request, ctx: RouteContext<()>) -> Result<Re
         return json_err(429, "rate_limited");
     }
     let db = ctx.env.d1("DB")?;
-    let disabled = read_disabled(&db).await;
-    Response::from_json(&serde_json::json!({ "disabled": disabled }))
+    Response::from_json(&policy_body(&db).await)
+}
+
+/// The whole policy a member reads: what is switched off, the mode and the approved rows.
+pub(crate) async fn policy_body(db: &D1Database) -> serde_json::Value {
+    let mut body = crate::plugin_allowlist::view(&crate::plugin_allowlist::read(db).await);
+    body["disabled"] = serde_json::json!(read_disabled(db).await);
+    body
 }
 
 /// Plugin ids no policy row can switch off — the core's `NEVER_DISABLED`

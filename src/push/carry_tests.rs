@@ -27,7 +27,7 @@ fn open(sealed: &str, key: &PushKey, device: &str) -> Option<Value> {
     let blob = URL_SAFE_NO_PAD.decode(parts.next()?).ok()?;
     let (nonce, ct) = blob.split_at(24);
     let pt = XChaCha20Poly1305::new((&key.key).into())
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: device.as_bytes() })
+        .decrypt(&XNonce::try_from(nonce).ok()?, Payload { msg: ct, aad: device.as_bytes() })
         .ok()?;
     serde_json::from_slice(&pt).ok()
 }

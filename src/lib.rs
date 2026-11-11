@@ -23,6 +23,9 @@ mod media;
 mod membership;
 mod messages;
 mod page_cursor;
+mod plugin_allowlist;
+mod app_catalog;
+mod app_catalog_flow;
 mod plugin_blob;
 mod plugin_log;
 mod plugin_limits;
@@ -37,8 +40,11 @@ mod room_library;
 mod self_provision;
 mod sfu;
 mod server;
+mod server_update;
 mod sigv4;
 mod storage;
+#[cfg(test)]
+mod crypto_vectors_tests;
 #[cfg(test)]
 mod template_tests;
 #[cfg(test)]
@@ -237,9 +243,28 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             "/admin/plugin-policy",
             admin::plugin_policy::set_plugin_policy,
         )
+        // The owner's plugin allowlist (`plugin_allowlist.rs`, Wave C3): its mode and rows, owner
+        // only; every member reads them on `GET /plugin-policy`.
+        .put_async("/admin/plugin-policy/mode", admin::plugin_allowlist::set_mode)
+        .post_async("/admin/plugin-allowlist", admin::plugin_allowlist::add_row)
+        .delete_async("/admin/plugin-allowlist/:id", admin::plugin_allowlist::remove_row)
+        // The server's app catalog (`app_catalog.rs`, Wave C5): every member lists and fetches,
+        // the owner adds and removes.
+        .get_async("/apps/catalog", admin::app_catalog::list)
+        .get_async("/apps/catalog/:id", admin::app_catalog::fetch)
+        .put_async("/admin/apps/catalog", admin::app_catalog::add)
+        .delete_async("/admin/apps/catalog/:id", admin::app_catalog::remove)
         // The plugin limits the owner sets (`plugin_limits.rs`): GET = admin, PATCH = owner.
         .get_async("/admin/plugin-limits", admin::plugin_limits::get_plugin_limits)
         .patch_async("/admin/plugin-limits", admin::plugin_limits::set_plugin_limits)
+        // A self-hosted relay's one-tap update (`server_update.rs`): the owner asks, the box's update
+        // timer polls on loopback with its token and reports. Without a token both `/internal/*`
+        // routes answer 404.
+        .get_async("/admin/server-update", admin::server_update::get_server_update)
+        .post_async("/admin/server-update", admin::server_update::request_server_update)
+        .patch_async("/admin/server-update", admin::server_update::set_server_update_auto)
+        .get_async("/internal/update-request", server_update::internal_request)
+        .post_async("/internal/update-result", server_update::internal_result)
         // Pluggable storage — the owner attaches and manages external blob backends. GET/probe =
         // require_admin; POST/PATCH/DELETE/drain = require_owner, because backend credentials are
         // powerful. `config_json` is a secret returned by NO response — WRITE-ONLY, same contract
@@ -310,6 +335,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/keys/signed-prekey", keys::handlers::rotate_signed_prekey)
         .post_async("/messages/send", messages::handlers::send)
         .post_async("/messages/read", messages::handlers::read)
+        // Scheduled messages: held in the sender's own inbox, released by its alarm at the time
+        // (`messages/scheduled.rs`). Both act on the caller's own inbox; nothing lists them.
+        .post_async("/messages/scheduled", messages::scheduled::put)
+        .delete_async("/messages/scheduled/:id", messages::scheduled::cancel)
         // The HTTP twin of receipt-sync: a device without a live WS pulls its own ticks by cursor,
         // returning {rows,more} identical to the WS `receipt_sync` frame.
         .get_async("/messages/receipt-sync", messages::handlers::receipt_sync)

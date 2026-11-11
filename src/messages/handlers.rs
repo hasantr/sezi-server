@@ -37,12 +37,20 @@ struct DirectHttpError {
 /// Transport-neutral classification for direct-message authorization. In
 /// particular, a D1/query failure is a retryable authorization outage, not an
 /// unclassified 500. `not_found_code` preserves each endpoint's wire contract.
+/// `room_only_passes`: whether a blocked pair in a common group passes here (a send, which then
+/// goes silent) or not (a read receipt: 1:1 traffic, stopped by the block).
 fn classify_direct_http(
     decision: std::result::Result<crate::contacts::DirectDecision, ()>,
     not_found_code: &'static str,
-) -> std::result::Result<(), DirectHttpError> {
+    room_only_passes: bool,
+) -> std::result::Result<crate::contacts::DirectDecision, DirectHttpError> {
     match decision {
-        Ok(crate::contacts::DirectDecision::Allowed) => Ok(()),
+        Ok(d @ crate::contacts::DirectDecision::Allowed) => Ok(d),
+        Ok(d @ crate::contacts::DirectDecision::RoomOnly) if room_only_passes => Ok(d),
+        Ok(crate::contacts::DirectDecision::RoomOnly) => Err(DirectHttpError {
+            status: 403,
+            code: "contact_not_authorized",
+        }),
         Ok(crate::contacts::DirectDecision::NotFound) => Err(DirectHttpError {
             status: 404,
             code: not_found_code,
@@ -97,6 +105,12 @@ struct SendBody {
     /// true; absent = an ordinary wake, as for every client before it.
     #[serde(default)]
     urgent: bool,
+    /// 1:1 only, beside `urgent`: the ring is a ROOM's (a group call's join or its leave, a course
+    /// session's start), sent pairwise to every member. It matters only between a blocked pair who
+    /// share a group (`contacts::DirectDecision::RoomOnly`), where it is the one wake that stays;
+    /// anywhere else it changes nothing. Absent = not a room's ring, as for every older client.
+    #[serde(default)]
+    room_ring: bool,
     /// 1:1 only: worth something only to a recipient device connected now — the typing
     /// indicator. Pushed to a live socket and kept nowhere, else dropped and acked as dropped
     /// (`inbox_do/live_frames.rs`). Absent = stored as always; ignored for a group.
@@ -293,6 +307,11 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
         if e.envelope_b64.len() < 20 || e.envelope_b64.len() > 64 * 1024 {
             return json_err(400, "bad_request");
         }
+        // A scheduled release is the relay's alone to hand over, at its time
+        // (`scheduled_rules::is_scheduled_envelope`).
+        if crate::messages::scheduled_rules::is_scheduled_envelope(&e.envelope_b64) {
+            return json_err(400, "bad_request");
+        }
     }
 
     let db = match ctx.env.d1("DB") {
@@ -343,15 +362,18 @@ pub async fn send(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     }
     // Contacts/Directory V2: apply one shared server-side gate before any
     // delivery or key-related side effect. Block reason is deliberately merged
-    // with missing-grant policy denial.
-    if let Err(err) = classify_direct_http(
+    // with missing-grant policy denial. A blocked pair sharing a group passes, with
+    // no wake but a room's ring (`DirectDecision::RoomOnly`).
+    let wake = match classify_direct_http(
         crate::contacts::direct_decision(&db, &sender_id, recipient_id)
             .await
             .map_err(|_| ()),
         "recipient_not_found",
+        true,
     ) {
-        return json_err(err.status, err.code);
-    }
+        Ok(decision) => decision.wake(wake, body.room_ring),
+        Err(err) => return json_err(err.status, err.code),
+    };
     #[derive(Deserialize)]
     struct Idr {
         #[allow(dead_code)] // fetched only as an existence check; the value is never read
@@ -519,6 +541,7 @@ pub async fn read(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
             .await
             .map_err(|_| ()),
         "not_found",
+        false,
     ) {
         return json_err(err.status, err.code);
     }
@@ -638,7 +661,7 @@ mod tests {
     #[test]
     fn http_direct_decision_maps_storage_failure_to_retryable_503() {
         assert_eq!(
-            classify_direct_http(Err(()), "recipient_not_found"),
+            classify_direct_http(Err(()), "recipient_not_found", true),
             Err(DirectHttpError {
                 status: 503,
                 code: "authorization_unavailable",
@@ -649,11 +672,20 @@ mod tests {
     #[test]
     fn http_direct_decision_maps_policy_outcomes_and_endpoint_not_found_code() {
         assert_eq!(
-            classify_direct_http(Ok(crate::contacts::DirectDecision::Allowed), "not_found"),
-            Ok(())
+            classify_direct_http(Ok(crate::contacts::DirectDecision::Allowed), "not_found", true),
+            Ok(crate::contacts::DirectDecision::Allowed)
+        );
+        // A blocked pair in a common group: a send passes (and goes silent), a read receipt not.
+        assert_eq!(
+            classify_direct_http(Ok(crate::contacts::DirectDecision::RoomOnly), "not_found", true),
+            Ok(crate::contacts::DirectDecision::RoomOnly)
         );
         assert_eq!(
-            classify_direct_http(Ok(crate::contacts::DirectDecision::Denied), "not_found"),
+            classify_direct_http(Ok(crate::contacts::DirectDecision::RoomOnly), "not_found", false),
+            Err(DirectHttpError { status: 403, code: "contact_not_authorized" })
+        );
+        assert_eq!(
+            classify_direct_http(Ok(crate::contacts::DirectDecision::Denied), "not_found", true),
             Err(DirectHttpError {
                 status: 403,
                 code: "contact_not_authorized",
@@ -663,6 +695,7 @@ mod tests {
             classify_direct_http(
                 Ok(crate::contacts::DirectDecision::NotFound),
                 "recipient_not_found",
+                true,
             ),
             Err(DirectHttpError {
                 status: 404,
@@ -670,7 +703,7 @@ mod tests {
             })
         );
         assert_eq!(
-            classify_direct_http(Ok(crate::contacts::DirectDecision::NotFound), "not_found"),
+            classify_direct_http(Ok(crate::contacts::DirectDecision::NotFound), "not_found", true),
             Err(DirectHttpError {
                 status: 404,
                 code: "not_found",

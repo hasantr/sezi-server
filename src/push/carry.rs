@@ -76,7 +76,7 @@ impl Carried {
     pub(crate) fn add(&mut self, device: &str, frame: &Value, key: Option<&PushKey>) -> bool {
         let Some(key) = key else { return false };
         let mut nonce = [0u8; 24];
-        if getrandom::getrandom(&mut nonce).is_err() {
+        if getrandom::fill(&mut nonce).is_err() {
             return false;
         }
         match frame_for(frame, device, key, &nonce) {
@@ -119,7 +119,7 @@ pub(crate) fn frame_for(frame: &Value, device: &str, key: &PushKey, nonce: &[u8;
 pub(crate) fn seal(key: &PushKey, device: &str, nonce: &[u8; 24], plaintext: &[u8]) -> Option<String> {
     let cipher = XChaCha20Poly1305::new((&key.key).into());
     let ct = cipher
-        .encrypt(XNonce::from_slice(nonce), Payload { msg: plaintext, aad: device.as_bytes() })
+        .encrypt(&XNonce::from(*nonce), Payload { msg: plaintext, aad: device.as_bytes() })
         .ok()?;
     let mut blob = Vec::with_capacity(nonce.len() + ct.len());
     blob.extend_from_slice(nonce);

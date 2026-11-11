@@ -32,7 +32,8 @@ workerd build that config was tested with, with its sha512 for each architecture
 - 64-bit Linux (x86_64 or ARM64) with **glibc ≥ 2.35** (workerd's floor): Debian 12/13, Ubuntu
   22.04+, Raspberry Pi OS 64-bit (bookworm). Ubuntu 20.04, RHEL 9, Alpine (musl) and 32-bit Pi
   OS are **NOT SUPPORTED** — workerd is not built for them.
-- `git`, `curl`, `tar`, `sha512sum`. **No Node.js.**
+- `git`, `curl`, `tar`, `sha512sum`, and for checking signed releases `openssl` (3.x) and `jq`
+  (`sudo apt install -y git curl openssl jq`). **No Node.js.**
 - ~35 MB to download once; the relay takes ~110–150 MB of memory, so 1 GB of RAM is plenty.
 
 ---
@@ -53,15 +54,23 @@ checks the tarball's sha512 against the lock **before** unpacking it, and instal
 `/var/lib/sezi/.local/sezi-workerd/<version>/`, with `current` pointing at it. A download that
 does not match is not installed. Nothing system-wide is touched.
 
-> **An update is `sudo bash /opt/sezi-server/deploy/update.sh`.** It fetches, exports the new
+> **An update is `sudo bash /opt/sezi-server/deploy/update.sh`** — or one tap in the app, once the
+> update timers of § 7 are installed. It first reads the **signed release channel**: the manifest
+> from the release hosts and from this repository's `channels/stable/`, checked with `openssl`
+> against the keys in `deploy/release-keys/` of the build that runs now, and refused if it does not
+> verify or is older than one this box already accepted. Only a build that manifest names is
+> installed, at exactly the commit it names. Then it exports the new
 > build into `releases/<build>/` and fetches its workerd while the relay still runs; then it stops
 > the relay only to back up `state/`, points `current` at the new build and starts it again (about
 > two seconds of downtime — clients reconnect and resend what was not acked), checks that it is
 > healthy on the new build, and moves code, workerd and data back if it is not.
 >
-> - `--to <build>` moves to that build instead — a newer one, or an older one to **go back**. Going
->   back keeps your data as it is: the relay's database changes only ever ADD, so an older build
->   runs on a newer database.
+> - `--to <build>` moves to that build instead — a newer one, or an older one the channel still
+>   keeps, to **go back**. Going back keeps your data as it is: the relay's database changes only
+>   ever ADD, so an older build runs on a newer database. A run without `--to` never goes back by
+>   itself from a build newer than the channel's.
+> - Until a signed channel is published, a run by hand moves by this repository's history alone and
+>   says so; `--signed` (what the update timers use) refuses instead.
 > - `--commit <sha>` moves to exactly that template commit.
 > - The last three builds and three state backups (`/var/lib/sezi/backup-pre-update-*.tar`) are
 >   kept, older ones removed; `/var/lib/sezi/update-result.json` says how the last run ended.
@@ -82,6 +91,7 @@ sudo cp /opt/sezi-server/deploy/sezi-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sezi-relay
 curl -s http://127.0.0.1:8788/healthz    # {"ok":true}
+sudo bash /opt/sezi-server/deploy/install-updater.sh   # update from the app, § 7 (recommended)
 ```
 
 `sezi-relay.service` runs `workerd serve` on `current/workerd/config.capnp` (the build `update.sh` last moved to), listening on
@@ -92,7 +102,8 @@ curl -s http://127.0.0.1:8788/healthz    # {"ok":true}
 `sezi` and `chmod 600`; the unit reads them as its environment. The names the relay accepts:
 `SEZI_CLAIM_SECRET`, `SEZI_TRUSTED_PROXY_HEADER`, `SEZI_WEB_ORIGINS`, `TURN_KEY_ID`,
 `TURN_API_TOKEN`, `TURN_MONTHLY_CAP`, `TURN_USER_MONTHLY_CAP`, `FCM_PROJECT_ID`,
-`FCM_SERVICE_ACCOUNT`, `PUSH_RELAY_URL`, `RESET_PASSWORD`. Nothing else is read from the
+`FCM_SERVICE_ACCOUNT`, `PUSH_RELAY_URL`, `RESET_PASSWORD`, and `SEZI_UPDATER_TOKEN` (written by
+`install-updater.sh`, § 7). Nothing else is read from the
 environment — the signing key is generated on first start and kept in the database.
 
 ---
@@ -213,6 +224,31 @@ sudo cp deploy/sezi-healthz.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sezi-healthz.timer
 ```
+
+---
+
+## 7. Update from the app (the update timers)
+
+```bash
+sudo bash /opt/sezi-server/deploy/install-updater.sh
+```
+
+It makes a token (`/etc/sezi/updater-token`, root only, and `SEZI_UPDATER_TOKEN` in `.dev.vars`),
+installs two timers and restarts the relay once so it reads the token:
+
+- `sezi-update.timer`, every two minutes: `deploy/sezi-update-poll.sh` asks the relay on
+  `127.0.0.1:8788`, with the token, whether its owner asked for a build in the app. If so it runs
+  `update.sh --signed --to <build>` and tells the relay how it went; the app shows it. While the
+  timer calls in, the app offers **Update now** and **Go back** instead of these written steps.
+- `sezi-update-nightly.timer`, about 03:30: installs the newest build automatically — but only
+  when the owner turned that on in the app (off by default), and with "security updates only",
+  only a release marked as a security fix.
+
+What the relay can ask for this way is a build number and nothing else, and `update.sh` installs
+only a build the signed release names — a relay someone took over cannot make root run anything
+of its own. The services run as root (they stop the relay and back up its data) and run this
+clone's scripts, which `update.sh` moves only to signed commits. `--remove` takes it all away.
+Other folders or user: the same `SEZI_*` variables as `update.sh`.
 
 ---
 

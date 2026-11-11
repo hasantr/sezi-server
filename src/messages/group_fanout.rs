@@ -442,7 +442,7 @@ pub(crate) async fn fan_out_group(
     if width > 0
         && !crate::ratelimit::check_rate_limit_weighted_env(
             env,
-            &format!("msg:grp_fanout:{}", msg.sender_id),
+            &crate::messages::scheduled_rules::fanout_bucket(&msg.sender_id),
             6000,
             60,
             width,

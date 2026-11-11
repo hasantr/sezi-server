@@ -506,6 +506,15 @@ pub async fn verify(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
             d1_text(device_id),
         ])?,
     );
+    // A server's first owner starts it in the owner's allowlist (decision D1, 2026-11-08): only
+    // in this batch, so a server that already had an owner keeps whatever it has, and a mode the
+    // owner already chose (an `open` is stored since then) is never overwritten.
+    if redeemed_genesis {
+        stmts.push(
+            db.prepare(crate::plugin_allowlist::SEED_FRESH_MODE_SQL)
+                .bind(&[d1_int(now as i64)])?,
+        );
+    }
 
     if let Err(error) = db.batch(stmts).await {
         // `idx_one_owner` is the backstop: two genesis claims can be in flight at once (the first

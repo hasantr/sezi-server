@@ -57,8 +57,8 @@ fn decode(row: &KeyRow) -> Option<PushKey> {
 fn mint() -> Option<PushKey> {
     let mut key = [0u8; 32];
     let mut id = [0u8; 8];
-    getrandom::getrandom(&mut key).ok()?;
-    getrandom::getrandom(&mut id).ok()?;
+    getrandom::fill(&mut key).ok()?;
+    getrandom::fill(&mut id).ok()?;
     Some(PushKey { id: hex::encode(id), key })
 }
 

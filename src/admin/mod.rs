@@ -3,6 +3,7 @@
 //! Every endpoint here must gate on `require_active_auth`, never on `require_auth`. See the guard
 //! test at the bottom of this file for why — it encodes a real hole that existed until 2026-07-25.
 
+pub mod app_catalog;
 pub mod cf_config;
 pub mod fcm_config;
 pub mod turn_config;
@@ -12,9 +13,11 @@ pub mod invite_list;
 pub mod invites;
 pub mod library;
 pub mod library_retention;
+pub mod plugin_allowlist;
 pub mod plugin_limits;
 pub mod plugin_policy;
 pub mod reset;
+pub mod server_update;
 pub mod stats;
 pub mod storage;
 
@@ -39,7 +42,8 @@ pub mod storage;
 mod auth_gate_guard {
     /// `include_str!` rather than reading from disk: it binds at compile time, so renaming or
     /// deleting a module breaks the build instead of silently emptying the guard.
-    const ADMIN_MODULES: [(&str, &str); 12] = [
+    const ADMIN_MODULES: [(&str, &str); 15] = [
+        ("app_catalog.rs", include_str!("app_catalog.rs")),
         ("cf_config.rs", include_str!("cf_config.rs")),
         ("fcm_config.rs", include_str!("fcm_config.rs")),
         ("handlers.rs", include_str!("handlers.rs")),
@@ -47,8 +51,10 @@ mod auth_gate_guard {
         ("invites.rs", include_str!("invites.rs")),
         ("library.rs", include_str!("library.rs")),
         ("library_retention.rs", include_str!("library_retention.rs")),
+        ("plugin_allowlist.rs", include_str!("plugin_allowlist.rs")),
         ("plugin_limits.rs", include_str!("plugin_limits.rs")),
         ("plugin_policy.rs", include_str!("plugin_policy.rs")),
+        ("server_update.rs", include_str!("server_update.rs")),
         ("sfu_config.rs", include_str!("sfu_config.rs")),
         ("stats.rs", include_str!("stats.rs")),
         ("storage.rs", include_str!("storage.rs")),

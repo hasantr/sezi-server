@@ -28,6 +28,26 @@ const _: () = assert!(CLIENT_LEVEL >= 1);
 /// The typed code the UI turns into "update the app" — never a sentence from the core.
 pub const UPDATE_REQUIRED_CODE: &str = "app/update-required";
 
+/// The oldest relay build (`/capabilities` `build`, yyyyMMddHHmm) this app works with — the other
+/// side's half of the bargain (`docs/SERVER_UPDATE_PLAN.md` §2.3, decision D10). The release
+/// channel's `app.min_server_build` says it too, and the higher of the two wins; this constant is
+/// what a device that has no manifest at hand goes by (a member's phone never reads the channel).
+///
+/// 0 = no relay build is known to be too old for this app. Raise it in the commit of an app change
+/// that a relay older than some build cannot serve; a server below it then shows its members a
+/// quiet "older than your app" line and its owner a red one. A build of 0 or none (a hand-built
+/// relay) is never judged.
+pub const MIN_SERVER_BUILD: i64 = 0;
+
+/// The typed code of "this server is older than this app", never a sentence from the core.
+pub const SERVER_TOO_OLD_CODE: &str = "server/too-old";
+
+/// Is a relay announcing `build` older than `wanted`? Unknown (0 or negative) on either side is
+/// no claim either way.
+pub fn server_too_old(build: i64, wanted: i64) -> bool {
+    build > 0 && wanted > 0 && build < wanted
+}
+
 /// Does a server that announces `min_client_level` need a newer app than this one? An absent
 /// announcement reads as 0: no requirement, which is what every relay older than this field means.
 pub fn update_required(min_client_level: u32) -> bool {
@@ -50,5 +70,14 @@ mod tests {
     #[test]
     fn the_code_is_the_one_the_ui_reads() {
         assert_eq!(UPDATE_REQUIRED_CODE, "app/update-required");
+        assert_eq!(SERVER_TOO_OLD_CODE, "server/too-old");
+    }
+
+    #[test]
+    fn only_a_known_build_below_a_known_floor_is_too_old() {
+        assert!(server_too_old(202_610_010_000, 202_611_010_000));
+        assert!(!server_too_old(202_611_010_000, 202_611_010_000));
+        assert!(!server_too_old(0, 202_611_010_000), "unknown build: no claim");
+        assert!(!server_too_old(202_610_010_000, 0), "no floor: no claim");
     }
 }

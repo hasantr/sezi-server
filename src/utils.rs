@@ -47,7 +47,7 @@ pub fn b64u_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
+    getrandom::fill(&mut buf).expect("getrandom failed");
     buf
 }
 

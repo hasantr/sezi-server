@@ -21,6 +21,7 @@
 #   sudo -u sezi -H sh /opt/sezi-server/deploy/fetch-workerd.sh   # checked against workerd/WORKERD.lock
 #   sudo cp /opt/sezi-server/deploy/sezi-relay.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now sezi-relay
+#   sudo bash /opt/sezi-server/deploy/install-updater.sh          # update from the app (README § 7)
 #
 # Fetching workerd is an INSTALL step, never part of ExecStart: a restart (the watchdog's
 # included) must not depend on reaching the npm registry. deploy/update.sh runs it for every build

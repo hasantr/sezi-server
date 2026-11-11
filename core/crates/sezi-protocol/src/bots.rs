@@ -39,6 +39,9 @@ impl InnerMessage {
             InnerMessage::ActivityBatch { events } => {
                 events.iter().any(|e| e.scope.room_id().is_some())
             }
+            // A room's scheduled message key opens a message the room will read; its cancel names
+            // one the room was to read.
+            InnerMessage::ScheduledKey { room: true, .. } | InnerMessage::ScheduledCancel { room: true, .. } => true,
             // A room's typing presence says who is writing there right now.
             InnerMessage::Typing { room: Some(_), .. } => true,
             // A room call's signal: its join carries the call's SFU frame key pairwise, the rest
@@ -51,9 +54,206 @@ impl InnerMessage {
     }
 }
 
+impl InnerMessage {
+    /// The room a frame that travels over 1:1 Olm BELONGS to — `None` for anything of a pair's
+    /// own. A room's secrets (every kind [`InnerMessage::carries_room_secret`] names) and the asks
+    /// that bring one (`RoomKeyRequest`, `PluginEpochRequest`, `PluginSnapshotRequest`,
+    /// `PluginInstallRequest`), and everything else a room sends pairwise: a group's read and
+    /// delivery receipts, its accept and membership notices, a plugin's removal, a room's
+    /// co-presence, typing, live location and call signalling (a group call's join, leave, and
+    /// its per-pair offers, answers and candidates all carry `room_id`).
+    ///
+    /// The kernel lets such a frame from someone I blocked through when the room is one we are
+    /// both active in and they an active member of (P1, Hasan 2026-11-10/11: blocking stops 1:1
+    /// only, so everything that belongs to a shared group works as for anyone — `kernel/
+    /// blocked_rooms.rs`); every other frame from them stays dropped. A batch of co-presence
+    /// events names a room only when all of it is one.
+    ///
+    /// The match is EXHAUSTIVE on purpose: a new kind is not a pair's own by default — whoever
+    /// adds one decides here whether a room sends it pairwise.
+    pub fn room_scope(&self) -> Option<String> {
+        let room = match self {
+            InnerMessage::RoomKeyShare { room_id, .. }
+            | InnerMessage::RoomKeyGossip { room_id, .. }
+            | InnerMessage::RoomKeyRequest { room_id, .. }
+            | InnerMessage::GroupOutboundCopy { room_id, .. }
+            | InnerMessage::GroupReceipt { room_id, .. }
+            | InnerMessage::GroupJoinAccepted { room_id }
+            | InnerMessage::GroupMembershipChanged { room_id } => room_id.clone(),
+            InnerMessage::PluginEpochKeyShare { room, .. }
+            | InnerMessage::PluginEpochRequest { room, .. }
+            | InnerMessage::PluginRecordSnapshot { room, .. }
+            | InnerMessage::PluginSnapshotRequest { room }
+            | InnerMessage::PluginInstallRequest { room, .. }
+            | InnerMessage::PluginRemoved { room, .. } => room.clone(),
+            InnerMessage::PluginRecord { room: Some(room), .. }
+            | InnerMessage::PluginInstall { room: Some(room), .. }
+            | InnerMessage::Typing { room: Some(room), .. } => room.clone(),
+            InnerMessage::Activity { scope: ActivityWireScope::Room { room_id }, .. } => room_id.clone(),
+            InnerMessage::ActivityBatch { events } => {
+                let first = events.first()?.scope.room_id()?;
+                if events.iter().any(|e| e.scope.room_id() != Some(first)) {
+                    return None;
+                }
+                first.to_string()
+            }
+            InnerMessage::ScheduledKey { room: true, conversation: Some(c), .. }
+            | InnerMessage::ScheduledCancel { room: true, conversation: Some(c), .. } => c.clone(),
+            // A room's live location goes per member over Olm and names the room; a 1:1 one names
+            // nothing from a peer (`kernel/live_location.rs`).
+            InnerMessage::LiveLocationUpdate { conversation: Some(c), .. } => c.clone(),
+            InnerMessage::CallSignal { data, .. } => serde_json::from_str::<serde_json::Value>(data)
+                .ok()?
+                .get("room_id")?
+                .as_str()?
+                .to_string(),
+            // A pair's own: 1:1 content and its receipts, a 1:1 call, the 1:1 halves of typing,
+            // co-presence, plugins, scheduled messages and live location; reactions, edits, pins
+            // and deletes, which a room sends over its Megolm, never pairwise. A group P2P file's
+            // download ack names no room here; the kernel finds it from the offer it acks.
+            InnerMessage::Text { .. }
+            | InnerMessage::File(_)
+            | InnerMessage::FileGroup { .. }
+            | InnerMessage::RichText { .. }
+            | InnerMessage::HtmlMessage { .. }
+            | InnerMessage::Location { .. }
+            | InnerMessage::LinkPreview { .. }
+            | InnerMessage::Activity { .. }
+            | InnerMessage::CallLog { .. }
+            | InnerMessage::P2pBlobOffer { .. }
+            | InnerMessage::P2pBlobReceived { .. }
+            | InnerMessage::MediaReceived { .. }
+            | InnerMessage::StateDigest { .. }
+            | InnerMessage::Typing { room: None, .. }
+            | InnerMessage::PluginRecord { room: None, .. }
+            | InnerMessage::PluginInstall { room: None, .. }
+            | InnerMessage::ScheduledKey { .. }
+            | InnerMessage::ScheduledCancel { .. }
+            | InnerMessage::LiveLocationUpdate { conversation: None, .. }
+            | InnerMessage::Reaction { .. }
+            | InnerMessage::RoomDelete { .. }
+            | InnerMessage::MessageEdit { .. }
+            | InnerMessage::Pin { .. }
+            | InnerMessage::LibraryCard(_)
+            | InnerMessage::ProfileAvatar { .. }
+            // Local rows only, refused on arrival.
+            | InnerMessage::RoomAccessNotice { .. }
+            | InnerMessage::CallRecordingNotice { .. }
+            | InnerMessage::PluginAddedNotice { .. }
+            | InnerMessage::RoomBotNotice { .. }
+            // A bot's.
+            | InnerMessage::BotCall { .. }
+            | InnerMessage::BotTap { .. }
+            // My own devices' only.
+            | InnerMessage::OutboundCopy { .. }
+            | InnerMessage::DeviceStatePacket { .. }
+            | InnerMessage::DeviceStateRequest { .. }
+            | InnerMessage::ReadSelfSync { .. }
+            | InnerMessage::DeleteSelfSync { .. }
+            | InnerMessage::OwnFileRequest { .. }
+            | InnerMessage::OwnFileOffer { .. }
+            | InnerMessage::EscrowCopy { .. }
+            | InnerMessage::TakeoverNotice { .. }
+            | InnerMessage::HistoryPageRequest { .. }
+            | InnerMessage::HistoryPageAnswer { .. }
+            // Judged once fetched (`kernel/indirect/receive.rs`).
+            | InnerMessage::Indirect(_)
+            | InnerMessage::Unknown => return None,
+        };
+        (!room.is_empty()).then_some(room)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1 (Hasan, 2026-11-10: blocking stops 1:1 only): every room secret names its room, and so
+    /// does every ask for one; nothing of the pair's own does. The kernel admits such a frame from
+    /// someone I blocked only for a room we are both active in.
+    #[test]
+    fn every_room_secret_and_every_ask_for_one_names_its_room() {
+        let secrets = [
+            InnerMessage::RoomKeyShare { room_id: "r".into(), session_id: "s".into(), session_key_b64: "k".into() },
+            InnerMessage::PluginEpochKeyShare { room: "r".into(), plugin: "p".into(), epoch: 1, key_b64: "k".into() },
+            InnerMessage::PluginRecordSnapshot { room: "r".into(), records: vec![] },
+            InnerMessage::Typing { room: Some("r".into()), ts: 1, active: true },
+            InnerMessage::CallSignal { call_id: "c".into(), signal_type: "join".into(), data: r#"{"room_id":"r"}"#.into() },
+            serde_json::from_str(r#"{"kind":"scheduled_key","schedule_id":"x","key":"k","release_at_ms":1,"digest":"d","conversation":"r","room":true}"#).unwrap(),
+            serde_json::from_str(r#"{"kind":"scheduled_cancel","schedule_id":"x","conversation":"r","room":true}"#).unwrap(),
+        ];
+        for s in &secrets {
+            assert!(s.carries_room_secret(), "{s:?}");
+            assert_eq!(s.room_scope().as_deref(), Some("r"), "{s:?}");
+        }
+        let asks = [
+            InnerMessage::RoomKeyRequest { room_id: "r".into(), session_id: None },
+            InnerMessage::PluginEpochRequest { room: "r".into(), plugin: "p".into(), floor: 1 },
+            InnerMessage::PluginSnapshotRequest { room: "r".into() },
+        ];
+        for a in &asks {
+            assert_eq!(a.room_scope().as_deref(), Some("r"), "{a:?}");
+        }
+        // Everything else a room sends pairwise (Hasan, 2026-11-11: everything of a shared group
+        // works as for anyone): its receipts, its notices, a plugin's removal, a group call's
+        // signalling of every kind, a room's live location.
+        let room = [
+            InnerMessage::GroupReceipt { room_id: "r".into(), msg_uids: vec!["m".into()], read: true, reads: vec![] },
+            InnerMessage::GroupJoinAccepted { room_id: "r".into() },
+            InnerMessage::GroupMembershipChanged { room_id: "r".into() },
+            InnerMessage::PluginRemoved { room: "r".into(), plugin_id: "p".into() },
+            InnerMessage::CallSignal { call_id: "g".into(), signal_type: "leave".into(), data: r#"{"room_id":"r"}"#.into() },
+            InnerMessage::CallSignal { call_id: "g".into(), signal_type: "ice".into(), data: r#"{"room_id":"r","c":1}"#.into() },
+            InnerMessage::LiveLocationUpdate {
+                target_uid: "m".into(),
+                target_by: "u".into(),
+                latitude: 1.0,
+                longitude: 2.0,
+                accuracy: None,
+                at_ms: 1,
+                stopped: false,
+                conversation: Some("r".into()),
+            },
+        ];
+        for k in &room {
+            assert_eq!(k.room_scope().as_deref(), Some("r"), "{k:?}");
+        }
+        // A pair's own stays a pair's own, whatever room it claims: a reaction, an edit or a pin
+        // over Olm is the 1:1's (a room sends those over its Megolm).
+        let own = [
+            InnerMessage::Text { body: "hi".into() },
+            InnerMessage::Typing { room: None, ts: 1, active: true },
+            InnerMessage::CallSignal { call_id: "c".into(), signal_type: "invite".into(), data: r#"{"sdp":"x"}"#.into() },
+            InnerMessage::CallSignal { call_id: "c".into(), signal_type: "answer".into(), data: "{}".into() },
+            serde_json::from_str(r#"{"kind":"scheduled_key","schedule_id":"x","key":"k","release_at_ms":1,"digest":"d","conversation":"r","room":false}"#).unwrap(),
+            InnerMessage::StateDigest { delivered_upto: 1, read_upto: 1, reply: false },
+            InnerMessage::MediaReceived { media_id: "m".into() },
+            InnerMessage::Reaction { target_uid: "m".into(), target_by: "u".into(), emoji: None, at_ms: 1, conversation: Some("r".into()) },
+            InnerMessage::Pin { target_uid: "m".into(), target_by: "u".into(), pinned: true, until_ms: None, at_ms: 1, conversation: Some("r".into()) },
+            InnerMessage::MessageEdit {
+                target_uid: "m".into(),
+                target_by: "u".into(),
+                content: Box::new(InnerMessage::Text { body: "x".into() }),
+                mentions: vec![],
+                at_ms: 1,
+                conversation: Some("r".into()),
+            },
+            InnerMessage::LiveLocationUpdate {
+                target_uid: "m".into(),
+                target_by: "u".into(),
+                latitude: 1.0,
+                longitude: 2.0,
+                accuracy: None,
+                at_ms: 1,
+                stopped: true,
+                conversation: None,
+            },
+            InnerMessage::RoomDelete { target_uid: "m".into(), target_by: "u".into() },
+        ];
+        for o in &own {
+            assert_eq!(o.room_scope(), None, "{o:?}");
+        }
+    }
 
     #[test]
     fn only_the_bot_kinds_are_bot_bound_and_they_round_trip() {

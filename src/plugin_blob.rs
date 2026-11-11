@@ -92,6 +92,17 @@ pub async fn put_code(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     if !is_group_admin(&role) {
         return json_err(403, "not_admin");
     }
+    // The owner's allowlist (Wave C3, `plugin_allowlist.rs`): on an `allowlist` server the upload
+    // must present an approved app — a claim the relay can judge but not tie to the ciphertext;
+    // every member's core checks the bytes themselves (that module's doc). A `400`, which every
+    // app since 2046 ends the op on.
+    if let Ok(db) = ctx.env.d1("DB") {
+        let list = crate::plugin_allowlist::read(&db).await;
+        let presented = crate::plugin_allowlist::Presented::from_headers(req.headers());
+        if let Err(code) = crate::plugin_allowlist::upload_decision(&list, &presented) {
+            return json_err(400, code);
+        }
+    }
     // R2 is OPTIONAL: without the binding there is nowhere to put server-hosted code → the SAME
     // clean 503 as the media path (the client treats it as nonretryable). AFTER the authorization
     // check (403 before service state) but BEFORE the rate limit and the body read.

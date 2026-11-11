@@ -303,7 +303,7 @@ async fn read_config(db: &D1Database, key: &str) -> Result<Option<String>> {
 fn generate_jwt_signing_pem() -> Result<String> {
     use ed25519_dalek::pkcs8::{spki::der::pem::LineEnding, EncodePrivateKey};
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)
+    getrandom::fill(&mut seed)
         .map_err(|e| Error::RustError(format!("self_provision: rng: {e}")))?;
     let key = ed25519_dalek::SigningKey::from_bytes(&seed);
     let pem = key

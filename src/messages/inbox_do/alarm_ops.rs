@@ -208,7 +208,12 @@ impl UserInbox {
         // Ground truth for delivery: the liveness test narrows the delivered_live false-positive
         // window but cannot close it (a socket that dies right after a ping). Still sitting in
         // pending means unacked means undelivered → wake once the grace period is over.
-        self.backstop_push_stale_pending().await;
+        // Scheduled messages whose time has come (`scheduled.rs`): one a run. A run that released
+        // leaves the backstop's wakes to the next run (a second away at most when more is due), so
+        // the two never share one invocation's subrequest budget (`scheduled_rules::RELEASE_RESERVED`).
+        if !self.release_due_scheduled().await {
+            self.backstop_push_stale_pending().await;
+        }
         let now_ms_val = (now_secs() * 1000) as i64;
         let last: Option<i64> = self
             .state
@@ -272,7 +277,10 @@ impl UserInbox {
         let (_, stalled) = self.pending_split();
         self.reconcile_revoked_if_stalled(stalled).await;
         let work = self.measure_alarm_work(account_removed);
-        if let Some(delay) = next_alarm_delay_ms(work, FLUSH_INTERVAL_MS, IDLE_INTERVAL_MS) {
+        // A held scheduled message keeps an otherwise idle inbox's alarm: its time is the next
+        // wake (or sooner, for one whose release did not finish).
+        let own = next_alarm_delay_ms(work, FLUSH_INTERVAL_MS, IDLE_INTERVAL_MS);
+        if let Some(delay) = crate::messages::scheduled_rules::with_release(own, self.next_scheduled_in()) {
             self.arm_alarm_within(delay).await;
         }
         Response::empty()

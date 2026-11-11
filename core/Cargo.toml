@@ -22,12 +22,12 @@ doc_overindented_list_items = "allow"
 # SAME type on both sides of a crate boundary; two independent declarations that resolved differently
 # would break the conversions in a way whose error message points nowhere useful.
 [workspace.dependencies]
-thiserror         = "1"
+thiserror         = "2"
 vodozemac         = "0.11"
 serde_json        = "1"
-rusqlite          = { version = "0.40", features = ["bundled", "blob"] }
+rusqlite          = { version = "0.41", features = ["bundled", "blob"] }
 reqwest           = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "query"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 blake3            = "1.5"
 hex               = "0.4"
 serde             = { version = "1", features = ["derive"] }
@@ -35,6 +35,10 @@ tar               = "0.4"
 chacha20poly1305  = "0.11"
 aead-stream       = { version = "0.6", features = ["alloc"] }
 rand              = { version = "0.10", features = ["std", "std_rng", "sys_rng", "thread_rng"] }
+# Every use here goes through `engine::general_purpose`, the scalar engine. 0.23's default
+# `simd-unsafe` only adds the explicit `Simd`/`Avx2`/`Neon` engines, which nothing here names, so
+# this workspace does not ask for it (hyper-util turns it on for itself anyway).
+base64            = { version = "0.23", default-features = false, features = ["std"] }
 # `CancellationToken` (handed out by `sezi-transfer`, selected on in this crate's chunk loops)
 # and `UnboundedSender<TransferProgress>` (built by the kernel, stored by the crate) both cross
 # the boundary — two declarations resolving differently would fail at those call sites.

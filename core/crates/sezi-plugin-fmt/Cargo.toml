@@ -1,0 +1,26 @@
+# Pure format work, no I/O and no kernel state: the deterministic tar bundle (path-traversal
+# rejection, per-file BLAKE3, the size ceiling), the signed v2 bundle and its `sezi-app.json`
+# manifest (Ed25519 publisher signature, semver, declared capabilities), and the install-time
+# egress token scan. Builds for wasm on its own.
+#
+# The scan is a TRANSPARENCY aid, never a security boundary — containment is the sandbox's job.
+[package]
+name = "sezi-plugin-fmt"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Plugin bundle packing/unpacking, the signed app manifest, and the egress scanner."
+
+[lints]
+workspace = true
+
+[dependencies]
+sezi-error = { path = "../sezi-error" }
+serde = { workspace = true }
+tar = { workspace = true }
+blake3 = { workspace = true }
+vodozemac = { workspace = true }
+serde_json = { workspace = true }
+# Verification only (the publisher signs elsewhere): no `rand_core`, so nothing reaches getrandom.
+ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
+base64 = { workspace = true }

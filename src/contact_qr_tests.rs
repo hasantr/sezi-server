@@ -65,7 +65,7 @@ fn signed_fixture() -> (String, String) {
     let mut proof_input = CanonicalWriter::new(CAPABILITY_PROOF_DOMAIN);
     proof_input.put_bytes(&unsigned).unwrap();
     proof_input.put_bytes(&signature).unwrap();
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&secret).unwrap();
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&secret).unwrap();
     mac.update(&proof_input.finish());
     claim.capability_proof_b64 = STANDARD_NO_PAD.encode(mac.finalize().into_bytes());
 

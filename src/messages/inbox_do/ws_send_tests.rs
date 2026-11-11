@@ -20,6 +20,20 @@ fn only_a_json_true_counts() {
     assert_eq!(ws_send_wake(&json!({ "silent": true, "urgent": true })), WakeIntent::Urgent);
 }
 
+/// `room_ring` (a ROOM's ring, the one wake a blocked pair who share a group keeps): only a JSON
+/// `true`; an older client sends none. Both doors pass it to `DirectDecision::wake`.
+#[test]
+fn the_room_ring_flag_is_read_at_both_doors() {
+    use super::ws_send_room_ring;
+    assert!(ws_send_room_ring(&json!({ "type": "send", "urgent": true, "room_ring": true })));
+    assert!(!ws_send_room_ring(&json!({ "type": "send", "urgent": true })));
+    assert!(!ws_send_room_ring(&json!({ "type": "send", "room_ring": "true" })));
+    let ws = include_str!("ws.rs");
+    assert!(ws.contains(concat!("decision.wake(ws_send_wake(&value), ", "ws_send_room_ring(&value))")));
+    let http = include_str!("../handlers.rs");
+    assert!(http.contains(concat!("decision.wake(wake, ", "body.room_ring)")));
+}
+
 /// The flags reach the recipient's inbox as the HTTP path's do — `silent` is the field
 /// `notify_inner` persists on the row (so the backstop skips it), and both are what the
 /// `/notify` arm reads before waking.

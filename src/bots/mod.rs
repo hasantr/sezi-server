@@ -12,7 +12,8 @@
 //! | `api.rs` | `/bot/v1/:method` — `getMe`, `getUpdates`, `sendMessage`, `setWebhook`, `deleteWebhook`, `getFile` |
 //! | `api_input.rs` | what a program may send it: body size, JSON shape, every field's type and bound |
 //! | `api_answer.rs` | every answer body it can read, Worker's and inbox's alike |
-//! | `conformance_tests.rs` | §2.5's tables (methods, errors) held against the code and the program's README |
+//! | `conformance_tests.rs` | §2.5's tables (methods, errors) held against the code and the program's README; the v1 contract (`tools/bots/api_v1.json`, `API_V1.md`, `CHANGELOG.md`) held against the code |
+//! | `api_spec.rs` | (tests) `tools/bots/api_v1.json` read, and the shape rule an answer or update is held to |
 //! | `webhook.rs` | the webhook's derived secret, its signature and envelope, one POST |
 //! | `listing.rs` | `GET /bots` — the enabled bots, for any active member |
 //! | `token.rs` | the key's shape, its hash, the lookup |
@@ -26,6 +27,8 @@ pub mod admin;
 pub mod api;
 pub(crate) mod api_answer;
 pub(crate) mod api_input;
+#[cfg(test)]
+pub(crate) mod api_spec;
 pub mod builtin;
 pub(crate) mod builtin_hearings_rules;
 pub(crate) mod builtin_rules;

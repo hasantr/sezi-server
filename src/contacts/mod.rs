@@ -40,7 +40,8 @@ const MARK_GRANT_APPLIED_SQL: &str = "UPDATE contact_requests SET grant_applied 
             AND g.revoked_at IS NULL)";
 
 /// Shared authorization query for `/messages/send`, key bundle and signed
-/// device-list fetches. Block is checked first and wins over every other path.
+/// device-list fetches. Block is checked first and wins over every other path —
+/// except an active common group, which turns it into `RoomOnly` (`decide`).
 /// `members` preserves the pre-0032 behavior. Strict policies accept an active
 /// account-level grant or the explicitly advertised active-common-group
 /// exception.
@@ -80,6 +81,56 @@ pub(crate) enum DirectDecision {
     Allowed,
     NotFound,
     Denied,
+    /// A blocked pair (either direction) that shares an active group. Blocking stops 1:1 only
+    /// (AGENTS.md): everything that belongs to a room they share still travels between them over
+    /// 1:1 Olm — room keys and the asks for them, a group's receipts and membership notices,
+    /// plugin records, a room's co-presence and its call signalling — so a 1:1 send passes, but
+    /// SILENTLY (stored, no push wake: `wake`) unless it is a ROOM's ring, and the receiving app
+    /// admits only what names a room both are active in (the core's `kernel/blocked_rooms.rs`).
+    /// Read receipts and a scheduled 1:1 release stay denied: they gate on `Allowed` alone.
+    RoomOnly,
+}
+
+impl DirectDecision {
+    /// The wake a 1:1 send under this decision may ask for. `Allowed`: the sender's, whatever it
+    /// is. `RoomOnly`: none — except a ring the sender declared a ROOM's (`urgent` with
+    /// `room_ring`: a group call's join, a course session's start, the leave that takes such a
+    /// ring down), which keeps its urgent wake, so a group call from a member I blocked still
+    /// rings on my phone. The relay cannot read the frame: it trusts the declared class, having
+    /// verified the one thing it can — that the pair shares an active group. The residual,
+    /// accepted (Hasan, 2026-11-11): a blocked member who shares a group can wake my phone with a
+    /// room-ring-class wake; the app reads and drops whatever is not that room's, and removal from
+    /// the group is the remedy. A 1:1 call between them never rings: the app sends a 1:1 ring
+    /// without `room_ring` (silent here), and drops a 1:1 ring on arrival whatever it claims. An
+    /// app from before `room_ring` declares none, so its group ring to a blocked member stays
+    /// silent, as it was before this.
+    pub(crate) fn wake(
+        self,
+        asked: crate::push::coalesce::WakeIntent,
+        room_ring: bool,
+    ) -> crate::push::coalesce::WakeIntent {
+        use crate::push::coalesce::WakeIntent;
+        match self {
+            DirectDecision::RoomOnly if asked.urgent() && room_ring => WakeIntent::Urgent,
+            DirectDecision::RoomOnly => WakeIntent::Silent,
+            _ => asked,
+        }
+    }
+}
+
+/// The decision from the query's row (pure, so the SQL and the rule are tested together).
+fn decide(row: &AuthzRow) -> DirectDecision {
+    if row.target_exists == 0 {
+        return DirectDecision::NotFound;
+    }
+    if row.blocked != 0 {
+        return if row.common_group != 0 { DirectDecision::RoomOnly } else { DirectDecision::Denied };
+    }
+    if crate::contact_grant::direct_message_allowed(&row.dm_policy, row.granted != 0, row.common_group != 0) {
+        DirectDecision::Allowed
+    } else {
+        DirectDecision::Denied
+    }
 }
 
 pub(crate) async fn direct_decision(
@@ -100,22 +151,7 @@ pub(crate) async fn direct_decision(
         // `members` default, but a missing target still fails closed.
         return Ok(DirectDecision::NotFound);
     };
-    if row.target_exists == 0 {
-        return Ok(DirectDecision::NotFound);
-    }
-    if row.blocked != 0 {
-        return Ok(DirectDecision::Denied);
-    }
-    let allowed = crate::contact_grant::direct_message_allowed(
-        &row.dm_policy,
-        row.granted != 0,
-        row.common_group != 0,
-    );
-    Ok(if allowed {
-        DirectDecision::Allowed
-    } else {
-        DirectDecision::Denied
-    })
+    Ok(decide(&row))
 }
 
 /// Map authorization to a response without exposing whether denial came from a
@@ -126,7 +162,9 @@ pub(crate) async fn require_direct(
     target: &str,
 ) -> std::result::Result<(), Response> {
     match direct_decision(db, caller, target).await {
-        Ok(DirectDecision::Allowed) => Ok(()),
+        // A blocked pair in a common group still fetches each other's keys and device lists:
+        // every room secret between them is sealed with them (`DirectDecision::RoomOnly`).
+        Ok(DirectDecision::Allowed | DirectDecision::RoomOnly) => Ok(()),
         Ok(DirectDecision::NotFound) => Err(json_err(404, "not_found").unwrap()),
         Ok(DirectDecision::Denied) => Err(json_err(403, "contact_not_authorized").unwrap()),
         Err(_) => Err(json_err(503, "authorization_unavailable").unwrap()),
@@ -308,6 +346,10 @@ fn contact_change_stmt(db: &D1Database, c: ContactChange<'_>) -> Result<D1Prepar
         d1_int(c.now),
     ])
 }
+
+#[cfg(test)]
+#[path = "direct_tests.rs"]
+mod direct_tests;
 
 #[cfg(test)]
 mod tests {

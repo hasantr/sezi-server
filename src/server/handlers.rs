@@ -104,6 +104,19 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
     // force, so each member's app holds its records to them and can warn at 80 %. Additive: an
     // app from before ignores the block and keeps its built-in figures.
     body["plugin_limits"] = crate::plugin_limits::read(&db).await.announced();
+    // The owner's plugin policy mode (`plugin_allowlist.rs`, Wave C3): `open` or `allowlist`, so an
+    // app knows before it reads `/plugin-policy` whether third-party apps need approval here.
+    // Additive: an app from before ignores it, and an app that finds no block reads `open`.
+    body["plugin_policy"] =
+        serde_json::json!({ "mode": crate::plugin_allowlist::read_mode(&db).await.as_str() });
+    // The bot program API this relay serves (`bots/api_answer.rs`, tools/bots/API_V1.md): its
+    // major version, path and features, before a program holds a key. Additive: nothing read
+    // it before.
+    body["bot_api"] = crate::bots::api_answer::discovery();
+    // A self-hosted relay's update timer called in within 15 min (`server_update.rs`), so the
+    // owner's app offers the one-tap update rather than the written guide. Additive: false on
+    // every relay without an updater token, Cloudflare's included; an older app ignores it.
+    body["updater"] = serde_json::Value::Bool(crate::server_update::updater_alive(&ctx.env, &db).await);
     // Where it runs, which Cloudflare version and which commit (`release_info.rs`): additive keys,
     // null when unknown.
     let version_id = ctx
@@ -229,6 +242,9 @@ fn capabilities_body(
         //   - library → the group library's parts are blobs in the same stores as media, so a
         //     server with no store answers every `/room-library` PUT with 503; announcing it
         //     there would be the lie this block exists to avoid. Hence media_ok.
+        //   - app_catalog → the owner's catalog of signed apps (`app_catalog.rs`, Wave C5): its
+        //     bundles live in the same stores, so no store, no catalog. Additive: an app from
+        //     before ignores the key, and an app that finds none hides the catalog.
         "features": {
             "messaging": true,
             "media": media_ok,
@@ -236,8 +252,13 @@ fn capabilities_body(
             "calls": true,
             "backup": true,
             "apps": media_ok,
+            "app_catalog": media_ok,
             "instrument_pack": true,
-            "library": media_ok
+            "library": media_ok,
+            // Scheduled messages held here and released at their time (`messages/scheduled.rs`):
+            // in the sender's inbox Durable Object, no store needed. An app finds none on an older
+            // relay and does not offer it.
+            "scheduled_messages": true
         },
         // ⚠️ P2P HONESTY: `supported:true` means the capability EXISTS and client toggles can
         // be persisted, while `available:false` means the transport is NOT ACTIVE YET

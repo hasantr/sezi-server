@@ -199,7 +199,12 @@ impl UserInbox {
                     && env_items.len() <= 100
                     && env_items
                         .iter()
-                        .all(|(_, e)| e.len() >= 20 && e.len() <= 64 * 1024);
+                        .all(|(_, e)| {
+                            e.len() >= 20
+                                && e.len() <= 64 * 1024
+                                // A scheduled release is the relay's alone to hand over.
+                                && !crate::messages::scheduled_rules::is_scheduled_envelope(e)
+                        });
                 // On the 1:1 path every device_id MUST be concrete — the sender knows the
                 // recipient's devices from the bundle, and a `None` would create orphan NULL
                 // pending rows nothing acks.
@@ -256,8 +261,10 @@ impl UserInbox {
                         return Ok(());
                     }
                 };
-                match crate::contacts::direct_decision(&authz_db, &sender_id, recipient_id).await {
-                    Ok(crate::contacts::DirectDecision::Allowed) => {}
+                // A blocked pair sharing a group passes, with no wake but a room's ring
+                // (`DirectDecision::RoomOnly`).
+                let decision = match crate::contacts::direct_decision(&authz_db, &sender_id, recipient_id).await {
+                    Ok(d @ (crate::contacts::DirectDecision::Allowed | crate::contacts::DirectDecision::RoomOnly)) => d,
                     Ok(crate::contacts::DirectDecision::NotFound) => {
                         let _ = ws.send_with_str(
                             serde_json::json!({"type":"send_err","ref":reff,"code":"recipient_not_found"})
@@ -279,7 +286,7 @@ impl UserInbox {
                         );
                         return Ok(());
                     }
-                }
+                };
                 // Rate-limit parity for the hot path: the SAME KV bucket and parameters as HTTP
                 // `/messages/send`, so the two share one 300/60s per-user limit rather than
                 // leaving the socket an unlimited way to bloat the recipient DO's SQLite. It runs
@@ -356,7 +363,7 @@ impl UserInbox {
                     #[serde(default)]
                     delivered_live: bool,
                 }
-                let wake = ws_send_wake(&value);
+                let wake = decision.wake(ws_send_wake(&value), ws_send_room_ring(&value));
                 let live = ws_send_live(&value);
                 let mut acks: Vec<serde_json::Value> = Vec::with_capacity(env_items.len());
                 for (dev, env_b64) in &env_items {
@@ -553,6 +560,13 @@ impl UserInbox {
 pub(super) fn ws_send_wake(frame: &serde_json::Value) -> WakeIntent {
     let flag = |k: &str| frame.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
     WakeIntent::from_flags(flag("silent"), flag("urgent"))
+}
+
+/// The frame declares its ring a ROOM's (`"room_ring": true`, beside `"urgent": true`): the one
+/// wake a send between a blocked pair who share a group keeps (`contacts::DirectDecision::wake`).
+/// Anything but a JSON `true` — an older client — is not.
+pub(super) fn ws_send_room_ring(frame: &serde_json::Value) -> bool {
+    frame.get("room_ring").and_then(serde_json::Value::as_bool).unwrap_or(false)
 }
 
 /// The frame asks for a live-only delivery (`live_frames.rs`): `"live": true`, written by the

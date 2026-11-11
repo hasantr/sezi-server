@@ -23,7 +23,7 @@
 //! The only genuinely test-only items are the three `SignParts` diagnostic fields, and the allow
 //! sits on those and nothing else.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -62,7 +62,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// HMAC-SHA256(key, data) → 32 bytes.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

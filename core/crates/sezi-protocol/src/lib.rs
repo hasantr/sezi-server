@@ -10,6 +10,8 @@ pub mod history_page;
 pub mod indirect;
 pub mod inner;
 pub mod link_card;
+/// Live location: the durations, the window, last-writer-wins and the send rate (`kernel/live_location.rs`).
+pub mod live_location;
 /// What a new device signs while it polls `link-status` (CRY-1: tagged, never the raw code).
 pub mod link_proof;
 pub mod media_id;
@@ -20,6 +22,8 @@ pub mod payload_frame;
 /// Pinned messages: the cap, the durations, expiry and last-writer-wins (`kernel/message_pins.rs`).
 pub mod pin;
 pub mod reaction;
+/// Scheduled messages: the one-time-key seal the relay holds and releases (`kernel/scheduled/`).
+pub mod scheduled;
 pub mod reply;
 pub mod sticker;
 pub mod takeover;

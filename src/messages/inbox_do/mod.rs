@@ -16,6 +16,7 @@ mod message;
 mod receipt;
 mod push_keys;
 mod self_read;
+mod scheduled;
 mod takeover_nudge;
 mod upgrade_refusal;
 use upgrade_refusal::refuse_unverified_upgrade;
@@ -322,6 +323,12 @@ impl DurableObject for UserInbox {
             (Method::Post, "/notify-member") => self.notify_member(req).await,
             (Method::Post, "/fanout") => self.fanout_hop(req).await,
             (Method::Post, "/devices-changed") => self.devices_changed(req).await, // dead_devices.rs
+            // A scheduled message of THIS account held or let go (`scheduled.rs`); reached only
+            // from `messages/scheduled.rs`, for the caller's own inbox.
+            (Method::Post, "/scheduled-put") => self.scheduled_put(req).await,
+            (Method::Post, "/scheduled-cancel") => self.scheduled_cancel(req).await,
+            // One member's share of another inbox's release (`scheduled.rs`).
+            (Method::Post, "/notify-release") => self.notify_release_here(req).await,
             (Method::Post, "/notify") => {
                 let body: NotifyBody = req.json().await?;
                 // Before the envelope is stored: what its wake must cover (`push::coalesce`).
@@ -685,6 +692,8 @@ impl UserInbox {
         storage.sql().exec_raw(wake_gate::WAKE_GATE_TABLE_SQL, sql_no_args())?;
         // Each device's push key (`push_keys.rs`).
         storage.sql().exec_raw(push_keys::PUSH_KEYS_TABLE_SQL, sql_no_args())?;
+        // Scheduled messages this account handed over, held until their time (`scheduled.rs`).
+        self.ensure_scheduled_table()?;
         // The initial arm goes through `ensure_alarm` (3 bounded retries, logs on failure) rather
         // than a single swallowed `set_alarm`: if the first arm fails and no WS reconnect ever
         // happens, the backstop never runs.

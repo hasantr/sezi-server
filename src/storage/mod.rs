@@ -26,7 +26,7 @@ mod s3;
 
 pub use health::{probe_all, write_health};
 pub use r2::R2Store;
-pub use router::{invalidate_storage_cache, placement_err_response, StorageRouter};
+pub use router::{invalidate_storage_cache, placement_err_response, PlacementError, StorageRouter};
 pub use s3::{validate_config as validate_s3_config, S3Config, S3Store};
 
 /// The default backend id. Meta rows (media_objects/plugin_media_objects/plugin_code_objects)

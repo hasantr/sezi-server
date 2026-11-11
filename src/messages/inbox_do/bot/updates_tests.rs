@@ -212,3 +212,59 @@ fn a_call_names_its_room_and_the_callers_room_role_from_the_relay() {
     assert_eq!(added["chat"], serde_json::json!({ "type": "room", "room_id": "g-1", "name": "Hukuk" }));
     assert_eq!(added["who"]["user_id"], "bob");
 }
+
+/// The bot API v1 contract (`tools/bots/api_v1.json`, B2): every update kind the relay builds is
+/// a documented kind, and holds to its documented fields and types — each builder in every way
+/// it can answer (with and without `who`, a command, a reply, a caption, a language). A field
+/// added here without its line in the spec (and the changelog, `bots/conformance_tests.rs`)
+/// fails, and so does a documented field that stops being answered.
+#[test]
+fn every_update_kind_holds_to_the_v1_contract() {
+    use crate::bots::api_spec::{check_shape, list};
+    let who = Who { user_id: "alice".into(), display_name: Some("Alice".into()), server_role: Some("member".into()) };
+    let ext = serde_json::json!({ "reply": { "uid": "b-1", "by": "bot", "kind": "text", "text": "earlier" } });
+    let m = sezi_protocol::inner::FileManifest {
+        v: 1,
+        media_id: "m".into(),
+        key_b64: "k".into(),
+        nonce_b64: "n".into(),
+        chunk_size: 65_536,
+        size: 12,
+        content_type: "text/plain".into(),
+        filename: "a.txt".into(),
+    };
+    let files = [("f-1".to_string(), &m), ("f-2".to_string(), &m)];
+    let room = CallRoom { id: "g-1", name: "Hukuk", role: "admin" };
+    let null = serde_json::Value::Null;
+    let built = [
+        message_update(1, "alice", Some(&who), Some("m-1"), "/ara kitap", &ext),
+        message_update(1, "bob", None, None, "hi", &null),
+        file_update(2, "alice", Some(&who), Some("m-2"), Some("the minutes"), &ext, &files),
+        file_update(2, "bob", None, None, None, &null, &files[..1]),
+        call_update(3, "alice", Some(&who), &room, "loc-7", "/durusma yarın", Some("tr"), Some(180)),
+        call_update(3, "bob", None, &room, "loc-8", "hi", None, None),
+        room_event_update("added", 4, "g-1", "Hukuk", Some(&serde_json::json!({"user_id": "bob"}))),
+        room_event_update("removed", 4, "g-1", "Hukuk", None),
+        ping_update(5, serde_json::json!({ "user_id": "owner", "display_name": "Owner" })),
+        ping_update(5, serde_json::json!({})),
+    ];
+    let kinds = list("updates");
+    let mut seen = std::collections::BTreeSet::new();
+    for u in &built {
+        let kind = u["kind"].as_str().unwrap();
+        let spec = kinds.iter().find(|k| k["kind"] == kind).unwrap_or_else(|| panic!("`{kind}` is not in api_v1.json"));
+        check_shape(kind, u, &spec["fields"]).unwrap();
+        seen.insert(kind.to_string());
+    }
+    let documented: std::collections::BTreeSet<String> =
+        kinds.iter().map(|k| k["kind"].as_str().unwrap().to_string()).collect();
+    assert_eq!(seen, documented, "a documented kind no builder makes, or the reverse");
+    // Every kind the inbox writes anywhere is one of these builders' (the room event's two are
+    // checked by `bot_room_event` before it calls the builder).
+    let src = include_str!("updates.rs");
+    for kind in ["\"kind\": \"message\"", "update[\"kind\"] = \"file\"", "update[\"kind\"] = \"call\"", "\"kind\": \"ping\""] {
+        assert!(src.contains(kind), "updates.rs no longer builds {kind}");
+    }
+    let room_src = include_str!("room.rs");
+    assert!(room_src.contains("matches!(kind.as_str(), \"added\" | \"removed\")"));
+}
