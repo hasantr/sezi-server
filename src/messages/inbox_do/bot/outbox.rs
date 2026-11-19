@@ -307,6 +307,8 @@ impl UserInbox {
         let next = [
             store.db.int(OUTBOX_NEXT, &[]),
             store.db.int(super::updates::RETENTION_NEXT, &[keep(), keep()]),
+            // What the bot sent and the room calls it was handed: their 7 days, idle or not.
+            self.bot_kept_next(),
             self.bot_webhook_next(),
             self.bot_builtin_next(),
             self.bot_builtin_expiry_next(),

@@ -1,6 +1,6 @@
 //! `GET /bots` — the server's enabled bots, for any active member (docs/BOTS_BUILD.md §2.5).
 //!
-//! `{bots:[{bot_id, name, about, builtin, ai_provider, ai_geo, commands}]}`. A client keeps this to
+//! `{bots:[{bot_id, name, about, builtin, ai_provider, ai_geo, app, commands}]}`. A client keeps this to
 //! tell a bot from a person (its own section, the "Bot" label, no E2E chip). `commands` is `[]`
 //! until `setCommands` (Phase 4) gives a bot any. Nothing about the program is here — whether it
 //! answers, its webhook — that is the owner's (`GET /admin/bots`). `ai_provider` is there for the
@@ -13,8 +13,13 @@ use serde::{Deserialize, Serialize};
 use worker::*;
 
 /// Enabled, not deleted, in creation order.
-pub(crate) const LIST_SQL: &str = "SELECT bot_id, name, about, builtin, ai_provider, ai_geo FROM bots
-      WHERE deleted_at IS NULL AND disabled_at IS NULL ORDER BY created_at, bot_id";
+///
+/// A bot's interface (`docs/BOT_APP_PLAN.md`) is named only while its catalog entry is still
+/// there: an entry the owner took off the catalog leaves the bot without one.
+pub(crate) const LIST_SQL: &str = "SELECT b.bot_id, b.name, b.about, b.builtin, b.ai_provider, b.ai_geo,
+             c.id AS app_entry, c.name AS app_name
+        FROM bots b LEFT JOIN app_catalog c ON c.id = b.app_entry
+      WHERE b.deleted_at IS NULL AND b.disabled_at IS NULL ORDER BY b.created_at, b.bot_id";
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct ListedBot {
@@ -28,6 +33,10 @@ pub(crate) struct ListedBot {
     pub(crate) ai_provider: Option<String>,
     #[serde(default)]
     pub(crate) ai_geo: Option<String>,
+    #[serde(default)]
+    pub(crate) app_entry: Option<String>,
+    #[serde(default)]
+    pub(crate) app_name: Option<String>,
 }
 
 pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -46,9 +55,18 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
                 "builtin": b.builtin,
                 "ai_provider": b.ai_provider,
                 "ai_geo": b.ai_geo,
+                "app": app_of(b.app_entry, b.app_name),
                 "commands": [],
             })
         })
         .collect();
     Response::from_json(&serde_json::json!({ "bots": bots }))
+}
+
+/// The listing's `app`: `{entry, name}` when the bot has an interface, else `null`.
+pub(crate) fn app_of(entry: Option<String>, name: Option<String>) -> serde_json::Value {
+    match (entry, name) {
+        (Some(entry), Some(name)) => serde_json::json!({ "entry": entry, "name": name }),
+        _ => serde_json::Value::Null,
+    }
 }

@@ -12,7 +12,7 @@ use super::builtin_policy as policy;
 use super::store::Exec;
 use super::outbox::OutKind;
 use super::room::BotRooms;
-use super::updates::{call_update, message_update, CallRoom, Who};
+use super::updates::{app_update, call_update, message_update, CallRoom, Who};
 use super::*;
 use crate::bots::builtin_rules::Lang;
 use sezi_bot_engine::{on_envelope, Effect, Envelope, Inbound};
@@ -223,6 +223,8 @@ impl UserInbox {
                         if msg_uid.as_deref().is_some_and(|u| !store.first_sight(&from, u, now)) {
                             continue;
                         }
+                        // They wrote: the program may answer them 1:1 (`dm_scope.rs`, D4).
+                        super::dm_scope::note_writer(&store.db, &from, now);
                         // Too many of theirs (or everybody's) waiting: acked, never queued.
                         if capped && !admit_member_update(&store.db, &from, None, now, &mut owed.busy) {
                             continue;
@@ -238,12 +240,25 @@ impl UserInbox {
                         if msg_uid.as_deref().is_some_and(|u| !store.first_sight(&from, u, now)) {
                             continue;
                         }
+                        super::dm_scope::note_writer(&store.db, &from, now);
                         if capped && !admit_member_update(&store.db, &from, None, now, &mut owed.busy) {
                             continue;
                         }
                         let who = pre.who.get(&from);
                         let (uid, cap) = (msg_uid.as_deref(), caption.as_deref());
                         self.bot_queue_file(&from, who, uid, &manifests, cap, &ext, env.remote_id, now);
+                    }
+                    // The bot's interface (`docs/BOT_APP_PLAN.md`): the member wrote, so the
+                    // program may answer them; the same per-member cap as a text.
+                    Effect::Update(Inbound::App { from, data, request_id, .. }) => {
+                        super::dm_scope::note_writer(&store.db, &from, now);
+                        if capped && !admit_member_update(&store.db, &from, None, now, &mut owed.busy) {
+                            continue;
+                        }
+                        let update = app_update(now, &from, pre.who.get(&from), &data, request_id.as_deref());
+                        if let Some(id) = self.bot_push_update(&update, now) {
+                            self.bot_note_update_src(id, &from, env.remote_id, None);
+                        }
                     }
                     Effect::Update(Inbound::PairAck { from }) => {
                         owed.pair_acks.insert(from);

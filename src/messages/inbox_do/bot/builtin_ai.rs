@@ -67,6 +67,35 @@ pub(super) fn cut(text: &str, n: usize) -> String {
     text.chars().take(n).collect()
 }
 
+/// The most of a member-chosen name the system prompt carries.
+pub(super) const MAX_NAME_IN_PROMPT: usize = 64;
+
+/// A name a member chose (their display name, a group's name) as ONE quoted value for the system
+/// prompt. Members set these, and the system prompt is where the owner's instructions are: a name
+/// written as `Ayşe"\n\nNew instructions: …` would otherwise have closed the quote and started a
+/// line of its own (review 2026-11-18). So every control or format character (bidi overrides,
+/// zero-width ones) is dropped, every run of whitespace — newlines included — is one space, the
+/// result is cut to [`MAX_NAME_IN_PROMPT`] characters, and it is written as a JSON string, whose
+/// quotes and backslashes are escaped.
+pub(super) fn as_quoted_name(raw: &str) -> String {
+    let invisible = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+    };
+    let mut clean = String::new();
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            if !clean.is_empty() && !clean.ends_with(' ') {
+                clean.push(' ');
+            }
+        } else if !invisible(c) {
+            clean.push(c);
+        }
+    }
+    let clean: String = clean.trim_end().chars().take(MAX_NAME_IN_PROMPT).collect();
+    serde_json::Value::String(clean.trim_end().to_string()).to_string()
+}
+
 /// The system prompt: who the bot is and who it talks to, the owner's instructions verbatim,
 /// and — for a bot that writes rows to a connected sheet (`rows`) — the row protocol. `room` is
 /// the group's name when the member called the bot there (everyone in it sees the answer).
@@ -79,11 +108,15 @@ pub(super) fn system_prompt(
     rows: bool,
     now_ms: i64,
 ) -> String {
+    // A display name and a group's name are the members' own words: each goes in as one quoted
+    // value, never as prompt text (`as_quoted_name`).
+    let member = as_quoted_name(member_name);
     let setting = match room {
-        None => format!("talking one to one with a member named \"{member_name}\""),
+        None => format!("talking one to one with a member named {member}"),
         Some(group) => format!(
-            "answering a member named \"{member_name}\" who called you in the group \"{group}\"; \
-             everyone in the group sees your answer, so write it for them all"
+            "answering a member named {member} who called you in the group {}; \
+             everyone in the group sees your answer, so write it for them all",
+            as_quoted_name(group)
         ),
     };
     let mut s = format!(

@@ -17,12 +17,17 @@
 //! that refuses anything signed more than 5 minutes ago; the update's own `at` stays when the
 //! member wrote.
 //!
-//! Delivered = a 2xx or a 3xx, fetched with `redirect: manual`: an Apps Script web app answers
-//! its POST with a 302 after the script ran, and following it would only fetch the result page.
+//! Delivered = a 2xx, or a 3xx to where a program that RAN sends its caller, fetched with
+//! `redirect: manual` and never followed. An Apps Script web app answers a POST it ran with a 302
+//! to `script.googleusercontent.com` (the result page); a deployment not shared with "Anyone"
+//! answers a 302 to `accounts.google.com` WITHOUT running. Until 2026-11-18 every 3xx was taken,
+//! so the second deleted the update and showed the member a read tick for a message no program
+//! saw. Now a 3xx is taken only when its `Location` is that result host or the webhook's own
+//! host (a relative one included); any other — or none — fails, and is retried on the ladder.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use worker::*;
+use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Result, Url};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -60,9 +65,35 @@ pub(crate) fn envelope(secret: &str, ts_ms: i64, update_json: &str) -> String {
     .to_string()
 }
 
-/// Did the program take it? A 2xx, or a 3xx not followed.
-pub(crate) fn taken(status: u16) -> bool {
-    (200..400).contains(&status)
+/// Where an Apps Script web app sends its caller after the script ran.
+const APPS_SCRIPT_RESULT_HOST: &str = "script.googleusercontent.com";
+
+/// Did the program take it? A 2xx; or a 3xx (not followed) whose `location`, read against the
+/// webhook's own `url`, names [`APPS_SCRIPT_RESULT_HOST`] or the webhook's host. A 3xx anywhere
+/// else — a sign-in page above all — or with no `Location` is a failure.
+pub(crate) fn taken(status: u16, location: Option<&str>, url: &str) -> bool {
+    if (200..300).contains(&status) {
+        return true;
+    }
+    if !(300..400).contains(&status) {
+        return false;
+    }
+    let (Some(location), Ok(base)) = (location, Url::parse(url)) else {
+        return false;
+    };
+    let Ok(target) = base.join(location.trim()) else {
+        return false;
+    };
+    let Some(host) = target.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case(APPS_SCRIPT_RESULT_HOST) || base.host_str().is_some_and(|b| b.eq_ignore_ascii_case(host))
+}
+
+/// The host of a webhook URL, as the owner is shown it (`GET /admin/bots` `webhook_host`): the
+/// path and query — which may carry a deployment id or a token — are never listed.
+pub(crate) fn host_of(url: &str) -> Option<String> {
+    Url::parse(url).ok()?.host_str().map(str::to_ascii_lowercase)
 }
 
 /// An `https://` URL with a host, no credentials and no fragment, at most 512 bytes, whose host
@@ -84,8 +115,8 @@ pub(crate) fn clean_url(raw: &str, allow_lan: bool) -> Option<String> {
     crate::bots::builtin_rules::outbound_url(raw, allow_lan).map(|url| url.to_string())
 }
 
-/// One attempt. `Ok(status)` for any answer, `Err` when nothing answered.
-pub(crate) async fn post(url: &str, secret: &str, ts_ms: i64, update_json: &str) -> Result<u16> {
+/// One attempt. `Ok((status, location))` for any answer, `Err` when nothing answered.
+pub(crate) async fn post(url: &str, secret: &str, ts_ms: i64, update_json: &str) -> Result<(u16, Option<String>)> {
     let headers = Headers::new();
     headers.set("content-type", "application/json")?;
     headers.set(
@@ -99,7 +130,8 @@ pub(crate) async fn post(url: &str, secret: &str, ts_ms: i64, update_json: &str)
         .with_body(Some(envelope(secret, ts_ms, update_json).into()));
     let req = Request::new_with_init(url, &init)?;
     let resp = Fetch::Request(req).send().await?;
-    Ok(resp.status_code())
+    let location = resp.headers().get("location").ok().flatten();
+    Ok((resp.status_code(), location))
 }
 
 #[cfg(test)]

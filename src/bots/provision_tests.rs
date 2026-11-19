@@ -5,7 +5,7 @@
 //! batch, bound in the same order.
 
 use super::*;
-use crate::bots::api::SEND_TARGET_SQL;
+use crate::bots::api::{send_target, Target, SEND_TARGET_SQL};
 use crate::bots::token::{INSERT_TOKEN_SQL, REVOKE_TOKENS_SQL};
 use crate::bots::BOTS_AMONG_SQL;
 use crate::contacts::DIRECT_AUTHZ_SQL;
@@ -213,19 +213,55 @@ fn the_directory_member_list_and_counts_hide_the_bot() {
     assert_eq!(none, 0);
 }
 
+fn send_verdict(db: &Connection, to: &str) -> Result<(), (u16, &'static str)> {
+    let t = db
+        .query_row(SEND_TARGET_SQL, params![to, BOT], |r| {
+            Ok(Target {
+                human: r.get("human")?,
+                blocked: r.get("blocked")?,
+                granted: r.get("granted")?,
+                revoked: r.get("revoked")?,
+                dm_policy: r.get("dm_policy")?,
+            })
+        })
+        .unwrap();
+    send_target(Some(&t))
+}
+
 #[test]
 fn a_bot_writes_only_to_unblocked_humans() {
     let db = setup();
     provision(&db);
     block(&db, BOT, "bob"); // either direction counts
-    let target = |to: &str| -> (i64, i64) {
-        db.query_row(SEND_TARGET_SQL, params![to, BOT], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
+    assert_eq!(send_verdict(&db, "alice"), Ok(()));
+    assert_eq!(send_verdict(&db, "bob"), Err((403, "blocked")));
+    assert_eq!(send_verdict(&db, BOT), Err((403, "not-a-member")), "not to itself, not to another bot");
+    assert_eq!(send_verdict(&db, "nobody"), Err((403, "not-a-member")));
+    assert_eq!(send_target(None), Err((403, "not-a-member")));
+}
+
+/// Review H12 / decision D4: a member who removed the bot (its grant revoked) is never written
+/// to, under any DM policy; under a strict one, neither is a member the bot holds no grant with.
+#[test]
+fn a_bot_honours_a_removal_and_a_strict_dm_policy() {
+    let db = setup(); // dm_policy = contacts_only
+    provision(&db);
+    let revoke = |who: &str| {
+        db.execute(
+            "UPDATE contact_grants SET revoked_at = ?3, revoked_by = ?2
+              WHERE user_low = MIN(?1, ?2) AND user_high = MAX(?1, ?2)",
+            params![BOT, who, NOW + 1],
+        )
+        .unwrap()
     };
-    assert_eq!(target("alice"), (1, 0));
-    assert_eq!(target("bob"), (1, 1));
-    assert_eq!(target(BOT), (0, 0), "not to itself, not to another bot");
-    assert_eq!(target("nobody"), (0, 0));
+    assert_eq!(revoke("alice"), 1);
+    assert_eq!(send_verdict(&db, "alice"), Err((403, "removed")), "the member removed the bot");
+    human(&db, "erin", "Erin"); // joined with no grant (none was made for her)
+    assert_eq!(send_verdict(&db, "erin"), Err((403, "dm-policy")), "a strict policy, no grant");
+    assert_eq!(send_verdict(&db, "bob"), Ok(()), "a member who holds the grant");
+    db.execute("UPDATE server_settings SET dm_policy = 'members' WHERE id = 1", []).unwrap();
+    assert_eq!(send_verdict(&db, "erin"), Ok(()), "an open server: every member");
+    assert_eq!(send_verdict(&db, "alice"), Err((403, "removed")), "a removal holds under any policy");
 }
 
 #[test]

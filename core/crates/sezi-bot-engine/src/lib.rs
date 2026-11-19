@@ -153,6 +153,9 @@ pub enum Inbound {
         lang: Option<String>,
         utc_offset_min: Option<i32>,
     },
+    /// A message from the bot's interface (`docs/BOT_APP_PLAN.md`): the web app the bot's owner
+    /// linked to it, open on `from`'s device, handed the bot `data` (a JSON text the app wrote).
+    App { from: String, device: String, data: String, request_id: Option<String> },
     /// A button tap (Phase 4).
     Tap { from: String, room_id: Option<String>, msg_uid: String, action_id: String },
     /// A member asking for the bot's room key again (Phase 3): answer with [`room_key_request`]

@@ -12,6 +12,7 @@
 //! | `send_guard.rs` | what a program's sends are held to: 60 a minute, 30 into one chat |
 //! | `api_budget.rs` | every API call of a program: 300 a minute, a burst of 60 |
 //! | `send_replay.rs` | idempotent sending: a repeated `client_id` answers the first `message_id` |
+//! | `dm_scope.rs` | whom a program writes to 1:1: who wrote lately (reply-only), or anyone by the owner's grant |
 //! | `backlog.rs` | what one member (100) and everybody (2,000) may leave waiting; the refused are told |
 //! | `outbox.rs` | what the tick owes the network, drained under a subrequest budget |
 //! | `updates.rs` | the update JSON and `getUpdates`' long poll |
@@ -32,7 +33,7 @@
 //!
 //! Internal routes (a DO stub is not public; only the Worker calls them):
 //! `/bot/init`, `/bot/budget`, `/bot/updates`, `/bot/api`, `/bot/file`, `/bot/state`, `/bot/webhook`,
-//! `/bot/webhook-secret`, `/bot/ping`, `/bot/builtin`, `/bot/builtin-test`, `/bot/wake`, `/bot/room-event`.
+//! `/bot/dm-scope`, `/bot/ping`, `/bot/builtin`, `/bot/builtin-test`, `/bot/wake`, `/bot/room-event`.
 
 use super::*;
 
@@ -50,6 +51,7 @@ mod builtin_sheet;
 mod builtin_store;
 mod deliver;
 mod deliver_order;
+mod dm_scope;
 mod files;
 mod hearings_answer;
 mod hearings_audit;
@@ -115,7 +117,8 @@ impl UserInbox {
         let tables = store::TABLES.iter().chain(builtin_store::TABLES.iter()).chain(room_store::TABLES.iter());
         let tables = tables.chain(send_guard::TABLES.iter()).chain(send_replay::TABLES.iter());
         let tables = tables.chain(files::TABLES.iter()).chain(hearings_audit::TABLES.iter());
-        for t in tables.chain(deliver_order::TABLES.iter()).chain(backlog::TABLES.iter()) {
+        let tables = tables.chain(deliver_order::TABLES.iter()).chain(backlog::TABLES.iter());
+        for t in tables.chain(dm_scope::TABLES.iter()) {
             sql.exec_raw(t, sql_no_args())?;
         }
         // Columns added since an older inbox made its tables: each once, its failure on a table
@@ -176,7 +179,10 @@ impl UserInbox {
             (Method::Post, "/bot/budget") => self.bot_take_call(),
             (Method::Get, "/bot/state") => self.bot_state(),
             (Method::Post, "/bot/webhook") => self.bot_set_webhook(req.json().await?).await,
-            (Method::Post, "/bot/webhook-secret") => self.bot_set_webhook_secret(req.json().await?).await,
+            (Method::Post, "/bot/dm-scope") => {
+                let body: serde_json::Value = req.json().await?;
+                self.bot_set_dm_scope(&body)
+            }
             (Method::Post, "/bot/ping") => {
                 let body: serde_json::Value = req.json().await?;
                 self.bot_ping(body.get("who").cloned().unwrap_or_default()).await
@@ -220,6 +226,9 @@ impl UserInbox {
         let ctx = self.bot_ctx()?;
         let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
         let method = s("method");
+        if method == "answerApp" {
+            return self.bot_answer_app(&ctx, body).await;
+        }
         if !matches!(method, "sendMessage" | "sendRoom") {
             return crate::bots::api::bot_err(404, "unknown-method");
         }
@@ -238,8 +247,15 @@ impl UserInbox {
         }
         // From the replay's last read to the reservation: no `await`, so no second call of the
         // same `client_id` can slip in between.
-        let db = self.bot_store().db;
+        let store = self.bot_store();
         let now = crate::utils::now_ms() as i64;
+        // 1:1 only to a member who wrote lately, unless the owner granted more (D4, `dm_scope.rs`).
+        let scope = dm_scope::Scope::stored(store.kv_get(dm_scope::KV_SCOPE).as_deref());
+        // Before the slot and the `client_id` are taken: a refusal spends neither.
+        if room.is_none() && !dm_scope::may_write(&store.db, scope, s("to"), now) {
+            return crate::bots::api::bot_err(403, "reply-only");
+        }
+        let db = store.db;
         let slot = match send_guard::take_slot(&db, &chat, now) {
             Ok(slot) => slot,
             Err(retry_after_s) => return send_guard::rate_limited(retry_after_s),
@@ -262,6 +278,48 @@ impl UserInbox {
         sent
     }
 
+    /// A program's `answerApp` (`docs/BOT_APP_PLAN.md`), after the Worker's checks: the reply-only
+    /// rule and the send limits as for a 1:1 text, then `BotAppData` sealed to every device of the
+    /// member. Never a chat row on their side: their kernel hands it to the bot's interface if it
+    /// is open.
+    async fn bot_answer_app(&self, ctx: &BotCtx, body: &serde_json::Value) -> Result<Response> {
+        let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let to = s("to");
+        let store = self.bot_store();
+        let now = crate::utils::now_ms() as i64;
+        let scope = dm_scope::Scope::stored(store.kv_get(dm_scope::KV_SCOPE).as_deref());
+        if !dm_scope::may_write(&store.db, scope, to, now) {
+            return crate::bots::api::bot_err(403, "reply-only");
+        }
+        let db = store.db;
+        let chat = send_guard::chat_key(Some(to), None);
+        let slot = match send_guard::take_slot(&db, &chat, now) {
+            Ok(slot) => slot,
+            Err(retry_after_s) => return send_guard::rate_limited(retry_after_s),
+        };
+        let inner = sezi_protocol::inner::InnerMessage::BotAppData {
+            data: s("data").to_string(),
+            request_id: body.get("request_id").and_then(|v| v.as_str()).map(str::to_string),
+        };
+        let payload = sezi_protocol::inner::ChatPayload::new(None, None, inner);
+        if self.bot_encrypt_payload(ctx, to, &payload).await?.is_none() {
+            send_guard::refund(&db, slot);
+            return crate::bots::api::bot_err(409, "no-devices");
+        }
+        self.bot_drain_outbox(ctx).await;
+        self.bot_rearm().await;
+        Response::from_json(&crate::bots::api_answer::app_answered())
+    }
+
+    /// `/bot/dm-scope {scope: "reply" | "anyone"}`: the owner's grant (D4). 400 for anything else.
+    fn bot_set_dm_scope(&self, body: &serde_json::Value) -> Result<Response> {
+        let Some(scope) = body.get("scope").and_then(|v| v.as_str()).and_then(dm_scope::Scope::parse) else {
+            return Response::error("bad scope", 400);
+        };
+        self.bot_store().kv_put(dm_scope::KV_SCOPE, scope.as_str());
+        Response::empty().map(|r| r.with_status(204))
+    }
+
     /// Counts, for diagnosis and the owner's page. No content.
     fn bot_state(&self) -> Result<Response> {
         use store::Exec;
@@ -282,6 +340,10 @@ impl UserInbox {
             // Updates the webhook kept refusing while it took later ones (`deliver_order.rs`).
             "webhook_aside": count_opt(deliver_order::ASIDE_COUNT),
             "webhook": s.kv_get("webhook_url").is_some(),
+            // Its host only (D5): the path and query may carry a deployment id or a token.
+            "webhook_host": s.kv_get("webhook_url").and_then(|u| crate::bots::webhook::host_of(&u)),
+            // Whom the program may write to 1:1 (D4, `dm_scope.rs`): `reply` or `anyone`.
+            "dm_scope": dm_scope::Scope::stored(s.kv_get(dm_scope::KV_SCOPE).as_deref()).as_str(),
             // Set, but its URL fails the outbound rule now: delivered nothing (`deliver::Hook`).
             "webhook_refused": self.bot_webhook() == deliver::Hook::Refused,
             // At its 2,000: nobody's new message is queued (`backlog.rs`) — most often a program

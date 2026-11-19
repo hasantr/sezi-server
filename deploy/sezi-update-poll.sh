@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # The box's half of the owner's one-tap update (docs/SERVER_UPDATE_PLAN.md §4.2–4.3), run as root
 # by sezi-update.timer every two minutes and by sezi-update-nightly.timer once a night
-# (deploy/install-updater.sh installs both).
+# (deploy/install-updater.sh installs both, and this script, from its root-owned copy).
 #
 #   sezi-update-poll.sh             ask the relay whether its owner asked for a build; if so, run
-#                                   deploy/update.sh --signed --to <build> and report how it ended
+#                                   update.sh --signed --to <build> and report how it ended
 #   sezi-update-poll.sh --nightly   when the owner turned on automatic updates, run update.sh
 #                                   --signed (--only-security for "security updates only") and
 #                                   report it if anything was done
@@ -16,16 +16,22 @@
 # (off/all/security); update.sh installs only a build the SIGNED release channel names, so a relay
 # that was taken can at most ask for a build Hasan's key signed.
 #
-# Environment (optional): SEZI_DIR, SEZI_DATA, SEZI_PORT as update.sh; SEZI_UPDATER_TOKEN_FILE;
-# SEZI_UPDATE_SH (the update script, default $SEZI_DIR/deploy/update.sh).
+# Root runs nothing from the relay's own tree (the clone, which the relay's user can write): this
+# script and update.sh come from $SEZI_UPDATER_DIR, the result and the lock live in
+# $SEZI_UPDATER_STATE — both root's (see update.sh, "WHAT ROOT RUNS AND TRUSTS").
+#
+# Environment (optional): SEZI_PORT as update.sh; SEZI_UPDATER_TOKEN_FILE; SEZI_UPDATER_DIR
+# (/usr/local/lib/sezi-updater), SEZI_UPDATER_STATE (/var/lib/sezi-updater); SEZI_UPDATE_SH (the
+# update script, default $SEZI_UPDATER_DIR/update.sh). The units pass on SEZI_DIR, SEZI_DATA and the
+# rest to update.sh.
 set -uo pipefail
 
-SRV="${SEZI_DIR:-/opt/sezi-server}"
-DATA="${SEZI_DATA:-/var/lib/sezi}"
 PORT="${SEZI_PORT:-8788}"
 TOKEN_FILE="${SEZI_UPDATER_TOKEN_FILE:-/etc/sezi/updater-token}"
-UPDATE_SH="${SEZI_UPDATE_SH:-$SRV/deploy/update.sh}"
-RESULT="$DATA/update-result.json"
+UPD="${SEZI_UPDATER_DIR:-/usr/local/lib/sezi-updater}"
+UST="${SEZI_UPDATER_STATE:-/var/lib/sezi-updater}"
+UPDATE_SH="${SEZI_UPDATE_SH:-$UPD/update.sh}"
+RESULT="$UST/update-result.json"
 BASE="http://127.0.0.1:$PORT"
 
 NIGHTLY=""
@@ -67,8 +73,8 @@ result_json() { # result_json <request id or empty> <code when there is no resul
 }
 # A busy lock is said before asking: a request is "picked" when it is handed out, so it must not be
 # handed to a box that cannot start it. (update.sh takes the same lock for itself.)
-mkdir -p "$DATA"
-if ! flock -n "$DATA/update.lock" true; then
+mkdir -p "$UST" && chmod 0700 "$UST" || exit 1
+if ! flock -n "$UST/update.lock" true; then
   echo "an update is running; asking next time"
   exit 0
 fi

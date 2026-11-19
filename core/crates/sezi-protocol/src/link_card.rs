@@ -97,8 +97,11 @@ fn is_web_url(url: &str) -> bool {
 
 /// The endings a bare domain ("adobe.com") is believed with — the same short list the chat's
 /// link finder uses (`mobile/lib/src/k7/k7_text_links.dart`), so a card is fetched for exactly
-/// the words the bubble draws as a link. A file name ("rapor.pdf") must not become one.
-const BARE_ENDINGS: &[&str] = &[
+/// the words the bubble draws as a link. A file name ("rapor.pdf") must not become one. Public
+/// because a store query that looks for links narrows its rows by these words first
+/// (`kernel/projection/shared_media.rs`): every address [first_link] finds holds `http`, `www.` or
+/// a `.` and one of them.
+pub const BARE_ENDINGS: &[&str] = &[
     "com", "net", "org", "io", "app", "dev", "ai", "edu", "gov", "info", "work", "tr", "eu", "de", "uk",
 ];
 

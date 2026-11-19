@@ -132,6 +132,18 @@ impl UserInbox {
                 .sql()
                 .exec_raw(DROP_DEVICE_ROWS_SQL, Some(vec![JsValue::from_str(&d.device_id)]));
         }
+        // A revoked device's socket opened before the revocation stays open otherwise, and its
+        // `ack`, `self_read` and `receipt_sync` arms check nothing per frame (only `send` does):
+        // it could go on reading and writing read and delivery state (audit 2026-11-18). Closed
+        // here, its reconnect meets the upgrade's own revoked-device refusal.
+        if !revoked.is_empty() {
+            for ws in self.state.get_websockets() {
+                let Some(dev) = super::message::ws_attachment_device(&ws) else { continue };
+                if revoked.iter().any(|d| d.device_id == dev) {
+                    let _ = ws.close(Some(1008), Some("device_revoked"));
+                }
+            }
+        }
         let _ = storage
             .put(RECONCILED_AT_KEY, crate::utils::now_ms() as i64)
             .await;

@@ -30,14 +30,44 @@ fn a_new_key_or_a_new_attempt_signs_differently() {
     assert_ne!(sign(SECRET, TS + 1, UPDATE_JSON), SIG);
 }
 
+const HOOK: &str = "https://script.google.com/macros/s/X/exec";
+
 #[test]
-fn a_redirect_counts_as_taken_and_an_error_does_not() {
-    for s in [200, 204, 302, 303] {
-        assert!(taken(s), "{s}");
+fn a_2xx_is_taken_and_an_error_is_not() {
+    for s in [200, 201, 204] {
+        assert!(taken(s, None, HOOK), "{s}");
     }
-    for s in [100, 400, 404, 429, 500, 502] {
-        assert!(!taken(s), "{s}");
+    for s in [100, 400, 401, 404, 429, 500, 502] {
+        assert!(!taken(s, None, HOOK), "{s}");
     }
+}
+
+#[test]
+fn a_redirect_is_taken_only_to_where_a_program_that_ran_sends_its_caller() {
+    // An Apps Script web app that RAN answers 302 to its result page.
+    let ran = "https://script.googleusercontent.com/macros/echo?user_content_key=abc&lib=X";
+    for s in [302, 303] {
+        assert!(taken(s, Some(ran), HOOK), "{s}");
+    }
+    assert!(taken(302, Some("https://SCRIPT.googleusercontent.com/x"), HOOK), "a host has no case");
+    // The webhook's own host, absolute or relative.
+    assert!(taken(302, Some("https://script.google.com/done"), HOOK));
+    assert!(taken(303, Some("/thanks"), HOOK));
+    assert!(taken(307, Some("https://hook.example.com/v2"), "https://hook.example.com/v1"));
+    // A deployment not shared with "Anyone" sends the POST to sign in, WITHOUT running.
+    let sign_in = "https://accounts.google.com/ServiceLogin?service=wise&continue=https://script.google.com/x";
+    assert!(!taken(302, Some(sign_in), HOOK), "a sign-in page is a failure");
+    for elsewhere in ["https://evil.example/", "https://script.googleusercontent.com.evil.example/", "//accounts.google.com/x"] {
+        assert!(!taken(302, Some(elsewhere), HOOK), "{elsewhere}");
+    }
+    assert!(!taken(302, None, HOOK), "a 3xx with no Location");
+    assert!(!taken(302, Some("http://[bad"), HOOK), "a Location that does not parse");
+}
+
+#[test]
+fn the_owner_sees_a_webhooks_host_and_nothing_after_it() {
+    assert_eq!(host_of("https://Script.Google.com/macros/s/SECRET/exec?k=v").as_deref(), Some("script.google.com"));
+    assert_eq!(host_of("not a url"), None);
 }
 
 #[test]

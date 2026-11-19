@@ -14,16 +14,27 @@
 #
 # THE SIGNED CHANNEL (docs/SERVER_UPDATE_PLAN.md §1, §4.1). Before anything moves, the release
 # manifest is fetched — from each release host (SEZI_RELEASE_HOSTS) and from the template's own
-# channels/stable/ after the fetch — and verified with openssl against the key files of the build
-# that RUNS (current/deploy/release-keys/: a new key arrives only through a release an old key
-# signed). The highest `seq` that verifies wins; one lower than this box already accepted
-# ($SEZI_DATA/release-seq) is a replay and is refused. Only a build the manifest names is installed:
-# its newest (`server.build`, at exactly `server.template_commit`), or one of `kept.server` ("go
-# back"). The newest build's workerd/ tree is checked against the signed `server.workerd.bundle`.
-# A run without --to never goes BACK to the channel's newest from a newer build. Needs openssl 3 and
-# jq. Where no channel is published yet a run by hand still moves by the template's history alone,
-# and says so; a --signed run refuses (`no-manifest`). After a signed update the clone moves only to
-# the signed commit, so root never runs a script no release named.
+# channels/stable/ after the fetch — and verified with openssl against ROOT'S OWN copy of the
+# release keys ($SEZI_UPDATER_DIR/release-keys, see below). The highest `seq` that verifies wins;
+# one lower than this box already accepted ($SEZI_UPDATER_STATE/release-seq) is a replay and is
+# refused. Only a build the manifest names is installed: its newest (`server.build`, at exactly
+# `server.template_commit`), or one of `kept.server` ("go back"). The newest build's workerd/ tree is
+# checked against the signed `server.workerd.bundle`. A run without --to never goes BACK to the
+# channel's newest from a newer build. Needs openssl 3 and jq. Where no channel is published yet a
+# run by hand still moves by the template's history alone, and says so; a --signed run refuses
+# (`no-manifest`).
+#
+# WHAT ROOT RUNS AND TRUSTS. The clone, its releases/ and the state directory belong to $SEZI_USER,
+# the account the relay runs as — so a relay someone took could change anything in them. Root
+# therefore runs this script, the poll script and the release keys only from a root-owned copy,
+# $SEZI_UPDATER_DIR (/usr/local/lib/sezi-updater, made by install-updater.sh), and keeps its own
+# files — the lock, the accepted seq, the result, the state backups — in $SEZI_UPDATER_STATE
+# (/var/lib/sezi-updater, root only). Every git command runs as $SEZI_USER, and so does every tar
+# that reads or writes the state; root holds only the bytes. The root copy is refreshed only from
+# the commit a manifest that verified names as the newest (refresh_updater below), so a new key or
+# a new update.sh arrives only through a release a key root already trusts signed. Without the root
+# copy (a run by hand on a box with no update timers) the keys of the build that runs are used, and
+# that is said: they are in a tree $SEZI_USER can write.
 #
 # LAYOUT. The clone stays where it was and only fetches; every build runs from its own exported tree:
 #
@@ -31,9 +42,14 @@
 #   /opt/sezi-server/releases/<build>/     one tree per build (git archive of its commit), never edited
 #   /opt/sezi-server/current -> releases/<build>     what the unit runs (ExecStart reads
 #                                                    current/workerd/config.capnp)
+#   /usr/local/lib/sezi-updater/           root's copy: update.sh, sezi-update-poll.sh,
+#                                          release-keys/, .sezi-commit (the commit it came from)
+#   /var/lib/sezi-updater/                 root only: update.lock, release-seq, update-result.json,
+#                                          backup-pre-update-*.tar, failed-state-*.tar
 #
 # The newest SEZI_KEEP (3) releases and state backups are kept, older ones pruned, and with them the
-# workerd versions no kept release names. Going back to a kept build moves `current` and restarts:
+# workerd versions no kept release names. The state a rolled-back build left (failed-state-*) is
+# never pruned. Going back to a kept build moves `current` and restarts:
 # its data stays as it is — the relay's migrations are expand-only, so the previous build runs on
 # the newer schema (AGENTS.md, "Relay migrations are expand-only"). An install from before this
 # layout is moved on its first run (its unit's paths are rewritten once, the old unit kept beside
@@ -43,18 +59,19 @@
 # take long (the fetch, the export, a new workerd download) happens first, while the relay runs.
 # Clients ride the gap: they reconnect within a second and resend what was not acked.
 #
-# The result is also written to $SEZI_DATA/update-result.json ({to, from, ok, code, at}); the
-# update timer (deploy/sezi-update-poll.sh) reports it to the relay, which tells the owner's app.
-# One run at a time ($SEZI_DATA/update.lock): a second exits 3 and writes no result.
+# The result is also written to $SEZI_UPDATER_STATE/update-result.json ({to, from, ok, code, at});
+# the update timer (sezi-update-poll.sh) reports it to the relay, which tells the owner's app.
+# One run at a time ($SEZI_UPDATER_STATE/update.lock): a second exits 3 and writes no result.
 #
 # Environment (optional): SEZI_DIR (/opt/sezi-server), SEZI_DATA (/var/lib/sezi), SEZI_UNIT
 # (sezi-relay), SEZI_PORT (8788), SEZI_USER (sezi — the user the relay runs as and owns the clone),
 # SEZI_KEEP (3), SEZI_UNIT_DIR (/etc/systemd/system), SEZI_RELEASE_HOSTS (the release hosts, space
-# separated — the app's own list by default), SEZI_REQUIRE_SIGNED (1 = as --signed).
+# separated — the app's own list by default), SEZI_REQUIRE_SIGNED (1 = as --signed),
+# SEZI_UPDATER_DIR (/usr/local/lib/sezi-updater), SEZI_UPDATER_STATE (/var/lib/sezi-updater).
 set -uo pipefail
 
-# Run from a copy: this file lives in the clone, which a fetch and the final fast-forward change,
-# and bash reads a script while it runs it.
+# Run from a copy: a fetch, the final fast-forward or a refresh of the root copy may replace this
+# file, and bash reads a script while it runs it.
 if [ -z "${SEZI_UPDATE_COPY:-}" ]; then
   copy=$(mktemp "${TMPDIR:-/tmp}/sezi-update.XXXXXX") || exit 1
   cp "$0" "$copy" || exit 1
@@ -68,14 +85,17 @@ UNIT="${SEZI_UNIT:-sezi-relay}"
 PORT="${SEZI_PORT:-8788}"
 RUN_AS="${SEZI_USER:-sezi}"
 KEEP="${SEZI_KEEP:-3}"
-UNIT_FILE="${SEZI_UNIT_DIR:-/etc/systemd/system}/$UNIT.service"
+UNIT_DIR="${SEZI_UNIT_DIR:-/etc/systemd/system}"
+UNIT_FILE="$UNIT_DIR/$UNIT.service"
+UPD="${SEZI_UPDATER_DIR:-/usr/local/lib/sezi-updater}"
+UST="${SEZI_UPDATER_STATE:-/var/lib/sezi-updater}"
 ST="$DATA/state"
 TS=$(date +%Y%m%d-%H%M%S)
-BK="$DATA/backup-pre-update-$TS.tar"
-RESULT="$DATA/update-result.json"
+BK="$UST/backup-pre-update-$TS.tar"
+RESULT="$UST/update-result.json"
 
 HOSTS="${SEZI_RELEASE_HOSTS-https://releases.revisetouch.work https://releases.revisetouch.com}"
-SEQ_FILE="$DATA/release-seq"
+SEQ_FILE="$UST/release-seq"
 CHANNEL=stable
 
 TO=""; COMMIT=""; LAYOUT_ONLY=""; ONLY_SECURITY=""
@@ -95,20 +115,32 @@ case "$TO" in ''|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;
 [ -z "$TO" ] || [ -z "$COMMIT" ] || { echo "--to and --commit name the same thing; give one" >&2; exit 2; }
 
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo): it stops and starts $UNIT" >&2; exit 1; }
-mkdir -p "$DATA"
-exec 9>"$DATA/update.lock"
-flock -n 9 || { echo "another update is running ($DATA/update.lock)" >&2; exit 3; }
+# Root's own directory: nothing in it is a path $RUN_AS could have put a link at.
+mkdir -p "$UST" && chmod 0700 "$UST" || { echo "cannot make $UST" >&2; exit 1; }
+exec 9>"$UST/update.lock"
+flock -n 9 || { echo "another update is running ($UST/update.lock)" >&2; exit 3; }
 as_user() { sudo -u "$RUN_AS" -H "$@"; }
 USER_HOME=$(getent passwd "$RUN_AS" | cut -d: -f6)
 [ -n "$USER_HOME" ] || { echo "no user '$RUN_AS' (SEZI_USER)" >&2; exit 1; }
 WORKERD_LINK="$USER_HOME/.local/sezi-workerd/current"
 git_() { as_user git -C "$SRV" "$@"; }
+# The seq a box from before $UST accepted, taken over once (digits only; read as $RUN_AS).
+if [ ! -s "$SEQ_FILE" ]; then
+  old_seq=$(as_user cat "$DATA/release-seq" 2>/dev/null | tr -dc 0-9)
+  [ -z "$old_seq" ] || echo "$old_seq" > "$SEQ_FILE"
+fi
+# The release keys root believes: its own copy, else (no update timers installed) the running
+# build's — found in find_manifest, after the layout move — which is said.
+KEYS=""; ls "$UPD/release-keys"/*.pem >/dev/null 2>&1 && KEYS=$UPD/release-keys
 
 FROM_BUILD=""
 result() { # result <ok> <code> [to]
   printf '{"to":%s,"from":%s,"ok":%s,"code":"%s","at":"%s"}\n' \
     "${3:-null}" "${FROM_BUILD:-null}" "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RESULT.tmp" &&
-    mv "$RESULT.tmp" "$RESULT"
+    mv "$RESULT.tmp" "$RESULT" || return 1
+  # A copy where a poll script from before the root copy looks for it (it only reports it to the
+  # relay), written as $RUN_AS: root never writes a path in a directory that user owns.
+  as_user sh -c 'cat > "$1.tmp" && mv "$1.tmp" "$1"' sh "$DATA/update-result.json" < "$RESULT" 2>/dev/null || true
 }
 served() { curl -fsS --max-time 3 "http://127.0.0.1:$PORT/capabilities" | grep -o '"build":[0-9]*' | cut -d: -f2; }
 healthy() {
@@ -147,8 +179,13 @@ verify() {
 # Returns 1 = nothing published anywhere, 2 = something answered and nothing verified, 3 = only
 # replays of an older seq.
 find_manifest() {
-  local keys=$SRV/current/deploy/release-keys n=0 answered="" rollback="" h seq have
-  [ -d "$keys" ] || keys=$SRV/deploy/release-keys
+  local keys n=0 answered="" rollback="" h seq have
+  if [ -z "$KEYS" ]; then
+    KEYS=$SRV/current/deploy/release-keys; [ -d "$KEYS" ] || KEYS=$SRV/deploy/release-keys
+    echo "WARNING: no root copy of the updater ($UPD), so the release keys are read from $KEYS,"
+    echo "  which $RUN_AS can write. Install the update timers (deploy/install-updater.sh) to fix that."
+  fi
+  keys=$KEYS
   have=$(cat "$SEQ_FILE" 2>/dev/null | tr -dc 0-9); have=${have:-0}
   M=""; M_SEQ=0; M_FROM=""
   try_one() { # try_one <manifest> <sig> <from>
@@ -200,6 +237,70 @@ bundle_ok() { # bundle_ok <commit> <release dir>
   rm -rf "$t"; return 1
 }
 
+# ── The updater's own root copy ─────────────────────────────────────────────────────────────
+# Root runs the updater from $UPD and believes the keys in $UPD/release-keys, never anything in the
+# clone (see the header). This keeps that copy current, and it is the only way anything gets in:
+#
+#   root's keys verify the manifest → the manifest names server.template_commit → the files are read
+#   out of THAT commit in a repository root makes for the purpose.
+#
+# $RUN_AS hands the objects over (its git, and so its answer, may be anything), but index-pack names
+# every object by the hash of its own bytes, and root then resolves commit → tree → file by those
+# names: what lands in $UPD is what the signed commit holds, or nothing. Never a copy of a file from
+# the clone or a release tree. A new key (or a new update.sh) therefore arrives only in a commit a key
+# root already trusted signed. Run only when $UPD or the update timers exist; it also moves timers
+# from before the root copy (they ran the clone's poll script) onto it.
+refresh_updater() { # refresh_updater <commit the verified manifest names as the newest>
+  local c=$1 g S f mode type sha name n=0 u changed=""
+  [ -d "$UPD" ] || [ -f "$UNIT_DIR/sezi-update.service" ] || return 0
+  printf '%s' "$c" | grep -qxE '[0-9a-f]{40}|[0-9a-f]{64}' || { echo "note: the manifest's commit '$c' is no full id; the updater's root copy is left as it is"; return 1; }
+  if [ "$(cat "$UPD/.sezi-commit" 2>/dev/null)" != "$c" ] || [ ! -f "$UPD/sezi-update-poll.sh" ]; then
+    g=$(mktemp -d) || return 1
+    rgit() { GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$g/r" "$@"; }
+    if ! GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        git init -q --bare --object-format="$([ ${#c} = 64 ] && echo sha256 || echo sha1)" "$g/r" ||
+      ! { echo "$c"
+          git_ rev-parse "$c^{tree}" "$c:deploy" "$c:deploy/release-keys"
+          git_ ls-tree "$c" deploy/update.sh deploy/sezi-update-poll.sh | awk '{ print $3 }'
+          git_ ls-tree "$c:deploy/release-keys" | awk '{ print $3 }'
+        } 2>/dev/null | git_ pack-objects -q --stdout | rgit index-pack --stdin >/dev/null 2>&1; then
+      rm -rf "$g"; echo "note: the objects of $c could not be read; the updater's root copy is left as it is"; return 1
+    fi
+    install -d -m 0755 "$UPD" || { rm -rf "$g"; return 1; }
+    S=$UPD/.staging; rm -rf "$S"; install -d -m 0755 "$S" "$S/release-keys"
+    for f in update.sh sezi-update-poll.sh; do
+      case "$(rgit ls-tree "$c" -- "deploy/$f")" in 100644\ blob\ *|100755\ blob\ *) ;; *) n=-1 ;; esac
+      rgit cat-file blob "$c:deploy/$f" > "$S/$f" 2>/dev/null && chmod 0755 "$S/$f" && bash -n "$S/$f" 2>/dev/null || n=-1
+    done
+    while [ "$n" -ge 0 ] && read -r mode type sha name; do
+      case "$mode $type $name" in "100644 blob "*.pem) ;; *) continue ;; esac
+      case "$name" in *[!A-Za-z0-9._-]*) continue ;; esac
+      rgit cat-file blob "$sha" > "$S/release-keys/$name" && chmod 0644 "$S/release-keys/$name" && n=$((n + 1)) || n=-1
+    done < <(rgit ls-tree "$c:deploy/release-keys" 2>/dev/null)
+    rm -rf "$g"
+    if [ "$n" -lt 1 ]; then
+      rm -rf "$S"; echo "note: the updater of $c (two scripts, a key at least) could not be read out of it; the root copy is left as it is"; return 1
+    fi
+    chown -R root:root "$S"
+    mv -f "$S/update.sh" "$UPD/update.sh" && mv -f "$S/sezi-update-poll.sh" "$UPD/sezi-update-poll.sh" &&
+      rm -rf "$UPD/.old-keys" && { [ ! -d "$UPD/release-keys" ] || mv "$UPD/release-keys" "$UPD/.old-keys"; } &&
+      mv "$S/release-keys" "$UPD/release-keys" && rm -rf "$UPD/.old-keys" "$S" &&
+      echo "$c" > "$UPD/.sezi-commit" || { echo "note: the updater's root copy could not be replaced ($UPD)"; return 1; }
+    echo "the updater's root copy ($UPD) is now that of commit $c ($n key(s))"
+  fi
+  # Timers from before the root copy ran the clone's poll script: point them at the root copy.
+  for u in sezi-update.service sezi-update-nightly.service; do
+    f=$UNIT_DIR/$u
+    [ -f "$f" ] && grep -q "^ExecStart=/bin/bash $SRV/deploy/sezi-update-poll.sh" "$f" || continue
+    sed -i -e "s#^ExecStart=/bin/bash $SRV/deploy/sezi-update-poll.sh#ExecStart=/bin/bash $UPD/sezi-update-poll.sh#" \
+      -e "/^\[Service\]\$/a Environment=SEZI_UPDATER_DIR=$UPD SEZI_UPDATER_STATE=$UST" "$f" && changed=1
+  done
+  [ -z "$changed" ] || { systemctl daemon-reload; echo "the update timers now run $UPD/sezi-update-poll.sh"; }
+  return 0
+}
+# After a run that ended well with a verified manifest: the root copy follows the channel's newest.
+refresh_from_channel() { [ -z "$M" ] || refresh_updater "$LATEST_C" || true; }
+
 # ── 0. The layout: releases/ + current ──────────────────────────────────────────────────────
 # An install from before it runs the clone's own workerd/; its build becomes the first release.
 if [ ! -L "$SRV/current" ]; then
@@ -234,6 +335,9 @@ fi
 
 OLD_REL=$(readlink "$SRV/current")
 FROM_BUILD=${OLD_REL#releases/}
+# The link is $RUN_AS's: what it says goes into root's result and paths only as a build stamp.
+case "$FROM_BUILD" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+  *) echo "$SRV/current points at '$OLD_REL', not releases/<build> — refused" >&2; exit 1 ;; esac
 OLD_WORKERD=$(readlink "$WORKERD_LINK" || true)
 echo "running: build $FROM_BUILD (serving $(served || echo '?'))"
 
@@ -260,7 +364,7 @@ if command -v jq >/dev/null && command -v openssl >/dev/null; then
   find_manifest; found=$?
   case $found in
     0) echo "signed channel: $CHANNEL seq $M_SEQ (${M_FROM:-the template mirror})" ;;
-    2) echo "a release manifest was found but none verifies against $SRV/current/deploy/release-keys — refused"
+    2) echo "a release manifest was found but none verifies against $KEYS — refused"
        result false bad-signature "${TO:-null}"; exit 1 ;;
     3) echo "only an older release manifest than this box already accepted was found — refused"
        result false seq-rollback "${TO:-null}"; exit 1 ;;
@@ -286,18 +390,19 @@ if [ -n "$M" ]; then
       result false not-in-channel "$TO"; exit 1; }
     # A kept build: the tree this box already ran (verified when it was installed), or the
     # template's history.
-    C=$(cat "$SRV/releases/$TO/.sezi-commit" 2>/dev/null) || C=""
+    C=$(as_user cat "$SRV/releases/$TO/.sezi-commit" 2>/dev/null | tr -dc 0-9a-f) || C=""
     [ -n "$C" ] || C=$(by_history "$TO") || {
       echo "no commit of $UPSTREAM carries build $TO — nothing changed"; result false no-such-build "$TO"; exit 1; }
     WANT=$TO
   else
     C=$LATEST_C; WANT=$LATEST
     if [ -z "$TO" ] && [ -n "$ONLY_SECURITY" ] && [ -z "$(mf .server.security.level)" ]; then
-      echo "build $LATEST is not a security release — nothing to do"; result true not-security "$LATEST"; exit 0
+      echo "build $LATEST is not a security release — nothing to do"; result true not-security "$LATEST"
+      refresh_from_channel; exit 0
     fi
     if [ -z "$TO" ] && [ "$LATEST" -lt "$FROM_BUILD" ]; then
       echo "build $FROM_BUILD runs, newer than the channel's $LATEST — nothing to do (--to goes back)"
-      result true newer-running "$LATEST"; exit 0
+      result true newer-running "$LATEST"; refresh_from_channel; exit 0
     fi
   fi
   { git_ cat-file -e "$C^{commit}" 2>/dev/null && git_ merge-base --is-ancestor "$C" "$UPSTREAM"; } || {
@@ -331,12 +436,12 @@ CLONE_TO=$UPSTREAM; [ -z "$M" ] || CLONE_TO=$C
 if [ "releases/$B" = "$OLD_REL" ]; then
   echo "already on build $B"
   git_ merge -q --ff-only "$CLONE_TO" 2>/dev/null || true
-  result true already "$B"; exit 0
+  result true already "$B"; refresh_from_channel; exit 0
 fi
 echo "target: build $B (commit $C)"
 
 REL="$SRV/releases/$B"
-if [ ! -d "$REL" ] || [ "$(cat "$REL/.sezi-commit" 2>/dev/null)" != "$C" ]; then
+if [ ! -d "$REL" ] || [ "$(as_user cat "$REL/.sezi-commit" 2>/dev/null)" != "$C" ]; then
   as_user rm -rf "$REL.new"
   as_user mkdir -p "$REL.new" &&
     git_ archive "$C" | as_user tar -x -C "$REL.new" &&
@@ -371,7 +476,9 @@ switch_back() {
   [ -n "$OLD_WORKERD" ] && as_user ln -sfn "$OLD_WORKERD" "$WORKERD_LINK"
 }
 systemctl stop "$UNIT"
-if ! tar -C "$DATA" -cf "$BK" state; then
+# tar reads the state as $RUN_AS (it is that user's tree, links and all); root only keeps the bytes,
+# in its own directory.
+if ! as_user tar -C "$DATA" -cf - state > "$BK"; then
   echo "backup failed — starting the relay on another build without one is refused; staying on $FROM_BUILD"
   rm -f "$BK"; switch_back; systemctl start "$UNIT"
   result false backup-failed "$B"; exit 1
@@ -390,12 +497,12 @@ prune() {
     as_user rm -rf "${SRV:?}/releases/$r" && echo "  pruned release $r"
   done
   # State backups: the newest $KEEP.
-  for r in $(ls -1t "$DATA"/backup-pre-update-*.tar 2>/dev/null); do
+  for r in $(ls -1t "$UST"/backup-pre-update-*.tar 2>/dev/null); do
     n=$((n + 1)); [ $n -le "$KEEP" ] || { rm -f "$r" && echo "  pruned backup $(basename "$r")"; }
   done
   # workerd versions no kept release names.
   local wbase=$USER_HOME/.local/sezi-workerd wanted v
-  wanted=$(cat "$SRV"/releases/*/workerd/WORKERD.lock 2>/dev/null | awk '$1 == "version" { print $2 }' | sort -u)
+  wanted=$(as_user sh -c 'cat "$1"/releases/*/workerd/WORKERD.lock' sh "$SRV" 2>/dev/null | awk '$1 == "version" { print $2 }' | sort -u)
   for v in $(ls -1 "$wbase" 2>/dev/null); do
     [ "$v" = current ] && continue
     echo "$wanted" | grep -qx "$v" || { as_user rm -rf "${wbase:?}/$v" && echo "  pruned workerd $v"; }
@@ -409,13 +516,31 @@ if healthy && [ "$(served)" = "$B" ]; then
   # Keep the clone's own scripts (this one, fetch-workerd.sh, the unit) at the newest published.
   git_ merge -q --ff-only "$CLONE_TO" 2>/dev/null || echo "note: the clone could not fast-forward to $CLONE_TO (local changes, or it is past it)"
   result true ok "$B"
+  refresh_from_channel
   exit 0
 fi
 
 echo "FAIL: not healthy on build $B — rolling back to $FROM_BUILD"
 systemctl stop "$UNIT"
 switch_back
-rm -rf "$ST" && tar -C "$DATA" -xf "$BK"
+# The backup is the state from before the update, so whatever the new build accepted meanwhile (a
+# message, a sign-up) is not in it. That state is kept, not deleted: as a tar beside the backups, or
+# — when it cannot be written — as the directory itself, moved aside. Never pruned.
+FAILED="$UST/failed-state-$B-$TS.tar"
+if as_user tar -C "$DATA" -cf - state > "$FAILED"; then
+  echo "the state build $B left is kept: $FAILED (restoring the backup from before it drops anything it accepted)"
+  rm -rf "$ST"
+else
+  rm -f "$FAILED"
+  as_user mv "$ST" "$DATA/state-failed-$B-$TS" &&
+    echo "the state build $B left is kept: $DATA/state-failed-$B-$TS"
+fi
+if [ -e "$ST" ]; then
+  echo "WARNING: the state build $B left could be neither saved nor moved aside, so the backup was NOT"
+  echo "  restored (the relay starts on that state); the backup from before the update is $BK"
+else
+  as_user tar -C "$DATA" -xf - < "$BK"
+fi
 systemctl daemon-reload
 systemctl start "$UNIT"
 if healthy; then

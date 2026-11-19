@@ -140,6 +140,24 @@ pub(crate) fn file_update(
     update
 }
 
+/// The update for a message from the bot's interface (`docs/BOT_APP_PLAN.md`): `kind: "app"`, the
+/// interface's `data` (a JSON text it wrote, passed as written) and its own `request_id`, which
+/// `answerApp` hands back so the interface can pair its question with the answer.
+pub(crate) fn app_update(
+    at_ms: i64,
+    from: &str,
+    who: Option<&Who>,
+    data: &str,
+    request_id: Option<&str>,
+) -> serde_json::Value {
+    let mut update = message_update(at_ms, from, who, None, "", &serde_json::Value::Null);
+    update["kind"] = "app".into();
+    update.as_object_mut().map(|o| o.remove("message"));
+    update.as_object_mut().map(|o| o.remove("command"));
+    update["app"] = serde_json::json!({ "data": data, "request_id": request_id });
+    update
+}
+
 /// Where a room call came from, as the relay's own tables say (never the caller's word).
 pub(crate) struct CallRoom<'a> {
     pub(crate) id: &'a str,

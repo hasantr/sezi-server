@@ -171,6 +171,45 @@ pub(crate) fn parse_send(body: &Value) -> Result<SendReq, Refusal> {
     })
 }
 
+/// The most an `answerApp` may hand the bot's interface: what the member's kernel takes
+/// (`core` `features/bot_app.rs` `BOT_APP_DATA_MAX`), with room for the frame around it.
+pub(crate) const MAX_APP_DATA_BYTES: usize = 32 * 1024;
+/// The longest `request_id` an interface sends (`core` `kernel/bot_app.rs`).
+pub(crate) const MAX_APP_REQUEST_ID_LEN: usize = 64;
+
+/// An `answerApp` that passed every check that needs no lookup (`docs/BOT_APP_PLAN.md`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AnswerAppReq {
+    pub(crate) user_id: String,
+    /// A JSON text, passed to the interface as written.
+    pub(crate) data: String,
+    pub(crate) request_id: Option<String>,
+}
+
+/// `answerApp {user_id, data, request_id?}`: `data` a string of valid JSON (an object or array
+/// is stringified first), at most [`MAX_APP_DATA_BYTES`].
+pub(crate) fn parse_answer_app(body: &Value) -> Result<AnswerAppReq, Refusal> {
+    let user_id = str_field(body, "user_id")?.ok_or(BAD_REQUEST)?;
+    let request_id = str_field(body, "request_id")?;
+    if user_id.len() != 36 || request_id.is_some_and(|r| r.is_empty() || r.len() > MAX_APP_REQUEST_ID_LEN) {
+        return Err(BAD_REQUEST);
+    }
+    let data = match body.get("data") {
+        Some(Value::String(s)) => {
+            if serde_json::from_str::<Value>(s).is_err() {
+                return Err(BAD_REQUEST);
+            }
+            s.clone()
+        }
+        Some(v @ (Value::Object(_) | Value::Array(_))) => v.to_string(),
+        _ => return Err(BAD_REQUEST),
+    };
+    if data.len() > MAX_APP_DATA_BYTES {
+        return Err((413, "too-large"));
+    }
+    Ok(AnswerAppReq { user_id: user_id.to_string(), data, request_id: request_id.map(str::to_string) })
+}
+
 /// Is the bot inbox's answer one the program may be handed as it is: a status below 500 and a
 /// JSON object carrying a boolean `ok`? Anything else — an inbox that threw, one purged under a
 /// call, a plain-text `not found` — is `bot/inbox-unavailable` (502), so every answer a program

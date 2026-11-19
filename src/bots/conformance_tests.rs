@@ -29,7 +29,7 @@ const BUILD_DOC: &str = include_str!("../../../docs/BOTS_BUILD.md");
 const README: &str = include_str!("../../../tools/bots/README.md");
 
 /// The methods a program can call today (Phases 1–3; Phase 4's are documented as not built).
-const METHODS: [&str; 6] = ["getMe", "getUpdates", "sendMessage", "setWebhook", "deleteWebhook", "getFile"];
+const METHODS: [&str; 7] = ["getMe", "getUpdates", "sendMessage", "setWebhook", "deleteWebhook", "getFile", "answerApp"];
 
 /// Every source file on the program's path: the Worker's door and the bot inbox's answers to it.
 /// Not the owner's surface (`admin.rs`, `builtin.rs`: `not-builtin` is the owner page's own code).
@@ -386,6 +386,7 @@ fn parse(method: &str, body: &Value) -> Result<(), Refusal> {
         "sendMessage" => parse_send(body).map(drop),
         "setWebhook" => parse_webhook(body).map(drop),
         "getFile" => parse_get_file(body).map(drop),
+        "answerApp" => parse_answer_app(body).map(drop),
         other => panic!("no parser named for {other}: add it here when it is dispatched"),
     }
 }
@@ -458,6 +459,7 @@ fn every_answer_holds_to_the_spec() {
             "sendMessage" => vec![api_answer::sent("b-1"), api_answer::duplicate("b-1")],
             "setWebhook" => vec![api_answer::webhook(Some("ab")), api_answer::webhook(None)],
             "deleteWebhook" => vec![api_answer::webhook(None)],
+            "answerApp" => vec![api_answer::app_answered()],
             // The file itself (`get_file_answers_bytes_only_on_success`).
             "getFile" => {
                 assert_eq!(m["answer"].as_object().unwrap().keys().collect::<Vec<_>>(), ["bytes"]);

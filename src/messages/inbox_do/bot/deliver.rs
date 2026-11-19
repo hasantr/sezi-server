@@ -10,7 +10,8 @@
 //! 2 min, 10 min, then hourly); the 24 h update window ends the attempts. The one exception is
 //! a poison update — one that keeps failing while a later one is taken: it is set aside and
 //! retried on its own, and may arrive late (`deliver_order.rs`). A taken update is deleted at
-//! once: a webhook's 2xx/3xx is its confirmation.
+//! once: a webhook's 2xx — or a 3xx to where a program that ran sends its caller
+//! (`bots::webhook::taken`) — is its confirmation.
 //!
 //! **Taken = read.** Whichever way, the moment the program has an update, the member's frame it
 //! came from gets a `forward-read` (queued in the outbox), so the member's blue tick means "the
@@ -80,6 +81,10 @@ pub(super) const HOOK_DONE: &str = "DELETE FROM bot_updates WHERE update_id = ?"
 /// The oldest update the program has not been handed (ms), for "no word from the program".
 pub(super) const WAITING_SINCE: &str =
     "SELECT MIN(created_at) AS t FROM bot_updates WHERE delivered_at IS NULL";
+
+/// Ends the webhook: its URL and the secret it was signed with, so delivery reads `Hook::None`
+/// and the queue waits for a poll. `deleteWebhook`, a key renewal, the owner's `clear_webhook`.
+pub(super) const WEBHOOK_CLEAR: &str = "DELETE FROM bot_kv WHERE k IN ('webhook_url', 'webhook_secret')";
 
 /// The stored webhook, as delivery sees it.
 #[derive(Debug, PartialEq, Eq)]
@@ -190,7 +195,8 @@ impl UserInbox {
     /// `/bot/webhook`: set or clear the webhook (the Worker checked the URL and derived the
     /// secret from the program's key). Setting one arms the alarm now: updates left waiting by
     /// polling are owed to it at once, not at the next member's frame (which may never come
-    /// before their 24 h end).
+    /// before their 24 h end). Cleared also by the owner: a key renewal (a leaked key's webhook
+    /// must not outlive it) and the owner's `clear_webhook` (`bots/admin.rs`).
     pub(super) async fn bot_set_webhook(&self, body: WebhookBody) -> Result<Response> {
         let store = self.bot_store();
         match (body.url, body.secret) {
@@ -203,22 +209,8 @@ impl UserInbox {
                 store.kv_put("webhook_secret", &secret);
                 self.arm_alarm_within(0).await;
             }
-            (None, _) => {
-                store.db.run("DELETE FROM bot_kv WHERE k IN ('webhook_url', 'webhook_secret')", &[]);
-            }
+            (None, _) => store.db.run(WEBHOOK_CLEAR, &[]),
             (Some(_), None) => return Response::error("secret required", 400),
-        }
-        Response::empty().map(|r| r.with_status(204))
-    }
-
-    /// `/bot/webhook-secret`: a renewed key's secret, for a webhook already set. Without one
-    /// there is nothing to sign, and the next `setWebhook` derives it anyway. The alarm is armed
-    /// as `setWebhook` arms it, so whatever is due goes out signed with the new secret.
-    pub(super) async fn bot_set_webhook_secret(&self, body: WebhookBody) -> Result<Response> {
-        let store = self.bot_store();
-        if let (Some(secret), Some(_)) = (body.secret, store.kv_get("webhook_url")) {
-            store.kv_put("webhook_secret", &secret);
-            self.arm_alarm_within(0).await;
         }
         Response::empty().map(|r| r.with_status(204))
     }
@@ -294,11 +286,12 @@ impl UserInbox {
             let status = super::builtin_ai::with_timeout(post, WEBHOOK_TIMEOUT_MS)
                 .await
                 .unwrap_or_else(|| Err(Error::RustError("webhook timed out".into())));
-            let taken = matches!(status, Ok(s) if crate::bots::webhook::taken(s));
+            let taken = matches!(&status, Ok((s, loc)) if crate::bots::webhook::taken(*s, loc.as_deref(), url));
             if taken {
                 self.bot_updates_taken(ctx, update_id, update_id, now);
             } else {
-                console_log!("[bot] webhook attempt failed: {:?}", status.map_err(|e| e.to_string()));
+                // The status alone: a `Location` may carry a deployment id or a sign-in query.
+                console_log!("[bot] webhook attempt failed: {:?}", status.map(|(s, _)| s).map_err(|e| e.to_string()));
             }
             taken
         };

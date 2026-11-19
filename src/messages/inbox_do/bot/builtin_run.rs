@@ -452,9 +452,15 @@ impl UserInbox {
         let room_name = room.map(|r| r.name.as_str());
         let system = builtin_ai::system_prompt(ai, &run.bot_name, name, room_name, run.cfg.writes_sheet(), now);
         let body = builtin_ai::request_body(ai, &system, &history, text);
-        store.db.run(bs::USAGE_BUMP, &[Arg::T(from), Arg::I(day)]);
         *spent += 1;
         let result = builtin_ai::call(ai, &key, &body, run.allow_lan).await;
+        // The member's day and the bot's are counted once per request, by its outcome — never
+        // per attempt: until 2026-11-18 each try was counted before it was made, so a provider
+        // outage spent three of a member's 50 and three of the owner's `daily_calls` on one
+        // message nobody got an answer to. The hearings kind counts the same way (`after_call`).
+        if model_call_counts(result.as_ref().map(|_| ()).map_err(|c| *c)) {
+            store.db.run(bs::USAGE_BUMP, &[Arg::T(from), Arg::I(day)]);
+        }
         if !self.builtin_current(run) {
             return Handled::Abandon; // answered on instructions that are gone: nothing is kept
         }
@@ -560,6 +566,17 @@ fn ai_limit(member_used: i64, bot_used: i64, daily_calls: u32) -> Option<Line> {
         Some(Line::BotDailyLimit)
     } else {
         None
+    }
+}
+
+/// Does this attempt's outcome count against the member's and the bot's day? An answer does, and
+/// so does a refusal the provider will give again (a bad key, a bad request: it answered, and
+/// retrying is not done). A passing failure (`builtin_ai::transient`: unreachable, overloaded,
+/// rate-limited) does not — whether it is retried or given up on, the member got nothing.
+fn model_call_counts(result: Result<(), &str>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(code) => !builtin_ai::transient(code),
     }
 }
 

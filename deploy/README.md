@@ -54,12 +54,21 @@ checks the tarball's sha512 against the lock **before** unpacking it, and instal
 `/var/lib/sezi/.local/sezi-workerd/<version>/`, with `current` pointing at it. A download that
 does not match is not installed. Nothing system-wide is touched.
 
-> **An update is `sudo bash /opt/sezi-server/deploy/update.sh`** — or one tap in the app, once the
-> update timers of § 7 are installed. It first reads the **signed release channel**: the manifest
-> from the release hosts and from this repository's `channels/stable/`, checked with `openssl`
-> against the keys in `deploy/release-keys/` of the build that runs now, and refused if it does not
-> verify or is older than one this box already accepted. Only a build that manifest names is
-> installed, at exactly the commit it names. Then it exports the new
+> **Who owns what.** `/opt/sezi-server` and `/var/lib/sezi` belong to `sezi`, the account the relay
+> runs as — so a relay someone broke into can change anything in them. That is fine for what runs
+> as `sezi`, and never fine for what runs as root. The updater (§ 7) therefore runs as root only
+> from its own root-owned copy, `/usr/local/lib/sezi-updater/` (`update.sh`,
+> `sezi-update-poll.sh`, `release-keys/`), keeps its own files in `/var/lib/sezi-updater/` (root
+> only), and does every git and tar step on the relay's tree as `sezi`. Do not make the clone or
+> the data root's again, and do not point a root timer of your own at a script in the clone.
+
+> **An update is one tap in the app** once the update timers of § 7 are installed — or by hand,
+> `sudo bash /usr/local/lib/sezi-updater/update.sh` (root's copy; before § 7, the clone's
+> `deploy/update.sh`, which then warns that it trusts keys `sezi` could change). It first reads the
+> **signed release channel**: the manifest from the release hosts and from this repository's
+> `channels/stable/`, checked with `openssl` against root's own `release-keys/`, and refused if it
+> does not verify or is older than one this box already accepted. Only a build that manifest names
+> is installed, at exactly the commit it names. Then it exports the new
 > build into `releases/<build>/` and fetches its workerd while the relay still runs; then it stops
 > the relay only to back up `state/`, points `current` at the new build and starts it again (about
 > two seconds of downtime — clients reconnect and resend what was not acked), checks that it is
@@ -72,8 +81,13 @@ does not match is not installed. Nothing system-wide is touched.
 > - Until a signed channel is published, a run by hand moves by this repository's history alone and
 >   says so; `--signed` (what the update timers use) refuses instead.
 > - `--commit <sha>` moves to exactly that template commit.
-> - The last three builds and three state backups (`/var/lib/sezi/backup-pre-update-*.tar`) are
->   kept, older ones removed; `/var/lib/sezi/update-result.json` says how the last run ended.
+> - The last three builds and three state backups (`/var/lib/sezi-updater/backup-pre-update-*.tar`)
+>   are kept, older ones removed; `/var/lib/sezi-updater/update-result.json` says how the last run
+>   ended. (Backups an older version left in `/var/lib/sezi/` stay there until you remove them.)
+> - **A rollback restores the backup from before the update**, so anything the new build accepted
+>   in the minutes it ran (a message, a sign-up) is not in the restored state. That state is not
+>   deleted: it is kept as `/var/lib/sezi-updater/failed-state-<build>-<time>.tar`, never pruned,
+>   and the run's log names it. Remove it by hand when you no longer need it.
 > - An install from before this layout (the unit running `/opt/sezi-server/workerd/`) is moved on
 >   its first run: the running build becomes `releases/<build>`, and the unit's paths are rewritten
 >   to `current/` once (the old unit is kept as `sezi-relay.service.pre-releases`). A unit you
@@ -234,9 +248,11 @@ sudo bash /opt/sezi-server/deploy/install-updater.sh
 ```
 
 It makes a token (`/etc/sezi/updater-token`, root only, and `SEZI_UPDATER_TOKEN` in `.dev.vars`),
+copies `update.sh`, `sezi-update-poll.sh` and `release-keys/` from the `deploy/` it is run from to
+`/usr/local/lib/sezi-updater/` (root:root; the timers run that copy and nothing in the clone),
 installs two timers and restarts the relay once so it reads the token:
 
-- `sezi-update.timer`, every two minutes: `deploy/sezi-update-poll.sh` asks the relay on
+- `sezi-update.timer`, every two minutes: `sezi-update-poll.sh` asks the relay on
   `127.0.0.1:8788`, with the token, whether its owner asked for a build in the app. If so it runs
   `update.sh --signed --to <build>` and tells the relay how it went; the app shows it. While the
   timer calls in, the app offers **Update now** and **Go back** instead of these written steps.
@@ -245,10 +261,32 @@ installs two timers and restarts the relay once so it reads the token:
   only a release marked as a security fix.
 
 What the relay can ask for this way is a build number and nothing else, and `update.sh` installs
-only a build the signed release names — a relay someone took over cannot make root run anything
-of its own. The services run as root (they stop the relay and back up its data) and run this
-clone's scripts, which `update.sh` moves only to signed commits. `--remove` takes it all away.
-Other folders or user: the same `SEZI_*` variables as `update.sh`.
+only a build the signed release names. The services run as root (they stop the relay and back up
+its data), so nothing they run or believe may be writable by `sezi`:
+
+- **Root runs only its own copy.** The scripts and the keys in `/usr/local/lib/sezi-updater/` are
+  root's; editing the clone, a release tree or their `release-keys/` changes nothing root runs or
+  trusts. Root's lock, accepted `seq`, result and state backups are in `/var/lib/sezi-updater/`.
+- **The copy changes only through a signed release.** After a run with a manifest that verified
+  against root's keys, `update.sh` refreshes the copy from the commit that manifest names as the
+  newest, read into a git repository root makes for the purpose — `sezi` hands the objects over,
+  but git names every object by the hash of its bytes, so root gets that commit's files or nothing
+  (`.sezi-commit` says which). A new release key, or a new `update.sh`, arrives only that way: in a
+  commit a key root already trusted signed.
+- **The one moment of trust is the install**: the copy is taken from the `deploy/` you run
+  `install-updater.sh` from. Run it from a clone you just made, or one whose
+  `git status` and `git log` you have looked at.
+
+**Installed the timers before 2026-11-18?** They ran the clone's `deploy/sezi-update-poll.sh` as
+root. Run `sudo bash /opt/sezi-server/deploy/install-updater.sh` once more (after
+`git -C /opt/sezi-server status` shows nothing changed): it keeps the token, installs the root copy
+and points the timers at it. A box that is not moved by hand is moved by its next signed update
+that runs the new `update.sh` (it says so in its log).
+
+`--remove` takes the timers, the token and `/usr/local/lib/sezi-updater/` away (it leaves
+`/var/lib/sezi-updater/`, which holds the state backups). Other folders or user: the same `SEZI_*`
+variables as `update.sh`, plus `SEZI_UPDATER_DIR` and `SEZI_UPDATER_STATE` — paths only root can
+write, every directory up to `/`.
 
 ---
 

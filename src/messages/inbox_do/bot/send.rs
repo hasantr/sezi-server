@@ -16,6 +16,17 @@ const SENT_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 /// How often the tick looks at the bot's one-time-key pool in D1.
 const OTK_CHECK_EVERY_MS: i64 = 10 * 60 * 1000;
 
+/// When the oldest row of the 7-day tables — what the bot sent (its words, for a resend), which
+/// member messages it saw, the room calls it was handed (their words) — or of `bot_writers` is
+/// due to go: one past its keep, since every expiry deletes rows strictly older than its cutoff,
+/// so the alarm armed for it finds the row gone and does not come back for it. NULL when nothing
+/// is kept. Bind: the sent keep, the seen keep, the calls' keep, the writers' window.
+pub(super) const KEPT_NEXT: &str = "SELECT MIN(t) AS t FROM (
+      SELECT MIN(created_at) + ? + 1 AS t FROM bot_sent
+      UNION ALL SELECT MIN(at) + ? + 1 FROM bot_seen
+      UNION ALL SELECT MIN(at) + ? + 1 FROM bot_calls
+      UNION ALL SELECT MIN(at) + ? + 1 FROM bot_writers)";
+
 /// A message id of the bot's: `b-<uuid>`.
 pub(super) fn new_msg_uid() -> String {
     format!("b-{}", uuid::Uuid::new_v4())
@@ -283,6 +294,15 @@ impl UserInbox {
         Response::empty().map(|r| r.with_status(204))
     }
 
+    /// When `KEPT_NEXT`'s oldest row is due to go, for `bot_rearm`: an idle bot — nobody writes,
+    /// its program silent — has no other alarm, and only a tick runs these expiries, so until
+    /// 2026-11-18 its sent messages and members' room calls stayed for as long as it was idle.
+    pub(super) fn bot_kept_next(&self) -> Option<i64> {
+        use super::store::{Arg, Exec};
+        let keeps = [SENT_TTL_MS, SENT_TTL_MS, super::room::CALL_TTL_MS, super::dm_scope::REPLY_WINDOW_MS];
+        self.bot_store().db.int(KEPT_NEXT, &keeps.map(Arg::I))
+    }
+
     /// Retention and the one-time-key pool. Best effort.
     pub(super) async fn bot_housekeeping(&self, ctx: &BotCtx) {
         let now = (now_secs() * 1000) as i64;
@@ -294,6 +314,7 @@ impl UserInbox {
         let _ = sql.exec_raw(super::files::READS_PRUNE, cutoff(super::files::READ_WINDOW_MS));
         let _ = sql.exec_raw("DELETE FROM bot_sent WHERE created_at < ?", cutoff(SENT_TTL_MS));
         let _ = sql.exec_raw(super::store::SEEN_EXPIRE, cutoff(SENT_TTL_MS));
+        let _ = sql.exec_raw(super::dm_scope::WRITER_EXPIRE, cutoff(super::dm_scope::REPLY_WINDOW_MS));
         let _ = sql.exec_raw(super::send_replay::CLIENT_EXPIRE, cutoff(super::send_replay::CLIENT_ID_TTL_MS));
         let _ = sql.exec_raw(super::deliver::SRC_ORPHANS, sql_no_args());
         let _ = sql.exec_raw(super::deliver_order::ASIDE_ORPHANS, sql_no_args());

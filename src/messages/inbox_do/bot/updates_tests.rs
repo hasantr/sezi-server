@@ -247,6 +247,8 @@ fn every_update_kind_holds_to_the_v1_contract() {
         room_event_update("removed", 4, "g-1", "Hukuk", None),
         ping_update(5, serde_json::json!({ "user_id": "owner", "display_name": "Owner" })),
         ping_update(5, serde_json::json!({})),
+        app_update(6, "alice", Some(&who), r#"{"rows":3}"#, Some("r-1")),
+        app_update(6, "bob", None, "[]", None),
     ];
     let kinds = list("updates");
     let mut seen = std::collections::BTreeSet::new();

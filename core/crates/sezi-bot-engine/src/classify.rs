@@ -69,6 +69,13 @@ pub(crate) fn classify(payload: &ChatPayload, from: &str, device: &str, was_prek
             lang: lang.clone(),
             utc_offset_min: *utc_offset_min,
         },
+        // The bot's interface talking to it, from the member's device.
+        InnerMessage::BotAppCall { data, request_id } => Inbound::App {
+            from: from.to_owned(),
+            device: device.to_owned(),
+            data: data.clone(),
+            request_id: request_id.clone(),
+        },
         // Something that carries a room's secret, sent to a bot: a member's kernel never does
         // (BOTS_BUILD §2.7), so this is a bug or a forgery. Read, acked and NEVER imported — the
         // engine has no store for another sender's key — and named so a test can see it arrive.

@@ -4,15 +4,17 @@
 //! |---|---|
 //! | `POST /admin/bots {name, about?}` | create → `{bot_id, token}`; the token is shown ONCE |
 //! | `GET /admin/bots` | every bot not deleted, with how its program is doing (below) |
-//! | `PATCH /admin/bots/:id {name?, about?, disabled?}` | change, turn off, turn back on |
-//! | `POST /admin/bots/:id/token` | a new key; the old one stops at once |
+//! | `PATCH /admin/bots/:id {name?, about?, disabled?, clear_webhook?, dm_scope?}` | change, turn off, turn back on; end the program's webhook; `dm_scope` `reply` / `anyone` (D4) |
+//! | `POST /admin/bots/:id/token` | a new key; the old one stops at once, and so does its webhook |
 //! | `DELETE /admin/bots/:id` | soft delete: the account and its name stay for old messages |
 //! | `POST /admin/bots/:id/test` | "Dene": a `ping` update to the program → `{ok, update_id}`; a built-in bot runs NOW → `{ok, kind, outcome, answer?}` |
 //! | `PUT`/`GET /admin/bots/:id/builtin` | a built-in bot's configuration (`builtin.rs`) |
 //!
 //! Each listed bot carries `program_seen_at` (seconds: its last API call or taken webhook),
 //! `waiting_since` (ms: the oldest update its program has not been handed), `webhook` (set or
-//! not), `webhook_refused` (set, but its URL fails the outbound rule at delivery, so nothing is
+//! not), `webhook_host` (its host alone, never the path or query — decision D5: the owner sees
+//! where members' messages go), `dm_scope` (`reply` / `anyone`, decision D4),
+//! `webhook_refused` (set, but its URL fails the outbound rule at delivery, so nothing is
 //! sent to it — one stored before the rule existed) and `program_silent` — "Programından haber yok": an update has waited 10 minutes and
 //! the program has not been seen in that time (BOTS_BUILD §5, R9 decision 4). Otherwise the
 //! page shows "last seen". `backlog_full` says the bot holds its 2,000 updates, so nobody's new
@@ -167,6 +169,9 @@ struct BotRow {
     disabled_at: Option<i64>,
     #[serde(default)]
     program_seen_at: Option<i64>,
+    /// The interface linked to it (`docs/BOT_APP_PLAN.md`): a catalog entry, or none.
+    #[serde(default)]
+    app_entry: Option<String>,
 }
 
 pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -176,7 +181,8 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let db = ctx.env.d1("DB")?;
     let rows: Vec<BotRow> = db
         .prepare(
-            "SELECT bot_id, name, about, builtin, ai_provider, created_at, disabled_at, program_seen_at
+            "SELECT bot_id, name, about, builtin, ai_provider, created_at, disabled_at, program_seen_at,
+                    app_entry
                FROM bots WHERE deleted_at IS NULL ORDER BY created_at, bot_id",
         )
         .all()
@@ -190,6 +196,10 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         webhook: bool,
         #[serde(default)]
         webhook_refused: bool,
+        #[serde(default)]
+        webhook_host: Option<String>,
+        #[serde(default)]
+        dm_scope: Option<String>,
         #[serde(default)]
         backlog_full: bool,
         #[serde(default)]
@@ -216,6 +226,8 @@ pub async fn list(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         v["waiting_since"] = state.waiting_since.into();
         v["webhook"] = state.webhook.into();
         v["webhook_refused"] = state.webhook_refused.into();
+        v["webhook_host"] = state.webhook_host.into();
+        v["dm_scope"] = state.dm_scope.into();
         v["backlog_full"] = state.backlog_full.into();
         v["unconfirmed"] = state.unconfirmed.into();
         let silent = row.builtin.is_none() && program_silent(state.waiting_since, row.program_seen_at, now);
@@ -257,6 +269,65 @@ struct PatchBody {
     name: Option<String>,
     about: Option<String>,
     disabled: Option<bool>,
+    /// `true` ends the program's webhook (D5: the owner sees its host and may end it); the
+    /// program's key sets one again. Absent or `false`: unchanged.
+    #[serde(default)]
+    clear_webhook: bool,
+    /// `"reply"` (the default: 1:1 only to a member who wrote lately) or `"anyone"` (D4).
+    dm_scope: Option<String>,
+    /// The bot's interface (`docs/BOT_APP_PLAN.md`): an app catalog entry id, or `""` to take it
+    /// off. Absent: unchanged.
+    app_entry: Option<String>,
+}
+
+/// The owner's changes the bot's inbox holds: the DM scope set, the webhook ended. Asked before
+/// any D1 write, so a change the inbox did not take is refused with the bot's row unchanged;
+/// false when one was not taken.
+async fn patch_inbox(env: &Env, bot_id: &str, body: &PatchBody) -> bool {
+    let mut calls = Vec::new();
+    if let Some(scope) = &body.dm_scope {
+        calls.push(("/bot/dm-scope", serde_json::json!({ "scope": scope })));
+    }
+    if body.clear_webhook {
+        calls.push(("/bot/webhook", serde_json::json!({ "url": null })));
+    }
+    for (path, call) in calls {
+        let r = super::bot_inbox(env, bot_id, Method::Post, path, Some(call.to_string())).await;
+        if !renewal_reached_inbox(r.as_ref().map(|r| r.status_code())) {
+            console_warn!("bot change refused bot={bot_id}: the inbox did not take {path}");
+            return false;
+        }
+    }
+    true
+}
+
+/// An app catalog entry id: the BLAKE3 of a bundle, 64 lowercase hex.
+pub(crate) fn is_entry_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Is the catalog keeping entry `id`?
+async fn catalog_has(db: &D1Database, id: &str) -> Result<bool> {
+    let row: Option<serde_json::Value> = db
+        .prepare("SELECT id FROM app_catalog WHERE id = ?1")
+        .bind(&[d1_text(id)])?
+        .first(None)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Is this a built-in bot (the relay runs it)?
+async fn is_builtin(db: &D1Database, bot_id: &str) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct R {
+        builtin: Option<String>,
+    }
+    let row: Option<R> = db
+        .prepare("SELECT builtin FROM bots WHERE bot_id = ?1")
+        .bind(&[d1_text(bot_id)])?
+        .first(None)
+        .await?;
+    Ok(row.and_then(|r| r.builtin).is_some())
 }
 
 /// A bot that exists and is not deleted.
@@ -282,8 +353,12 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         return json_err(400, "bad_request");
     };
     let body: PatchBody = req.json().await.unwrap_or_default();
-    if body.name.is_none() && body.about.is_none() && body.disabled.is_none() {
+    let nothing = body.name.is_none() && body.about.is_none() && body.disabled.is_none();
+    if nothing && !body.clear_webhook && body.dm_scope.is_none() && body.app_entry.is_none() {
         return json_err(400, "bad_request");
+    }
+    if body.dm_scope.as_deref().is_some_and(|s| !matches!(s, "reply" | "anyone")) {
+        return json_err(400, "bad_dm_scope");
     }
     let name = match body.name.as_deref().map(clean_name) {
         Some(None) => return json_err(400, "bad_name"),
@@ -294,12 +369,30 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         Some(Ok(a)) => Some(a),
         None => None,
     };
+    if body.app_entry.as_deref().is_some_and(|e| !e.is_empty() && !is_entry_id(e)) {
+        return json_err(400, "bad_app");
+    }
     let db = ctx.env.d1("DB")?;
     if !live_bot(&db, &bot_id).await? {
         return json_err(404, "not_found");
     }
+    if let Some(entry) = body.app_entry.as_deref().filter(|e| !e.is_empty()) {
+        // A built-in bot answers by the relay's own rules; it reads no `app` update.
+        if is_builtin(&db, &bot_id).await? {
+            return json_err(409, "builtin_no_app");
+        }
+        if !catalog_has(&db, entry).await? {
+            return json_err(404, "app_not_in_catalog");
+        }
+    }
+    if !patch_inbox(&ctx.env, &bot_id, &body).await {
+        return json_err(502, "inbox_unavailable");
+    }
     let now = d1_int(now_secs() as i64);
     let mut stmts = Vec::new();
+    if body.clear_webhook {
+        stmts.push(db.prepare(super::api::SET_WEBHOOK_SQL).bind(&[d1_text(&bot_id), d1_opt_text(None)])?);
+    }
     if let Some(n) = &name {
         stmts.push(
             db.prepare("UPDATE bots SET name = ?2 WHERE bot_id = ?1")
@@ -321,6 +414,13 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
                 .bind(&[d1_text(&bot_id), d1_opt_text(a.as_deref())])?,
         );
     }
+    if let Some(entry) = &body.app_entry {
+        let entry = (!entry.is_empty()).then_some(entry.as_str());
+        stmts.push(
+            db.prepare("UPDATE bots SET app_entry = ?2 WHERE bot_id = ?1")
+                .bind(&[d1_text(&bot_id), d1_opt_text(entry)])?,
+        );
+    }
     match body.disabled {
         Some(true) => stmts.push(
             db.prepare("UPDATE bots SET disabled_at = COALESCE(disabled_at, ?2) WHERE bot_id = ?1")
@@ -332,7 +432,9 @@ pub async fn update(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         ),
         None => {}
     }
-    db.batch(stmts).await?;
+    if !stmts.is_empty() {
+        db.batch(stmts).await?; // a DM scope alone is the inbox's, written above
+    }
     // A built-in bot held its queue while it was off; back on, it runs now.
     if body.disabled == Some(false) {
         let _ = super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/wake", None).await;
@@ -356,17 +458,17 @@ pub async fn renew_token(req: Request, ctx: RouteContext<()>) -> Result<Response
         return json_err(404, "not_found");
     }
     let secret = token::mint(&bot_id);
-    // A webhook in force is signed with the NEW key's secret from now on; the old one stops
-    // verifying, as the old key stops working. The inbox hears the new secret FIRST, and a renewal
-    // it did not take is refused with nothing changed: until 2026-10-26 a failed push was only
-    // logged, so the program held a new key while every webhook came signed with the old one's
-    // secret and failed its check. Should the token write below fail after the push, the webhooks
-    // signed meanwhile fail and wait on their retries, and the owner's next renewal heals both.
-    let push = serde_json::json!({ "secret": super::webhook::derive_secret(&secret) });
-    let pushed =
-        super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/webhook-secret", Some(push.to_string())).await;
-    if !renewal_reached_inbox(pushed.as_ref().map(|r| r.status_code())) {
-        console_warn!("bot key renewal refused bot={bot_id}: the inbox did not take the webhook secret");
+    // A key is renewed because it leaked, and whoever holds the old one may have pointed the
+    // webhook at themselves: members' words would go on being POSTed there, signed with the new
+    // key's secret, after the old key stopped working (until 2026-11-18 the renewal only re-signed
+    // it). So a renewal ENDS the webhook, in the inbox and in the owner's copy; the program that
+    // holds the new key sets it again, and until then updates wait for a poll. The inbox is asked
+    // FIRST, and a renewal it did not take is refused with nothing changed — the old key working
+    // and its webhook in place, so the owner's next try is a clean one.
+    let clear = serde_json::json!({ "url": null });
+    let cleared = super::bot_inbox(&ctx.env, &bot_id, Method::Post, "/bot/webhook", Some(clear.to_string())).await;
+    if !renewal_reached_inbox(cleared.as_ref().map(|r| r.status_code())) {
+        console_warn!("bot key renewal refused bot={bot_id}: the inbox did not clear the webhook");
         return json_err(502, "inbox_unavailable");
     }
     let now = d1_int(now_secs() as i64);
@@ -375,6 +477,8 @@ pub async fn renew_token(req: Request, ctx: RouteContext<()>) -> Result<Response
             .bind(&[d1_text(&bot_id), now.clone()])?,
         db.prepare(token::INSERT_TOKEN_SQL)
             .bind(&[d1_text(&token::hash(&secret)), d1_text(&bot_id), now])?,
+        db.prepare(super::api::SET_WEBHOOK_SQL)
+            .bind(&[d1_text(&bot_id), d1_opt_text(None)])?,
     ])
     .await?;
     Response::from_json(&serde_json::json!({ "bot_id": bot_id, "token": secret }))
@@ -507,10 +611,46 @@ mod tests {
         // The order is the point: the inbox is asked before the old key is revoked, and a refusal
         // returns before the token batch.
         let body = fn_body(include_str!("admin.rs"), "renew_token");
-        let push = body.find("/bot/webhook-secret").expect("push");
+        let push = body.find("\"/bot/webhook\"").expect("push");
         let refuse = body.find("inbox_unavailable").expect("refusal");
         let revoke = body.find("REVOKE_TOKENS_SQL").expect("revoke");
         assert!(push < refuse && refuse < revoke, "push, refuse, then revoke");
+    }
+
+    /// A renewed key is a leaked one: the webhook whoever held the old key may have set ends with
+    /// it, in the inbox (which POSTs) and in the owner's copy (which the list shows), in the same
+    /// step — never re-signed and kept, as it was until 2026-11-18.
+    #[test]
+    fn renewing_a_key_ends_its_webhook_everywhere() {
+        let body = fn_body(include_str!("admin.rs"), "renew_token");
+        assert!(body.contains("json!({ \"url\": null })"), "the inbox's webhook is cleared");
+        assert!(!body.contains("\"secret\""), "nothing is re-signed");
+        let batch = &body[body.find("db.batch(").expect("one batch")..];
+        for stmt in ["REVOKE_TOKENS_SQL", "INSERT_TOKEN_SQL", "SET_WEBHOOK_SQL"] {
+            assert!(batch.contains(stmt), "{stmt} is not in the renewal's batch");
+        }
+        assert!(batch.contains("d1_opt_text(None)"), "the owner's copy is set to NULL");
+        // What the inbox does with it: `deliver_tests.rs`, a_cleared_webhook_is_posted_nothing.
+    }
+
+    /// D5: the owner ends a webhook with `clear_webhook: true`; absent, nothing changes. The
+    /// listing shows its host, never its path.
+    #[test]
+    fn the_owner_sees_the_webhooks_host_and_can_end_it() {
+        let parse = |s: &str| serde_json::from_str::<super::PatchBody>(s).unwrap();
+        assert!(parse(r#"{"clear_webhook": true}"#).clear_webhook);
+        assert!(!parse(r#"{"name": "x"}"#).clear_webhook, "an older app's PATCH changes no webhook");
+        assert_eq!(parse(r#"{"dm_scope": "anyone"}"#).dm_scope.as_deref(), Some("anyone"));
+        let src = include_str!("admin.rs");
+        let update = fn_body(src, "update");
+        let ask = update.find("patch_inbox(").expect("the inbox is asked");
+        let write = update.find("db.batch(stmts)").expect("the D1 write");
+        assert!(ask < write, "the inbox first, so a refusal changes nothing");
+        assert!(update.contains("SET_WEBHOOK_SQL"), "the owner's copy is cleared too");
+        let list = fn_body(src, "list");
+        assert!(list.contains("v[\"webhook_host\"]") && list.contains("v[\"dm_scope\"]"));
+        let state = include_str!("../messages/inbox_do/bot/mod.rs");
+        assert!(state.contains("\"webhook_host\": s.kv_get(\"webhook_url\").and_then(|u| crate::bots::webhook::host_of(&u))"));
     }
 
     #[test]

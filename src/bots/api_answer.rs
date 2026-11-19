@@ -23,7 +23,7 @@ pub(crate) const API_VERSION: u32 = 1;
 /// What this relay's v1 does, by name (`tools/bots/api_v1.json` describes each). A program asks
 /// `features` rather than guessing from a server's build: a name is added when its behaviour
 /// ships and is never taken back inside v1.
-pub(crate) const FEATURES: [&str; 9] = [
+pub(crate) const FEATURES: [&str; 10] = [
     "long_poll",
     "webhook",
     "direct_messages",
@@ -33,6 +33,8 @@ pub(crate) const FEATURES: [&str; 9] = [
     "idempotent_send",
     "member_files",
     "discovery",
+    // `app` updates and `answerApp`: the bot's interface (`docs/BOT_APP_PLAN.md`), since 1.3.
+    "bot_app",
 ];
 
 /// The bot API as `/capabilities` announces it (`bot_api`): readable before a program holds a
@@ -68,6 +70,11 @@ pub(crate) fn updates(rows: impl IntoIterator<Item = (i64, String)>) -> Value {
 /// `sendMessage`.
 pub(crate) fn sent(message_id: &str) -> Value {
     json!({ "ok": true, "message_id": message_id })
+}
+
+/// `answerApp` queued for the member's devices.
+pub(crate) fn app_answered() -> Value {
+    json!({ "ok": true })
 }
 
 /// `sendMessage` repeated under its `client_id`: the first send's id.

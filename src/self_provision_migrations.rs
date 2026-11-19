@@ -195,4 +195,5 @@ pub(super) const MIGRATIONS: &[(&str, &str)] = &[
     ("0058_server_update_requests", include_str!("../migrations/0058_server_update_requests.sql")),
     ("0059_plugin_allowlist", include_str!("../migrations/0059_plugin_allowlist.sql")),
     ("0060_app_catalog", include_str!("../migrations/0060_app_catalog.sql")),
+    ("0061_bot_app", include_str!("../migrations/0061_bot_app.sql")),
 ];

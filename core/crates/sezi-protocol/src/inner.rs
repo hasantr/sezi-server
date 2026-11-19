@@ -834,6 +834,23 @@ pub enum InnerMessage {
         msg_uid: String,
         action_id: String,
     },
+    /// A bot's interface talking to its bot: the web app linked to the bot (`docs/BOT_APP_PLAN.md`)
+    /// hands the bot `data`, a JSON text it wrote, over the member's 1:1 Olm lane. Bot-bound like
+    /// `BotCall`; the bot's program reads it as an `app` update. `request_id` is the app's own,
+    /// echoed back on the bot's answer so the app can pair them.
+    BotAppCall {
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    /// A bot's answer to its interface (bot → member), never a row: the member's kernel hands
+    /// `data` to the bot's app if it is open, and drops it otherwise. Believed only from a bot.
+    /// Invisible, so a build that predates it drops it silently.
+    BotAppData {
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
     /// A reaction: one emoji the sender puts on a message, or takes back (`emoji: None`) —
     /// `crate::reaction`. Invisible control (NO UI row), a durable op that must arrive. It names
     /// its target as a reply does: the target's `msg_uid` and its author, so each device finds its
@@ -1202,6 +1219,8 @@ impl InnerMessage {
                 | InnerMessage::HistoryPageAnswer { .. }
                 | InnerMessage::Indirect(_)
                 | InnerMessage::PluginEpochRequest { .. }
+                | InnerMessage::BotAppCall { .. }
+                | InnerMessage::BotAppData { .. }
         )
     }
 

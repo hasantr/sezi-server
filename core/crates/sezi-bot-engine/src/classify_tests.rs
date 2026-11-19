@@ -101,3 +101,12 @@ fn an_album_is_one_file_update_of_bounded_size() {
     let no_blob = of(InnerMessage::File(manifest("")));
     assert_eq!(classify(&no_blob, "u", "d", false), Inbound::Ignored("empty_file"));
 }
+
+#[test]
+fn the_bots_interface_reaches_the_program_as_an_app_call() {
+    let p = of(InnerMessage::BotAppCall { data: r#"{"q":1}"#.into(), request_id: Some("r-1".into()) });
+    assert_eq!(
+        classify(&p, "u", "d", false),
+        Inbound::App { from: "u".into(), device: "d".into(), data: r#"{"q":1}"#.into(), request_id: Some("r-1".into()) }
+    );
+}

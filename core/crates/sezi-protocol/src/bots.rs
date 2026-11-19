@@ -14,7 +14,10 @@ impl InnerMessage {
     /// Is this addressed to a bot only? `true` → a human kernel acks and drops it, never stores
     /// it (`kernel/inbound_control.rs` and `kernel/groups.rs`, beside `is_local_only`).
     pub fn is_bot_bound(&self) -> bool {
-        matches!(self, InnerMessage::BotCall { .. } | InnerMessage::BotTap { .. })
+        matches!(
+            self,
+            InnerMessage::BotCall { .. } | InnerMessage::BotTap { .. } | InnerMessage::BotAppCall { .. }
+        )
     }
 
     /// Does this carry a room's secret — a key that opens the room's messages or its plugin
@@ -44,6 +47,9 @@ impl InnerMessage {
             InnerMessage::ScheduledKey { room: true, .. } | InnerMessage::ScheduledCancel { room: true, .. } => true,
             // A room's typing presence says who is writing there right now.
             InnerMessage::Typing { room: Some(_), .. } => true,
+            // A room's live location goes per member and names the room (`room_scope`): where a
+            // member is standing is the room's to see, never a bot's.
+            InnerMessage::LiveLocationUpdate { conversation: Some(_), .. } => true,
             // A room call's signal: its join carries the call's SFU frame key pairwise, the rest
             // say who is in the room's call. A bot is never a call participant.
             InnerMessage::CallSignal { data, .. } => serde_json::from_str::<serde_json::Value>(data)
@@ -144,6 +150,9 @@ impl InnerMessage {
             // A bot's.
             | InnerMessage::BotCall { .. }
             | InnerMessage::BotTap { .. }
+            | InnerMessage::BotAppCall { .. }
+            // A bot's answer to its interface: 1:1, the bot's own.
+            | InnerMessage::BotAppData { .. }
             // My own devices' only.
             | InnerMessage::OutboundCopy { .. }
             | InnerMessage::DeviceStatePacket { .. }
@@ -218,6 +227,8 @@ mod tests {
         for k in &room {
             assert_eq!(k.room_scope().as_deref(), Some("r"), "{k:?}");
         }
+        // Where a member is standing is never a bot's to know.
+        assert!(room.last().is_some_and(InnerMessage::carries_room_secret), "a room's live location");
         // A pair's own stays a pair's own, whatever room it claims: a reaction, an edit or a pin
         // over Olm is the 1:1's (a room sends those over its Megolm).
         let own = [

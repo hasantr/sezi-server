@@ -163,20 +163,39 @@ fn a_held_webhook_queue_waits_for_the_hold_and_an_empty_one_arms_nothing() {
 /// not POSTed until the next member's frame woke the inbox, and could expire at 24 h first
 /// (review 2026-10-27, #4). Every door that creates work arms the alarm; this one too.
 #[test]
-fn setting_a_webhook_or_its_renewed_secret_arms_the_alarm() {
+fn setting_a_webhook_arms_the_alarm() {
     let code = include_str!("deliver.rs").split("#[cfg(test)]").next().unwrap();
     let set = fn_body(code, "bot_set_webhook");
     let stored = set.find("kv_put(\"webhook_url\"").expect("the URL is stored");
     let arm = set.find("arm_alarm_within(0)").expect("setWebhook arms no alarm");
     assert!(stored < arm, "armed before the URL is in place");
-    let renew = fn_body(code, "bot_set_webhook_secret");
-    let stored = renew.find("kv_put(\"webhook_secret\"").expect("the secret is stored");
-    let arm = renew.find("arm_alarm_within(0)").expect("a renewed secret arms no alarm");
-    assert!(stored < arm, "armed before the secret is in place");
-    // The routes await them: an alarm armed inside a future nobody polls is never armed.
+    // The route awaits it: an alarm armed inside a future nobody polls is never armed.
     let routes = include_str!("mod.rs");
-    for f in ["bot_set_webhook(", "bot_set_webhook_secret("] {
-        let at = routes.find(&format!("self.{f}")).expect(f);
-        assert!(routes[at..at + 80].contains(".await"), "{f} is not awaited");
-    }
+    let at = routes.find("self.bot_set_webhook(").expect("route");
+    assert!(routes[at..at + 80].contains(".await"), "bot_set_webhook is not awaited");
+    // A renewed key no longer re-signs a webhook: it ends it (`bots/admin.rs`, renew_token).
+    assert!(!routes.contains("/bot/webhook-secret"));
+}
+
+/// After a key renewal (or the owner's `clear_webhook`) the inbox's webhook is gone, URL and
+/// secret, so the round POSTs nothing to the old URL and the updates wait for a poll.
+#[test]
+fn a_cleared_webhook_is_posted_nothing() {
+    let c = db();
+    let put = |k: &str, v: &str| c.execute(super::super::store::KV_PUT, params![k, v]).unwrap();
+    put("webhook_url", "https://leaker.example/hook");
+    put("webhook_secret", "old-secret");
+    put("bot_id", "b-1");
+    let kv = |k: &str| -> Option<String> {
+        c.query_row(super::super::store::KV_GET, [k], |r| r.get(0)).ok()
+    };
+    assert_eq!(
+        webhook_at_delivery(kv("webhook_url"), kv("webhook_secret"), false),
+        Hook::Live("https://leaker.example/hook".into(), "old-secret".into())
+    );
+    c.execute(WEBHOOK_CLEAR, []).unwrap();
+    assert_eq!(webhook_at_delivery(kv("webhook_url"), kv("webhook_secret"), false), Hook::None);
+    assert_eq!(kv("bot_id").as_deref(), Some("b-1"), "nothing else of the inbox goes");
+    let set = fn_body(include_str!("deliver.rs"), "bot_set_webhook");
+    assert!(set.contains("(None, _) => store.db.run(WEBHOOK_CLEAR, &[])"));
 }

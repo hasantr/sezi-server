@@ -23,7 +23,10 @@
 //! Errors are `{ok:false, error:"bot/<code>"}`.
 //!
 //! The Worker checks the key and who the bot may write to; the bot's inbox does the encryption.
-//! A bot may write to an active human of this server who has not blocked it, and to nobody else.
+//! A bot may write 1:1 to an active human of this server with no block between them, who has
+//! not removed the bot (`bot/removed`) and whom the server's DM policy lets it reach
+//! (`bot/dm-policy`) — `send_target`; and then, unless the owner granted "anyone", only to one
+//! who wrote to it lately (`bot/reply-only`, the inbox's `dm_scope.rs`). Decision D4.
 
 use super::api_input::{self as input, Chat, SendReq};
 use super::token::{self, BotAuth};
@@ -31,12 +34,53 @@ use crate::d1util::d1_text;
 use serde::Deserialize;
 use worker::*;
 
-/// Is the target an active human, and is there a block between them? Bind: target, bot.
+/// Is the target an active human, is there a block between them, does the pair's contact grant
+/// stand or was it revoked (the member removed the bot), and the server's `dm_policy`.
+/// Bind: target, bot.
 pub(crate) const SEND_TARGET_SQL: &str = "SELECT
        EXISTS(SELECT 1 FROM users WHERE id = ?1 AND kind = 'human') AS human,
        EXISTS(SELECT 1 FROM contact_blocks
                WHERE (blocker_user_id = ?1 AND blocked_user_id = ?2)
-                  OR (blocker_user_id = ?2 AND blocked_user_id = ?1)) AS blocked";
+                  OR (blocker_user_id = ?2 AND blocked_user_id = ?1)) AS blocked,
+       EXISTS(SELECT 1 FROM contact_grants
+               WHERE user_low = CASE WHEN ?2 < ?1 THEN ?2 ELSE ?1 END
+                 AND user_high = CASE WHEN ?2 < ?1 THEN ?1 ELSE ?2 END
+                 AND revoked_at IS NULL) AS granted,
+       EXISTS(SELECT 1 FROM contact_grants
+               WHERE user_low = CASE WHEN ?2 < ?1 THEN ?2 ELSE ?1 END
+                 AND user_high = CASE WHEN ?2 < ?1 THEN ?1 ELSE ?2 END
+                 AND revoked_at IS NOT NULL) AS revoked,
+       COALESCE((SELECT dm_policy FROM server_settings WHERE id = 1), 'members') AS dm_policy";
+
+/// What `SEND_TARGET_SQL` answers.
+#[derive(Deserialize, Debug)]
+pub(crate) struct Target {
+    pub(crate) human: i64,
+    pub(crate) blocked: i64,
+    pub(crate) granted: i64,
+    pub(crate) revoked: i64,
+    pub(crate) dm_policy: String,
+}
+
+/// May a program bot write to this member 1:1? Decision D4's Worker half: a block, a member who
+/// removed the bot (its grant revoked) and a strict `dm_policy` the bot holds no grant under are
+/// honoured whatever the owner granted. Until 2026-11-18 only "a human, not blocked" was asked
+/// (review H12). Who wrote to the bot lately is the inbox's half (`inbox_do/bot/dm_scope.rs`).
+pub(crate) fn send_target(t: Option<&Target>) -> std::result::Result<(), (u16, &'static str)> {
+    let Some(t) = t.filter(|t| t.human == 1) else {
+        return Err((403, "not-a-member"));
+    };
+    if t.blocked != 0 {
+        return Err((403, "blocked"));
+    }
+    if t.granted == 0 && t.revoked != 0 {
+        return Err((403, "removed"));
+    }
+    if t.granted == 0 && t.dm_policy != "members" {
+        return Err((403, "dm-policy"));
+    }
+    Ok(())
+}
 
 /// The owner's copy of the webhook (`GET /admin/bots`), written only when it changes: a program
 /// calling `setWebhook` with the same URL on every start (or in a loop) writes no D1 row.
@@ -112,6 +156,10 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
             set_webhook(&ctx.env, &db, &bot, url, &token).await
         }
         "deleteWebhook" => set_webhook(&ctx.env, &db, &bot, "", "").await,
+        "answerApp" => match input::parse_answer_app(&body) {
+            Ok(answer) => answer_app(&ctx.env, &db, &bot, answer).await,
+            Err((status, code)) => bot_err(status, code),
+        },
         "getFile" => match input::parse_get_file(&body) {
             Ok(file_id) => get_file(&ctx.env, &bot, file_id).await,
             Err((status, code)) => bot_err(status, code),
@@ -224,6 +272,24 @@ async fn set_webhook(env: &Env, db: &D1Database, bot: &BotAuth, url: &str, token
     Response::from_json(&super::api_answer::webhook(secret.as_deref()))
 }
 
+/// An `answerApp` (`docs/BOT_APP_PLAN.md`): to the same people a 1:1 `sendMessage` may reach
+/// (an active human who has not blocked the bot), then the bot's inbox, which applies the
+/// reply-only rule and the send limits as for a text.
+async fn answer_app(env: &Env, db: &D1Database, bot: &BotAuth, answer: input::AnswerAppReq) -> Result<Response> {
+    let target: Option<Target> = db
+        .prepare(SEND_TARGET_SQL)
+        .bind(&[d1_text(&answer.user_id), d1_text(&bot.bot_id)])?
+        .first(None)
+        .await?;
+    if let Err((status, code)) = send_target(target.as_ref()) {
+        return bot_err(status, code);
+    }
+    let call = serde_json::json!({
+        "method": "answerApp", "to": answer.user_id, "data": answer.data, "request_id": answer.request_id,
+    });
+    inbox_answer(super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/api", Some(call.to_string())).await).await
+}
+
 /// A `sendMessage` that `api_input::parse_send` accepted: who it may go to, then the bot's inbox,
 /// which counts the send limits (`inbox_do/bot/send_guard.rs`: 60 a minute, 30 into one chat,
 /// `bot/rate-limited` with `retry_after`) — exactly, and without the KV put per send the
@@ -245,20 +311,13 @@ async fn send_message(env: &Env, db: &D1Database, bot: &BotAuth, send: SendReq) 
         }
         Chat::User(to) => to,
     };
-    #[derive(Deserialize)]
-    struct Target {
-        human: i64,
-        blocked: i64,
-    }
     let target: Option<Target> = db
         .prepare(SEND_TARGET_SQL)
         .bind(&[d1_text(&to), d1_text(&bot.bot_id)])?
         .first(None)
         .await?;
-    match target {
-        Some(t) if t.human == 1 && t.blocked == 0 => {}
-        Some(t) if t.human == 1 => return bot_err(403, "blocked"),
-        _ => return bot_err(403, "not-a-member"),
+    if let Err((status, code)) = send_target(target.as_ref()) {
+        return bot_err(status, code);
     }
     let call = serde_json::json!({
         "method": "sendMessage", "to": to, "text": send.text, "client_id": send.client_id,

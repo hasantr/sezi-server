@@ -55,6 +55,22 @@ const MIN_RESET_KEY_LEN: usize = 8;
 struct ResetBody {
     #[serde(default)]
     password: String,
+    /// `/admin/reset-key` only: the key in force now, required whenever one exists. Without it
+    /// an owner token alone could replace the key and then use it, which is the very single
+    /// factor the key exists to prevent (audit 2026-11-18). An app from before this field sends
+    /// none, so it can still install a FIRST key but no longer change one — `reset_key_current_required`.
+    #[serde(default)]
+    current: String,
+}
+
+/// Is `given` the reset key in force? Env secret first, then the stored hash — the order
+/// [`reset`] decides by. `None` = no key exists at all.
+async fn current_key_matches(env: &Env, db: &D1Database, given: &str) -> Option<bool> {
+    let env_secret = crate::utils::env_text(env, "RESET_PASSWORD").unwrap_or_default();
+    if !env_secret.is_empty() {
+        return Some(secret_eq(given, &env_secret));
+    }
+    stored_reset_hash(db).await.map(|hash| verify_code(given, &hash))
 }
 
 #[derive(Deserialize)]
@@ -108,11 +124,26 @@ pub async fn set_reset_key(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     if let Err(resp) = require_owner(&user_id, &ctx.env).await {
         return Ok(resp);
     }
+    // The same brake and bucket as the wipe: checking the current key here must not become a
+    // second, unbraked place to grind it.
+    if !crate::ratelimit::check_rate_limit_env(&ctx.env, &format!("admin:reset:{user_id}"), 5, 900)
+        .await
+    {
+        return json_err(429, "rate_limited");
+    }
     let body: ResetBody = req.json().await.unwrap_or_default();
     if body.password.len() < MIN_RESET_KEY_LEN {
         return json_err(400, "reset_key_too_short");
     }
     let db = ctx.env.d1("DB")?;
+    match current_key_matches(&ctx.env, &db, &body.current).await {
+        None => {}
+        Some(true) => {}
+        Some(false) if body.current.is_empty() => {
+            return json_err(403, "reset_key_current_required")
+        }
+        Some(false) => return json_err(403, "reset_password_invalid"),
+    }
     db.prepare(
         "INSERT INTO server_config(key,value,created_at) VALUES(?,?,?)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value,created_at=excluded.created_at",
@@ -259,14 +290,9 @@ pub async fn reset(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
     //
     // FAIL-CLOSED with NEITHER: a server holding no destruction kit cannot be wiped over the
     // network at all. An owner-token compromise alone must never be enough to erase a server.
-    let env_secret = crate::utils::env_text(&ctx.env, "RESET_PASSWORD").unwrap_or_default();
-    let authorized = if !env_secret.is_empty() {
-        secret_eq(&body.password, &env_secret)
-    } else {
-        match stored_reset_hash(&db).await {
-            Some(hash) => verify_code(&body.password, &hash),
-            None => return json_err(503, "reset_not_configured"),
-        }
+    let authorized = match current_key_matches(&ctx.env, &db, &body.password).await {
+        Some(ok) => ok,
+        None => return json_err(503, "reset_not_configured"),
     };
     if !authorized {
         return json_err(403, "reset_password_invalid");

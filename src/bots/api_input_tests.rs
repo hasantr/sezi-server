@@ -140,7 +140,7 @@ fn the_api_hands_the_program_no_raw_inbox_answer() {
     let api = include_str!("api.rs");
     assert!(!api.contains("passthrough("), "a raw inbox answer can reach the program");
     let calls = api.matches("super::bot_inbox(").count();
-    assert_eq!(calls, 6, "the call budget, getUpdates, setWebhook, the two sends, and getFile");
+    assert_eq!(calls, 7, "the call budget, getUpdates, setWebhook, the two sends, getFile and answerApp");
     assert!(api.matches("inbox_answer(").count() >= calls, "each one is judged");
 }
 
@@ -174,4 +174,26 @@ fn get_file_takes_one_file_id() {
     ] {
         assert_eq!(parse_get_file(&bad), Err((400, "bad-request")), "{bad}");
     }
+}
+
+/// `answerApp` (`docs/BOT_APP_PLAN.md`): JSON only — an object or array as it is, a string only
+/// when it is JSON itself — to a 36-character member, at most 32 KiB, with a short `request_id`.
+#[test]
+fn an_app_answer_carries_json_to_one_member() {
+    let user = "6f1c2a0e-1b2c-4d3e-8f9a-0b1c2d3e4f50";
+    let ok = parse_answer_app(&json!({"user_id": user, "data": {"rows": 3}, "request_id": "r-1"})).unwrap();
+    assert_eq!((ok.data.as_str(), ok.request_id.as_deref()), (r#"{"rows":3}"#, Some("r-1")));
+    assert_eq!(parse_answer_app(&json!({"user_id": user, "data": "[1,2]"})).unwrap().data, "[1,2]");
+    for bad in [
+        json!({"user_id": user, "data": "not json"}),
+        json!({"user_id": user, "data": 5}),
+        json!({"user_id": user}),
+        json!({"user_id": "short", "data": {}}),
+        json!({"user_id": user, "data": {}, "request_id": ""}),
+        json!({"user_id": user, "data": {}, "request_id": "x".repeat(65)}),
+    ] {
+        assert_eq!(parse_answer_app(&bad).err(), Some((400, "bad-request")), "{bad}");
+    }
+    let big = json!({"user_id": user, "data": [ "x".repeat(MAX_APP_DATA_BYTES) ]});
+    assert_eq!(parse_answer_app(&big).err(), Some((413, "too-large")));
 }

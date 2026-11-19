@@ -24,6 +24,17 @@ struct RefreshBody {
 const REFRESH_TTL_SEC: u64 = 30 * 24 * 60 * 60;
 const ACCESS_TTL_SEC: u64 = 15 * 60;
 
+/// The rotation's revoke: only a token still live. Binds: the old token's hash.
+const REVOKE_LIVE_SQL: &str =
+    "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ? AND revoked = 0";
+
+/// The rotation's successor, written only when the revoke just before it in the same batch
+/// changed a row — so of two requests racing on one token, exactly one gets a successor.
+/// Binds: new hash, user, expires_at, created_at, device.
+const INSERT_SUCCESSOR_SQL: &str =
+    "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
+     SELECT ?, ?, ?, 0, ?, ? WHERE changes() = 1";
+
 /// May a refresh naming `claim` renew a token ISSUED to `row`?
 ///
 /// **The row is the authority; the claim can only refuse.** Never
@@ -161,22 +172,33 @@ pub(crate) async fn rotate(
     // The revoke also sits BEHIND the device checks: a refresh refused with 403
     // `device_mismatch` or 401 `device_revoked` issues no successor AND burns no token.
     // Refusing a request and destroying the credential it presented are not the same act.
-    db.batch(vec![
-        db.prepare("UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?")
-            .bind(&[d1_text(&old_hash)])?,
-        db.prepare(
-            "INSERT INTO refresh_tokens (token_hash, user_id, expires_at, revoked, created_at, device_id)
-             VALUES (?, ?, ?, 0, ?, ?)",
-        )
-        .bind(&[
-            d1_text(&new_hash),
-            d1_text(&user_id),
-            d1_int((now + REFRESH_TTL_SEC) as i64),
-            d1_int(now as i64),
-            d1_text(device_id),
-        ])?,
-    ])
-    .await?;
+    //
+    // ONE SPENDER (audit 2026-11-18). The read above and this batch are not atomic: two requests
+    // presenting the same token both pass the read, and an unconditional revoke let both mint a
+    // successor — two live sessions from one token. So the revoke only takes a token still live
+    // (`AND revoked = 0`), the successor is written only when THAT revoke changed a row
+    // (`changes()` inside the same transaction), and a batch whose insert wrote nothing is the
+    // loser of the race and answers `invalid_refresh`, holding nothing.
+    let results = db
+        .batch(vec![
+            db.prepare(REVOKE_LIVE_SQL).bind(&[d1_text(&old_hash)])?,
+            db.prepare(INSERT_SUCCESSOR_SQL).bind(&[
+                d1_text(&new_hash),
+                d1_text(&user_id),
+                d1_int((now + REFRESH_TTL_SEC) as i64),
+                d1_int(now as i64),
+                d1_text(device_id),
+            ])?,
+        ])
+        .await?;
+    let issued = results
+        .get(1)
+        .and_then(|r| r.meta().ok().flatten())
+        .and_then(|m| m.changes)
+        .unwrap_or(0);
+    if issued != 1 {
+        return Ok(Err((401, "invalid_refresh")));
+    }
 
     // The heartbeat of a session that is actually being used — a device renews here about every
     // quarter of an hour, which is exactly the resolution the devices screen wants. Best-effort:
@@ -295,6 +317,32 @@ mod tests {
         assert_eq!(revoked_flag(&c, "new"), 0);
     }
 
+    /// Two requests that both read the token as live: the first rotation issues a successor, the
+    /// second — the same two statements, run after it — revokes nothing and so issues nothing.
+    /// These are the handler's own statements.
+    #[test]
+    fn of_two_rotations_racing_on_one_token_only_one_issues_a_successor() {
+        let mut c = rotation_schema();
+        let mut rotate = |new: &str| -> usize {
+            let tx = c.transaction().unwrap();
+            tx.execute(super::REVOKE_LIVE_SQL, params!["old"]).unwrap();
+            let n = tx
+                .execute(super::INSERT_SUCCESSOR_SQL, params![new, "u", 9999, 2, "dev-a"])
+                .unwrap();
+            tx.commit().unwrap();
+            n
+        };
+        assert_eq!(rotate("first"), 1, "the first rotation must issue its successor");
+        assert_eq!(rotate("second"), 0, "the loser of the race must get nothing");
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM refresh_tokens WHERE revoked = 0", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "one token, one live successor"
+        );
+    }
+
     /// Source guard: the two writes must stay in ONE batch. A behavioural test cannot see this —
     /// the bug was never inside a statement, it was the gap BETWEEN two of them — so the
     /// assertion is over the source, the `groups_tests.rs` shape.
@@ -308,12 +356,12 @@ mod tests {
             "expected exactly one revoke statement in refresh.rs"
         );
         let batch_at = src
-            .find("db.batch(vec![")
+            .find(".batch(vec![")
             .expect("the rotation batch is gone — the revoke and the insert have been split apart");
-        assert!(
-            src.find(&revoke).unwrap() > batch_at,
-            "the revoke escaped the batch and runs on its own again"
-        );
+        for stmt in [concat!("(REVOKE_LIVE", "_SQL)"), concat!("(INSERT_SUCCESSOR", "_SQL)")] {
+            let at = src.find(stmt).expect("a rotation statement is no longer prepared");
+            assert!(at > batch_at, "{stmt} escaped the batch and runs on its own again");
+        }
         assert_eq!(
             src.matches(concat!(".run", "()")).count(),
             0,
