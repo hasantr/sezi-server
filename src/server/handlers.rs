@@ -255,6 +255,10 @@ fn capabilities_body(
             "app_catalog": media_ok,
             "instrument_pack": true,
             "library": media_ok,
+            // Drive (`drive.rs`): a member's own encrypted file space, a room whose files are
+            // library parts — so it is there exactly when the library is. An app finds none on an
+            // older relay and says the server has no Drive yet.
+            "drive": media_ok,
             // Scheduled messages held here and released at their time (`messages/scheduled.rs`):
             // in the sender's inbox Durable Object, no store needed. An app finds none on an older
             // relay and does not offer it.

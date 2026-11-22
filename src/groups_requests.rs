@@ -188,6 +188,10 @@ async fn admin_gate(
         .env
         .d1("DB")
         .map_err(|_| json_err(503, "db_unavailable").unwrap())?;
+    // A personal drive admits nobody (`drive.rs`): no request into it is listed or approved.
+    if let Some(resp) = crate::drive::refuse_personal(&db, &group_id).await {
+        return Err(resp);
+    }
     match group_role(&db, &group_id, &caller).await {
         Ok(Some(role)) if is_group_admin(&role) => Ok((caller, group_id)),
         Ok(Some(_)) => Err(json_err(403, "forbidden").unwrap()),

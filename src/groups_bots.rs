@@ -110,6 +110,10 @@ async fn gate(
         return json_err(400, "bad_request").map(Err);
     };
     let db = ctx.env.d1("DB")?;
+    // No bot in a personal drive (`drive.rs`): it is nobody's but its owner's.
+    if let Some(resp) = crate::drive::refuse_personal(&db, &group_id).await {
+        return Ok(Err(resp));
+    }
     let room_role = match group_role(&db, &group_id, &user_id).await? {
         Some(role) if is_group_admin(&role) => role,
         Some(_) => return json_err(403, "forbidden").map(Err),

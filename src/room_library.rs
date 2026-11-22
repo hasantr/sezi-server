@@ -103,12 +103,18 @@ pub(crate) const SELECT_OBJECT_SQL: &str = "SELECT uploader_id, kind, size_bytes
 
 /// Everything a PUT needs to decide, in ONE round trip: the retention to freeze, both caps, and
 /// the two usages — each usage read only when its cap is set, so a server with no caps (the
-/// default) pays for neither sum. Binds: room. No row = a server_settings row that was never
+/// default) pays for neither sum. Binds: ?1 room. No row = a server_settings row that was never
 /// seeded, which the handler reads as "no caps, keep until deleted".
-pub(crate) const PUT_POLICY_SQL: &str = "SELECT s.library_retention_days AS retention_days, \
+///
+/// The retention applies to a GROUP's library only: a Drive space (`drive.rs`) keeps its files
+/// until they are deleted — a drive that expires is not a drive (docs/DRIVE_PLAN.md §10.3). A room
+/// with no `groups` row reads as a group, so nothing that was kept before is kept longer now.
+pub(crate) const PUT_POLICY_SQL: &str = "SELECT \
+       CASE WHEN COALESCE((SELECT kind FROM groups WHERE id = ?1), 'group') = 'group' \
+         THEN s.library_retention_days END AS retention_days, \
        s.max_room_library_bytes AS max_room, s.max_storage_bytes AS max_server, \
        CASE WHEN s.max_room_library_bytes IS NULL THEN 0 ELSE \
-         (SELECT COALESCE(SUM(size_bytes), 0) FROM room_library_objects WHERE room_id = ?) \
+         (SELECT COALESCE(SUM(size_bytes), 0) FROM room_library_objects WHERE room_id = ?1) \
        END AS room_used, \
        CASE WHEN s.max_storage_bytes IS NULL THEN 0 ELSE \
          COALESCE((SELECT media_bytes FROM server_stats WHERE id = 1), 0) \

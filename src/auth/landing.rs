@@ -39,13 +39,13 @@ pub(crate) const SNAPSHOT_PERSONAL_LANDING_SQL: &str = "UPDATE invite_attributio
       WHERE invite_token_hash = ?1 AND verified_at IS NULL AND kind = 'personal'";
 
 /// The direct landing: a consent row, only while the minter is still an ACTIVE owner/admin of the
-/// group and the group has room. RETURNING says whether it happened. `OR IGNORE` makes a verify
-/// retry a no-op. Binds: `?1` room, `?2` user, `?3` now, `?4` minter (NULL fails the EXISTS),
+/// group, the group has room and is a group (never a Drive space, `drive.rs`). RETURNING says
+/// whether it happened. `OR IGNORE` makes a verify retry a no-op. Binds: `?1` room, `?2` user, `?3` now, `?4` minter (NULL fails the EXISTS),
 /// `?5` ceiling.
 pub(crate) const LAND_DIRECT_SQL: &str = "INSERT OR IGNORE INTO group_members
        (group_id, user_id, role, joined_at, status, added_by)
      SELECT g.id, ?2, 'member', ?3, 'pending', ?4 FROM groups g
-      WHERE g.id = ?1
+      WHERE g.id = ?1 AND g.kind = 'group'
         AND EXISTS (SELECT 1 FROM group_members a
                      WHERE a.group_id = g.id AND a.user_id = ?4 AND a.status = 'active'
                        AND a.role IN ('owner', 'admin'))
@@ -55,7 +55,7 @@ pub(crate) const LAND_DIRECT_SQL: &str = "INSERT OR IGNORE INTO group_members
 /// The join request. Binds: `?1` room, `?2` user, `?3` invite_hash, `?4` invite_label, `?5` now.
 pub(crate) const LAND_REQUEST_SQL: &str = "INSERT INTO group_join_requests
        (group_id, user_id, invite_hash, invite_label, state, requested_at)
-     SELECT g.id, ?2, ?3, ?4, 'pending', ?5 FROM groups g WHERE g.id = ?1
+     SELECT g.id, ?2, ?3, ?4, 'pending', ?5 FROM groups g WHERE g.id = ?1 AND g.kind = 'group'
      ON CONFLICT(group_id, user_id) DO NOTHING
      RETURNING user_id";
 

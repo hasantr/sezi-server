@@ -29,7 +29,8 @@ fn transfer_fixture() -> Connection {
          CREATE TABLE groups(
            id TEXT PRIMARY KEY, name TEXT NOT NULL,
            created_by TEXT NOT NULL REFERENCES users(id),
-           created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+           created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+           kind TEXT NOT NULL DEFAULT 'group');
          CREATE TABLE group_members(
            group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
            user_id TEXT NOT NULL REFERENCES users(id),
@@ -37,7 +38,7 @@ fn transfer_fixture() -> Connection {
            status TEXT NOT NULL DEFAULT 'active', added_by TEXT,
            PRIMARY KEY(group_id, user_id));
          INSERT INTO users VALUES('c'),('b'),('m'),('p');
-         INSERT INTO groups VALUES('g','G','c',100,100);
+         INSERT INTO groups(id,name,created_by,created_at,updated_at) VALUES('g','G','c',100,100);
          INSERT INTO group_members VALUES
            ('g','c','owner',1,'active',NULL),
            ('g','b','admin',2,'active','c'),
@@ -283,7 +284,7 @@ fn the_owned_group_count_tracks_the_owner_row_and_not_created_by() {
     let db = transfer_fixture();
     db.execute_batch(
         "INSERT INTO users VALUES('x');
-         INSERT INTO groups VALUES('x','X','c',1,1);
+         INSERT INTO groups(id,name,created_by,created_at,updated_at) VALUES('x','X','c',1,1);
          INSERT INTO group_members VALUES('x','c','owner',1,'active',NULL);",
     )
     .unwrap();
@@ -330,7 +331,7 @@ fn the_recipient_cap_is_read_before_the_batch_and_never_inside_it() {
         let db = transfer_fixture();
         db.execute_batch(
             "INSERT INTO users VALUES('x1'),('x2');
-             INSERT INTO groups VALUES('x1','X1','b',1,1),('x2','X2','b',1,1);
+             INSERT INTO groups(id,name,created_by,created_at,updated_at) VALUES('x1','X1','b',1,1),('x2','X2','b',1,1);
              INSERT INTO group_members VALUES
                ('x1','b','owner',1,'active',NULL),('x2','b','owner',1,'active',NULL);",
         )

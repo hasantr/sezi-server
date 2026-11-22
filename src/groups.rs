@@ -22,7 +22,7 @@ mod delete;
 #[path = "groups_notify.rs"]
 mod notify;
 #[path = "groups_read.rs"]
-mod read;
+pub(crate) mod read;
 #[path = "groups_requests.rs"]
 mod requests;
 pub(crate) use requests::nudge_landing;
@@ -31,7 +31,7 @@ pub use requests::{
     my_join_requests, request_join_by_invite,
 };
 #[path = "groups_transfer.rs"]
-mod transfer;
+pub(crate) mod transfer;
 
 use crate::auth::middleware::{device_revoked, require_existing_account_auth};
 use crate::d1util::{d1_int, d1_null, d1_opt_text, d1_text};
@@ -325,8 +325,12 @@ pub async fn list_my_groups(req: Request, ctx: RouteContext<()>) -> Result<Respo
         Ok(uid) => uid,
         Err(resp) => return Ok(resp),
     };
+    let all_kinds = req
+        .url()
+        .ok()
+        .is_some_and(|u| u.query_pairs().any(|(k, v)| k == "kinds" && v == "all"));
     let db = ctx.env.d1("DB")?;
-    Response::from_json(&read::my_groups_page(&db, &user_id).await?)
+    Response::from_json(&read::my_groups_page(&db, &user_id, all_kinds).await?)
 }
 
 // GET /groups/:id/members (auth required) → the group's members; only a member may read it. The
@@ -370,6 +374,9 @@ pub async fn add_member(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
         return json_err(400, "bad_request");
     }
     let db = ctx.env.d1("DB")?;
+    if let Some(resp) = crate::drive::refuse_personal(&db, &group_id).await {
+        return Ok(resp);
+    }
     match group_role(&db, &group_id, &requester).await? {
         Some(role) if is_group_admin(&role) => {}
         Some(_) => return json_err(403, "forbidden"),
@@ -626,6 +633,9 @@ pub async fn set_role(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         return json_err(400, "bad_role");
     }
     let db = ctx.env.d1("DB")?;
+    if let Some(resp) = crate::drive::refuse_personal(&db, &group_id).await {
+        return Ok(resp);
+    }
     // Only the group-owner may assign roles — and therefore only the owner may hand the group on.
     match group_role(&db, &group_id, &requester).await? {
         Some(role) if role == "owner" => {}
@@ -704,6 +714,9 @@ pub async fn update_settings(mut req: Request, ctx: RouteContext<()>) -> Result<
         return json_err(400, "settings_too_large");
     }
     let db = ctx.env.d1("DB")?;
+    if let Some(resp) = crate::drive::refuse_personal(&db, &group_id).await {
+        return Ok(resp);
+    }
     match group_role(&db, &group_id, &requester).await? {
         Some(role) if is_group_admin(&role) => {}
         Some(_) => return json_err(403, "forbidden"),

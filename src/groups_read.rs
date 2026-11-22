@@ -34,6 +34,7 @@ struct MyGroupRow {
     status: String,
     added_by: Option<String>,
     join_requests: i64,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -57,34 +58,27 @@ struct CountRow {
 /// the house cursor codec is private to `contacts/mod.rs`. `total`/`truncated` cost one extra
 /// `COUNT(*)` and make the loss VISIBLE, which is the part that cannot be recovered afterwards;
 /// a real cursor is then a change to the client and this function together.
-pub(super) async fn my_groups_page(db: &D1Database, user_id: &str) -> Result<serde_json::Value> {
+///
+/// **SPACES ONLY WHEN ASKED.** A Drive space is a room too (`drive.rs`), but an app from before
+/// Drive would show it as a group named "drive"; it is listed only with `?kinds=all`, which an app
+/// that knows spaces always sends — it must, or the refresh that marks a room missing from the
+/// listing as removed would evict the drive (`core` `groups_lifecycle.rs`).
+pub(super) async fn my_groups_page(
+    db: &D1Database,
+    user_id: &str,
+    all_kinds: bool,
+) -> Result<serde_json::Value> {
     let rows: Vec<MyGroupRow> = db
-        .prepare(
-            "SELECT g.id, g.name, gm.role,
-                    (SELECT COUNT(*) FROM group_members x
-                       WHERE x.group_id = g.id AND x.status = 'active') AS member_count,
-                    g.created_at, g.visibility, g.auto_join, g.settings_json,
-                    gm.status, gm.added_by,
-                    CASE WHEN gm.status = 'active' AND gm.role IN ('owner', 'admin')
-                         THEN (SELECT COUNT(*) FROM group_join_requests r
-                                WHERE r.group_id = g.id AND r.state = 'pending')
-                         ELSE 0 END AS join_requests
-             FROM groups g
-             JOIN group_members gm ON gm.group_id = g.id
-             WHERE gm.user_id = ?
-             ORDER BY CASE gm.status WHEN 'active' THEN 0 ELSE 1 END,
-                      g.updated_at DESC, g.id
-             LIMIT ?",
-        )
-        .bind(&[d1_text(user_id), d1_int(MAX_GROUPS_PAGE)])?
+        .prepare(MY_GROUPS_SQL)
+        .bind(&[d1_text(user_id), d1_int(all_kinds as i64), d1_int(MAX_GROUPS_PAGE)])?
         .all()
         .await?
         .results()?;
     // Counted separately rather than derived from `rows.len()`: a full page is not proof of a
     // truncated one, and the client needs to know HOW MUCH it is missing, not merely that it is.
     let total = db
-        .prepare("SELECT COUNT(*) AS c FROM group_members WHERE user_id = ?")
-        .bind(&[d1_text(user_id)])?
+        .prepare(MY_GROUPS_COUNT_SQL)
+        .bind(&[d1_text(user_id), d1_int(all_kinds as i64)])?
         .first::<CountRow>(None)
         .await?
         .map(|row| row.c)
@@ -106,6 +100,9 @@ pub(super) async fn my_groups_page(db: &D1Database, user_id: &str) -> Result<ser
                 // Pending join requests (a class invite's landing group), counted for the
                 // group's admins only — the list itself is `GET /groups/:id/join-requests`.
                 "join_requests": r.join_requests,
+                // 'group', or a Drive space's kind (`drive.rs`). Additive: an app from before
+                // never reads it, and never sees a space unless it asks.
+                "kind": r.kind,
             })
         })
         .collect();
@@ -115,6 +112,29 @@ pub(super) async fn my_groups_page(db: &D1Database, user_id: &str) -> Result<ser
         "truncated": total > groups.len() as i64,
     }))
 }
+
+/// The page itself. Binds: ?1 user, ?2 all kinds (0/1), ?3 limit.
+pub(crate) const MY_GROUPS_SQL: &str = "SELECT g.id, g.name, gm.role,
+                    (SELECT COUNT(*) FROM group_members x
+                       WHERE x.group_id = g.id AND x.status = 'active') AS member_count,
+                    g.created_at, g.visibility, g.auto_join, g.settings_json,
+                    gm.status, gm.added_by,
+                    CASE WHEN gm.status = 'active' AND gm.role IN ('owner', 'admin')
+                         THEN (SELECT COUNT(*) FROM group_join_requests r
+                                WHERE r.group_id = g.id AND r.state = 'pending')
+                         ELSE 0 END AS join_requests,
+                    g.kind
+             FROM groups g
+             JOIN group_members gm ON gm.group_id = g.id
+             WHERE gm.user_id = ?1 AND (g.kind = 'group' OR ?2 = 1)
+             ORDER BY CASE gm.status WHEN 'active' THEN 0 ELSE 1 END,
+                      g.updated_at DESC, g.id
+             LIMIT ?3";
+
+/// What the page would hold without its limit. Binds: ?1 user, ?2 all kinds (0/1).
+pub(crate) const MY_GROUPS_COUNT_SQL: &str = "SELECT COUNT(*) AS c FROM group_members gm
+       JOIN groups g ON g.id = gm.group_id
+      WHERE gm.user_id = ?1 AND (g.kind = 'group' OR ?2 = 1)";
 
 /// One row of `GET /groups/:id/members`.
 ///

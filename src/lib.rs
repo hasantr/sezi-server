@@ -10,6 +10,7 @@ mod contact_grant;
 mod contact_qr;
 mod contacts;
 mod d1util;
+mod drive;
 mod devices;
 mod door_bucket;
 mod door_cors;
@@ -278,6 +279,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // Groups — membership, member-level rather than server-admin.
         .post_async("/groups", groups::create_group)
         .get_async("/groups", groups::list_my_groups)
+        .put_async("/drive/personal", drive::put_personal)
         .get_async("/groups/:id/members", groups::group_members)
         .post_async("/groups/:id/add-member", groups::add_member)
         .post_async("/groups/:id/remove-member", groups::remove_member)

@@ -26,10 +26,14 @@ use worker::*;
 /// filter guarantees the count can never come in UNDER the number of groups actually held — the
 /// direction that matters for a bound.
 ///
+/// Drive spaces are NOT counted (`g.kind = 'group'`): a personal drive exists once per member and
+/// can never be transferred (`drive.rs` `refuse_personal`), so it is no way past the bound.
+///
 /// A `const` rather than an inline string so the rusqlite tests in `groups_tests.rs` exercise the
 /// statement that actually ships.
-pub(super) const OWNED_GROUP_COUNT_SQL: &str =
-    "SELECT COUNT(*) AS c FROM group_members WHERE user_id = ? AND role = 'owner'";
+pub(crate) const OWNED_GROUP_COUNT_SQL: &str = "SELECT COUNT(*) AS c FROM group_members gm
+       JOIN groups g ON g.id = gm.group_id
+      WHERE gm.user_id = ? AND gm.role = 'owner' AND g.kind = 'group'";
 
 /// Transfer 1/3 — demote the sitting owner (the caller). Binds: group_id, caller. The
 /// `role = 'owner'` predicate makes the statement inert for anyone who is not the owner, so a
