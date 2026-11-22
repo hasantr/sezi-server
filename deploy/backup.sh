@@ -38,9 +38,12 @@ rsync -a --delete "$STATE_DIR/" "$DEST/"
 echo "[sezi-backup] $SERVICE tekrar başlatılıyor…"
 systemctl start "$SERVICE"
 
-# Eski yedekleri buda: en yeni KEEP adedi tut, gerisini sil.
+# Prune old backups: keep the newest KEEP, delete the rest.
+# Ordered by NAME (state-YYYYMMDD-HHMMSS sorts by time), never by mtime: `rsync -a` above copies
+# the state directory's own mtime onto every backup, so all of them share one mtime and an
+# mtime sort deleted the backup just taken once KEEP existed (every night from 2026-11-07 on).
 echo "[sezi-backup] eski yedekler budanıyor (sakla=$KEEP)…"
-ls -1dt "$BACKUP_ROOT"/state-* 2>/dev/null | tail -n +"$((KEEP + 1))" | while read -r old; do
+ls -1d "$BACKUP_ROOT"/state-* 2>/dev/null | sort -r | tail -n +"$((KEEP + 1))" | while read -r old; do
 	echo "[sezi-backup]   siliniyor: $old"
 	rm -rf "$old"
 done
