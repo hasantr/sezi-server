@@ -29,11 +29,12 @@ const BUILD_DOC: &str = include_str!("../../../docs/BOTS_BUILD.md");
 const README: &str = include_str!("../../../tools/bots/README.md");
 
 /// The methods a program can call today (Phases 1–3; Phase 4's are documented as not built).
-const METHODS: [&str; 7] = ["getMe", "getUpdates", "sendMessage", "setWebhook", "deleteWebhook", "getFile", "answerApp"];
+const METHODS: [&str; 8] =
+    ["getMe", "getUpdates", "sendMessage", "setWebhook", "deleteWebhook", "getFile", "answerApp", "sendDocument"];
 
 /// Every source file on the program's path: the Worker's door and the bot inbox's answers to it.
 /// Not the owner's surface (`admin.rs`, `builtin.rs`: `not-builtin` is the owner page's own code).
-const PROGRAM_PATH: [(&str, &str); 11] = [
+const PROGRAM_PATH: [(&str, &str); 13] = [
     ("bots/api.rs", include_str!("api.rs")),
     ("bots/api_input.rs", include_str!("api_input.rs")),
     ("bots/key_brake.rs", include_str!("key_brake.rs")),
@@ -45,6 +46,8 @@ const PROGRAM_PATH: [(&str, &str); 11] = [
     ("inbox_do/bot/room.rs", include_str!("../messages/inbox_do/bot/room.rs")),
     ("inbox_do/bot/send_guard.rs", include_str!("../messages/inbox_do/bot/send_guard.rs")),
     ("inbox_do/bot/files.rs", include_str!("../messages/inbox_do/bot/files.rs")),
+    ("bots/api_document.rs", include_str!("api_document.rs")),
+    ("inbox_do/bot/send_file.rs", include_str!("../messages/inbox_do/bot/send_file.rs")),
 ];
 
 /// Every `(DDD, "code")` in `src`: `bot_err(403, "disabled")`, `Err((400, "bad-text"))`.
@@ -387,6 +390,8 @@ fn parse(method: &str, body: &Value) -> Result<(), Refusal> {
         "setWebhook" => parse_webhook(body).map(drop),
         "getFile" => parse_get_file(body).map(drop),
         "answerApp" => parse_answer_app(body).map(drop),
+        // Its query parameters, read as an object of strings (`api_document.rs`).
+        "sendDocument" => parse_document(body).map(drop),
         other => panic!("no parser named for {other}: add it here when it is dispatched"),
     }
 }
@@ -460,6 +465,7 @@ fn every_answer_holds_to_the_spec() {
             "setWebhook" => vec![api_answer::webhook(Some("ab")), api_answer::webhook(None)],
             "deleteWebhook" => vec![api_answer::webhook(None)],
             "answerApp" => vec![api_answer::app_answered()],
+            "sendDocument" => vec![api_answer::sent("b-1")],
             // The file itself (`get_file_answers_bytes_only_on_success`).
             "getFile" => {
                 assert_eq!(m["answer"].as_object().unwrap().keys().collect::<Vec<_>>(), ["bytes"]);

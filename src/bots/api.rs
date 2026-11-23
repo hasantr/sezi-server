@@ -135,9 +135,14 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     }
     // "When did the program last show up" (the owner's "no word from it" line).
     super::mark_program_seen(&ctx.env, &bot.bot_id).await;
-    let body = match read_body(&mut req).await? {
-        Ok(b) => b,
-        Err((status, code)) => return bot_err(status, code),
+    // The one method whose body is the file itself, not JSON (`api_document.rs`): dispatched
+    // before the JSON body is read, after the key, `disabled` and the call budget like any call.
+    let body = match &*method {
+        "sendDocument" => return super::api_document::send_document(req, &ctx.env, &db, &bot).await,
+        _ => match read_body(&mut req).await? {
+            Ok(b) => b,
+            Err((status, code)) => return bot_err(status, code),
+        },
     };
     match method.as_str() {
         "getMe" => Response::from_json(&super::api_answer::me(&bot.bot_id, &bot.name, bot.about.as_deref())),
@@ -199,7 +204,7 @@ async fn read_body(req: &mut Request) -> Result<std::result::Result<serde_json::
 /// The bot inbox's answer as the program gets it: as it is when it is the documented `{ok, …}`
 /// JSON below 500 (`api_input::is_program_answer`), with its `Retry-After`; anything else —
 /// the inbox threw, was purged under the call, answered plain text — is `bot/inbox-unavailable`.
-async fn inbox_answer(resp: Result<Response>) -> Result<Response> {
+pub(crate) async fn inbox_answer(resp: Result<Response>) -> Result<Response> {
     let Ok(mut resp) = resp else {
         return bot_err(502, "inbox-unavailable");
     };

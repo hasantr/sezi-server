@@ -25,6 +25,7 @@
 
 pub mod admin;
 pub mod api;
+pub(crate) mod api_document;
 pub(crate) mod api_answer;
 pub(crate) mod api_input;
 #[cfg(test)]

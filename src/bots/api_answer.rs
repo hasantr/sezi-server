@@ -23,7 +23,7 @@ pub(crate) const API_VERSION: u32 = 1;
 /// What this relay's v1 does, by name (`tools/bots/api_v1.json` describes each). A program asks
 /// `features` rather than guessing from a server's build: a name is added when its behaviour
 /// ships and is never taken back inside v1.
-pub(crate) const FEATURES: [&str; 10] = [
+pub(crate) const FEATURES: [&str; 11] = [
     "long_poll",
     "webhook",
     "direct_messages",
@@ -35,6 +35,8 @@ pub(crate) const FEATURES: [&str; 10] = [
     "discovery",
     // `app` updates and `answerApp`: the bot's interface (`docs/BOT_APP_PLAN.md`), since 1.3.
     "bot_app",
+    // `sendDocument`: a file into a 1:1 chat (`bots/api_document.rs`), since 1.4.
+    "documents",
 ];
 
 /// The bot API as `/capabilities` announces it (`bot_api`): readable before a program holds a

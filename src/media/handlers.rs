@@ -1,9 +1,8 @@
 use crate::auth::middleware::require_active_auth;
-use crate::d1util::{d1_int, d1_opt_text, d1_text};
+use crate::d1util::d1_text;
 use crate::respond::{json_err, json_err_msg};
 use crate::utils::now_secs;
 use serde::Deserialize;
-use uuid::Uuid;
 use worker::*;
 
 const MAX_SIZE: u64 = 50 * 1024 * 1024; // 50 MiB
@@ -78,84 +77,11 @@ pub async fn upload(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     // Read the body as bytes (50 MiB ceiling).
     let bytes = req.bytes().await?;
 
-    let id = Uuid::new_v4().to_string();
-    let now = now_secs();
-    // The retention window is owner-configured and read from the SAME source as the /capabilities
-    // announcement, so the advertised "kept this long" matches actual behaviour.
-    let retention_days = crate::server::handlers::fetch_retention_days(&ctx.env).await as u64;
-
-    // Write the D1 meta BEFORE the R2 PUT: if the PUT then fails, the meta row is swept at expiry
-    // and nothing is orphaned. PUT-then-INSERT with a failing INSERT would leave a blob in R2 that
-    // cleanup — being D1-driven — would NEVER see. `store_id` is left to its column DEFAULT, so a
-    // single-store install need not name it; `content_type` is kept in D1 for type assurance on
-    // external backends.
-    db.prepare(
-        "INSERT INTO media_objects (blob_id, uploader_id, size_bytes, created_at, expires_at, content_type, scope_kind, scope_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&[
-        d1_text(&id),
-        d1_text(&user_id),
-        d1_int(size as i64),
-        d1_int(now as i64),
-        d1_int((now + retention_days * 24 * 3600) as i64),
-        d1_text(&content_type),
-        d1_opt_text(scope_kind.as_deref()),
-        d1_opt_text(scope_id.as_deref()),
-    ])?
-    .run()
-    .await?;
-
-    // Bump the storage counters — what the enforcement check above reads. The media_objects INSERT
-    // is the source of counter truth (the daily reconcile recomputes from it), so the hook sits
-    // immediately after it: even if the R2 PUT later fails, expiry-cleanup removes the row and
-    // decrements the counter there. BEST-EFFORT — a counter error never breaks the upload.
-    crate::usage::media_added(&db, &user_id, size as i64).await;
-
-    // COUNT-ONLY: daily volume counters for the "TODAY" section of /admin/stats. Same discipline
-    // as media_added — best-effort, never breaks the upload.
-    crate::usage::count_bump(&db, "upload_bytes", size as i64).await;
-    crate::usage::count_bump(&db, "upload_count", 1).await;
-
-    // Write through the single choke-point, which returns the store_id it actually wrote to
-    // (priority overflow, per-store max_bytes, PUT fallback). All stores full → 429
-    // quota_exceeded/server_storage; every attempt failing its PUT → 503 upload_failed.
-    let store_id = match router
-        .put_new(
-            crate::storage::StorageClass::Media,
-            &crate::storage::media_key(&id),
-            bytes,
-            &content_type,
-        )
-        .await
-    {
-        Ok(sid) => sid,
-        Err(e) => {
-            // ROLLBACK: no put_new failure variant (AllFull / AllFailed / NoActive) writes a
-            // blob, so the meta-first row and the quota counters describe something that does not
-            // exist. Leaving it to expiry-cleanup takes a whole retention window, and throughout
-            // it the reconcile counts the row as REAL — which can lock the user out of their own
-            // quota. So undo it at once: delete the row, decrement the counter (media_removed
-            // clamps at 0). Best-effort; the original error response is preserved, and even a
-            // failed rollback still leaves expiry-cleanup as the last line of defence.
-            db.prepare("DELETE FROM media_objects WHERE blob_id = ?")
-                .bind(&[d1_text(&id)])?
-                .run()
-                .await
-                .ok();
-            crate::usage::media_removed(&db, &[(user_id.clone(), size as i64)]).await;
-            return crate::storage::placement_err_response(e);
-        }
+    let scope = scope_kind.as_deref().zip(scope_id.as_deref());
+    let id = match super::store_blob::store_media_blob(&ctx.env, &db, &router, &user_id, scope, bytes, &content_type).await? {
+        Ok(id) => id,
+        Err(refused) => return Ok(refused),
     };
-    // The meta INSERT landed with the primary store as its DEFAULT; if put_new wrote elsewhere
-    // (overflow/fallback) one UPDATE corrects it, leaving the meta-first discipline untouched. On
-    // a single-store install the store_id already equals the DEFAULT, so no extra D1 write.
-    if store_id != crate::storage::PRIMARY_STORE_ID {
-        db.prepare("UPDATE media_objects SET store_id = ? WHERE blob_id = ?")
-            .bind(&[d1_text(&store_id), d1_text(&id)])?
-            .run()
-            .await?;
-    }
 
     Response::from_json(&serde_json::json!({ "id": id, "size": size }))
 }

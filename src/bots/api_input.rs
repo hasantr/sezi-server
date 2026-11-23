@@ -99,6 +99,40 @@ pub(crate) fn parse_get_file(body: &Value) -> Result<&str, Refusal> {
     ok.then_some(id).ok_or(BAD_REQUEST)
 }
 
+/// A `sendDocument`'s query, read as an object of strings (`bots/api_document.rs`): the member,
+/// the file name they see, its type.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DocumentReq {
+    pub(crate) user_id: String,
+    pub(crate) name: String,
+    pub(crate) mime: String,
+}
+
+/// A file name as it will show: 1..=200 characters, no separator, no control character.
+pub(crate) fn document_name_ok(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && n.chars().count() <= 200 && !n.contains(['/', '\\']) && !n.chars().any(char::is_control)
+}
+
+/// A content type of the plain `type/subtype` shape, at most 100 bytes.
+pub(crate) fn document_mime_ok(mime: &str) -> bool {
+    mime.len() <= 100
+        && mime.split_once('/').is_some_and(|(a, b)| {
+            !a.is_empty() && !b.is_empty() && mime.bytes().all(|c| c.is_ascii_alphanumeric() || b"/.+-_".contains(&c))
+        })
+}
+
+/// `sendDocument {user_id, name, mime?}` (its query parameters).
+pub(crate) fn parse_document(body: &Value) -> Result<DocumentReq, Refusal> {
+    let user_id = str_field(body, "user_id")?.ok_or(BAD_REQUEST)?;
+    let name = str_field(body, "name")?.ok_or(BAD_REQUEST)?;
+    let mime = str_field(body, "mime")?.unwrap_or("application/octet-stream");
+    if user_id.len() != 36 || !document_name_ok(name) || !document_mime_ok(mime) {
+        return Err(BAD_REQUEST);
+    }
+    Ok(DocumentReq { user_id: user_id.to_string(), name: name.trim().to_string(), mime: mime.to_string() })
+}
+
 /// Where a `sendMessage` goes.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum Chat {

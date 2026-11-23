@@ -9,6 +9,7 @@
 //! | `store.rs` | the bot tables (created lazily, only here) and the engine's `BotStore` over them |
 //! | `ingest.rs` | the alarm's tick: open stored frames in one synchronous block, ack, queue |
 //! | `send.rs` | `sendMessage`, pair-acks (repair and reply), resends after a re-pair |
+//! | `send_file.rs` | `sendDocument`: a file the Worker stored, sealed to the member as a file message |
 //! | `send_guard.rs` | what a program's sends are held to: 60 a minute, 30 into one chat |
 //! | `api_budget.rs` | every API call of a program: 300 a minute, a burst of 60 |
 //! | `send_replay.rs` | idempotent sending: a repeated `client_id` answers the first `message_id` |
@@ -70,6 +71,7 @@ mod room_plan;
 mod room_send;
 mod room_store;
 mod send;
+mod send_file;
 mod send_guard;
 mod send_replay;
 mod store;
@@ -228,6 +230,9 @@ impl UserInbox {
         let method = s("method");
         if method == "answerApp" {
             return self.bot_answer_app(&ctx, body).await;
+        }
+        if method == "sendDocument" {
+            return self.bot_send_document(&ctx, body).await;
         }
         if !matches!(method, "sendMessage" | "sendRoom") {
             return crate::bots::api::bot_err(404, "unknown-method");
