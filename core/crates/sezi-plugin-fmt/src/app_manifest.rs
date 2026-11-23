@@ -173,17 +173,21 @@ pub enum Capability {
     LinkMeta,
     /// `external.videoThumb`.
     VideoThumb,
+    /// `library.list`, `ui.playLibrary` — the room's library, read only: what is in it and
+    /// playing an item in Sezi's own player. The bytes never reach the app (2026-11-22).
+    Library,
 }
 
 impl Capability {
     /// Every capability this reader knows, in name order of the contract's table.
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 7] = [
         Capability::Roster,
         Capability::Media,
         Capability::Video,
         Capability::Network,
         Capability::LinkMeta,
         Capability::VideoThumb,
+        Capability::Library,
     ];
 
     /// The name it is granted, consented and refused under.
@@ -195,6 +199,7 @@ impl Capability {
             Capability::Network => "network",
             Capability::LinkMeta => "external.linkMeta",
             Capability::VideoThumb => "external.videoThumb",
+            Capability::Library => "library",
         }
     }
 }
@@ -211,6 +216,7 @@ pub struct Capabilities {
     pub network_purpose: Option<String>,
     pub link_meta: bool,
     pub video_thumb: bool,
+    pub library: bool,
     /// Capability names this reader does not know: parsed, never granted (module doc).
     pub unknown: BTreeSet<String>,
 }
@@ -225,6 +231,7 @@ impl Capabilities {
             Capability::Network => !self.origins.is_empty(),
             Capability::LinkMeta => self.link_meta,
             Capability::VideoThumb => self.video_thumb,
+            Capability::Library => self.library,
         }
     }
 
@@ -506,6 +513,7 @@ fn parse_capabilities(v: Option<&Value>) -> Result<Capabilities, &'static str> {
             "roster" => caps.roster = flag(Some(value), BAD_CAPABILITY)?,
             "media" => caps.media = flag(Some(value), BAD_CAPABILITY)?,
             "video" => caps.video = flag(Some(value), BAD_CAPABILITY)?,
+            "library" => caps.library = flag(Some(value), BAD_CAPABILITY)?,
             "network" => {
                 let n = value.as_object().ok_or(BAD_CAPABILITY)?;
                 let list = n.get("origins").and_then(Value::as_array).ok_or(BAD_CAPABILITY)?;

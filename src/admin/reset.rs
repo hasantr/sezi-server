@@ -185,6 +185,9 @@ const WIPE_TABLES: &[&str] = &[
     "plugin_media_objects",
     "plugin_code_objects",
     "room_library_objects",
+    // The disk-read library items hold no blob: nothing to copy into storage_orphans.
+    "room_library_disk",
+    "disk_catalogs",
     // Group state. Join requests first: they reference both `groups` and `users`.
     "group_join_requests",
     "group_members",

@@ -289,3 +289,25 @@ fn property_mutated_bytes_never_panic() {
         }
     }
 }
+
+/// `library` (2026-11-22): the room's library, read only — a known name, granted and consented
+/// under that name; declared false it is nothing at all.
+#[test]
+fn the_library_capability_is_read_and_granted_by_name() {
+    let m = with(|o| {
+        o.insert("capabilities".into(), serde_json::json!({ "library": true }));
+    })
+    .unwrap();
+    assert!(m.capabilities.library && m.capabilities.has(Capability::Library));
+    assert!(m.capabilities.unknown.is_empty());
+    assert_eq!(m.capabilities.granted().into_iter().collect::<Vec<_>>(), vec!["library"]);
+    let off = with(|o| {
+        o.insert("capabilities".into(), serde_json::json!({ "library": false }));
+    })
+    .unwrap();
+    assert!(off.capabilities.granted().is_empty());
+    assert!(with(|o| {
+        o.insert("capabilities".into(), serde_json::json!({ "library": "yes" }));
+    })
+    .is_err());
+}

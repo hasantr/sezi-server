@@ -10,6 +10,8 @@ mod contact_grant;
 mod contact_qr;
 mod contacts;
 mod d1util;
+mod disk;
+mod disk_catalog;
 mod drive;
 mod devices;
 mod door_bucket;
@@ -369,6 +371,15 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .get_async("/room-library/:room/:id", room_library::get_object)
         .delete_async("/room-library/:room/:id", room_library::delete_object)
         .get_async("/room-library/:room", room_library::list_objects)
+        .post_async("/room-library/:room/disk", disk::add_to_room)
+        .get_async("/room-library/:room/catalogs", disk_catalog::list)
+        .post_async("/room-library/:room/catalogs", disk_catalog::share)
+        .delete_async("/room-library/:room/catalogs/:cid", disk_catalog::unshare)
+        .get_async("/room-library/:room/catalogs/:cid/list", disk_catalog::browse)
+        .get_async("/room-library/:room/catalogs/:cid/search", disk_catalog::search)
+        .post_async("/room-library/:room/catalogs/:cid/open", disk_catalog::open)
+        .get_async("/admin/disk", disk::list)
+        .post_async("/admin/disk/prepare", disk::prepare)
         // The operator-hosted instrument pack (music studio): one SoundFont per server. PUT and
         // DELETE are owner-only; both GETs take any active member token. This is the ONE object
         // the relay stores and serves in PLAINTEXT — see instrument_pack.rs for why. The static

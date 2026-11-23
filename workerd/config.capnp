@@ -11,8 +11,8 @@ const config :Workerd.Config = ( services = [
             esModule = embed "modules/core_user_sezi-server--__mf_do_wrapper.js" ),
           ( name = "shim.js",
             esModule = embed "modules/core_user_sezi-server--shim.js" ),
-          ( name = "4e32b32b8d37d07cb6facf206d5905a19539feac-index_bg.wasm",
-            wasm = embed "modules/core_user_sezi-server--4e32b32b8d37d07cb6facf206d5905a19539feac-index_bg.wasm" ) ],
+          ( name = "8d643240c2f16cbe30ea6c6a1b93a9e67b7b6262-index_bg.wasm",
+            wasm = embed "modules/core_user_sezi-server--8d643240c2f16cbe30ea6c6a1b93a9e67b7b6262-index_bg.wasm" ) ],
         compatibilityDate = "2026-10-23",
         compatibilityFlags = ["nodejs_compat"],
         bindings = [
@@ -72,7 +72,9 @@ const config :Workerd.Config = ( services = [
             fromEnvironment = "TURN_MONTHLY_CAP" ),
           ( name = "TURN_USER_MONTHLY_CAP",
             fromEnvironment = "TURN_USER_MONTHLY_CAP" ),
-          (name = "SEZI_HOSTING", text = "workerd") ],
+          (name = "SEZI_HOSTING", text = "workerd"),
+          ( name = "SEZI_DISK",
+            service = (name = "sezi-disk", props = (empty = void)) ) ],
         globalOutbound = (
           name = "strip-cf-connecting-ip:0",
           props = (empty = void) ),
@@ -269,7 +271,11 @@ const config :Workerd.Config = ( services = [
           requireClientCerts = false,
           trustBrowserCas = true,
           trustedCertificates = [],
-          minVersion = goodDefault ) ) ) ],
+          minVersion = goodDefault ) ) ),
+    ( name = "sezi-disk",
+      external = (
+        address = "127.0.0.1:8790",
+        http = (style = host) ) ) ],
   sockets = [
     ( name = "http",
       address = "127.0.0.1:8787",

@@ -483,7 +483,11 @@ pub async fn get_object(req: Request, ctx: RouteContext<()>) -> Result<Response>
     }
     let db = ctx.env.d1("DB")?;
     let Some(row) = load_object(&db, &room_id, &object_id).await? else {
-        return json_err(404, "not_found");
+        // Not a stored part: perhaps a part of a file on the server's own disk (`disk.rs`).
+        return match crate::disk::get_part(&ctx.env, &db, &room_id, &object_id, header(&req, "range").as_deref()).await? {
+            Some(resp) => Ok(resp),
+            None => json_err(404, "not_found"),
+        };
     };
     // The sweep runs daily; without this an expired part stays readable for up to a day past the
     // retention its group was promised.
@@ -548,7 +552,11 @@ pub async fn delete_object(req: Request, ctx: RouteContext<()>) -> Result<Respon
     }
     let db = ctx.env.d1("DB")?;
     let Some(row) = load_object(&db, &room_id, &object_id).await? else {
-        return no_content();
+        // A disk item's part (`disk.rs`): the item leaves the room, its file stays on the disk.
+        return match crate::disk::delete_part(&db, &room_id, &object_id, &user_id, &role).await? {
+            Some(resp) => Ok(resp),
+            None => no_content(),
+        };
     };
     // A group admin removes what no longer belongs in the room; anyone else removes only their
     // own. The server OWNER has no say here — running the server is not a seat in the group.

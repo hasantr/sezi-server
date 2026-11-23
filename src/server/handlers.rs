@@ -113,6 +113,10 @@ pub async fn capabilities(_req: Request, ctx: RouteContext<()>) -> Result<Respon
     // major version, path and features, before a program holds a key. Additive: nothing read
     // it before.
     body["bot_api"] = crate::bots::api_answer::discovery();
+    // The server's own disk as a library source (`disk.rs`): a gateway answers on the box. Only
+    // a self-hosted relay has one; an app finds none elsewhere, or on an older relay, and does
+    // not offer "from the server's disk".
+    body["features"]["server_disk"] = serde_json::Value::Bool(crate::disk::reachable(&ctx.env).await);
     // A self-hosted relay's update timer called in within 15 min (`server_update.rs`), so the
     // owner's app offers the one-tap update rather than the written guide. Additive: false on
     // every relay without an updater token, Cloudflare's included; an older app ignores it.
