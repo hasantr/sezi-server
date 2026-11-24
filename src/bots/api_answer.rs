@@ -23,7 +23,7 @@ pub(crate) const API_VERSION: u32 = 1;
 /// What this relay's v1 does, by name (`tools/bots/api_v1.json` describes each). A program asks
 /// `features` rather than guessing from a server's build: a name is added when its behaviour
 /// ships and is never taken back inside v1.
-pub(crate) const FEATURES: [&str; 12] = [
+pub(crate) const FEATURES: [&str; 13] = [
     "long_poll",
     "webhook",
     "direct_messages",
@@ -39,6 +39,8 @@ pub(crate) const FEATURES: [&str; 12] = [
     "documents",
     // `sendAppFile`: a file for the bot's interface, no message (`bots/api_document.rs`), since 1.5.
     "app_files",
+    // `setMyCommands` / `getMyCommands` / `deleteMyCommands`: the menu members see (`bots/commands.rs`), since 1.6.
+    "command_menu",
 ];
 
 /// The bot API as `/capabilities` announces it (`bot_api`): readable before a program holds a
@@ -80,6 +82,16 @@ pub(crate) fn sent(message_id: &str) -> Value {
 /// hand its interface. `media_id` is the blob, the rest opens it (`sezi_file::decrypt_in_memory`).
 pub(crate) fn app_file(manifest: &sezi_protocol::inner::FileManifest) -> Value {
     json!({ "ok": true, "file": manifest })
+}
+
+/// `setMyCommands` / `deleteMyCommands`: kept.
+pub(crate) fn commands_set() -> Value {
+    json!({ "ok": true })
+}
+
+/// `getMyCommands`: the list the program set, `[]` for none.
+pub(crate) fn commands(list: &[super::api_input::BotCommand]) -> Value {
+    json!({ "ok": true, "commands": list })
 }
 
 /// `answerApp` queued for the member's devices.

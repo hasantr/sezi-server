@@ -166,6 +166,9 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
             Ok(answer) => answer_app(&ctx.env, &db, &bot, answer).await,
             Err((status, code)) => bot_err(status, code),
         },
+        "setMyCommands" => super::commands::set(&db, &bot, input::parse_set_commands(&body)).await,
+        "getMyCommands" => super::commands::get(&db, &bot).await,
+        "deleteMyCommands" => super::commands::delete(&db, &bot).await,
         "getFile" => match input::parse_get_file(&body) {
             Ok(file_id) => get_file(&ctx.env, &bot, file_id).await,
             Err((status, code)) => bot_err(status, code),

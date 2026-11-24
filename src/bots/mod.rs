@@ -31,6 +31,7 @@ pub(crate) mod api_input;
 #[cfg(test)]
 pub(crate) mod api_spec;
 pub mod builtin;
+pub(crate) mod commands;
 pub(crate) mod builtin_hearings_rules;
 pub(crate) mod builtin_rules;
 pub(crate) mod key_brake;

@@ -258,3 +258,62 @@ pub(crate) fn is_program_answer(status: u16, body: &[u8]) -> bool {
 #[cfg(test)]
 #[path = "api_input_tests.rs"]
 mod tests;
+
+/// The most commands a bot lists (`setMyCommands`), as Telegram allows.
+pub(crate) const MAX_COMMANDS: usize = 100;
+/// A command's name: 1..=32 lowercase letters (any script), digits and `_` — what an update's
+/// `command.name` can be (`inbox_do/bot/updates.rs` `parse_command` lowercases what it reads).
+pub(crate) const MAX_COMMAND_CHARS: usize = 32;
+/// What the menu shows beside a command, 1..=256 characters after trimming.
+pub(crate) const MAX_COMMAND_DESCRIPTION_CHARS: usize = 256;
+
+/// One command a bot lists, checked. `app`: choosing it in the menu opens the bot's interface
+/// with the command as its start (`sezgi.ctx().botStart`) instead of sending a text.
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BotCommand {
+    pub(crate) command: String,
+    pub(crate) description: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) app: bool,
+}
+
+/// A command name as a menu offers it: a leading `/` dropped, then held to its shape.
+pub(crate) fn command_name_ok(name: &str) -> bool {
+    let n = name.chars().count();
+    (1..=MAX_COMMAND_CHARS).contains(&n)
+        && name.chars().all(|c| (c.is_alphanumeric() || c == '_') && !c.is_uppercase())
+}
+
+/// `setMyCommands {commands:[{command, description, app?}]}`: the shape (`bad-request`), then each
+/// entry (`bad-command`: a name or description out of shape, a name twice, more than 100).
+pub(crate) fn parse_set_commands(body: &Value) -> Result<Vec<BotCommand>, Refusal> {
+    let Some(Value::Array(list)) = body.get("commands") else {
+        return Err(BAD_REQUEST);
+    };
+    if list.len() > MAX_COMMANDS {
+        return Err((400, "bad-command"));
+    }
+    let mut out: Vec<BotCommand> = Vec::with_capacity(list.len());
+    for entry in list {
+        let Value::Object(e) = entry else {
+            return Err(BAD_REQUEST);
+        };
+        let (Some(Value::String(name)), Some(Value::String(desc))) = (e.get("command"), e.get("description")) else {
+            return Err(BAD_REQUEST);
+        };
+        let app = match e.get("app") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(BAD_REQUEST),
+        };
+        let name = name.trim().trim_start_matches('/');
+        let desc = desc.trim();
+        let desc_ok = (1..=MAX_COMMAND_DESCRIPTION_CHARS).contains(&desc.chars().count())
+            && !desc.chars().any(char::is_control);
+        if !command_name_ok(name) || !desc_ok || out.iter().any(|c| c.command == name) {
+            return Err((400, "bad-command"));
+        }
+        out.push(BotCommand { command: name.to_string(), description: desc.to_string(), app });
+    }
+    Ok(out)
+}

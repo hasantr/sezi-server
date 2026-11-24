@@ -198,4 +198,5 @@ pub(super) const MIGRATIONS: &[(&str, &str)] = &[
     ("0061_bot_app", include_str!("../migrations/0061_bot_app.sql")),
     ("0062_drive_spaces", include_str!("../migrations/0062_drive_spaces.sql")),
     ("0063_room_library_disk", include_str!("../migrations/0063_room_library_disk.sql")),
+    ("0064_bot_commands", include_str!("../migrations/0064_bot_commands.sql")),
 ];

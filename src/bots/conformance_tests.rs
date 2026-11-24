@@ -29,7 +29,7 @@ const BUILD_DOC: &str = include_str!("../../../docs/BOTS_BUILD.md");
 const README: &str = include_str!("../../../tools/bots/README.md");
 
 /// The methods a program can call today (Phases 1–3; Phase 4's are documented as not built).
-const METHODS: [&str; 9] = [
+const METHODS: [&str; 12] = [
     "getMe",
     "getUpdates",
     "sendMessage",
@@ -39,11 +39,14 @@ const METHODS: [&str; 9] = [
     "answerApp",
     "sendDocument",
     "sendAppFile",
+    "setMyCommands",
+    "getMyCommands",
+    "deleteMyCommands",
 ];
 
 /// Every source file on the program's path: the Worker's door and the bot inbox's answers to it.
 /// Not the owner's surface (`admin.rs`, `builtin.rs`: `not-builtin` is the owner page's own code).
-const PROGRAM_PATH: [(&str, &str); 13] = [
+const PROGRAM_PATH: [(&str, &str); 14] = [
     ("bots/api.rs", include_str!("api.rs")),
     ("bots/api_input.rs", include_str!("api_input.rs")),
     ("bots/key_brake.rs", include_str!("key_brake.rs")),
@@ -57,6 +60,7 @@ const PROGRAM_PATH: [(&str, &str); 13] = [
     ("inbox_do/bot/files.rs", include_str!("../messages/inbox_do/bot/files.rs")),
     ("bots/api_document.rs", include_str!("api_document.rs")),
     ("inbox_do/bot/send_file.rs", include_str!("../messages/inbox_do/bot/send_file.rs")),
+    ("bots/commands.rs", include_str!("commands.rs")),
 ];
 
 /// Every `(DDD, "code")` in `src`: `bot_err(403, "disabled")`, `Err((400, "bad-text"))`.
@@ -393,7 +397,8 @@ fn the_specs_methods_and_errors_are_the_codes() {
 /// What the parser of each method accepts.
 fn parse(method: &str, body: &Value) -> Result<(), Refusal> {
     match method {
-        "getMe" | "deleteWebhook" => Ok(()),
+        "getMe" | "deleteWebhook" | "getMyCommands" | "deleteMyCommands" => Ok(()),
+        "setMyCommands" => parse_set_commands(body).map(drop),
         "getUpdates" => parse_updates(body).map(drop),
         "sendMessage" => parse_send(body).map(drop),
         "setWebhook" => parse_webhook(body).map(drop),
@@ -475,6 +480,15 @@ fn every_answer_holds_to_the_spec() {
             "deleteWebhook" => vec![api_answer::webhook(None)],
             "answerApp" => vec![api_answer::app_answered()],
             "sendDocument" => vec![api_answer::sent("b-1")],
+            "setMyCommands" | "deleteMyCommands" => vec![api_answer::commands_set()],
+            "getMyCommands" => vec![
+                api_answer::commands(&[]),
+                api_answer::commands(&[crate::bots::api_input::BotCommand {
+                    command: "raf".into(),
+                    description: "Rafı aç".into(),
+                    app: true,
+                }]),
+            ],
             "sendAppFile" => vec![api_answer::app_file(&sezi_protocol::inner::FileManifest {
                 v: 1,
                 media_id: "m-1".into(),
@@ -537,6 +551,9 @@ fn every_limit_in_the_spec_is_the_codes() {
             "waiting_per_member" => declares(backlog, "PER_SENDER: i64", v),
             "stored_per_bot" => declares(backlog, "PER_BOT: i64", v),
             "file_bytes" => v as u64 == crate::media::bot_access::MAX_BOT_FILE_BYTES,
+            "commands" => v == crate::bots::api_input::MAX_COMMANDS as i64,
+            "command_chars" => v == crate::bots::api_input::MAX_COMMAND_CHARS as i64,
+            "command_description_chars" => v == crate::bots::api_input::MAX_COMMAND_DESCRIPTION_CHARS as i64,
             "file_reads_per_minute" => declares(files, "READS_PER_MINUTE: i64", v),
             "webhook_url_bytes" => declares(hook, "MAX_URL_LEN: usize", v),
             "webhook_aside_after_failures" => declares(order, "ASIDE_AFTER: i64", v),
