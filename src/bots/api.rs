@@ -135,10 +135,11 @@ pub async fn dispatch(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     }
     // "When did the program last show up" (the owner's "no word from it" line).
     super::mark_program_seen(&ctx.env, &bot.bot_id).await;
-    // The one method whose body is the file itself, not JSON (`api_document.rs`): dispatched
+    // The two methods whose body is the file itself, not JSON (`api_document.rs`): dispatched
     // before the JSON body is read, after the key, `disabled` and the call budget like any call.
     let body = match &*method {
-        "sendDocument" => return super::api_document::send_document(req, &ctx.env, &db, &bot).await,
+        "sendDocument" => return super::api_document::send_document(req, &ctx.env, &db, &bot, false).await,
+        "sendAppFile" => return super::api_document::send_document(req, &ctx.env, &db, &bot, true).await,
         _ => match read_body(&mut req).await? {
             Ok(b) => b,
             Err((status, code)) => return bot_err(status, code),

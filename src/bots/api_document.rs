@@ -8,6 +8,11 @@
 //! (scope `peer`), and hands the manifest to the bot's inbox, which seals it to every device of the
 //! member (`inbox_do/bot/send_file.rs`). Their app downloads and opens it like any file.
 //!
+//! `sendAppFile` (bot API 1.5) is the same file for the bot's INTERFACE: stored the same way, held
+//! to the same reply-only rule by the inbox, but sent as no message — its manifest (where the blob
+//! is and its key) comes back to the program, which hands it to its interface in an `answerApp`,
+//! and the member's app opens it there (a book straight into the reader), nothing in the chat.
+//!
 //! The plaintext passes through this Worker in memory, as it does through `getFile`; the store
 //! keeps only ciphertext. A send the inbox refuses (reply-only, a send limit, no device) takes
 //! the blob back out.
@@ -22,7 +27,14 @@ use crate::d1util::d1_text;
 /// The largest document: the same 10 MiB a bot may read from a member (`getFile`).
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = crate::media::bot_access::MAX_BOT_FILE_BYTES;
 
-pub(crate) async fn send_document(mut req: Request, env: &Env, db: &D1Database, bot: &BotAuth) -> Result<Response> {
+/// `for_app`: `sendAppFile` — no message, the manifest back to the program.
+pub(crate) async fn send_document(
+    mut req: Request,
+    env: &Env,
+    db: &D1Database,
+    bot: &BotAuth,
+    for_app: bool,
+) -> Result<Response> {
     let url = req.url()?;
     let query: serde_json::Map<String, serde_json::Value> =
         url.query_pairs().map(|(k, v)| (k.into_owned(), serde_json::Value::String(v.into_owned()))).collect();
@@ -71,7 +83,8 @@ pub(crate) async fn send_document(mut req: Request, env: &Env, db: &D1Database, 
         Err(refused) => return Ok(refused),
     };
     manifest.media_id = media_id.clone();
-    let call = serde_json::json!({ "method": "sendDocument", "to": to, "manifest": manifest });
+    let method = if for_app { "sendAppFile" } else { "sendDocument" };
+    let call = serde_json::json!({ "method": method, "to": to, "manifest": manifest });
     let resp = super::bot_inbox(env, &bot.bot_id, Method::Post, "/bot/api", Some(call.to_string())).await;
     let sent = matches!(&resp, Ok(r) if r.status_code() == 200);
     if !sent {

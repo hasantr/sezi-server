@@ -29,8 +29,17 @@ const BUILD_DOC: &str = include_str!("../../../docs/BOTS_BUILD.md");
 const README: &str = include_str!("../../../tools/bots/README.md");
 
 /// The methods a program can call today (Phases 1–3; Phase 4's are documented as not built).
-const METHODS: [&str; 8] =
-    ["getMe", "getUpdates", "sendMessage", "setWebhook", "deleteWebhook", "getFile", "answerApp", "sendDocument"];
+const METHODS: [&str; 9] = [
+    "getMe",
+    "getUpdates",
+    "sendMessage",
+    "setWebhook",
+    "deleteWebhook",
+    "getFile",
+    "answerApp",
+    "sendDocument",
+    "sendAppFile",
+];
 
 /// Every source file on the program's path: the Worker's door and the bot inbox's answers to it.
 /// Not the owner's surface (`admin.rs`, `builtin.rs`: `not-builtin` is the owner page's own code).
@@ -391,7 +400,7 @@ fn parse(method: &str, body: &Value) -> Result<(), Refusal> {
         "getFile" => parse_get_file(body).map(drop),
         "answerApp" => parse_answer_app(body).map(drop),
         // Its query parameters, read as an object of strings (`api_document.rs`).
-        "sendDocument" => parse_document(body).map(drop),
+        "sendDocument" | "sendAppFile" => parse_document(body).map(drop),
         other => panic!("no parser named for {other}: add it here when it is dispatched"),
     }
 }
@@ -466,6 +475,16 @@ fn every_answer_holds_to_the_spec() {
             "deleteWebhook" => vec![api_answer::webhook(None)],
             "answerApp" => vec![api_answer::app_answered()],
             "sendDocument" => vec![api_answer::sent("b-1")],
+            "sendAppFile" => vec![api_answer::app_file(&sezi_protocol::inner::FileManifest {
+                v: 1,
+                media_id: "m-1".into(),
+                key_b64: "k".into(),
+                nonce_b64: "n".into(),
+                chunk_size: 65536,
+                size: 1,
+                content_type: "application/epub+zip".into(),
+                filename: "a.epub".into(),
+            })],
             // The file itself (`get_file_answers_bytes_only_on_success`).
             "getFile" => {
                 assert_eq!(m["answer"].as_object().unwrap().keys().collect::<Vec<_>>(), ["bytes"]);

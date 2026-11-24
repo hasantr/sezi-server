@@ -46,4 +46,25 @@ impl UserInbox {
         self.bot_rearm().await;
         Response::from_json(&crate::bots::api_answer::sent(&msg_uid))
     }
+
+    /// `sendAppFile` (API 1.5): the same reply-only rule, then nothing is sent — the manifest goes
+    /// back to the program for its interface (`answerApp`). No send slot: it is no message, and an
+    /// interface opening books one after another would otherwise trip the chat's send limit; the
+    /// call budget and the member's storage still bound it.
+    pub(super) async fn bot_app_file(&self, body: &serde_json::Value) -> Result<Response> {
+        let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(manifest) = body
+            .get("manifest")
+            .and_then(|m| serde_json::from_value::<FileManifest>(m.clone()).ok())
+        else {
+            return crate::bots::api::bot_err(400, "bad-request");
+        };
+        let store = self.bot_store();
+        let now = crate::utils::now_ms() as i64;
+        let scope = dm_scope::Scope::stored(store.kv_get(dm_scope::KV_SCOPE).as_deref());
+        if !dm_scope::may_write(&store.db, scope, to, now) {
+            return crate::bots::api::bot_err(403, "reply-only");
+        }
+        Response::from_json(&crate::bots::api_answer::app_file(&manifest))
+    }
 }

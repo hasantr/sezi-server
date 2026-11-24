@@ -23,7 +23,7 @@ pub(crate) const API_VERSION: u32 = 1;
 /// What this relay's v1 does, by name (`tools/bots/api_v1.json` describes each). A program asks
 /// `features` rather than guessing from a server's build: a name is added when its behaviour
 /// ships and is never taken back inside v1.
-pub(crate) const FEATURES: [&str; 11] = [
+pub(crate) const FEATURES: [&str; 12] = [
     "long_poll",
     "webhook",
     "direct_messages",
@@ -37,6 +37,8 @@ pub(crate) const FEATURES: [&str; 11] = [
     "bot_app",
     // `sendDocument`: a file into a 1:1 chat (`bots/api_document.rs`), since 1.4.
     "documents",
+    // `sendAppFile`: a file for the bot's interface, no message (`bots/api_document.rs`), since 1.5.
+    "app_files",
 ];
 
 /// The bot API as `/capabilities` announces it (`bot_api`): readable before a program holds a
@@ -72,6 +74,12 @@ pub(crate) fn updates(rows: impl IntoIterator<Item = (i64, String)>) -> Value {
 /// `sendMessage`.
 pub(crate) fn sent(message_id: &str) -> Value {
     json!({ "ok": true, "message_id": message_id })
+}
+
+/// `sendAppFile`: the stored file's manifest — where its blob is and its key — for the program to
+/// hand its interface. `media_id` is the blob, the rest opens it (`sezi_file::decrypt_in_memory`).
+pub(crate) fn app_file(manifest: &sezi_protocol::inner::FileManifest) -> Value {
+    json!({ "ok": true, "file": manifest })
 }
 
 /// `answerApp` queued for the member's devices.
